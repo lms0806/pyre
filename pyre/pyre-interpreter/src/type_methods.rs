@@ -2999,6 +2999,7 @@ pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     let keepends = crate::builtins::kwarg_get(kwargs, "keepends")
         .or_else(|| pos.get(1).copied())
         .map(crate::baseobjspace::is_true)
+        .transpose()?
         .unwrap_or(false);
     let mut parts: Vec<PyObjectRef> = Vec::new();
     let mut start = 0usize;

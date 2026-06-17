@@ -1,7 +1,11 @@
 //! W_BoolObject — Python `bool` type.
 //!
-//! Booleans are a subtype of int in Python. In pyre, they use a separate
-//! struct for JIT type specialization via `GuardClass`.
+//! `W_BoolObject` is a subclass of `W_IntObject` (`boolobject.py:30`), so a
+//! bool holds the same `intval: i64` field at the same offset as an int
+//! (0 for `False`, 1 for `True`). The two are distinguished only by the
+//! `&BOOL_TYPE` vtable, which lets `GuardClass` specialize on the concrete
+//! class while every `intval` field read stays layout-compatible with
+//! `W_IntObject`.
 
 use crate::pyobject::*;
 
@@ -9,11 +13,12 @@ use crate::pyobject::*;
 #[repr(C)]
 pub struct W_BoolObject {
     pub ob_header: PyObject,
-    pub boolval: bool,
+    pub intval: i64,
 }
 
-/// Field offset of `boolval` within `W_BoolObject`, for JIT field access.
-pub const BOOL_BOOLVAL_OFFSET: usize = std::mem::offset_of!(W_BoolObject, boolval);
+/// Field offset of `intval` within `W_BoolObject`, for JIT field access.
+/// Layout-identical to `INT_INTVAL_OFFSET` (`bool` inherits `intval`).
+pub const BOOL_INTVAL_OFFSET: usize = std::mem::offset_of!(W_BoolObject, intval);
 
 /// Fixed payload size (`framework.py:811`).
 pub const W_BOOL_OBJECT_SIZE: usize = std::mem::size_of::<W_BoolObject>();
@@ -42,7 +47,7 @@ impl crate::lltype::GcType for W_BoolObject {
 /// `obj` must point to a valid `W_BoolObject`.
 #[inline]
 pub unsafe fn w_bool_get_value(obj: PyObjectRef) -> bool {
-    unsafe { (*(obj as *const W_BoolObject)).boolval }
+    unsafe { (*(obj as *const W_BoolObject)).intval != 0 }
 }
 
 // ── Bool singletons ──────────────────────────────────────────────────
@@ -59,7 +64,7 @@ static TRUE_SINGLETON: W_BoolObject = W_BoolObject {
         ob_type: &BOOL_TYPE as *const PyType,
         w_class: std::ptr::null_mut(),
     },
-    boolval: true,
+    intval: 1,
 };
 
 static FALSE_SINGLETON: W_BoolObject = W_BoolObject {
@@ -67,7 +72,7 @@ static FALSE_SINGLETON: W_BoolObject = W_BoolObject {
         ob_type: &BOOL_TYPE as *const PyType,
         w_class: std::ptr::null_mut(),
     },
-    boolval: false,
+    intval: 0,
 };
 
 /// Get a boolean PyObjectRef from a bool value.

@@ -3837,7 +3837,15 @@ pub extern "C" fn bh_truth_fn(value: i64) -> i64 {
     if obj.is_null() {
         return 0;
     }
-    pyre_interpreter::opcode_ops::truth_value(obj) as i64
+    match pyre_interpreter::opcode_ops::truth_value(obj) {
+        Ok(truth) => truth as i64,
+        Err(err) => {
+            // A raising `__bool__` / `__len__` publishes for the trailing
+            // GuardNoException, then returns 0.
+            publish_residual_call_exception(err.to_exc_object() as i64);
+            0
+        }
+    }
 }
 
 /// RPython: bhimpl_int_lt, bhimpl_int_eq, etc. — comparison helper.
@@ -4153,12 +4161,17 @@ pub extern "C" fn bh_unary_invert_fn(value: i64) -> i64 {
 /// UNARY_NOT residual (`unary_not` HLOp → `residual_call_r_r`).  Returns
 /// `not value` as a bool object via `opcode_ops::truth_value`.  A user
 /// `__bool__` / `__len__` may run Python (`MayForce`), matching the
-/// interpreter's UNARY_NOT truth path; `truth_value` does not surface an
-/// error (the JIT and the interpreter share `is_true`), so the helper is
-/// infallible and never publishes `BH_LAST_EXC_VALUE`.
+/// interpreter's UNARY_NOT truth path; a raising `__bool__` publishes
+/// through `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the
+/// call returns 0.
 pub extern "C" fn bh_unary_not_fn(value: i64) -> i64 {
-    let truth = pyre_interpreter::opcode_ops::truth_value(value as pyre_object::PyObjectRef);
-    pyre_object::w_bool_from(!truth) as i64
+    match pyre_interpreter::opcode_ops::truth_value(value as pyre_object::PyObjectRef) {
+        Ok(truth) => pyre_object::w_bool_from(!truth) as i64,
+        Err(err) => {
+            publish_residual_call_exception(err.to_exc_object() as i64);
+            0
+        }
+    }
 }
 
 /// LOAD_FAST_CHECK residual (`load_fast_check` HLOp → `residual_call_ir_r`).

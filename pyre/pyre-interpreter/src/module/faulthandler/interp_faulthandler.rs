@@ -162,14 +162,22 @@ pub fn register_module(ns: &mut DictStorage) {
             }
             let signum = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
             let fd = faulthandler_extract_fd(args.get(1).copied().unwrap_or(pyre_object::PY_NULL))?;
+            // handler.py:174 `@unwrap_spec(all_threads=int, chain=int)`
+            // with defaults `all_threads=1, chain=0`: the arguments are
+            // coerced as integers (`gateway_int_w`, raising on a non-int),
+            // not by truthiness; `register` then tests `if all_threads:`.
             let all_threads = args
                 .get(2)
-                .map(|&a| crate::baseobjspace::is_true(a))
-                .unwrap_or(true);
+                .map(|&a| crate::baseobjspace::gateway_int_w(a))
+                .transpose()?
+                .unwrap_or(1)
+                != 0;
             let chain = args
                 .get(3)
-                .map(|&a| crate::baseobjspace::is_true(a))
-                .unwrap_or(false);
+                .map(|&a| crate::baseobjspace::gateway_int_w(a))
+                .transpose()?
+                .unwrap_or(0)
+                != 0;
             #[cfg(all(unix, feature = "host_env"))]
             {
                 rustpython_host_env::faulthandler::register_user_signal(

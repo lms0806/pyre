@@ -28,11 +28,13 @@ use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 pub use crate::objspace::descroperation::*;
 pub(crate) use crate::objspace::std::formatting::{format_g_like, normalise_exponent};
 
-// ── Hash-error slot for dict key gate ────────────────────────────────
-// The strict hash hook (`pyre_object_hash_w_trampoline` in pyre-jit)
-// stores the concrete PyError here when `try_hash_value` fails.
-// Dict entry gates call `take_pending_hash_error` after a checked
-// dict op returns `DictKeyError` to recover the exception.
+// ── Pending dict-key-callback error slot ─────────────────────────────
+// The `r_dict(eq_w, hash_w)` callbacks (`pyre_object_hash_w_trampoline`
+// / `pyre_object_eq_w_trampoline` in pyre-jit) cannot return a `Result`
+// across the pyre-object dict probe, so on a raising `__hash__` or
+// `__eq__` they stash the concrete PyError here.  Dict entry gates call
+// `take_pending_hash_error` after a checked dict op returns
+// `DictKeyError` to recover whichever exception was raised.
 thread_local! {
     static PENDING_HASH_ERROR: Cell<Option<PyError>> = const { Cell::new(None) };
 }
@@ -541,7 +543,7 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
         if let Some(cls_type) = crate::typedef::r#type(classinfo) {
             if let Some(check) = lookup_in_type(cls_type, "__instancecheck__") {
                 let result = crate::call::call_function_impl_result(check, &[classinfo, obj])?;
-                return Ok(is_true(result));
+                return Ok(is_true(result)?);
             }
         }
         p_recursive_isinstance_w(obj, classinfo)
@@ -586,7 +588,7 @@ pub fn issubclass(derived: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, 
         if let Some(cls_type) = crate::typedef::r#type(classinfo) {
             if let Some(check) = lookup_in_type(cls_type, "__subclasscheck__") {
                 let result = crate::call::call_function_impl_result(check, &[classinfo, derived])?;
-                return Ok(is_true(result));
+                return Ok(is_true(result)?);
             }
         }
         p_recursive_issubclass_w(derived, classinfo)
@@ -618,81 +620,94 @@ pub fn issubclass(derived: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, 
 /// for staticmethod / classmethod) can propagate it.
 pub fn isabstractmethod_w(obj: PyObjectRef) -> Result<bool, crate::PyError> {
     match getattr_str(obj, "__isabstractmethod__") {
-        Ok(w_result) => Ok(is_true(w_result)),
+        Ok(w_result) => Ok(is_true(w_result)?),
         Err(e) if matches!(e.kind, crate::PyErrorKind::AttributeError) => Ok(false),
         Err(e) => Err(e),
     }
 }
 
-pub fn is_true(obj: PyObjectRef) -> bool {
+/// descroperation.py:265-285 `is_true`.
+///
+/// ```python
+/// def is_true(space, w_obj):
+///     w_descr = space.lookup(w_obj, "__bool__")
+///     if w_descr is None:
+///         w_descr = space.lookup(w_obj, "__len__")
+///         if w_descr is None:
+///             return True
+///         w_res = space.get_and_call_function(w_descr, w_obj)
+///         return space._check_len_result(space.index(w_res)) != 0
+///     w_res = space.get_and_call_function(w_descr, w_obj)
+///     if space.is_w(w_res, space.w_False): return False
+///     if space.is_w(w_res, space.w_True):  return True
+///     raise oefmt(space.w_TypeError,
+///                 "__bool__ should return bool, returned %T", w_obj)
+/// ```
+///
+/// The leading built-in fast paths short-circuit the `lookup` + call
+/// machinery for types whose `__bool__` / `__len__` are fixed and cannot
+/// raise. Only objects reaching the generic tail consult `__bool__` then
+/// `__len__`, where the call exceptions — and the non-bool-`__bool__`
+/// TypeError — propagate to the caller.
+pub fn is_true(obj: PyObjectRef) -> Result<bool, PyError> {
     let obj = unwrap_cell(obj);
     unsafe {
         if is_bool(obj) {
-            return w_bool_get_value(obj);
+            return Ok(w_bool_get_value(obj));
         }
         if is_int(obj) {
-            return w_int_get_value(obj) != 0;
+            return Ok(w_int_get_value(obj) != 0);
         }
         if is_long(obj) {
-            return w_long_get_value(obj).clone() != BigInt::from(0);
+            return Ok(w_long_get_value(obj).clone() != BigInt::from(0));
         }
         if is_float(obj) {
-            return w_float_get_value(obj) != 0.0;
+            return Ok(w_float_get_value(obj) != 0.0);
         }
         if is_str(obj) {
-            return w_str_len(obj) != 0;
+            return Ok(w_str_len(obj) != 0);
         }
         if is_list(obj) {
-            return w_list_len(obj) > 0;
+            return Ok(w_list_len(obj) > 0);
         }
         if is_tuple(obj) {
-            return w_tuple_len(obj) > 0;
+            return Ok(w_tuple_len(obj) > 0);
         }
         if is_dict(obj) {
-            return w_dict_len(obj) > 0;
+            return Ok(w_dict_len(obj) > 0);
         }
         if pyre_object::is_set_or_frozenset(obj) {
-            return pyre_object::w_set_len(obj) > 0;
+            return Ok(pyre_object::w_set_len(obj) > 0);
         }
         if pyre_object::is_w_range(obj) {
-            return pyre_object::w_range_bool(obj);
+            return Ok(pyre_object::w_range_bool(obj));
         }
         if is_none(obj) {
-            return false;
+            return Ok(false);
         }
-        // Instance __bool__ / __len__ — PyPy: descroperation.py is_true
-        if is_instance(obj) {
-            let w_type = w_instance_get_type(obj);
-            // Try __bool__ first (type MRO)
-            if let Some(method) = lookup_in_type_where(w_type, "__bool__") {
-                let result = crate::call_function(method, &[obj]);
-                if !result.is_null() {
-                    if is_bool(result) {
-                        return w_bool_get_value(result);
-                    }
-                    if is_int(result) {
-                        return w_int_get_value(result) != 0;
-                    }
-                    return true; // non-null → truthy fallback
-                }
-            }
-            // Then __len__ (type MRO) — nonzero length = truthy
-            if let Some(method) = lookup_in_type_where(w_type, "__len__") {
-                let result = crate::call_function(method, &[obj]);
-                if !result.is_null() && is_int(result) {
-                    return w_int_get_value(result) != 0;
-                }
-            }
-            // Also check per-instance __len__ (ATTR_TABLE)
-            if let Ok(method) = getattr_str(obj, "__len__") {
-                let result = crate::call_function(method, &[obj]);
-                if !result.is_null() && is_int(result) {
-                    return w_int_get_value(result) != 0;
-                }
-            }
-        }
-        true // default: objects are truthy
     }
+    // descroperation.py:266-273 — `__bool__` first, then `__len__`; both
+    // looked up on the type (`space.lookup`), not the instance dict.
+    if let Some(w_descr) = unsafe { lookup(obj, "__bool__") } {
+        let w_res = crate::builtins::call_and_check(w_descr, &[obj])?;
+        // descroperation.py:277-285 — the only instances of bool are
+        // `w_False` / `w_True`, so a non-bool result is a TypeError. The
+        // message reports the receiver's type, matching upstream's `%T`
+        // on `w_obj`.
+        if unsafe { is_bool(w_res) } {
+            return Ok(unsafe { w_bool_get_value(w_res) });
+        }
+        return Err(PyError::type_error(format!(
+            "__bool__ should return bool, returned {}",
+            object_functionstr_type_name(obj),
+        )));
+    }
+    if let Some(w_descr) = unsafe { lookup(obj, "__len__") } {
+        let w_res = crate::builtins::call_and_check(w_descr, &[obj])?;
+        let w_index = space_index(w_res)?;
+        return Ok(_check_len_result(w_index)? != 0);
+    }
+    Ok(true)
 }
 
 // ── Subscript operations ─────────────────────────────────────────────
@@ -1234,7 +1249,7 @@ fn range_index_method(args: &[PyObjectRef]) -> PyResult {
         loop {
             match next(it) {
                 Ok(item) => {
-                    if is_true(compare(item, needle, CompareOp::Eq)?) {
+                    if is_true(compare(item, needle, CompareOp::Eq)?)? {
                         return Ok(w_int_new(i));
                     }
                     i += 1;
@@ -1343,9 +1358,13 @@ pub fn finditem(obj: PyObjectRef, index: PyObjectRef) -> Result<Option<PyObjectR
 // calls `space.setitem` as a bare statement), so the traced residual
 // call is a void `CALL_N` (`rpython/jit/codewriter/jtransform.py
 // handle_residual_call` keys `result_kind` off the discarded result's
-// Void concretetype). The unit return models that: the prior `PyResult`
-// (always `Ok(w_none())`) surfaced a ref result every caller discards.
-pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> Result<(), PyError> {
+// Void concretetype). descroperation.py:389 setitem returns
+// `space.get_and_call_function`'s result: builtin containers'
+// `__setitem__` yield None; an instance's `__setitem__` yields its own
+// return value.  STORE_SUBSCR and the `jit_setitem` residual drop this
+// result, so the void-ness lives at the opcode boundary, not in this
+// method's `PyResult` type.
+pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
     let obj = unwrap_cell(obj);
     let index = unwrap_cell(index);
     let value = unwrap_cell(value);
@@ -1361,19 +1380,19 @@ pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> Resu
             ));
         }
         if is_list(obj) {
-            return setitem_list(obj, index, value).map(|_| ());
+            return setitem_list(obj, index, value);
         }
         if is_dict(obj) {
             return match pyre_object::dictmultiobject::w_dict_store_checked(obj, index, value) {
-                Ok(()) => Ok(()),
+                Ok(()) => Ok(w_none()),
                 Err(_) => Err(take_pending_hash_error()),
             };
         }
         if pyre_object::bytearrayobject::is_bytearray(obj) {
-            return setitem_bytearray(obj, index, value).map(|_| ());
+            return setitem_bytearray(obj, index, value);
         }
         if is_instance(obj) {
-            return setitem_instance(obj, index, value).map(|_| ());
+            return setitem_instance(obj, index, value);
         }
         Err(PyError::type_error(format!(
             "'{}' object does not support item assignment",
@@ -1502,12 +1521,11 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
 
 #[inline(never)]
 unsafe fn setitem_instance(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
-    // descroperation.py __setitem__ — `space.get_and_call_function`
-    // raises on instance error.  pyre `call_function` stashes errors
-    // as PY_NULL; `call_and_check` recovers them.
+    // descroperation.py:389 returns `space.get_and_call_function`'s result.
+    // pyre `call_function` stashes errors as PY_NULL; `call_and_check`
+    // recovers them and yields the `__setitem__` return value.
     if let Some(method) = lookup_in_type_where(w_instance_get_type(obj), "__setitem__") {
-        crate::builtins::call_and_check(method, &[obj, index, value])?;
-        return Ok(w_none());
+        return crate::builtins::call_and_check(method, &[obj, index, value]);
     }
     Err(PyError::type_error(format!(
         "'{}' object does not support item assignment",
@@ -1550,9 +1568,11 @@ pub fn flag_sequence_bug_compat(w_type: PyObjectRef) -> bool {
         )
 }
 
-/// Python-level `not` operation.
-pub fn not_(obj: PyObjectRef) -> PyObjectRef {
-    w_bool_from(!is_true(obj))
+/// Python-level `not` operation. descroperation.py:289-290
+/// `not_ = space.newbool(not space.is_true(w_obj))`; the `is_true` call
+/// may raise, so the result is fallible.
+pub fn not_(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    Ok(w_bool_from(!is_true(obj)?))
 }
 
 /// PyPy-compatible attribute lookup returning `None` when not found.
@@ -5702,7 +5722,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
             "__suppress_context__" => {
                 // `interp_exceptions.py:215-216 descr_setsuppresscontext`
                 // — `space.bool_w(w_value)` coerces via `__bool__`.
-                let b = is_true(value);
+                let b = is_true(value)?;
                 unsafe { pyre_object::excobject::w_exception_set_suppress_context(obj, b) };
                 return Ok(w_none());
             }
@@ -7807,7 +7827,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             }
             let w_obj = next(it.w_iterable)?;
             let w_bool = crate::call::call_function_impl_result(it.w_predicate, &[w_obj])?;
-            if !is_true(w_bool) {
+            if !is_true(w_bool)? {
                 it.stopped = true;
                 return Err(PyError::stop_iteration());
             }
@@ -7834,7 +7854,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 loop {
                     let w_obj = next(it.w_iterable)?;
                     let w_bool = crate::call::call_function_impl_result(it.w_predicate, &[w_obj])?;
-                    if !is_true(w_bool) {
+                    if !is_true(w_bool)? {
                         it.started = true;
                         break w_obj;
                     }
@@ -7860,10 +7880,10 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             loop {
                 let w_obj = next(it.w_iterable)?;
                 let pred = if it.w_predicate.is_null() {
-                    is_true(w_obj)
+                    is_true(w_obj)?
                 } else {
                     let w_pred = crate::call::call_function_impl_result(it.w_predicate, &[w_obj])?;
-                    is_true(w_pred)
+                    is_true(w_pred)?
                 };
                 if !pred {
                     return Ok(w_obj);
@@ -8024,7 +8044,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 return Err(PyError::stop_iteration());
             }
             let sentinel = ci::w_callable_iterator_get_sentinel(obj);
-            if is_true(compare(result, sentinel, CompareOp::Eq)?) {
+            if is_true(compare(result, sentinel, CompareOp::Eq)?)? {
                 ci::w_callable_iterator_set_callable(obj, pyre_object::PY_NULL);
                 return Err(PyError::stop_iteration());
             }
@@ -8924,7 +8944,7 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
                     return match unsafe {
                         pyre_object::dictmultiobject::w_dict_lookup_checked(dict, k)
                     } {
-                        Ok(Some(have)) => Ok(eq_w(have, want)),
+                        Ok(Some(have)) => eq_w(have, want),
                         Ok(None) => Ok(false),
                         Err(_) => Err(take_pending_hash_error()),
                     };
@@ -8932,7 +8952,7 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
                 pyre_object::dictviewobject::DictViewKind::Values => {
                     // values view: PyPy uses iter-based scan.
                     for (_, v) in pyre_object::w_dict_items(dict) {
-                        if eq_w(v, needle) {
+                        if eq_w(v, needle)? {
                             return Ok(true);
                         }
                     }
@@ -8954,7 +8974,7 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
             loop {
                 match next(it) {
                     Ok(item) => {
-                        if is_true(compare(item, needle, CompareOp::Eq)?) {
+                        if is_true(compare(item, needle, CompareOp::Eq)?)? {
                             return Ok(true);
                         }
                     }
@@ -8970,7 +8990,7 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
             let len = w_list_len(haystack);
             for i in 0..len {
                 if let Some(item) = w_list_getitem(haystack, i as i64) {
-                    if eq_w(item, needle) {
+                    if eq_w(item, needle)? {
                         return Ok(true);
                     }
                 }
@@ -8981,7 +9001,7 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
             let len = w_tuple_len(haystack);
             for i in 0..len {
                 if let Some(item) = w_tuple_getitem(haystack, i as i64) {
-                    if eq_w(item, needle) {
+                    if eq_w(item, needle)? {
                         return Ok(true);
                     }
                 }
@@ -9014,12 +9034,12 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
             let w_type = w_instance_get_type(haystack);
             if let Some(method) = lookup_in_type_where(w_type, "__contains__") {
                 let result = crate::builtins::call_and_check(method, &[haystack, needle])?;
-                return Ok(is_true(result));
+                return Ok(is_true(result)?);
             }
             // Also check per-instance attributes (ATTR_TABLE)
             if let Ok(method) = getattr_str(haystack, "__contains__") {
                 let result = crate::builtins::call_and_check(method, &[haystack, needle])?;
-                return Ok(is_true(result));
+                return Ok(is_true(result)?);
             }
         }
     }
@@ -9034,7 +9054,7 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
         if let Some(w_type) = crate::typedef::r#type(haystack) {
             if let Some(method) = lookup_in_type_where(w_type, "__contains__") {
                 let result = crate::builtins::call_and_check(method, &[haystack, needle])?;
-                return Ok(is_true(result));
+                return Ok(is_true(result)?);
             }
         }
     }
@@ -9043,7 +9063,7 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
     loop {
         match getitem(haystack, pyre_object::w_int_new(i)) {
             Ok(item) => {
-                if eq_w(item, needle) {
+                if eq_w(item, needle)? {
                     return Ok(true);
                 }
                 i += 1;
@@ -9104,10 +9124,12 @@ pub fn hash_w_strict(obj: PyObjectRef) -> Result<i64, PyError> {
 }
 
 /// Compare two objects for equality (returns bool, not PyObjectRef).
-/// baseobjspace.py:823-825 `eq_w`: identity first, then `==` truth.
-pub fn eq_w(a: PyObjectRef, b: PyObjectRef) -> bool {
+/// baseobjspace.py:823-825 `eq_w`:
+///   `self.is_w(w_obj1, w_obj2) or self.is_true(self.eq(w_obj1, w_obj2))`.
+/// A raising `__eq__` or a raising `__bool__` on its result propagates.
+pub fn eq_w(a: PyObjectRef, b: PyObjectRef) -> Result<bool, PyError> {
     if a == b {
-        return true;
+        return Ok(true);
     }
     unsafe {
         use pyre_object::*;
@@ -9122,18 +9144,16 @@ pub fn eq_w(a: PyObjectRef, b: PyObjectRef) -> bool {
             } else {
                 w_int_get_value(b)
             };
-            return av == bv;
+            return Ok(av == bv);
         }
         if is_str(a) && is_str(b) {
             // Compare WTF-8 bytes so lone-surrogate strings compare by
             // content instead of panicking in `w_str_get_value`.
-            return pyre_object::w_str_get_wtf8(a).as_bytes()
-                == pyre_object::w_str_get_wtf8(b).as_bytes();
+            return Ok(pyre_object::w_str_get_wtf8(a).as_bytes()
+                == pyre_object::w_str_get_wtf8(b).as_bytes());
         }
     }
-    compare(a, b, CompareOp::Eq)
-        .map(|r| is_true(r))
-        .unwrap_or(false)
+    Ok(is_true(compare(a, b, CompareOp::Eq)?)?)
 }
 
 /// `baseobjspace.py:933 ObjSpace._side_effects_ok`.

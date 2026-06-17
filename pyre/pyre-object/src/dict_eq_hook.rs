@@ -20,9 +20,11 @@ use std::cell::Cell;
 
 /// `pypy/interpreter/baseobjspace.py:823-825 W_ObjectSpace.eq_w`
 /// signature: returns `True` when `a` and `b` are equal per the
-/// standard `__eq__` protocol.  Unlike PyPy's `space.eq_w` (which
-/// raises on `__eq__` errors), the trampoline swallows errors and
-/// returns `false` — matching pyre's `baseobjspace::eq_w` shape.
+/// standard `__eq__` protocol.  PyPy's `space.eq_w` raises on `__eq__`
+/// errors; the trampoline cannot return a `Result` across the dict
+/// probe, so on error it calls [`signal_eq_error`] and returns `false`.
+/// Checked dict ops convert the flag to a `DictKeyError` after the
+/// probe; the concrete `PyError` rides the interpreter pending slot.
 pub type EqWHookFn = unsafe fn(a: PyObjectRef, b: PyObjectRef) -> bool;
 
 /// `pypy/interpreter/baseobjspace.py:840-845 W_ObjectSpace.hash_w`
@@ -51,6 +53,13 @@ thread_local! {
     /// interpreter-side pending-error slot the trampoline fills before
     /// signalling).  Null means no error.
     static HASH_W_ERROR: Cell<PyObjectRef> = const { Cell::new(std::ptr::null_mut()) };
+    /// Error flag set by the `eq_w` hook when a user `__eq__` (or the
+    /// `__bool__` of its result) raises during a key comparison.  The
+    /// hash flag fires at key-construction time; this one fires during
+    /// the bucket probe, so checked dict ops consult it *after* the
+    /// `IndexMap` access.  Presence-only, same as the hash flag; the
+    /// payload travels through the interpreter pending-error slot.
+    static EQ_W_ERROR: Cell<PyObjectRef> = const { Cell::new(std::ptr::null_mut()) };
 }
 
 /// Signal that the most recent `hash_w` call failed.  Called by the
@@ -79,6 +88,47 @@ pub extern "C" fn take_hash_error() -> bool {
             true
         }
     })
+}
+
+/// Signal that the most recent `eq_w` key comparison raised.  Called by
+/// the eq hook trampoline when `space.eq_w` returns `Err`.  Checked dict
+/// ops observe the flag with [`take_eq_error`] after the bucket probe.
+/// `dont_look_inside`: thread-local write, residualizes via the
+/// registered fnaddr.  `obj` must be a valid PyObjectRef.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn signal_eq_error(obj: PyObjectRef) {
+    EQ_W_ERROR.with(|cell| cell.set(obj));
+}
+
+/// Consume the pending eq error flag, returning `true` if a comparison
+/// raised since the last `take`.  Callers branch on presence only; the
+/// error payload is retrieved from the interpreter-side pending-error
+/// slot.  `dont_look_inside`: thread-local read, residualizes via the
+/// registered fnaddr.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn take_eq_error() -> bool {
+    EQ_W_ERROR.with(|cell| {
+        let obj = cell.get();
+        if obj.is_null() {
+            false
+        } else {
+            cell.set(std::ptr::null_mut());
+            true
+        }
+    })
+}
+
+/// Peek the pending eq error flag without consuming it.
+/// `dict_keys_equal` consults this at the top of every comparison so
+/// that once `space.eq_w` has raised during a bucket probe, the
+/// remaining comparisons in that probe are skipped: the Rust `Eq`
+/// callback cannot abort an `IndexMap` scan, but suppressing further
+/// user `__eq__` calls means no extra comparison runs and the FIRST
+/// exception is the one retained — matching `r_dict(space.eq_w, ...)`
+/// which raises at the first comparison (`dictmultiobject.py:1209`).
+#[inline]
+pub(crate) fn eq_error_pending() -> bool {
+    EQ_W_ERROR.with(|cell| !cell.get().is_null())
 }
 
 /// Install the `eq_w` callback for this thread.  Called from

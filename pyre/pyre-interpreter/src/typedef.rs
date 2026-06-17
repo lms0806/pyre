@@ -1251,7 +1251,7 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     Ok(pyre_object::w_bool_from(crate::baseobjspace::is_true(
         w_obj,
-    )))
+    )?))
 }
 /// When `cls` is a user subclass of the builtin `base` (not `base`
 /// itself, not null/non-type), return it so `__new__` can tag the fresh
@@ -3847,18 +3847,18 @@ fn slice_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 
 /// sliceobject.py `descr_eq` / `descr_ne` — compare the three components.
 /// `slice is slice` is always equal even with non-comparable params.
-fn slice_components_eq(a: PyObjectRef, b: PyObjectRef) -> bool {
+fn slice_components_eq(a: PyObjectRef, b: PyObjectRef) -> Result<bool, crate::PyError> {
     unsafe {
-        crate::baseobjspace::eq_w(
+        Ok(crate::baseobjspace::eq_w(
             pyre_object::sliceobject::w_slice_get_start(a),
             pyre_object::sliceobject::w_slice_get_start(b),
-        ) && crate::baseobjspace::eq_w(
+        )? && crate::baseobjspace::eq_w(
             pyre_object::sliceobject::w_slice_get_stop(a),
             pyre_object::sliceobject::w_slice_get_stop(b),
-        ) && crate::baseobjspace::eq_w(
+        )? && crate::baseobjspace::eq_w(
             pyre_object::sliceobject::w_slice_get_step(a),
             pyre_object::sliceobject::w_slice_get_step(b),
-        )
+        )?)
     }
 }
 
@@ -3868,7 +3868,7 @@ fn slice_descr_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Ok(pyre_object::w_bool_from(true));
     }
     if unsafe { pyre_object::sliceobject::is_slice(b) } {
-        Ok(pyre_object::w_bool_from(slice_components_eq(a, b)))
+        Ok(pyre_object::w_bool_from(slice_components_eq(a, b)?))
     } else {
         Ok(pyre_object::w_not_implemented())
     }
@@ -3880,7 +3880,7 @@ fn slice_descr_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Ok(pyre_object::w_bool_from(false));
     }
     if unsafe { pyre_object::sliceobject::is_slice(b) } {
-        if slice_components_eq(a, b) {
+        if slice_components_eq(a, b)? {
             Ok(pyre_object::w_bool_from(false))
         } else {
             Ok(pyre_object::w_bool_from(true))
@@ -3910,14 +3910,14 @@ fn slice_lt_components(a: PyObjectRef, b: PyObjectRef) -> Result<PyObjectRef, cr
             pyre_object::sliceobject::w_slice_get_start(b),
         )
     };
-    if crate::baseobjspace::eq_w(sa, sb) {
+    if crate::baseobjspace::eq_w(sa, sb)? {
         let (ta, tb) = unsafe {
             (
                 pyre_object::sliceobject::w_slice_get_stop(a),
                 pyre_object::sliceobject::w_slice_get_stop(b),
             )
         };
-        if crate::baseobjspace::eq_w(ta, tb) {
+        if crate::baseobjspace::eq_w(ta, tb)? {
             let (pa, pb) = unsafe {
                 (
                     pyre_object::sliceobject::w_slice_get_step(a),
@@ -4098,7 +4098,7 @@ fn init_union_type(ns: &mut DictStorage) {
                 }
                 Ok(pyre_object::w_bool_from(crate::genericalias::union_set_eq(
                     self_, other,
-                )))
+                )?))
             },
             2,
         ),
@@ -6580,6 +6580,7 @@ fn init_int_type(ns: &mut DictStorage) {
             };
             let signed = crate::builtins::kwarg_get(kwargs, "signed")
                 .map(crate::baseobjspace::is_true)
+                .transpose()?
                 .unwrap_or(false);
             let bits = length * 8;
             let zero = malachite_bigint::BigInt::from(0);
@@ -6757,7 +6758,7 @@ fn init_int_type(ns: &mut DictStorage) {
             |args| {
                 Ok(pyre_object::w_bool_from(crate::baseobjspace::is_true(
                     args[0],
-                )))
+                )?))
             },
             1,
         ),
@@ -7156,7 +7157,7 @@ fn init_float_type(ns: &mut DictStorage) {
             |args| {
                 Ok(pyre_object::w_bool_from(crate::baseobjspace::is_true(
                     args[0],
-                )))
+                )?))
             },
             1,
         ),
@@ -7446,7 +7447,7 @@ fn init_object_type(ns: &mut DictStorage) {
                 if unsafe { pyre_object::is_not_implemented(eq) } {
                     return Ok(eq);
                 }
-                Ok(pyre_object::w_bool_from(!crate::baseobjspace::is_true(eq)))
+                Ok(pyre_object::w_bool_from(!crate::baseobjspace::is_true(eq)?))
             },
             2,
         ),
@@ -8995,6 +8996,7 @@ fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     let keepends = crate::builtins::kwarg_get(kwargs, "keepends")
         .or_else(|| pos.get(1).copied())
         .map(crate::baseobjspace::is_true)
+        .transpose()?
         .unwrap_or(false);
     let args = pos;
     let mut parts: Vec<PyObjectRef> = Vec::new();
@@ -9225,6 +9227,7 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     };
     let signed = crate::builtins::kwarg_get(kwargs, "signed")
         .map(crate::baseobjspace::is_true)
+        .transpose()?
         .unwrap_or(false);
     let mut val = malachite_bigint::BigInt::from(0);
     if little_endian {
@@ -11132,10 +11135,14 @@ fn init_set_type(ns: &mut DictStorage) {
                 let mut keep = true;
                 for other in &args[1..] {
                     let other_items = crate::builtins::collect_iterable(*other)?;
-                    if !other_items
-                        .iter()
-                        .any(|&o| crate::baseobjspace::eq_w(item, o))
-                    {
+                    let mut found = false;
+                    for &o in other_items.iter() {
+                        if crate::baseobjspace::eq_w(item, o)? {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
                         keep = false;
                         break;
                     }
@@ -11158,10 +11165,14 @@ fn init_set_type(ns: &mut DictStorage) {
             for item in other_items {
                 // toggle: remove if present, add otherwise
                 let self_items = unsafe { pyre_object::w_set_items(args[0]) };
-                if self_items
-                    .iter()
-                    .any(|&existing| crate::baseobjspace::eq_w(item, existing))
-                {
+                let mut present = false;
+                for &existing in self_items.iter() {
+                    if crate::baseobjspace::eq_w(item, existing)? {
+                        present = true;
+                        break;
+                    }
+                }
+                if present {
                     unsafe { pyre_object::w_set_discard(args[0], item) };
                 } else {
                     unsafe { pyre_object::w_set_add(args[0], item) };

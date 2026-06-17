@@ -2509,11 +2509,9 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             for i in 0..min_len {
                 let ea = w_tuple_getitem(a, i as i64).unwrap_or(PY_NULL);
                 let eb = w_tuple_getitem(b, i as i64).unwrap_or(PY_NULL);
-                let eq = match compare(ea, eb, CompareOp::Eq) {
-                    Ok(r) => is_true(r),
-                    Err(_) => false,
-                };
-                if !eq {
+                // tupleobject.py:137 `if not space.eq_w(items1[p], items2[p]):
+                //     return getattr(space, name)(items1[p], items2[p])`
+                if !crate::baseobjspace::eq_w(ea, eb)? {
                     return compare(ea, eb, op);
                 }
             }
@@ -2541,10 +2539,9 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 for (k, v) in pyre_object::w_dict_items(a) {
                     match pyre_object::w_dict_lookup(b, k) {
                         Some(other_v) => {
-                            let same = compare(v, other_v, CompareOp::Eq)
-                                .map(|r| is_true(r))
-                                .unwrap_or(false);
-                            if !same {
+                            // dictmultiobject.py:664 `if not space.eq_w(w_val,
+                            // w_rightval): return space.w_False`
+                            if !crate::baseobjspace::eq_w(v, other_v)? {
                                 equal = false;
                                 break;
                             }
@@ -2654,11 +2651,9 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             for i in 0..min_len {
                 let ea = pyre_object::w_list_getitem(a, i as i64).unwrap_or(PY_NULL);
                 let eb = pyre_object::w_list_getitem(b, i as i64).unwrap_or(PY_NULL);
-                let eq = match compare(ea, eb, CompareOp::Eq) {
-                    Ok(r) => is_true(r),
-                    Err(_) => false,
-                };
-                if !eq {
+                // listobject.py:590 `if not space.eq_w(w_item1, w_item2):
+                //     return getattr(space, name)(w_item1, w_item2)`
+                if !crate::baseobjspace::eq_w(ea, eb)? {
                     return compare(ea, eb, op);
                 }
             }
@@ -2892,11 +2887,11 @@ mod tests {
 
     #[test]
     fn test_truthiness() {
-        assert!(is_true(w_int_new(1)));
-        assert!(!is_true(w_int_new(0)));
-        assert!(!is_true(w_none()));
-        assert!(is_true(w_bool_from(true)));
-        assert!(!is_true(w_bool_from(false)));
+        assert!(is_true(w_int_new(1)).unwrap());
+        assert!(!is_true(w_int_new(0)).unwrap());
+        assert!(!is_true(w_none()).unwrap());
+        assert!(is_true(w_bool_from(true)).unwrap());
+        assert!(!is_true(w_bool_from(false)).unwrap());
     }
 
     #[test]
@@ -2996,10 +2991,8 @@ mod tests {
 
     #[test]
     fn test_long_truthiness() {
-        assert!(is_true(w_long_new(
-            BigInt::from(i64::MAX) + BigInt::from(1)
-        )));
-        assert!(!is_true(w_long_new(BigInt::from(0))));
+        assert!(is_true(w_long_new(BigInt::from(i64::MAX) + BigInt::from(1))).unwrap());
+        assert!(!is_true(w_long_new(BigInt::from(0))).unwrap());
     }
 
     #[test]

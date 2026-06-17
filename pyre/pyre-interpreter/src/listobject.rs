@@ -21,20 +21,6 @@ pub enum FindOrCountResult {
     NotFound,
 }
 
-/// `baseobjspace.py:823` `space.eq_w(w_obj1, w_obj2)` —
-///     `return self.eq(w_obj1, w_obj2) is self.w_True`.
-///
-/// Returns a `Result<bool, PyError>` so that `__eq__` exceptions
-/// propagate up to the list descr caller, matching PyPy. The int-like
-/// and str fast paths live inside `baseobjspace::compare`.
-fn eq_w(a: PyObjectRef, b: PyObjectRef) -> Result<bool, PyError> {
-    if a == b {
-        return Ok(true);
-    }
-    let result = crate::baseobjspace::compare(a, b, crate::baseobjspace::CompareOp::Eq)?;
-    Ok(crate::baseobjspace::is_true(result))
-}
-
 /// `listobject.py:417` `W_ListObject.find_or_count`.
 ///
 /// Dispatches to the current strategy's typed fast path via
@@ -69,7 +55,7 @@ pub fn w_list_find_or_count(
             Some(v) => v,
             None => break,
         };
-        if eq_w(w_curr, w_item)? {
+        if crate::baseobjspace::eq_w(w_curr, w_item)? {
             if count {
                 result += 1;
             } else {

@@ -1017,6 +1017,14 @@ pub fn generated_binary_int_value(
         return None;
     }
 
+    // boolobject.py:74-76 descr_and/or/xor: when both operands are bool the
+    // result is a bool (`space.newbool`), not an int.  The bitwise op runs on
+    // the shared `intval` exactly as for ints — only the boxing differs, so
+    // note it here and pick the bool boxing below.  Mixed bool/int bitwise
+    // yields an int and boxes as int.
+    let result_is_bool = matches!(op_code, OpCode::IntAnd | OpCode::IntOr | OpCode::IntXor)
+        && unsafe { pyre_object::is_bool(concrete_lhs) && pyre_object::is_bool(concrete_rhs) };
+
     // intobject.py range validation for FloorDiv/Mod/Shift.
     // For FloorDiv/Mod the RPython-orthodox preconditions are
     // `rhs != 0` AND `not (lhs == i64::MIN && rhs == -1)` — PyPy
@@ -1071,18 +1079,21 @@ pub fn generated_binary_int_value(
         }
     }
 
-    // RPython jitcode: guard_class + getfield_gc_i per operand.
+    // RPython jitcode: guard_class + getfield_gc_i per operand.  bool and
+    // int share the `intval` field; guard each operand against its own
+    // vtable (BOOL_TYPE / INT_TYPE) so a bool unboxes through its own class.
     // Skip unbox if value is already raw int (Type::Int).
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     let lhs_raw = if frame.value_type(a) == majit_ir::Type::Int {
         a
     } else {
-        crate::state::trace_unbox_int_with_resume(frame, a, int_type_addr)
+        let (type_addr, descr) = crate::state::int_or_bool_unbox_type_descr(concrete_lhs);
+        crate::state::trace_unbox_int_with_resume_descr(frame, a, type_addr, descr)
     };
     let rhs_raw = if frame.value_type(b) == majit_ir::Type::Int {
         b
     } else {
-        crate::state::trace_unbox_int_with_resume(frame, b, int_type_addr)
+        let (type_addr, descr) = crate::state::int_or_bool_unbox_type_descr(concrete_rhs);
+        crate::state::trace_unbox_int_with_resume_descr(frame, b, type_addr, descr)
     };
 
     // The inlined `_ovf_zer` wrapper (`rint.py:429 ll_int_py_div_
@@ -1203,8 +1214,14 @@ pub fn generated_binary_int_value(
         frame.generate_guard(ctx, OpCode::GuardNoOverflow, &[]);
     }
 
-    // RPython jitcode: wrapint → new_with_vtable + setfield_gc
-    let boxed = crate::state::wrapint(ctx, raw_result);
+    // RPython jitcode: wrapint → new_with_vtable + setfield_gc.  A both-bool
+    // bitwise result is boxed via `space.newbool` (boolobject.py:74-76) so it
+    // keeps the bool type; the 0/1 raw is already a truth value.
+    let boxed = if result_is_bool {
+        crate::helpers::emit_trace_bool_value_from_truth(ctx, raw_result, false)
+    } else {
+        crate::state::wrapint(ctx, raw_result)
+    };
     Some(boxed)
 }
 
@@ -1258,7 +1275,6 @@ pub fn generated_binary_float_value(
 
     let float_type_addr =
         &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
 
     // Unbox a float object to raw f64.
     let unbox_float =
@@ -1303,13 +1319,15 @@ pub fn generated_binary_float_value(
         };
 
     // Unbox an int object to raw i64, then CastIntToFloat → f64.
-    // RPython: space.float_w(w_int) → float(w_int.intval)
+    // RPython: space.float_w(w_int) → float(w_int.intval).  bool shares int's
+    // `intval`, so a bool coerces through its own &BOOL_TYPE guard.
     let unbox_int_to_float =
-        |frame: &mut crate::state::MIFrame, ctx: &mut majit_metainterp::TraceCtx, obj: majit_ir::OpRef| -> majit_ir::OpRef {
+        |frame: &mut crate::state::MIFrame, ctx: &mut majit_metainterp::TraceCtx, obj: majit_ir::OpRef, concrete: pyre_object::PyObjectRef| -> majit_ir::OpRef {
             let raw_int = if frame.value_type(obj) == majit_ir::Type::Int {
                 obj
             } else {
-                crate::state::trace_unbox_int_with_resume(frame, obj, int_type_addr)
+                let (type_addr, descr) = crate::state::int_or_bool_unbox_type_descr(concrete);
+                crate::state::trace_unbox_int_with_resume_descr(frame, obj, type_addr, descr)
             };
             let r = ctx.record_op(OpCode::CastIntToFloat, &[raw_int]);
             // Box(value) parity: derive concrete float from the int's
@@ -1323,14 +1341,14 @@ pub fn generated_binary_float_value(
     let lhs_raw = if frame.value_type(a) == majit_ir::Type::Float {
         a
     } else if lhs_is_int {
-        unbox_int_to_float(frame, ctx, a)
+        unbox_int_to_float(frame, ctx, a, concrete_lhs)
     } else {
         unbox_float(frame, ctx, a)
     };
     let rhs_raw = if frame.value_type(b) == majit_ir::Type::Float {
         b
     } else if rhs_is_int {
-        unbox_int_to_float(frame, ctx, b)
+        unbox_int_to_float(frame, ctx, b, concrete_rhs)
     } else {
         unbox_float(frame, ctx, b)
     };
@@ -1399,20 +1417,24 @@ pub fn generated_compare_value_direct(
     unsafe {
         if pyre_object::is_int(concrete_lhs) && pyre_object::is_int(concrete_rhs) {
             let cmp = int_compare_lookup(op);
-            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+            // bool and int share `intval`; guard each operand against its own
+            // vtable (BOOL_TYPE / INT_TYPE) so a bool comparand unboxes
+            // through its own class.  The comparison result is a bool.
             let lhs_raw = if frame.value_type(a) == majit_ir::Type::Int {
                 a
             } else if let Some(raw) = crate::state::try_trace_const_boxed_int(ctx, a, concrete_lhs) {
                 raw
             } else {
-                crate::state::trace_unbox_int_with_resume(frame, a, int_type_addr)
+                let (type_addr, descr) = crate::state::int_or_bool_unbox_type_descr(concrete_lhs);
+                crate::state::trace_unbox_int_with_resume_descr(frame, a, type_addr, descr)
             };
             let rhs_raw = if frame.value_type(b) == majit_ir::Type::Int {
                 b
             } else if let Some(raw) = crate::state::try_trace_const_boxed_int(ctx, b, concrete_rhs) {
                 raw
             } else {
-                crate::state::trace_unbox_int_with_resume(frame, b, int_type_addr)
+                let (type_addr, descr) = crate::state::int_or_bool_unbox_type_descr(concrete_rhs);
+                crate::state::trace_unbox_int_with_resume_descr(frame, b, type_addr, descr)
             };
             let truth = ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
             // Box(value) parity: stamp the bool result from the operands'
@@ -1455,15 +1477,17 @@ pub fn generated_compare_value_direct(
             let cmp = float_compare_lookup(op);
             let float_type_addr =
                 &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
-            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-            // Unbox lhs: float direct, int via CastIntToFloat
+            // Unbox lhs: float direct, int (or bool, via its own &BOOL_TYPE
+            // guard) via CastIntToFloat.
             let lhs_raw = if frame.value_type(a) == majit_ir::Type::Float {
                 a
             } else if lhs_is_int || frame.value_type(a) == majit_ir::Type::Int {
                 let raw_int = if frame.value_type(a) == majit_ir::Type::Int {
                     a
                 } else {
-                    crate::state::trace_unbox_int_with_resume(frame, a, int_type_addr)
+                    let (type_addr, descr) =
+                        crate::state::int_or_bool_unbox_type_descr(concrete_lhs);
+                    crate::state::trace_unbox_int_with_resume_descr(frame, a, type_addr, descr)
                 };
                 let cast = ctx.record_op(majit_ir::OpCode::CastIntToFloat, &[raw_int]);
                 // Box(value) parity: derive concrete float from the int's
@@ -1482,7 +1506,9 @@ pub fn generated_compare_value_direct(
                 let raw_int = if frame.value_type(b) == majit_ir::Type::Int {
                     b
                 } else {
-                    crate::state::trace_unbox_int_with_resume(frame, b, int_type_addr)
+                    let (type_addr, descr) =
+                        crate::state::int_or_bool_unbox_type_descr(concrete_rhs);
+                    crate::state::trace_unbox_int_with_resume_descr(frame, b, type_addr, descr)
                 };
                 let cast = ctx.record_op(majit_ir::OpCode::CastIntToFloat, &[raw_int]);
                 if let Some(majit_ir::Value::Int(n)) = ctx.box_value(raw_int) {
@@ -1540,12 +1566,14 @@ pub fn generated_unary_int_value(
         return None;
     }
 
-    // RPython jitcode: guard_class + getfield_gc_i
+    // RPython jitcode: guard_class + getfield_gc_i.  bool shares int's
+    // `intval`; unbox a bool through its own &BOOL_TYPE guard (`-True` /
+    // `~True` yield an int, so the result boxing below is unchanged).
     let payload = if frame.value_type(value) == majit_ir::Type::Int {
         value
     } else {
-        let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-        crate::state::trace_unbox_int_with_resume(frame, value, int_type_addr)
+        let (type_addr, descr) = crate::state::int_or_bool_unbox_type_descr(concrete_value);
+        crate::state::trace_unbox_int_with_resume_descr(frame, value, type_addr, descr)
     };
     // intobject.py:628 descr_neg: `if a == MININT: return <long>`.  At
     // concrete MININT the interpreter negates through the long branch, so
@@ -1989,7 +2017,7 @@ fn unbox_int_or_long_for_int_strategy<F: pyre_jit_trace::walker_frame_ops::Walke
 ///
 /// RPython jitcode parity: the codewriter generates type-specialized
 /// truth tests from space.is_true(w_obj):
-///   bool: guard_class + getfield_gc_i(boolval) → int_ne(val, 0)
+///   bool: guard_class + getfield_gc_i(intval) → int_ne(val, 0)
 ///   int:  guard_class + getfield_gc_i(intval) → int_ne(val, 0)
 ///   float: guard_class + getfield_gc_f(floatval) → float_ne(val, 0.0)
 ///   None: guard_class → const_int(0)
@@ -2035,6 +2063,30 @@ pub fn generated_truth_value_direct(
     }
 
     unsafe {
+        // boolobject.py: bool_is_true → guard_class + getfield(intval) → int_ne(0).
+        // The exact-bool shortcut precedes the int arm: `is_int` is true for a
+        // bool (W_BoolObject is a W_IntObject subclass), so checking int first
+        // would guard the operand against &INT_TYPE — a class a bool never
+        // matches — and the trace would deopt on every bool.
+        if pyre_object::is_bool(concrete_val) {
+            let bool_type_addr = &pyre_object::pyobject::BOOL_TYPE as *const _ as i64;
+            let bool_value = if let Some(raw) =
+                crate::state::try_trace_const_boxed_int(ctx, value, concrete_val)
+            {
+                raw
+            } else {
+                crate::state::trace_unbox_int_with_resume_descr(
+                    frame, value, bool_type_addr,
+                    crate::descr::bool_intval_descr(),
+                )
+            };
+            let zero = ctx.const_int(0);
+            let truth = ctx.record_op(OpCode::IntNe, &[bool_value, zero]);
+            if let Some(majit_ir::Value::Int(n)) = ctx.box_value(bool_value) {
+                ctx.set_opref_concrete(truth, majit_ir::Value::Int((n != 0) as i64));
+            }
+            return Some(truth);
+        }
         // intobject.py: int_is_true → guard_class + getfield(intval) → int_ne(0)
         if pyre_object::is_int(concrete_val) {
             let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
@@ -2048,26 +2100,6 @@ pub fn generated_truth_value_direct(
             let zero = ctx.const_int(0);
             let truth = ctx.record_op(OpCode::IntNe, &[int_value, zero]);
             if let Some(majit_ir::Value::Int(n)) = ctx.box_value(int_value) {
-                ctx.set_opref_concrete(truth, majit_ir::Value::Int((n != 0) as i64));
-            }
-            return Some(truth);
-        }
-        // boolobject.py: bool_is_true → guard_class + getfield(boolval) → int_ne(0)
-        if pyre_object::is_bool(concrete_val) {
-            let bool_type_addr = &pyre_object::pyobject::BOOL_TYPE as *const _ as i64;
-            let bool_value = if let Some(raw) =
-                crate::state::try_trace_const_boxed_int(ctx, value, concrete_val)
-            {
-                raw
-            } else {
-                crate::state::trace_unbox_int_with_resume_descr(
-                    frame, value, bool_type_addr,
-                    crate::descr::bool_boolval_descr(),
-                )
-            };
-            let zero = ctx.const_int(0);
-            let truth = ctx.record_op(OpCode::IntNe, &[bool_value, zero]);
-            if let Some(majit_ir::Value::Int(n)) = ctx.box_value(bool_value) {
                 ctx.set_opref_concrete(truth, majit_ir::Value::Int((n != 0) as i64));
             }
             return Some(truth);
@@ -2878,11 +2910,20 @@ pub fn opimpl_check_neg_index(
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
 
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     let raw_index = if frame.value_type(indexbox) == majit_ir::Type::Int {
         indexbox
     } else {
-        crate::state::trace_unbox_int_with_resume(frame, indexbox, int_type_addr)
+        // descroperation.py getindex_w / int_w accept the whole
+        // W_IntObject family uniformly; a bool index guards its own
+        // &BOOL_TYPE vtable but shares the intval field. Pick the guard
+        // class from the boxed key's concrete (INT_TYPE when unavailable).
+        let concrete_key_obj = match ctx.box_value(indexbox) {
+            Some(majit_ir::Value::Ref(gcref)) => gcref.0 as pyre_object::PyObjectRef,
+            _ => pyre_object::PY_NULL,
+        };
+        let (type_addr, intval_descr) =
+            crate::state::int_or_bool_unbox_type_descr(concrete_key_obj);
+        crate::state::trace_unbox_int_with_resume_descr(frame, indexbox, type_addr, intval_descr)
     };
     // Box(value) parity: stamp the unboxed index with its concrete.
     ctx.set_opref_concrete(raw_index, majit_ir::Value::Int(concrete_key));
@@ -2942,11 +2983,20 @@ pub fn opimpl_check_resizable_neg_index<F: pyre_jit_trace::walker_frame_ops::Wal
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
 
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     let raw_index = if frame.value_type(indexbox) == majit_ir::Type::Int {
         indexbox
     } else {
-        crate::state::trace_unbox_int_with_resume(frame, indexbox, int_type_addr)
+        // descroperation.py getindex_w / int_w accept the whole
+        // W_IntObject family uniformly; a bool index guards its own
+        // &BOOL_TYPE vtable but shares the intval field. Pick the guard
+        // class from the boxed key's concrete (INT_TYPE when unavailable).
+        let concrete_key_obj = match frame.ctx().box_value(indexbox) {
+            Some(majit_ir::Value::Ref(gcref)) => gcref.0 as pyre_object::PyObjectRef,
+            _ => pyre_object::PY_NULL,
+        };
+        let (type_addr, intval_descr) =
+            crate::state::int_or_bool_unbox_type_descr(concrete_key_obj);
+        crate::state::trace_unbox_int_with_resume_descr(frame, indexbox, type_addr, intval_descr)
     };
     frame
         .ctx_mut()

@@ -1936,7 +1936,7 @@ impl TruthOpcodeHandler for PyFrame {
     type Truth = bool;
 
     fn truth_value(&mut self, value: Self::Value) -> Result<Self::Truth, PyError> {
-        Ok(truth_value(value))
+        truth_value(value)
     }
 
     fn bool_value_from_truth(
@@ -2594,7 +2594,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     fn to_bool(&mut self) -> Result<(), PyError> {
         let val = self.pop();
-        let truth = crate::baseobjspace::is_true(val);
+        let truth = crate::baseobjspace::is_true(val)?;
         self.push(pyre_object::w_bool_from(truth));
         Ok(())
     }
@@ -4029,9 +4029,9 @@ r = acc",
     #[test]
     fn test_float_truthiness() {
         // Test via is_true directly since `not` uses ToBool instruction
-        assert!(!is_true(w_float_new(0.0)));
-        assert!(is_true(w_float_new(1.5)));
-        assert!(is_true(w_float_new(-0.1)));
+        assert!(!is_true(w_float_new(0.0)).unwrap());
+        assert!(is_true(w_float_new(1.5)).unwrap());
+        assert!(is_true(w_float_new(-0.1)).unwrap());
     }
 
     // ── str tests ────────────────────────────────────────────────────
@@ -5216,7 +5216,7 @@ result = fib(10)";
         res.expect("boolean and failed");
         unsafe {
             let r = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
-            assert!(!crate::baseobjspace::is_true(r));
+            assert!(!crate::baseobjspace::is_true(r).unwrap());
         }
     }
 

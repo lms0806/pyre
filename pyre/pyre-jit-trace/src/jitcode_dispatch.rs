@@ -8134,7 +8134,15 @@ fn walker_int_specialization_operands(
     r_args: &[OpRef],
     allboxes: &[OpRef],
     call_descr: &dyn majit_ir::descr::CallDescr,
-) -> Option<(OpRef, OpRef, i64, i64, i64)> {
+) -> Option<(
+    OpRef,
+    OpRef,
+    pyre_object::PyObjectRef,
+    pyre_object::PyObjectRef,
+    i64,
+    i64,
+    i64,
+)> {
     if r_args.len() != 2 {
         return None;
     }
@@ -8143,17 +8151,11 @@ fn walker_int_specialization_operands(
     let lhs_obj = walker_concrete_ref_object(ctx, lhs)?;
     let rhs_obj = walker_concrete_ref_object(ctx, rhs)?;
     let (lhs_val, rhs_val) = unsafe {
-        // Exclude `bool`: though a subtype of int, `W_BoolObject` has its own
-        // `&BOOL_TYPE` vtable and a 1-byte `boolval` field, not `W_IntObject`'s
-        // 8-byte `intval` at offset 16.  Int-path unbox (`GuardClass INT_TYPE` +
-        // `getfield intval`) would guard the wrong class and read 7 bytes past
-        // `boolval`.  Route bool operands through the generic residual call,
-        // which forces the correct value.
-        if !pyre_object::is_int(lhs_obj)
-            || !pyre_object::is_int(rhs_obj)
-            || pyre_object::is_bool(lhs_obj)
-            || pyre_object::is_bool(rhs_obj)
-        {
+        // `bool` is a `W_IntObject` subclass sharing the 8-byte `intval` at
+        // offset 16; the consumer unboxes it through its own `&BOOL_TYPE`
+        // guard, so it stays on the int path.  Returns the concrete objects
+        // so the consumer can pick the per-operand class/descr.
+        if !pyre_object::is_int(lhs_obj) || !pyre_object::is_int(rhs_obj) {
             return None;
         }
         (
@@ -8162,7 +8164,15 @@ fn walker_int_specialization_operands(
         )
     };
     let boxed_result_i64 = walker_execute_may_force_boxed(ctx, allboxes, call_descr)?;
-    Some((lhs, rhs, lhs_val, rhs_val, boxed_result_i64))
+    Some((
+        lhs,
+        rhs,
+        lhs_obj,
+        rhs_obj,
+        lhs_val,
+        rhs_val,
+        boxed_result_i64,
+    ))
 }
 
 /// Float counterpart of [`walker_int_specialization_operands`].  Each
@@ -8177,7 +8187,17 @@ fn walker_float_specialization_operands(
     r_args: &[OpRef],
     allboxes: &[OpRef],
     call_descr: &dyn majit_ir::descr::CallDescr,
-) -> Option<(OpRef, OpRef, bool, bool, f64, f64, i64)> {
+) -> Option<(
+    OpRef,
+    OpRef,
+    pyre_object::PyObjectRef,
+    pyre_object::PyObjectRef,
+    bool,
+    bool,
+    f64,
+    f64,
+    i64,
+)> {
     if r_args.len() != 2 {
         return None;
     }
@@ -8187,11 +8207,9 @@ fn walker_float_specialization_operands(
     let rhs_obj = walker_concrete_ref_object(ctx, rhs)?;
     let coerce = |obj: pyre_object::PyObjectRef| -> Option<(bool, f64)> {
         unsafe {
-            // Exclude `bool` from the int arm for the same reason as the int
-            // specialization: its layout/vtable differ from `W_IntObject`, so
-            // unboxing it as an int reads the wrong field.  `None` here routes
-            // the operation through the generic residual call.
-            if pyre_object::is_int(obj) && !pyre_object::is_bool(obj) {
+            // `bool` is a `W_IntObject` subclass sharing `intval`; it coerces
+            // through the int arm via its own &BOOL_TYPE guard at the consumer.
+            if pyre_object::is_int(obj) {
                 Some((true, pyre_object::w_int_get_value(obj) as f64))
             } else if pyre_object::is_float(obj) {
                 Some((false, pyre_object::w_float_get_value(obj)))
@@ -8209,6 +8227,8 @@ fn walker_float_specialization_operands(
     Some((
         lhs,
         rhs,
+        lhs_obj,
+        rhs_obj,
         lhs_is_int,
         rhs_is_int,
         lhs_f64,
@@ -8231,21 +8251,40 @@ fn walker_unbox_int(
     obj: OpRef,
     int_type_addr: i64,
 ) -> Result<OpRef, DispatchError> {
+    walker_unbox_int_typed(
+        ctx,
+        op_pc,
+        obj,
+        int_type_addr,
+        crate::descr::int_intval_descr(),
+    )
+}
+
+/// [`walker_unbox_int`] with an explicit `intval` descr so a `bool` operand
+/// can guard its own `&BOOL_TYPE` and read through `bool_intval_descr`
+/// (`bool` shares `W_IntObject`'s `intval` field).
+fn walker_unbox_int_typed(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    obj: OpRef,
+    type_addr: i64,
+    intval_descr: majit_ir::DescrRef,
+) -> Result<OpRef, DispatchError> {
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.trace_ctx.const_int(int_type_addr);
+        let type_const = ctx.trace_ctx.const_int(type_addr);
         ctx.trace_ctx
             .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
         walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
         ctx.trace_ctx
             .heap_cache_mut()
-            .class_now_known(obj, int_type_addr);
+            .class_now_known(obj, type_addr);
     }
     Ok(crate::generated::trace_unbox_int(
         ctx.trace_ctx,
         obj,
-        int_type_addr,
+        type_addr,
         crate::descr::ob_type_descr(),
-        crate::descr::int_intval_descr(),
+        intval_descr,
     ))
 }
 
@@ -8287,12 +8326,14 @@ fn walker_coerce_operand_to_float(
     ctx: &mut WalkContext<'_, '_>,
     op_pc: usize,
     obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
     is_int: bool,
     val: f64,
 ) -> Result<OpRef, DispatchError> {
     let raw = if is_int {
-        let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-        let raw_int = walker_unbox_int(ctx, op_pc, obj, int_type_addr)?;
+        // bool shares int's `intval`; guard its own &BOOL_TYPE before the cast.
+        let (type_addr, descr) = crate::state::int_or_bool_unbox_type_descr(concrete_obj);
+        let raw_int = walker_unbox_int_typed(ctx, op_pc, obj, type_addr, descr)?;
         ctx.trace_ctx.record_op(OpCode::CastIntToFloat, &[raw_int])
     } else {
         let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
@@ -8395,8 +8436,22 @@ fn try_walker_specialize_binary_op_int(
         _ => return Ok(None),
     };
 
+    // boolobject.py:74-76 descr_and/or/xor: when both operands are bool the
+    // And/Or/Xor result is a bool (`space.newbool`), not an int.  The op runs
+    // on the shared `intval` as for ints; only the boxing differs (picked
+    // below).  `walker_concrete_ref_object` reads the same source as
+    // `walker_int_specialization_operands`, so the flag stays consistent.
+    let result_is_bool = matches!(op_code, OpCode::IntAnd | OpCode::IntOr | OpCode::IntXor)
+        && match (
+            walker_concrete_ref_object(ctx, r_args[0]),
+            walker_concrete_ref_object(ctx, r_args[1]),
+        ) {
+            (Some(l), Some(r)) => unsafe { pyre_object::is_bool(l) && pyre_object::is_bool(r) },
+            _ => false,
+        };
+
     // Speculation gate + authentic boxed result (shared with COMPARE_OP).
-    let Some((lhs, rhs, la, rb, boxed_result_i64)) =
+    let Some((lhs, rhs, lhs_obj, rhs_obj, la, rb, boxed_result_i64)) =
         walker_int_specialization_operands(ctx, r_args, allboxes, call_descr)
     else {
         return Ok(None);
@@ -8406,7 +8461,6 @@ fn try_walker_specialize_binary_op_int(
     // needs_concrete_check): bail to the generic leg when the bare-IR-op
     // emission would be unsound (zero / INT_MIN-overflow divisor, oversized
     // / overflowing shift); large right-shift folds to a const.
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     if needs_check {
         match op_code {
             OpCode::IntFloorDiv | OpCode::IntMod => {
@@ -8449,8 +8503,12 @@ fn try_walker_specialize_binary_op_int(
     }
 
     // --- emit the specialized IR (walker-native) ---
-    let lhs_raw = walker_unbox_int(ctx, op_pc, lhs, int_type_addr)?;
-    let rhs_raw = walker_unbox_int(ctx, op_pc, rhs, int_type_addr)?;
+    // bool and int share `intval`; guard each operand against its own vtable
+    // (BOOL_TYPE / INT_TYPE) so a bool unboxes through its own class.
+    let (lhs_type, lhs_descr) = crate::state::int_or_bool_unbox_type_descr(lhs_obj);
+    let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
+    let lhs_raw = walker_unbox_int_typed(ctx, op_pc, lhs, lhs_type, lhs_descr)?;
+    let rhs_raw = walker_unbox_int_typed(ctx, op_pc, rhs, rhs_type, rhs_descr)?;
     let (raw_result, concrete_value) = match op_code {
         OpCode::IntFloorDiv | OpCode::IntMod => {
             // rint.py:429/520 _ovf_zer guards: int_eq(rhs,0)→guard_false +
@@ -8511,7 +8569,14 @@ fn try_walker_specialize_binary_op_int(
     if has_overflow {
         walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoOverflow, &[])?;
     }
-    let boxed = crate::state::wrapint(ctx.trace_ctx, raw_result);
+    // A both-bool bitwise result boxes via `space.newbool` (boolobject.py:
+    // 74-76) so it keeps the bool type; `boxed_result_i64` is already the
+    // authentic W_Bool the forced residual produced.
+    let boxed = if result_is_bool {
+        crate::helpers::emit_trace_bool_value_from_truth(ctx.trace_ctx, raw_result, false)
+    } else {
+        crate::state::wrapint(ctx.trace_ctx, raw_result)
+    };
     ctx.trace_ctx.set_opref_concrete(
         boxed,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
@@ -8555,16 +8620,20 @@ fn try_walker_specialize_compare_op_int(
         ComparisonOperator::Equal => OpCode::IntEq,
         ComparisonOperator::NotEqual => OpCode::IntNe,
     };
-    let Some((lhs, rhs, la, rb, boxed_result_i64)) =
+    let Some((lhs, rhs, lhs_obj, rhs_obj, la, rb, boxed_result_i64)) =
         walker_int_specialization_operands(ctx, r_args, allboxes, call_descr)
     else {
         return Ok(None);
     };
 
     // --- emit the specialized IR (walker-native) ---
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    let lhs_raw = walker_unbox_int(ctx, op_pc, lhs, int_type_addr)?;
-    let rhs_raw = walker_unbox_int(ctx, op_pc, rhs, int_type_addr)?;
+    // bool and int share `intval`; guard each operand against its own vtable
+    // so a bool comparand unboxes through &BOOL_TYPE.  The comparison result
+    // is a bool either way.
+    let (lhs_type, lhs_descr) = crate::state::int_or_bool_unbox_type_descr(lhs_obj);
+    let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
+    let lhs_raw = walker_unbox_int_typed(ctx, op_pc, lhs, lhs_type, lhs_descr)?;
+    let rhs_raw = walker_unbox_int_typed(ctx, op_pc, rhs, rhs_type, rhs_descr)?;
     let truth = ctx.trace_ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
     let folded = majit_metainterp::eval_binop_i(cmp, la, rb);
     ctx.trace_ctx
@@ -8809,8 +8878,17 @@ fn try_walker_specialize_binary_op_float(
         _ => return Ok(None),
     };
 
-    let Some((lhs, rhs, lhs_is_int, rhs_is_int, lhs_f64, rhs_f64, boxed_result_i64)) =
-        walker_float_specialization_operands(ctx, r_args, allboxes, call_descr)
+    let Some((
+        lhs,
+        rhs,
+        lhs_obj,
+        rhs_obj,
+        lhs_is_int,
+        rhs_is_int,
+        lhs_f64,
+        rhs_f64,
+        boxed_result_i64,
+    )) = walker_float_specialization_operands(ctx, r_args, allboxes, call_descr)
     else {
         return Ok(None);
     };
@@ -8826,8 +8904,8 @@ fn try_walker_specialize_binary_op_float(
     }
 
     // --- emit the specialized IR (walker-native) ---
-    let lhs_raw = walker_coerce_operand_to_float(ctx, op_pc, lhs, lhs_is_int, lhs_f64)?;
-    let rhs_raw = walker_coerce_operand_to_float(ctx, op_pc, rhs, rhs_is_int, rhs_f64)?;
+    let lhs_raw = walker_coerce_operand_to_float(ctx, op_pc, lhs, lhs_obj, lhs_is_int, lhs_f64)?;
+    let rhs_raw = walker_coerce_operand_to_float(ctx, op_pc, rhs, rhs_obj, rhs_is_int, rhs_f64)?;
     let raw_result = match op_code {
         Some(op_code) => {
             let r = ctx.trace_ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
@@ -8912,13 +8990,10 @@ fn try_walker_specialize_subscr(
     };
 
     // Gate: list[int], non-negative index in bounds, int- or float-storage.
-    // A bool index (`is_int` accepts `W_BoolObject`) must NOT be unboxed via
-    // the int path: it has a 1-byte `boolval`, not W_IntObject's `intval@16`.
+    // A bool index (`is_int` accepts `W_BoolObject`) is fine: bool shares
+    // int's `intval`, so it unboxes through its own &BOOL_TYPE guard below.
     let (sid, index, concrete_len) = unsafe {
-        if !pyre_object::pyobject::is_list(list_obj)
-            || !pyre_object::is_int(key_obj)
-            || pyre_object::is_bool(key_obj)
-        {
+        if !pyre_object::pyobject::is_list(list_obj) || !pyre_object::is_int(key_obj) {
             return Ok(None);
         }
         let index = pyre_object::w_int_get_value(key_obj);
@@ -8974,9 +9049,10 @@ fn try_walker_specialize_subscr(
         .heap_cache_mut()
         .replace_box(strategy, sid_const);
 
-    // Unbox the index operand (guard_class INT + getfield intval).
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    let raw_index = walker_unbox_int(ctx, op_pc, key_op, int_type_addr)?;
+    // Unbox the index operand (guard_class + getfield intval).  bool shares
+    // int's `intval`, so a bool index guards its own &BOOL_TYPE.
+    let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
+    let raw_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
     ctx.trace_ctx
         .set_opref_concrete(raw_index, majit_ir::Value::Int(index));
 
@@ -9083,13 +9159,12 @@ fn try_walker_specialize_store_subscr(
     // Gate: list[int] = value, non-negative index in bounds, storage matching
     // the value type (int storage ← W_IntObject, float storage ← W_FloatObject).
     let (sid, index, concrete_len) = unsafe {
-        // Bool index / bool int-storage value must route through the generic
-        // path: `is_int` accepts `W_BoolObject`, whose 1-byte `boolval` is not
-        // W_IntObject's `intval@16`, so int-path unbox would read garbage.
-        if !pyre_object::pyobject::is_list(list_obj)
-            || !pyre_object::is_int(key_obj)
-            || pyre_object::is_bool(key_obj)
-        {
+        // A bool index is fine: bool shares int's `intval`, unboxed below via
+        // its own &BOOL_TYPE guard.  A bool *value* into int storage must still
+        // route through the generic path — PyPy's IntegerListStrategy rejects a
+        // W_BoolObject (`is_correct_type` is exact-type), switching the list to
+        // object storage, so the int-storage fast path would drop the bool type.
+        if !pyre_object::pyobject::is_list(list_obj) || !pyre_object::is_int(key_obj) {
             return Ok(None);
         }
         let index = pyre_object::w_int_get_value(key_obj);
@@ -9142,9 +9217,10 @@ fn try_walker_specialize_store_subscr(
         .heap_cache_mut()
         .replace_box(strategy, sid_const);
 
-    // Unbox the index operand.
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    let raw_index = walker_unbox_int(ctx, op_pc, key_op, int_type_addr)?;
+    // Unbox the index operand.  bool shares int's `intval`, so a bool index
+    // guards its own &BOOL_TYPE.
+    let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
+    let raw_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
     ctx.trace_ctx
         .set_opref_concrete(raw_index, majit_ir::Value::Int(index));
 
@@ -9169,6 +9245,9 @@ fn try_walker_specialize_store_subscr(
             list_op,
             crate::descr::list_int_items_block_descr(),
         );
+        // The value is a true W_IntObject (the gate excludes bool from int
+        // storage), so it unboxes through the plain INT_TYPE guard.
+        let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
         let raw = walker_unbox_int(ctx, op_pc, value_op, int_type_addr)?;
         let elem = unsafe { pyre_object::w_int_get_value(value_obj) };
         ctx.trace_ctx
@@ -9261,15 +9340,24 @@ fn try_walker_specialize_compare_op_float(
         ComparisonOperator::Equal => OpCode::FloatEq,
         ComparisonOperator::NotEqual => OpCode::FloatNe,
     };
-    let Some((lhs, rhs, lhs_is_int, rhs_is_int, lhs_f64, rhs_f64, boxed_result_i64)) =
-        walker_float_specialization_operands(ctx, r_args, allboxes, call_descr)
+    let Some((
+        lhs,
+        rhs,
+        lhs_obj,
+        rhs_obj,
+        lhs_is_int,
+        rhs_is_int,
+        lhs_f64,
+        rhs_f64,
+        boxed_result_i64,
+    )) = walker_float_specialization_operands(ctx, r_args, allboxes, call_descr)
     else {
         return Ok(None);
     };
 
     // --- emit the specialized IR (walker-native) ---
-    let lhs_raw = walker_coerce_operand_to_float(ctx, op_pc, lhs, lhs_is_int, lhs_f64)?;
-    let rhs_raw = walker_coerce_operand_to_float(ctx, op_pc, rhs, rhs_is_int, rhs_f64)?;
+    let lhs_raw = walker_coerce_operand_to_float(ctx, op_pc, lhs, lhs_obj, lhs_is_int, lhs_f64)?;
+    let rhs_raw = walker_coerce_operand_to_float(ctx, op_pc, rhs, rhs_obj, rhs_is_int, rhs_f64)?;
     let truth = ctx.trace_ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
     let folded =
         majit_metainterp::eval_float_cmp(cmp, lhs_f64.to_bits() as i64, rhs_f64.to_bits() as i64);

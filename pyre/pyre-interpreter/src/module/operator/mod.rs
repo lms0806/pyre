@@ -78,9 +78,9 @@ crate::py_module! {
         "and_"     / 2 = |args| and_(args[0], args[1]),
         "or_"      / 2 = |args| or_(args[0], args[1]),
         "xor"      / 2 = |args| xor(args[0], args[1]),
-        "not_"     / 1 = |args| Ok(w_bool_from(!is_true(args[0]))),
+        "not_"     / 1 = |args| Ok(w_bool_from(!is_true(args[0])?)),
         // interp_operator.py:138
-        "truth"    / 1 = |args| Ok(w_bool_from(is_true(args[0]))),
+        "truth"    / 1 = |args| Ok(w_bool_from(is_true(args[0])?)),
         "is_"      / 2 = |args| Ok(w_bool_from(std::ptr::eq(args[0], args[1]))),
         "is_not"   / 2 = |args| Ok(w_bool_from(!std::ptr::eq(args[0], args[1]))),
         "contains" / 2 = |args| Ok(w_bool_from(contains(args[0], args[1])?)),

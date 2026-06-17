@@ -412,7 +412,7 @@ pub fn register_module(ns: &mut DictStorage) {
                 let selectors = crate::builtins::collect_iterable(args[1])?;
                 let mut out = Vec::new();
                 for (d, s) in data.iter().zip(selectors.iter()) {
-                    if crate::baseobjspace::is_true(*s) {
+                    if crate::baseobjspace::is_true(*s)? {
                         out.push(*d);
                     }
                 }

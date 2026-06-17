@@ -701,8 +701,13 @@ pub fn cached_call_descrs() -> Vec<DescrRef> {
 
 /// Create a CallDescr for CALL_MAY_FORCE_* operations.
 ///
-/// RPython treats these as may-raise calls guarded by GUARD_NOT_FORCED, not as
-/// generic cannot-raise helpers.
+/// The trait-dispatch leg records a residual through this descr; the walker
+/// leg records the equivalent residual through a calldescr the codewriter
+/// builds with `forces_virtual_or_virtualizable_effect_info()`
+/// (`CallFlavor::MayForce`). Both must carry the same
+/// `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` `EffectInfo` so the optimizer and
+/// `do_residual_call` treat the two legs' may-force ops identically
+/// (`MetaCallMayForceDescr::get_extra_info` mirrors that constructor).
 pub fn make_call_may_force_descr(arg_types: &[Type], result_type: Type) -> DescrRef {
     #[derive(Debug)]
     struct MetaCallMayForceDescr {
@@ -730,17 +735,34 @@ pub fn make_call_may_force_descr(arg_types: &[Type], result_type: Type) -> Descr
             0
         }
         fn get_extra_info(&self) -> &EffectInfo {
-            // CALL_MAY_FORCE pairs with `GUARD_NOT_FORCED`; the
-            // optimizer postpones the call (heap.rs:2722-2747) and
-            // flushes lazy sets at the guard via
-            // `force_lazy_sets_for_guard` (heap.rs:2770). That's the
-            // single flush that mirrors RPython's same code path, so
-            // there is no need to also fire `force_from_effectinfo`
-            // at the call site itself — leave the bitsets empty.
-            // `EF_CAN_RAISE` keeps the optimizer from flagging the
-            // call as elidable / loopinvariant.
-            static INFO: EffectInfo =
-                EffectInfo::const_new(ExtraEffect::CanRaise, OopSpecIndex::None);
+            // Byte-identical to `forces_virtual_or_virtualizable_effect_info()`
+            // (the `CallFlavor::MayForce` row the codewriter stamps on the
+            // walker-leg calldescr): `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`
+            // with analyzer-empty read/write bitsets. The two legs must
+            // agree on the descr shape for the same residual.
+            //
+            // `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` is the only extraeffect
+            // consistent with the `CALL_MAY_FORCE_*` opcode this descr
+            // accompanies: `check_forces_virtual_or_virtualizable()` reads
+            // `extraeffect >= EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`, so the
+            // earlier `EF_CAN_RAISE` (5 < 6) failed that test while still
+            // riding a may-force op. `> EF_CANNOT_RAISE` keeps
+            // `check_can_raise()` true so the may-force sequence still
+            // records its trailing `GUARD_NO_EXCEPTION`.
+            //
+            // The empty bitsets are faithful, not a shortcut: the
+            // analyzer-absent fallback (`effectinfo_from_writeanalyze` with
+            // `bottom_result()`) produces empty `read/write_descrs_*`, so
+            // `force_from_effectinfo` finds no descr bits set and leaves
+            // cached heap state live across the call. Promoting instead to
+            // `EF_RANDOM_EFFECTS` would trip `has_random_effects()` and
+            // route OptHeap through `clean_caches`, over-invalidating heap
+            // PyPy keeps live for analyzer-empty virtualizable-forcing
+            // callees.
+            static INFO: EffectInfo = EffectInfo::const_new(
+                ExtraEffect::ForcesVirtualOrVirtualizable,
+                OopSpecIndex::None,
+            );
             &INFO
         }
     }
@@ -999,5 +1021,26 @@ mod set_effect_bitstrings_tests {
             found,
             "cached_call_descrs must include the descr we just made"
         );
+    }
+
+    /// The trait-dispatch leg's `make_call_may_force_descr` and the walker
+    /// leg's `forces_virtual_or_virtualizable_effect_info()` must classify a
+    /// may-force residual identically: `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`
+    /// (consistent with the `CALL_MAY_FORCE_*` opcode), can-raise (trailing
+    /// `GUARD_NO_EXCEPTION` retained), no random effects (no `clean_caches`
+    /// over-invalidation), and no oopspec.
+    #[test]
+    fn may_force_descr_matches_forces_virtual_effect_info() {
+        let canonical = forces_virtual_or_virtualizable_effect_info();
+        let descr = make_call_may_force_descr(&[Type::Ref], Type::Ref);
+        let ei = descr.as_call_descr().unwrap().get_extra_info();
+
+        assert_eq!(ei.extraeffect, canonical.extraeffect);
+        assert_eq!(ei.extraeffect, ExtraEffect::ForcesVirtualOrVirtualizable);
+        assert!(ei.check_forces_virtual_or_virtualizable());
+        assert!(ei.check_can_raise(false));
+        assert!(!ei.has_random_effects());
+        assert!(!ei.has_oopspec());
+        assert!(!ei.check_can_invalidate());
     }
 }

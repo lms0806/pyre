@@ -54,54 +54,60 @@ pub fn generic_alias_class_getitem(args: &[PyObjectRef]) -> crate::PyResult {
             args.len().saturating_sub(1)
         )));
     }
-    Ok(make_generic_alias(args[0], args[1]))
+    make_generic_alias(args[0], args[1])
 }
 
 /// `GenericAlias.__new__` (`_pypy_generic_alias.py:19`) — wrap a bare item
 /// into a 1-tuple, collect the free parameters, allocate.
-pub fn make_generic_alias(origin: PyObjectRef, item: PyObjectRef) -> PyObjectRef {
+pub fn make_generic_alias(
+    origin: PyObjectRef,
+    item: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     let args = if unsafe { is_tuple(item) } {
         item
     } else {
         w_tuple_new(vec![item])
     };
-    let parameters = collect_parameters(args);
-    w_generic_alias_new(origin, args, parameters)
+    let parameters = collect_parameters(args)?;
+    Ok(w_generic_alias_new(origin, args, parameters))
 }
 
 /// `_collect_parameters(args)` (`_pypy_generic_alias.py:150`) — gather the
 /// free type variables in order of first appearance.
-fn collect_parameters(args: PyObjectRef) -> PyObjectRef {
+fn collect_parameters(args: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let mut params: Vec<PyObjectRef> = Vec::new();
     let n = unsafe { w_tuple_len(args) };
     for i in 0..n {
         if let Some(t) = unsafe { w_tuple_getitem(args, i as i64) } {
-            collect_parameters_one(t, &mut params);
+            collect_parameters_one(t, &mut params)?;
         }
     }
-    w_tuple_new(params)
+    Ok(w_tuple_new(params))
 }
 
-fn collect_parameters_one(t: PyObjectRef, params: &mut Vec<PyObjectRef>) {
+fn collect_parameters_one(
+    t: PyObjectRef,
+    params: &mut Vec<PyObjectRef>,
+) -> Result<(), crate::PyError> {
     unsafe {
         if is_type(t) {
             // A bare class exposes no `__parameters__` descriptor of its own.
-            return;
+            return Ok(());
         }
         if is_tuple(t) {
             let n = w_tuple_len(t);
             for i in 0..n {
                 if let Some(x) = w_tuple_getitem(t, i as i64) {
-                    collect_parameters_one(x, params);
+                    collect_parameters_one(x, params)?;
                 }
             }
-            return;
+            return Ok(());
         }
     }
     // `hasattr(t, '__typing_subst__')` → `t` is itself a parameter.
     if crate::baseobjspace::getattr_str(t, "__typing_subst__").is_ok() {
-        push_unique(params, t);
-        return;
+        push_unique(params, t)?;
+        return Ok(());
     }
     // Otherwise pull `getattr(t, '__parameters__', ())`.
     if let Ok(sub) = crate::baseobjspace::getattr_str(t, "__parameters__") {
@@ -109,17 +115,26 @@ fn collect_parameters_one(t: PyObjectRef, params: &mut Vec<PyObjectRef>) {
             let n = unsafe { w_tuple_len(sub) };
             for i in 0..n {
                 if let Some(x) = unsafe { w_tuple_getitem(sub, i as i64) } {
-                    push_unique(params, x);
+                    push_unique(params, x)?;
                 }
             }
         }
     }
+    Ok(())
 }
 
-fn push_unique(params: &mut Vec<PyObjectRef>, item: PyObjectRef) {
-    if !params.iter().any(|&p| crate::baseobjspace::eq_w(p, item)) {
+fn push_unique(params: &mut Vec<PyObjectRef>, item: PyObjectRef) -> Result<(), crate::PyError> {
+    let mut found = false;
+    for &p in params.iter() {
+        if crate::baseobjspace::eq_w(p, item)? {
+            found = true;
+            break;
+        }
+    }
+    if !found {
         params.push(item);
     }
+    Ok(())
 }
 
 // ── typedef methods ──────────────────────────────────────────────────
@@ -177,10 +192,10 @@ fn ga_eq(args: &[PyObjectRef]) -> crate::PyResult {
         crate::baseobjspace::eq_w(
             w_generic_alias_get_origin(self_),
             w_generic_alias_get_origin(other),
-        ) && crate::baseobjspace::eq_w(
+        )? && crate::baseobjspace::eq_w(
             w_generic_alias_get_args(self_),
             w_generic_alias_get_args(other),
-        ) && w_generic_alias_get_unpacked(self_) == w_generic_alias_get_unpacked(other)
+        )? && w_generic_alias_get_unpacked(self_) == w_generic_alias_get_unpacked(other)
     };
     Ok(w_bool_from(eq))
 }
@@ -230,7 +245,7 @@ pub(crate) fn create_union(x: PyObjectRef, y: PyObjectRef) -> crate::PyResult {
     if !unionable(x) || !unionable(y) {
         return Ok(w_not_implemented());
     }
-    if unsafe { crate::baseobjspace::eq_w(x, y) } {
+    if crate::baseobjspace::eq_w(x, y)? {
         return Ok(x);
     }
     Ok(w_union_new(normalize_none(x), normalize_none(y)))
@@ -240,33 +255,33 @@ pub(crate) fn create_union(x: PyObjectRef, y: PyObjectRef) -> crate::PyResult {
 /// `set(self.__args__) == set(other.__args__)`.  Both arg tuples are
 /// deduplicated at construction, so equal length plus subset is set
 /// equality.
-pub(crate) fn union_set_eq(a: PyObjectRef, b: PyObjectRef) -> bool {
+pub(crate) fn union_set_eq(a: PyObjectRef, b: PyObjectRef) -> Result<bool, crate::PyError> {
     unsafe {
         let aa = w_union_get_args(a);
         let bb = w_union_get_args(b);
         let na = w_tuple_len(aa);
         let nb = w_tuple_len(bb);
         if na != nb {
-            return false;
+            return Ok(false);
         }
         for i in 0..na {
             let Some(x) = w_tuple_getitem(aa, i as i64) else {
-                return false;
+                return Ok(false);
             };
             let mut found = false;
             for j in 0..nb {
                 if let Some(y) = w_tuple_getitem(bb, j as i64) {
-                    if crate::baseobjspace::eq_w(x, y) {
+                    if crate::baseobjspace::eq_w(x, y)? {
                         found = true;
                         break;
                     }
                 }
             }
             if !found {
-                return false;
+                return Ok(false);
             }
         }
-        true
+        Ok(true)
     }
 }
 
@@ -308,7 +323,7 @@ fn ga_new(args: &[PyObjectRef]) -> crate::PyResult {
             args.len().saturating_sub(1)
         )));
     }
-    Ok(make_generic_alias(args[1], args[2]))
+    make_generic_alias(args[1], args[2])
 }
 
 /// Build the `types.GenericAlias` namespace.

@@ -1730,7 +1730,7 @@ fn sre_pattern_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_bool_from(
         p.flags == q.flags
             && p_code == q_code
-            && crate::baseobjspace::eq_w(p.w_pattern, q.w_pattern),
+            && crate::baseobjspace::eq_w(p.w_pattern, q.w_pattern)?,
     ))
 }
 

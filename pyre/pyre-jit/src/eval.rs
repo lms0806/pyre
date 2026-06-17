@@ -152,12 +152,23 @@ fn pyre_object_gc_write_barrier_trampoline(obj: *mut u8) {
 /// `pyre_interpreter::baseobjspace::eq_w` (line-by-line port of
 /// `baseobjspace.py:823-825 W_ObjectSpace.eq_w`).  Registered at
 /// JIT init so all subsequent `dict_keys_equal` calls reach the full
-/// comparison protocol.
+/// comparison protocol.  A raising `__eq__` (or `__bool__` of its
+/// result) cannot return a `Result` across the bucket probe, so the
+/// `PyError` is stashed on the shared pending slot and flagged via
+/// `dict_eq_hook::signal_eq_error`; the checked dict op converts the
+/// flag to a `DictKeyError` after the probe.
 unsafe fn pyre_object_eq_w_trampoline(
     a: pyre_object::PyObjectRef,
     b: pyre_object::PyObjectRef,
 ) -> bool {
-    pyre_interpreter::baseobjspace::eq_w(a, b)
+    match pyre_interpreter::baseobjspace::eq_w(a, b) {
+        Ok(v) => v,
+        Err(e) => {
+            pyre_interpreter::baseobjspace::set_pending_hash_error(e);
+            pyre_object::dict_eq_hook::signal_eq_error(a);
+            false
+        }
+    }
 }
 
 /// `pypy/objspace/std/dictmultiobject.py:1210 r_dict(space.eq_w,
@@ -2928,9 +2939,9 @@ fn log_named_global_result(frame: &PyFrame, label: &str) {
             return;
         }
         // pyobject.rs:308 `is_int` returns true for both INT_TYPE and
-        // BOOL_TYPE, but W_BoolObject's layout differs from W_IntObject —
-        // calling w_int_get_value on a bool reads the wrong field. Match
-        // INT_TYPE strictly so the int payload read stays sound.
+        // BOOL_TYPE (bool is a W_IntObject subclass sharing `intval`). Match
+        // INT_TYPE strictly here so the log labels a bool result distinctly
+        // in the branch below.
         if pyre_object::pyobject::py_type_check(value, &pyre_object::pyobject::INT_TYPE) {
             eprintln!(
                 "[jit][{label}] result_ptr=0x{:x} kind=int intval={}",

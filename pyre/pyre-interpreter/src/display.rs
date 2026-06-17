@@ -223,7 +223,14 @@ unsafe fn builtin_leaf_repr_string(obj: PyObjectRef, tp: *const PyType) -> Optio
             Some(format!("{}", &*(*long_obj).value))
         } else if std::ptr::eq(tp, &BOOL_TYPE as *const PyType) {
             let bool_obj = obj as *const pyre_object::boolobject::W_BoolObject;
-            Some(if (*bool_obj).boolval { "True" } else { "False" }.to_string())
+            Some(
+                if (*bool_obj).intval != 0 {
+                    "True"
+                } else {
+                    "False"
+                }
+                .to_string(),
+            )
         } else {
             None
         }

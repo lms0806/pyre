@@ -664,7 +664,7 @@ fn compare(w_self: PyObjectRef, w_ref2: PyObjectRef, invert: bool) -> Result<PyO
         crate::baseobjspace::compare(w_obj1, w_obj2, crate::baseobjspace::CompareOp::Eq)?
     };
     if invert {
-        Ok(crate::baseobjspace::not_(w_res))
+        crate::baseobjspace::not_(w_res)
     } else {
         Ok(w_res)
     }
@@ -1165,7 +1165,7 @@ pub fn proxy_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
     Ok(pyre_object::w_bool_from(crate::baseobjspace::is_true(
         w_obj0,
-    )))
+    )?))
 }
 
 // 2-/3-arg attribute ops with name-string conversion.
@@ -1197,9 +1197,9 @@ pub fn proxy_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 }
 
 pub fn proxy_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    // Generated wrapper (interp__weakref.py:374): `return space.setitem(...)`.
     let w_obj0 = force(args[0])?;
-    crate::baseobjspace::setitem(w_obj0, args[1], args[2])?;
-    Ok(pyre_object::w_none())
+    crate::baseobjspace::setitem(w_obj0, args[1], args[2])
 }
 
 pub fn proxy_delitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {

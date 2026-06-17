@@ -14,7 +14,6 @@ use majit_metainterp::{
 
 use pyre_interpreter::bytecode::{CodeObject, ComparisonOperator, Instruction};
 use pyre_interpreter::pyframe::PyFrame;
-use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_object::PyObjectRef;
 use pyre_object::boolobject::w_bool_get_value;
 use pyre_object::pyobject::{
@@ -1823,17 +1822,6 @@ impl ConcreteValue {
             ConcreteValue::Int(_) | ConcreteValue::Float(_) | ConcreteValue::Bool(_) => None,
         }
     }
-
-    /// Truth value (RPython box.getint() != 0 for goto_if_not).
-    pub fn is_truthy(&self) -> bool {
-        match self {
-            ConcreteValue::Int(v) => *v != 0,
-            ConcreteValue::Float(v) => *v != 0.0,
-            ConcreteValue::Bool(v) => *v,
-            ConcreteValue::Ref(obj) => objspace_truth_value(*obj),
-            ConcreteValue::Null => false,
-        }
-    }
 }
 
 #[inline]
@@ -2770,6 +2758,27 @@ pub(crate) fn trace_unbox_int_with_resume<F: crate::walker_frame_ops::WalkerFram
     int_type_addr: i64,
 ) -> OpRef {
     trace_unbox_int_with_resume_descr(frame, obj, int_type_addr, crate::descr::int_intval_descr())
+}
+
+/// `(guard_class type addr, intval descr)` for unboxing a concrete int- or
+/// bool-valued operand. `W_BoolObject` is a `W_IntObject` subclass sharing
+/// the `intval` field, so a bool unboxes through the same `getfield` but
+/// guards its own `&BOOL_TYPE` vtable and keys the heapcache by the bool
+/// field descr.
+pub(crate) fn int_or_bool_unbox_type_descr(
+    concrete: pyre_object::PyObjectRef,
+) -> (i64, majit_ir::DescrRef) {
+    if !concrete.is_null() && unsafe { pyre_object::is_bool(concrete) } {
+        (
+            &pyre_object::pyobject::BOOL_TYPE as *const _ as i64,
+            crate::descr::bool_intval_descr(),
+        )
+    } else {
+        (
+            &pyre_object::pyobject::INT_TYPE as *const _ as i64,
+            crate::descr::int_intval_descr(),
+        )
+    }
 }
 
 pub(crate) fn trace_unbox_int_with_resume_descr<F: crate::walker_frame_ops::WalkerFrameOps>(
@@ -10162,9 +10171,11 @@ mod tests {
         }
     }
 
-    /// type_id=0 case: W_BoolObject has no dedicated GC type id but a
-    /// distinct vtable (`&BOOL_TYPE`). The orthodox materializer must
-    /// dispatch on `descr.vtable()` rather than `type_id`.
+    /// W_BoolObject has a dedicated GC type id (`W_BOOL_GC_TYPE_ID = 5`)
+    /// but shares `W_IntObject`'s layout, distinguished by the
+    /// `&BOOL_TYPE` vtable. This test passes `type_id: 0` to confirm the
+    /// orthodox materializer dispatches on `descr.vtable()` rather than
+    /// `type_id`.
     #[test]
     fn test_materialize_virtual_ref_reconstructs_bool_object() {
         use pyre_object::boolobject::w_bool_get_value;
@@ -10175,7 +10186,7 @@ mod tests {
             descr: Some(descr.clone()),
             type_id: 0,
             fields: vec![(
-                crate::descr::bool_boolval_descr().index(),
+                crate::descr::bool_intval_descr().index(),
                 MaterializedValue::Value(1),
             )],
         };
@@ -10562,8 +10573,9 @@ mod tests {
         .expect("generic helper call should box raw operands first");
 
         let recorder = ctx.into_recorder();
-        // GuardNoException (pyjitpl.py:2082) follows the residual Call*, so
-        // look up the Call* op explicitly rather than via `ops().last()`.
+        // GuardNotForced (pyjitpl.py:2079) + GuardNoException (pyjitpl.py:2082)
+        // follow the residual may-force Call*, so look up the Call* op
+        // explicitly rather than via `ops().last()`.
         let call = recorder
             .ops()
             .iter()
@@ -10571,7 +10583,14 @@ mod tests {
             .find(|op| {
                 matches!(
                     op.opcode,
-                    OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN
+                    OpCode::CallI
+                        | OpCode::CallR
+                        | OpCode::CallF
+                        | OpCode::CallN
+                        | OpCode::CallMayForceI
+                        | OpCode::CallMayForceR
+                        | OpCode::CallMayForceF
+                        | OpCode::CallMayForceN
                 )
             })
             .expect("call op should be present");

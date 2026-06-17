@@ -206,15 +206,25 @@ mod deque_class {
                 }
                 Ok(())
             }
-            fn count(self_obj: PyObjectRef, x: PyObjectRef) -> i64 {
-                snapshot(self_obj)
-                    .into_iter()
-                    .filter(|&it| crate::baseobjspace::eq_w(it, x))
-                    .count() as i64
+            fn count(self_obj: PyObjectRef, x: PyObjectRef) -> Result<i64, crate::PyError> {
+                let mut n = 0i64;
+                for it in snapshot(self_obj) {
+                    if crate::baseobjspace::eq_w(it, x)? {
+                        n += 1;
+                    }
+                }
+                Ok(n)
             }
             fn remove(self_obj: PyObjectRef, x: PyObjectRef) -> Result<(), crate::PyError> {
                 let mut items = snapshot(self_obj);
-                match items.iter().position(|&it| crate::baseobjspace::eq_w(it, x)) {
+                let mut pos = None;
+                for (i, &it) in items.iter().enumerate() {
+                    if crate::baseobjspace::eq_w(it, x)? {
+                        pos = Some(i);
+                        break;
+                    }
+                }
+                match pos {
                     Some(pos) => {
                         items.remove(pos);
                         store(self_obj, items);
@@ -224,10 +234,13 @@ mod deque_class {
                         "deque.remove(x): x not in deque")),
                 }
             }
-            fn __contains__(self_obj: PyObjectRef, x: PyObjectRef) -> bool {
-                snapshot(self_obj)
-                    .into_iter()
-                    .any(|it| crate::baseobjspace::eq_w(it, x))
+            fn __contains__(self_obj: PyObjectRef, x: PyObjectRef) -> Result<bool, crate::PyError> {
+                for it in snapshot(self_obj) {
+                    if crate::baseobjspace::eq_w(it, x)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
             }
             fn reverse(self_obj: PyObjectRef) {
                 let mut items = snapshot(self_obj);
@@ -265,7 +278,7 @@ mod deque_class {
                 );
                 let mut i = start;
                 while i < stop {
-                    if crate::baseobjspace::eq_w(items[i as usize], x) {
+                    if crate::baseobjspace::eq_w(items[i as usize], x)? {
                         return Ok(i);
                     }
                     i += 1;

@@ -604,14 +604,14 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
             let func_is_none = unsafe { pyre_object::is_none(func) };
             for item in items {
                 let keep = if func_is_none {
-                    crate::baseobjspace::is_true(item)
+                    crate::baseobjspace::is_true(item)?
                 } else {
-                    let result = crate::call_function(func, &[item]);
-                    if result.is_null() {
-                        false
-                    } else {
-                        crate::baseobjspace::is_true(result)
-                    }
+                    // functional.py:936 next_w: `w_pred =
+                    // space.call_function(self.w_predicate, w_obj)` then
+                    // `space.is_true(w_pred)` — a raising predicate or
+                    // truthiness propagates.
+                    let result = crate::call::call_function_impl_result(func, &[item])?;
+                    crate::baseobjspace::is_true(result)?
                 };
                 if keep {
                     out.push(item);
@@ -1490,7 +1490,7 @@ fn select_extremum(
         // types.  Errors (TypeError from incomparable types) are
         // propagated to the caller as PyPy does.
         let result = crate::baseobjspace::compare(key, best_key, cmp_op)?;
-        if crate::baseobjspace::is_true(result) {
+        if crate::baseobjspace::is_true(result)? {
             best_item = item;
             best_key = key;
         }
@@ -4830,6 +4830,7 @@ fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     kwarg_reject_unknown(kwargs, &["strict"], "zip")?;
     let strict = kwarg_get(kwargs, "strict")
         .map(|v| crate::baseobjspace::is_true(v))
+        .transpose()?
         .unwrap_or(false);
     if args.is_empty() {
         return Ok(pyre_object::w_seq_iter_new(
@@ -5101,6 +5102,7 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     let key_fn = kwarg_get(kwargs, "key").filter(|k| unsafe { !pyre_object::is_none(*k) });
     let reverse = kwarg_get(kwargs, "reverse")
         .map(|v| crate::baseobjspace::is_true(v))
+        .transpose()?
         .unwrap_or(false);
     let mut items = collect_iterable(iterable)?;
     // `pypy/objspace/std/listobject.py W_ListObject.descr_sort` →
@@ -5135,7 +5137,10 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
             return false;
         }
         match crate::baseobjspace::compare(ka, kb, crate::baseobjspace::CompareOp::Lt) {
-            Ok(r) => crate::baseobjspace::is_true(r),
+            Ok(r) => crate::baseobjspace::is_true(r).unwrap_or_else(|e| {
+                sort_error.set(Some(e));
+                false
+            }),
             Err(e) => {
                 sort_error.set(Some(e));
                 false
@@ -5188,7 +5193,7 @@ fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "any() takes exactly one argument");
     let items = collect_iterable(args[0])?;
     for item in items {
-        if crate::baseobjspace::is_true(item) {
+        if crate::baseobjspace::is_true(item)? {
             return Ok(w_bool_from(true));
         }
     }
@@ -5558,7 +5563,7 @@ fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "all() takes exactly one argument");
     let items = collect_iterable(args[0])?;
     for item in items {
-        if !crate::baseobjspace::is_true(item) {
+        if !crate::baseobjspace::is_true(item)? {
             return Ok(w_bool_from(false));
         }
     }

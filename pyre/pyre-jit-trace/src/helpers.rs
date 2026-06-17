@@ -247,6 +247,24 @@ pub fn emit_trace_call_may_force_ref_typed(
     ctx.call_may_force_ref_typed(helper, args, arg_types)
 }
 
+pub fn emit_trace_call_may_force_void_typed(
+    ctx: &mut TraceCtx,
+    helper: *const (),
+    args: &[OpRef],
+    arg_types: &[Type],
+) {
+    ctx.call_may_force_void_typed(helper, args, arg_types);
+}
+
+pub fn emit_trace_call_may_force_int_typed(
+    ctx: &mut TraceCtx,
+    helper: *const (),
+    args: &[OpRef],
+    arg_types: &[Type],
+) -> OpRef {
+    ctx.call_may_force_int_typed(helper, args, arg_types)
+}
+
 pub fn emit_trace_build_flat(
     ctx: &mut TraceCtx,
     kind: FlatBuildKind,
@@ -363,7 +381,7 @@ pub fn emit_trace_store_name_to_namespace(
 }
 
 pub fn emit_trace_truth_value(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
-    emit_trace_call_int_typed(ctx, jit_truth_value as *const (), &[value], &[Type::Ref])
+    emit_trace_call_may_force_int_typed(ctx, jit_truth_value as *const (), &[value], &[Type::Ref])
 }
 
 pub fn emit_trace_bool_value_from_truth(ctx: &mut TraceCtx, truth: OpRef, negate: bool) -> OpRef {
@@ -378,11 +396,16 @@ pub fn emit_trace_bool_value_from_truth(ctx: &mut TraceCtx, truth: OpRef, negate
     } else {
         truth
     };
-    emit_trace_call_ref_typed(
-        ctx,
+    // `space.newbool` selects the `w_True` / `w_False` singleton: it cannot
+    // raise, so the residual is EF_CANNOT_RAISE (no trailing GuardNoException).
+    // It is NOT elidable here — the boxed bool feeds consumers (COMPARE_OP
+    // boxing, the bool-bitwise lowering) that need a recorded OpRef, so a pure
+    // call folding to an inline Const would break their `OpRef` reads.
+    ctx.call_ref_typed_with_effect(
         jit_bool_value_from_truth as *const (),
         &[truth],
         &[Type::Int],
+        EffectInfo::new(ExtraEffect::CannotRaise, OopSpecIndex::None),
     )
 }
 
@@ -398,7 +421,7 @@ pub fn emit_trace_binary_value(
         )));
     };
     let tag = ctx.const_int(tag);
-    Ok(emit_trace_call_ref_typed(
+    Ok(emit_trace_call_may_force_ref_typed(
         ctx,
         jit_binary_value_from_tag as *const (),
         &[a, b, tag],
@@ -413,7 +436,7 @@ pub fn emit_trace_compare_value(
     op: pyre_interpreter::bytecode::ComparisonOperator,
 ) -> OpRef {
     let tag = ctx.const_int(compare_op_tag(op));
-    emit_trace_call_ref_typed(
+    emit_trace_call_may_force_ref_typed(
         ctx,
         jit_compare_value_from_tag as *const (),
         &[a, b, tag],
@@ -442,7 +465,7 @@ pub fn emit_trace_float_constant(ctx: &mut TraceCtx, value: f64) -> OpRef {
 }
 
 pub fn emit_trace_unary_negative_value(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
-    emit_trace_call_ref_typed(
+    emit_trace_call_may_force_ref_typed(
         ctx,
         jit_unary_negative_value as *const (),
         &[value],
@@ -451,7 +474,7 @@ pub fn emit_trace_unary_negative_value(ctx: &mut TraceCtx, value: OpRef) -> OpRe
 }
 
 pub fn emit_trace_unary_invert_value(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
-    emit_trace_call_ref_typed(
+    emit_trace_call_may_force_ref_typed(
         ctx,
         jit_unary_invert_value as *const (),
         &[value],
@@ -538,21 +561,26 @@ pub trait TraceHelperAccess {
 
     fn trace_store_subscr(&mut self, obj: OpRef, key: OpRef, value: OpRef) -> Result<(), PyError> {
         self.with_trace_ctx(|ctx| {
-            // STORE_SUBSCR discards the result → void `CALL_N`
+            // STORE_SUBSCR drops `space.setitem`'s result, so the opimpl's
+            // residual call has `op.result.concretetype == Void`
             // (`jtransform.py handle_residual_call` keys `result_kind` off
-            // `op.result.concretetype`, which is Void when the opimpl drops
-            // the value). `setitem` returns `Result<(), PyError>`, so the
-            // residual helper `jit_setitem` is a void shim; its raise is
+            // it) → void may-force `CALL_N`.  `space.setitem` itself returns the
+            // `__setitem__` result (descroperation.py:389); the void shim
+            // `jit_setitem` drops it to match the opcode.  Its raise is
             // surfaced by the `guard_no_exception` recorded below, mirroring
             // the rtyper presenting only the success type as `FUNC.RESULT`
             // (`call.py:222`) with out-of-band `OperationError` propagation.
-            emit_trace_call_void_typed(
+            emit_trace_call_may_force_void_typed(
                 ctx,
                 jit_setitem as *const (),
                 &[obj, key, value],
                 &[Type::Ref, Type::Ref, Type::Ref],
             );
         });
+        // pyjitpl.py:2079-2082: `space.setitem` may invoke `__setitem__`, which
+        // can force the virtualizable, so the residual is a may-force call
+        // guarded by GUARD_NOT_FORCED before handle_possible_exception.
+        self.trace_record_not_forced_guard();
         self.trace_record_no_exception_guard();
         Ok(())
     }
@@ -560,13 +588,16 @@ pub trait TraceHelperAccess {
     fn trace_load_attr(&mut self, obj: OpRef, name: &str) -> Result<OpRef, PyError> {
         let result = self.with_trace_ctx(|ctx| {
             let [name_ptr, name_len] = trace_name_args(ctx, name);
-            emit_trace_call_ref_typed(
+            emit_trace_call_may_force_ref_typed(
                 ctx,
                 jit_getattr as *const (),
                 &[obj, name_ptr, name_len],
                 &[Type::Ref, Type::Int, Type::Int],
             )
         });
+        // pyjitpl.py:2079-2082: `space.getattr` may invoke `__getattribute__` /
+        // `__getattr__`, forcing the virtualizable → may-force + GUARD_NOT_FORCED.
+        self.trace_record_not_forced_guard();
         self.trace_record_no_exception_guard();
         Ok(result)
     }
@@ -574,13 +605,16 @@ pub trait TraceHelperAccess {
     fn trace_store_attr(&mut self, obj: OpRef, name: &str, value: OpRef) -> Result<(), PyError> {
         self.with_trace_ctx(|ctx| {
             let [name_ptr, name_len] = trace_name_args(ctx, name);
-            let _ = emit_trace_call_int_typed(
+            let _ = emit_trace_call_may_force_int_typed(
                 ctx,
                 jit_setattr as *const (),
                 &[obj, name_ptr, name_len, value],
                 &[Type::Ref, Type::Int, Type::Int, Type::Ref],
             );
         });
+        // pyjitpl.py:2079-2082: `space.setattr` may invoke `__setattr__`,
+        // forcing the virtualizable → may-force + GUARD_NOT_FORCED.
+        self.trace_record_not_forced_guard();
         self.trace_record_no_exception_guard();
         Ok(())
     }
@@ -617,6 +651,8 @@ pub trait TraceHelperAccess {
 
     fn trace_truth_value(&mut self, value: OpRef) -> Result<OpRef, PyError> {
         let result = self.with_trace_ctx(|ctx| emit_trace_truth_value(ctx, value));
+        // pyjitpl.py:2079: `__bool__` may force the virtualizable.
+        self.trace_record_not_forced_guard();
         self.trace_record_no_exception_guard();
         Ok(result)
     }
@@ -626,10 +662,10 @@ pub trait TraceHelperAccess {
         truth: OpRef,
         negate: bool,
     ) -> Result<OpRef, PyError> {
-        let result =
-            self.with_trace_ctx(|ctx| emit_trace_bool_value_from_truth(ctx, truth, negate));
-        self.trace_record_no_exception_guard();
-        Ok(result)
+        // `space.newbool` selects a singleton (EF_CANNOT_RAISE), so no
+        // trailing GuardNoException — matching the walker / codegen legs that
+        // box the bool without one.
+        self.with_trace_ctx(|ctx| Ok(emit_trace_bool_value_from_truth(ctx, truth, negate)))
     }
 
     fn trace_binary_value(
@@ -641,6 +677,9 @@ pub trait TraceHelperAccess {
         // `?` short-circuits on unsupported binary ops before any call is
         // recorded, so the guard only fires when a call was emitted.
         let result = self.with_trace_ctx(|ctx| emit_trace_binary_value(ctx, a, b, op))?;
+        // pyjitpl.py:2079: the generic binary op may invoke `__add__` etc.,
+        // forcing the virtualizable.
+        self.trace_record_not_forced_guard();
         self.trace_record_no_exception_guard();
         Ok(result)
     }
@@ -652,18 +691,25 @@ pub trait TraceHelperAccess {
         op: pyre_interpreter::bytecode::ComparisonOperator,
     ) -> Result<OpRef, PyError> {
         let result = self.with_trace_ctx(|ctx| emit_trace_compare_value(ctx, a, b, op));
+        // pyjitpl.py:2079: the generic compare may invoke `__lt__` etc.,
+        // forcing the virtualizable.
+        self.trace_record_not_forced_guard();
         self.trace_record_no_exception_guard();
         Ok(result)
     }
 
     fn trace_unary_negative_value(&mut self, value: OpRef) -> Result<OpRef, PyError> {
         let result = self.with_trace_ctx(|ctx| emit_trace_unary_negative_value(ctx, value));
+        // pyjitpl.py:2079: `__neg__` may force the virtualizable.
+        self.trace_record_not_forced_guard();
         self.trace_record_no_exception_guard();
         Ok(result)
     }
 
     fn trace_unary_invert_value(&mut self, value: OpRef) -> Result<OpRef, PyError> {
         let result = self.with_trace_ctx(|ctx| emit_trace_unary_invert_value(ctx, value));
+        // pyjitpl.py:2079: `__invert__` may force the virtualizable.
+        self.trace_record_not_forced_guard();
         self.trace_record_no_exception_guard();
         Ok(result)
     }

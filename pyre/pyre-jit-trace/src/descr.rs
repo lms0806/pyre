@@ -794,9 +794,9 @@ static W_BOOL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         W_BOOL_GC_TYPE_ID,
         &pyre_object::pyobject::BOOL_TYPE as *const _ as usize,
         &[(
-            "W_BoolObject.boolval",
-            BOOL_BOOLVAL_OFFSET,
-            1,
+            "W_BoolObject.intval",
+            BOOL_INTVAL_OFFSET,
+            8,
             Type::Int,
             false,
             true,
@@ -1681,7 +1681,7 @@ use pyre_object::rangeobject::{
 };
 use pyre_object::strobject::STR_LEN_OFFSET;
 use pyre_object::{
-    BOOL_BOOLVAL_OFFSET, FLOAT_ARRAY_BLOCK_OFFSET, FLOAT_ARRAY_HEAP_CAP_OFFSET,
+    BOOL_INTVAL_OFFSET, FLOAT_ARRAY_BLOCK_OFFSET, FLOAT_ARRAY_HEAP_CAP_OFFSET,
     FLOAT_ARRAY_LEN_OFFSET, FLOAT_ARRAY_PTR_OFFSET, INT_ARRAY_BLOCK_OFFSET,
     INT_ARRAY_HEAP_CAP_OFFSET, INT_ARRAY_LEN_OFFSET, INT_ARRAY_PTR_OFFSET, INT_INTVAL_OFFSET,
     W_ListObject, W_TupleObject,
@@ -1926,7 +1926,7 @@ pub fn int_intval_descr() -> DescrRef {
     field_descr_from_group(&W_INT_DESCR_GROUP, 0)
 }
 
-pub fn bool_boolval_descr() -> DescrRef {
+pub fn bool_intval_descr() -> DescrRef {
     field_descr_from_group(&W_BOOL_DESCR_GROUP, 0)
 }
 

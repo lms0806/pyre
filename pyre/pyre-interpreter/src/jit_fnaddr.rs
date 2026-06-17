@@ -526,6 +526,18 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::dict_eq_hook::signal_eq_error",
+        "pyre_object::signal_eq_error",
+        pyre_object::dict_eq_hook::signal_eq_error as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dict_eq_hook::take_eq_error",
+        "pyre_object::take_eq_error",
+        pyre_object::dict_eq_hook::take_eq_error as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_interpreter::stack_check::stack_almost_full",
         "pyre_interpreter::stack_almost_full",
         crate::stack_check::stack_almost_full as *const (),

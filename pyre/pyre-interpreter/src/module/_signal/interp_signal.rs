@@ -145,12 +145,13 @@ fn signal_signal(w_signum: PyObjectRef, w_handler: PyObjectRef) -> Result<PyObje
     // anything else must be callable.  PyPy compares with
     // `space.eq_w(w_handler, space.newint(SIG_DFL/SIG_IGN))`, so any
     // equality-compatible object (int subclass, bool, custom `__eq__`)
-    // is accepted — use `eq_w` rather than an exact-int read.
-    let is_dfl = crate::baseobjspace::eq_w(w_handler, pyre_object::w_int_new(0));
-    let is_ign = crate::baseobjspace::eq_w(w_handler, pyre_object::w_int_new(1));
-    if is_dfl {
+    // is accepted — use `eq_w` rather than an exact-int read.  The
+    // `if / elif` short-circuits: when the SIG_DFL compare is true the
+    // SIG_IGN compare never runs, so a handler equal to SIG_DFL whose
+    // `__eq__` raises against SIG_IGN is still accepted.
+    if crate::baseobjspace::eq_w(w_handler, pyre_object::w_int_new(0))? {
         signalstate::pypysig_default(signum);
-    } else if is_ign {
+    } else if crate::baseobjspace::eq_w(w_handler, pyre_object::w_int_new(1))? {
         signalstate::pypysig_ignore(signum);
     } else if !crate::baseobjspace::callable_w(w_handler) {
         return Err(crate::PyError::type_error(
@@ -433,6 +434,7 @@ pub fn register_module(ns: &mut DictStorage) {
             }
             let warn_on_full_buffer = crate::builtins::kwarg_get(kwargs, "warn_on_full_buffer")
                 .map(crate::baseobjspace::is_true)
+                .transpose()?
                 .unwrap_or(true);
             let fd = if let Some(&a) = positional.first() {
                 if !unsafe { pyre_object::is_int(a) } {

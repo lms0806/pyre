@@ -7926,7 +7926,7 @@ impl MIFrame {
                 "missing concrete branch value during trace",
             ));
         }
-        Ok(objspace_truth_value(concrete_val))
+        objspace_truth_value(concrete_val)
     }
 
     #[allow(dead_code)]
@@ -9968,6 +9968,9 @@ impl TraceHelperAccess for MIFrame {
             let rhs = box_value_for_python_helper(this, ctx, b);
             crate::helpers::emit_trace_binary_value(ctx, lhs, rhs, op)
         })?;
+        // pyjitpl.py:2079: the generic binary op may invoke `__add__` etc.,
+        // forcing the virtualizable.
+        self.trace_record_not_forced_guard();
         self.trace_record_no_exception_guard();
         Ok(result)
     }

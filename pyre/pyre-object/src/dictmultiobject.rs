@@ -119,6 +119,10 @@ pub unsafe fn object_key_for(obj: PyObjectRef) -> ObjectKey {
         // Infallible path: swallow the error and use structural hash.
         // Checked callers should use `object_key_for_checked` instead.
     }
+    // Clear any stale eq flag so the upcoming bucket probe starts clean;
+    // an infallible probe's own error is then swallowed by the next key
+    // construction, never leaking into a later checked op.
+    crate::dict_eq_hook::take_eq_error();
     ObjectKey { hash, obj }
 }
 
@@ -133,6 +137,9 @@ pub unsafe fn object_key_for_checked(obj: PyObjectRef) -> Result<ObjectKey, Dict
     if crate::dict_eq_hook::take_hash_error() {
         return Err(DictKeyError);
     }
+    // Clean slate for the bucket probe that follows in the caller; its
+    // eq error is read back via `take_dict_key_error` after the access.
+    crate::dict_eq_hook::take_eq_error();
     Ok(ObjectKey { hash, obj })
 }
 
@@ -174,6 +181,18 @@ unsafe fn _never_equal_to_int(key: PyObjectRef) -> bool {
 /// this marker to a real exception via `take_pending_hash_error()`.
 #[derive(Debug)]
 pub struct DictKeyError;
+
+/// `true` when the most recent checked dict op raised through either key
+/// callback of the `r_dict(eq_w, hash_w)` pair: `space.hash_w` at key
+/// construction or `space.eq_w` during the bucket probe.  Reading clears
+/// both flags.  The concrete `PyError` rides the interpreter-side
+/// pending slot, retrieved via `take_pending_hash_error`.
+#[inline]
+unsafe fn take_dict_key_error() -> bool {
+    let hash = crate::dict_eq_hook::take_hash_error();
+    let eq = crate::dict_eq_hook::take_eq_error();
+    hash || eq
+}
 
 /// Test-only structural hash hook.  Walks the same built-in type ladder
 /// as `dict_keys_equal` (`:1207-1260`) so equal keys land in the same
@@ -1438,6 +1457,16 @@ pub(crate) unsafe fn dict_keys_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
     if a.is_null() || b.is_null() {
         return false;
     }
+    // Once `space.eq_w` has raised earlier in this probe, skip every
+    // remaining user comparison.  The Rust `Eq` callback cannot abort the
+    // `IndexMap` scan, but suppressing further `__eq__` calls means no extra
+    // comparison runs and the first exception is the one that propagates —
+    // matching `r_dict(space.eq_w, space.hash_w)` raising at the first
+    // comparison.  The flag is cleared per op in `object_key_for(_checked)`,
+    // so this only fires after a raise within the current probe.
+    if crate::dict_eq_hook::eq_error_pending() {
+        return false;
+    }
     if let Some(eq) = unsafe { crate::dict_eq_hook::try_eq_w(a, b) } {
         // `ObjectKey::eq` already gates on `self.hash != other.hash`
         // before calling `dict_keys_equal`, so the bucket invariant
@@ -1615,7 +1644,7 @@ pub unsafe fn w_dict_lookup_checked(
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
     let result = strategy.getitem(obj, key);
-    if crate::dict_eq_hook::take_hash_error() {
+    if take_dict_key_error() {
         return Err(DictKeyError);
     }
     Ok(result)
@@ -1664,7 +1693,11 @@ pub unsafe fn w_dict_lookup_object_strategy_checked(
     }
     let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
     let key = object_key_for_checked(key)?;
-    Ok(entries.get(&key).copied())
+    let result = entries.get(&key).copied();
+    if take_dict_key_error() {
+        return Err(DictKeyError);
+    }
+    Ok(result)
 }
 
 /// Internal helper: `ModuleDictStrategy::getitem` body for pyre's
@@ -1732,7 +1765,11 @@ pub unsafe fn w_module_dict_lookup_inner_checked(
     let proxy = (*(obj as *const W_ModuleDictObject)).dict_storage_proxy;
     if let Some(entries) = w_module_dict_object_storage(obj) {
         let object_key = object_key_for_checked(key)?;
-        if let Some(&v) = entries.get(&object_key) {
+        let hit = entries.get(&object_key).copied();
+        if take_dict_key_error() {
+            return Err(DictKeyError);
+        }
+        if let Some(v) = hit {
             return Ok(Some(v));
         }
         if !proxy.is_null() {
@@ -1753,7 +1790,11 @@ pub unsafe fn w_module_dict_lookup_inner_checked(
     w_module_dict_switch_to_object_strategy(obj);
     let entries = w_module_dict_object_storage(obj).ok_or(DictKeyError)?;
     let object_key = object_key_for_checked(key)?;
-    if let Some(&v) = entries.get(&object_key) {
+    let hit = entries.get(&object_key).copied();
+    if take_dict_key_error() {
+        return Err(DictKeyError);
+    }
+    if let Some(v) = hit {
         return Ok(Some(v));
     }
     Ok(None)
@@ -1838,7 +1879,7 @@ pub unsafe fn w_dict_store_checked(
         return w_dict_store_object_strategy_checked(obj, key, value);
     }
     strategy.setitem(obj, key, value);
-    if crate::dict_eq_hook::take_hash_error() {
+    if take_dict_key_error() {
         return Err(DictKeyError);
     }
     Ok(())
@@ -1903,7 +1944,7 @@ pub unsafe fn w_dict_setdefault_checked(
         return Ok(value);
     }
     let result = strategy.setdefault(obj, key, value);
-    if crate::dict_eq_hook::take_hash_error() {
+    if take_dict_key_error() {
         return Err(DictKeyError);
     }
     Ok(result)
@@ -1941,13 +1982,13 @@ pub unsafe fn w_dict_pop_checked(
         let strategy = (*(obj as *const W_DictObject)).dstrategy;
         match strategy.pop(obj, key, None) {
             Ok(val) => {
-                if crate::dict_eq_hook::take_hash_error() {
+                if take_dict_key_error() {
                     return Err(DictKeyError);
                 }
                 Ok(Some(val))
             }
             Err(()) => {
-                if crate::dict_eq_hook::take_hash_error() {
+                if take_dict_key_error() {
                     return Err(DictKeyError);
                 }
                 Ok(None)
@@ -1981,7 +2022,17 @@ pub unsafe fn w_dict_store_object_strategy_checked(
     let object_key = object_key_for_checked(key)?;
     let dict = &mut *(obj as *mut W_DictObject);
     let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+    // Single setitem probe (matches `r_dict.setitem`'s one bucket scan).
+    // When `space.eq_w` raises mid-probe the comparison reads as "not
+    // equal", so `insert` finds no match and appends a fresh (spurious)
+    // entry at the end; drop it with `pop` so the store leaves the dict
+    // unchanged, matching r_dict raising at the comparison without
+    // completing the store.  A no-raise store touches the bucket once.
     entries.insert(object_key, value);
+    if take_dict_key_error() {
+        entries.pop();
+        return Err(DictKeyError);
+    }
     dict_write_barrier(obj);
     maybe_sync_dict_storage_store(dict.dict_storage_proxy, key, value);
     Ok(())
@@ -2034,7 +2085,14 @@ pub unsafe fn w_module_dict_store_inner_checked(
     let object_key = object_key_for_checked(key)?;
     let proxy = (*(obj as *const W_ModuleDictObject)).dict_storage_proxy;
     let entries = w_module_dict_object_storage_mut(obj);
+    // Single setitem probe; on an `__eq__` raise mid-probe `insert` appends
+    // a spurious entry, so drop it with `pop` and leave the dict unchanged
+    // (see `w_dict_store_object_strategy_checked`).
     entries.insert(object_key, value);
+    if take_dict_key_error() {
+        entries.pop();
+        return Err(DictKeyError);
+    }
     let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
     strategy.mutated();
     if crate::is_str(key) {
@@ -2640,7 +2698,7 @@ pub unsafe fn w_dict_delitem_checked(
         return w_dict_delitem_object_strategy_checked(obj, key);
     }
     let removed = strategy.delitem(obj, key);
-    if crate::dict_eq_hook::take_hash_error() {
+    if take_dict_key_error() {
         return Err(DictKeyError);
     }
     Ok(removed)
@@ -2683,8 +2741,16 @@ pub unsafe fn w_dict_delitem_object_strategy_checked(
     let dict = &mut *(obj as *mut W_DictObject);
     let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
     let mut hit = false;
+    // `shift_remove` removes only on a positive match; an `__eq__` raise
+    // reads as "not equal" (and short-circuits the rest of the probe), so
+    // the key is never found and the dict is left unchanged.  Reporting the
+    // error before touching the storage proxy is therefore the
+    // first-exception, no-mutation path that `r_dict.delitem` raises on.
     if entries.shift_remove(&object_key).is_some() {
         hit = true;
+    }
+    if take_dict_key_error() {
+        return Err(DictKeyError);
     }
     if !dict.dict_storage_proxy.is_null() {
         if let Some(key_str) = key_as_utf8(key) {
@@ -2768,7 +2834,11 @@ pub unsafe fn w_module_dict_delitem_inner_checked(
         let object_key = object_key_for_checked(key)?;
         let proxy = (*(obj as *const W_ModuleDictObject)).dict_storage_proxy;
         let entries = w_module_dict_object_storage_mut(obj);
-        if entries.shift_remove(&object_key).is_some() {
+        let removed = entries.shift_remove(&object_key).is_some();
+        if take_dict_key_error() {
+            return Err(DictKeyError);
+        }
+        if removed {
             let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
             strategy.mutated();
             if let Some(ks) = key_as_utf8(key) {
@@ -2798,7 +2868,11 @@ pub unsafe fn w_module_dict_delitem_inner_checked(
     let object_key = object_key_for_checked(key)?;
     let proxy = (*(obj as *const W_ModuleDictObject)).dict_storage_proxy;
     let entries = w_module_dict_object_storage_mut(obj);
-    if entries.shift_remove(&object_key).is_some() {
+    let removed = entries.shift_remove(&object_key).is_some();
+    if take_dict_key_error() {
+        return Err(DictKeyError);
+    }
+    if removed {
         let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
         strategy.mutated();
         if let Some(ks) = key_as_utf8(key) {
@@ -3303,6 +3377,56 @@ mod tests {
         unsafe {
             w_dict_store(dict, key, w_int_new(99));
             assert_eq!(w_int_get_value(w_dict_lookup(dict, key).unwrap()), 99);
+        }
+    }
+
+    /// Force every key into one bucket so a store probes the existing
+    /// entry by equality.
+    unsafe fn constant_collision_hash(_obj: PyObjectRef) -> i64 {
+        42
+    }
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static RAISING_EQ_CALLS: AtomicU32 = AtomicU32::new(0);
+
+    /// An `eq_w` hook that always raises: it records the call, signals the
+    /// error flag, and returns `false` (the Rust `Eq` callback cannot raise).
+    unsafe fn raising_eq(a: PyObjectRef, _b: PyObjectRef) -> bool {
+        RAISING_EQ_CALLS.fetch_add(1, Ordering::Relaxed);
+        crate::dict_eq_hook::signal_eq_error(a);
+        false
+    }
+
+    /// A user `__eq__` that raises during a colliding store must leave the
+    /// dict unchanged and surface the first error, matching r_dict raising
+    /// mid-probe without completing setitem.  Verifies: the store reports an
+    /// error, the spuriously appended entry is dropped (k1 intact, k2 never
+    /// stored), and `__eq__` runs exactly once (the probe short-circuits
+    /// after the first raise).
+    #[test]
+    fn test_dict_store_raising_eq_leaves_dict_unchanged() {
+        install_test_hash_hook();
+        unsafe {
+            crate::dict_eq_hook::register_hash_w_hook(constant_collision_hash);
+            let dict = w_dict_new();
+            let k1 = w_str_new("k1");
+            let k2 = w_str_new("k2");
+            // Seed one entry while the bucket is empty (no comparison runs).
+            w_dict_store(dict, k1, w_int_new(1));
+
+            RAISING_EQ_CALLS.store(0, Ordering::Relaxed);
+            crate::dict_eq_hook::register_eq_w_hook(raising_eq);
+            let result = w_dict_store_checked(dict, k2, w_int_new(2));
+            crate::dict_eq_hook::clear_eq_w_hook();
+
+            assert!(result.is_err());
+            // The probe stopped at the first raising comparison.
+            assert_eq!(RAISING_EQ_CALLS.load(Ordering::Relaxed), 1);
+            // The dict is unchanged: k1 intact, k2 never inserted.
+            assert_eq!(w_int_get_value(w_dict_lookup(dict, k1).unwrap()), 1);
+            assert!(w_dict_lookup(dict, k2).is_none());
+            // The error flag was consumed by the store, not left dangling.
+            assert!(!crate::dict_eq_hook::take_eq_error());
         }
     }
 

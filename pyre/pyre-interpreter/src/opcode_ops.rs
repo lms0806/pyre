@@ -170,7 +170,7 @@ pub fn unary_invert_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
     invert(value)
 }
 
-pub fn truth_value(value: PyObjectRef) -> bool {
+pub fn truth_value(value: PyObjectRef) -> Result<bool, PyError> {
     let value = crate::baseobjspace::unwrap_cell(value);
     is_true(value)
 }
@@ -227,10 +227,25 @@ pub fn list_extend_value(list: PyObjectRef, iterable: PyObjectRef) -> Result<(),
 
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_truth_value(value: i64) -> i64 {
-    truth_value(value as PyObjectRef) as i64
+    match truth_value(value as PyObjectRef) {
+        Ok(truth) => truth as i64,
+        Err(err) => {
+            // A raising `__bool__` / `__len__` publishes into the backend
+            // exception cells so the trailing GuardNoException deopts and
+            // re-raises through the blackhole (llmodel.py:194-199
+            // _store_exception).  Return 0 — the guard fires before the
+            // truth is consumed.
+            crate::runtime_ops::jit_publish_exception(err.to_exc_object());
+            0
+        }
+    }
 }
 
-#[majit_macros::jit_may_force]
+// `space.newbool` selects the `w_True` / `w_False` singleton — it neither
+// forces a virtualizable nor raises (EF_CANNOT_RAISE), unlike the may-force
+// helpers.  Not elidable: the trace consumes the boxed bool as a recorded
+// OpRef, so it must not fold to an inline Const.
+#[majit_macros::dont_look_inside_cannot_raise]
 pub extern "C" fn jit_bool_value_from_truth(value: i64) -> i64 {
     bool_value_from_truth(value != 0) as i64
 }
@@ -312,7 +327,9 @@ pub extern "C" fn jit_setitem(obj: i64, index: i64, value: i64) {
         index as PyObjectRef,
         value as PyObjectRef,
     ) {
-        Ok(()) => {}
+        // STORE_SUBSCR drops `space.setitem`'s result; this void shim does
+        // the same so the recorded residual is a void `CALL_N`.
+        Ok(_) => {}
         Err(err) => {
             // llmodel.py:194-199 _store_exception: publish the exception into
             // the backend pos_exception cells so the GuardNoException recorded
@@ -440,7 +457,7 @@ mod tests {
 
     #[test]
     fn test_truth_and_unary_helpers_share_objspace_semantics() {
-        assert!(!truth_value(w_int_new(0)));
+        assert!(!truth_value(w_int_new(0)).unwrap());
         let neg = unary_negative_value(w_int_new(4)).expect("unary negate should succeed");
         let inv = unary_invert_value(w_int_new(5)).expect("unary invert should succeed");
         unsafe {

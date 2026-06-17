@@ -41,13 +41,17 @@ fn trace_frame_type() -> PyObjectRef {
 /// 391`): a non-None callback return value overrides whichever value
 /// the setattr left behind, matching CPython issue11992 bug-for-bug
 /// compatibility.
-fn flush_trace_frame_writeback(frame: *mut PyFrame, w_frame: PyObjectRef, init_lineno: isize) {
+fn flush_trace_frame_writeback(
+    frame: *mut PyFrame,
+    w_frame: PyObjectRef,
+    init_lineno: isize,
+) -> Result<(), crate::PyError> {
     if frame.is_null() || w_frame.is_null() {
-        return;
+        return Ok(());
     }
     let new_f_trace = match crate::baseobjspace::getattr_str(w_frame, "f_trace") {
         Ok(v) => v,
-        Err(_) => return,
+        Err(_) => return Ok(()),
     };
     // pyframe.py:785-791 fset_f_trace:
     //   if space.is_w(w_trace, space.w_None):
@@ -94,7 +98,7 @@ fn flush_trace_frame_writeback(frame: *mut PyFrame, w_frame: PyObjectRef, init_l
     // truthy values; pyre's `is_true` is the equivalent.
     if let Ok(new_lines_obj) = crate::baseobjspace::getattr_str(w_frame, "f_trace_lines") {
         if !new_lines_obj.is_null() {
-            let new_lines = unsafe { crate::baseobjspace::is_true(new_lines_obj) };
+            let new_lines = unsafe { crate::baseobjspace::is_true(new_lines_obj) }?;
             unsafe {
                 (*frame).getorcreatedebug(init_lineno).f_trace_lines = new_lines;
             }
@@ -102,12 +106,13 @@ fn flush_trace_frame_writeback(frame: *mut PyFrame, w_frame: PyObjectRef, init_l
     }
     if let Ok(new_opcodes_obj) = crate::baseobjspace::getattr_str(w_frame, "f_trace_opcodes") {
         if !new_opcodes_obj.is_null() {
-            let new_opcodes = unsafe { crate::baseobjspace::is_true(new_opcodes_obj) };
+            let new_opcodes = unsafe { crate::baseobjspace::is_true(new_opcodes_obj) }?;
             unsafe {
                 (*frame).getorcreatedebug(init_lineno).f_trace_opcodes = new_opcodes;
             }
         }
     }
+    Ok(())
 }
 
 fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
@@ -1467,7 +1472,7 @@ impl ExecutionContext {
                 // raw frame to the callback, so its setattrs land
                 // directly; pyre runs the callback against a wrapper
                 // and must propagate explicitly.
-                flush_trace_frame_writeback(frame, frame_obj, init_lineno);
+                flush_trace_frame_writeback(frame, frame_obj, init_lineno)?;
                 let w_result = call_result?;
                 if w_result != pyre_object::w_none() {
                     unsafe {
