@@ -4436,6 +4436,29 @@ impl<'a> AssemblerARM64<'a> {
             } else {
                 Vec::new()
             }
+        } else if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
+            // Finish/Jump carry no failargs; their result kind comes from
+            // the argument boxes, whose types are fixed at construction
+            // (resoperation.py:719/727/739).  When neither a fail descr nor
+            // a preset fail_arg_types list supplies them, infer from the
+            // arglist so the FINISH's done_with_this_frame_descr kind
+            // matches the caller's CALL_ASSEMBLER result kind (a Void
+            // mismatch routes every return through the assembler helper
+            // instead of the result-loading fast path).
+            op.getarglist()
+                .iter()
+                .map(|opref| {
+                    self.opref_type_at(opref.to_opref(), op_index)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "infer_fail_arg_types: opref_type_at({:?}) returned None at \
+                                 op_index={:?} (Finish/Jump arg): RPython box.type is fixed at \
+                                 construction (resoperation.py:719/727/739)",
+                                opref, op_index
+                            )
+                        })
+                })
+                .collect()
         } else if let Some(fa) = op.getfailargs() {
             fa.iter()
                 .map(|opref| {

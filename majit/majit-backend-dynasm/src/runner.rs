@@ -3941,7 +3941,6 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "CALL_ASSEMBLER/ref-preservation path still fails after backend FINISH descr attachment; direct dispatch/ref rewriting needs backend fix"]
     fn test_call_assembler_round_trips_ref_input_through_rewritten_jitframe() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -3994,7 +3993,6 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "CALL_ASSEMBLER/ref-preservation path still fails after backend FINISH descr attachment; direct self-recursive dispatch returns the wrong value"]
     fn test_call_assembler_supports_direct_self_recursive_dispatch() {
         let mut backend = make_call_assembler_backend();
 
@@ -4069,7 +4067,6 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "CALL_ASSEMBLER/ref-preservation path still fails after backend FINISH descr attachment; ref self-recursive dispatch needs backend fix"]
     fn test_call_assembler_supports_direct_self_recursive_ref_dispatch() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -4174,7 +4171,6 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "CALL_ASSEMBLER/ref-preservation path still fails after backend FINISH descr attachment; virtualizable ref dispatch needs backend fix"]
     fn test_call_assembler_self_recursive_virtualizable_ref_arg_preserves_input0() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -4271,7 +4267,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "CALL_ASSEMBLER/ref-preservation path still fails after backend FINISH descr attachment; vable frame rewrite needs backend fix"]
+    #[ignore = "vable CALL_ASSEMBLER expansion still materializes the wrong frame: returns 0 instead of the rewritten vable field value (distinct from the FINISH done-descr kind bug)"]
     fn test_call_assembler_uses_gc_rewritten_vable_frame_without_double_materializing() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -4357,7 +4353,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "CALL_ASSEMBLER/ref-preservation path still fails after backend FINISH descr attachment; bridge re-entry with virtualizable ref input needs backend fix"]
+    #[ignore = "virtualizable bridge re-entry: regalloc panics `box InputArg not found` (regalloc.rs:1280) — vable bridge inputarg binding gap, distinct from the FINISH done-descr kind bug"]
     fn test_self_recursive_virtualizable_bridge_reads_input0_from_compiled_bridge() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -4463,7 +4459,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "CALL_ASSEMBLER/ref-preservation path still fails after backend FINISH descr attachment; double-recursive virtualizable dispatch needs backend fix"]
+    #[ignore = "double-recursive virtualizable dispatch: regalloc panics `box InputArgInt(1) not found` (regalloc.rs:1280) — vable inputarg binding gap, distinct from the FINISH done-descr kind bug"]
     fn test_double_recursive_virtualizable_call_assembler_keeps_entry_input0_live() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -4588,7 +4584,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "CALL_ASSEMBLER/ref-preservation path still fails after backend FINISH descr attachment; bridge materialization of register ref inputs needs backend fix"]
+    #[ignore = "bridge ref-input materialization panics at aarch64/assembler.rs:3394 — distinct from the FINISH done-descr kind bug"]
     fn test_bridge_materializes_register_ref_inputs_for_resolve_opref_ops() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -4672,7 +4668,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "CALL_ASSEMBLER/ref-preservation path still fails after backend FINISH descr attachment; bridge materialization of two register refs needs backend fix"]
+    #[ignore = "bridge two-ref-input materialization panics at aarch64/assembler.rs:3394 — distinct from the FINISH done-descr kind bug"]
     fn test_bridge_materializes_two_register_ref_inputs_before_unused_raw_load() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -4827,7 +4823,6 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "CALL_ASSEMBLER/ref-preservation path still fails after backend FINISH descr attachment; immediately preceding CallR ref is not safely preserved"]
     fn test_call_assembler_preserves_ref_from_immediately_preceding_callr() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -4892,7 +4887,6 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "CALL_ASSEMBLER/ref-preservation path still fails after backend FINISH descr attachment; helper ref rewrite with second ref arg needs backend fix"]
     fn test_call_assembler_preserves_helper_ref_when_rewritten_with_second_ref_arg() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -4962,7 +4956,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "CALL_ASSEMBLER/ref-preservation path still fails after backend FINISH descr attachment; collecting callee can lose fresh CallR ref"]
+    #[ignore = "collecting callee with second ref arg: regalloc panics `box InputArgRef(1) not found` (regalloc.rs:1280) — distinct from the FINISH done-descr kind bug"]
     fn test_call_assembler_preserves_fresh_callr_ref_with_second_ref_arg_across_collecting_callee_alloc()
      {
         install_test_libc_jitframe_tracer();
@@ -5044,7 +5038,6 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "CALL_ASSEMBLER/ref-preservation path still fails after backend FINISH descr attachment; collecting callee with two ref inputs needs backend fix"]
     fn test_call_assembler_preserves_two_ref_inputs_across_collecting_callee_alloc() {
         install_test_libc_jitframe_tracer();
         let mut gc = MiniMarkGC::with_config(GcConfig {
@@ -5116,7 +5109,6 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "CALL_ASSEMBLER/ref-preservation path still fails after backend FINISH descr attachment; collecting callee ref input preservation needs backend fix"]
     fn test_call_assembler_preserves_ref_input_across_collecting_callee_alloc() {
         install_test_libc_jitframe_tracer();
         let mut gc = MiniMarkGC::with_config(GcConfig {
@@ -5179,7 +5171,6 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "CALL_ASSEMBLER/ref-preservation path still fails after backend FINISH descr attachment; collecting frame allocation can lose fresh CallR ref"]
     fn test_call_assembler_preserves_fresh_callr_ref_across_collecting_frame_alloc() {
         install_test_libc_jitframe_tracer();
         let mut gc = MiniMarkGC::with_config(GcConfig {
