@@ -553,6 +553,16 @@ fn raise_speculative_error(reason: &'static str) -> ! {
 pub struct OptContext {
     /// The output operation list being built.
     pub new_operations: Vec<majit_ir::OpRc>,
+    /// optimizer.py:246 `self._emittedoperations = {}` — result positions
+    /// of ops emitted by THIS optimizer run. `as_operation`
+    /// (optimizer.py:369-377) only treats a box as a producer when
+    /// `op in self._emittedoperations`, so pattern-matching rewrites
+    /// (e.g. autogenintrules.py int_add chain reassociation) never reach
+    /// across an optimization-run boundary into a previous phase's ops.
+    /// A Phase-2 lookup that followed a label arg to its Phase-1 producer
+    /// would re-express a per-iteration value in terms of the PREAMBLE's
+    /// entry value, which the loop header does not carry per-iteration.
+    pub emitted_operations: majit_ir::vec_set::VecSet<OpRef>,
     /// Number of input arguments, used to offset emitted op positions
     /// so that variable indices don't collide with input arg indices.
     num_inputs: u32,
@@ -819,6 +829,27 @@ pub struct OptContext {
     /// lowest-priority store so a later emission at the same position always
     /// wins.
     pub(crate) input_ops: Vec<majit_ir::OpRc>,
+    /// `pos -> producer` index over `input_ops`, mirroring the `rfind`
+    /// (last-occurrence-wins) lookup in `find_producer_op`. `input_ops` is
+    /// seeded once at optimizer setup and never mutated afterwards, so this
+    /// is rebuilt in lockstep with the seeding assignment via
+    /// `rebuild_input_ops_index`. Eliminates the O(n) scan of the full
+    /// recorder trace that `find_producer_op` otherwise performs on every
+    /// miss of the higher-priority stores (the dominant O(n^2) cost on very
+    /// large traces, e.g. aheui's logo loop).
+    ///
+    /// No PyPy counterpart: upstream keys producer information on the box
+    /// itself (`box._forwarded` / `PtrInfo`, `optimizer.py`), so a
+    /// positional producer scan never exists there. Pyre's flat
+    /// `OpRef(u32)` has no such per-box slot, so `find_producer_op` scans
+    /// by position; this map is a pure O(1) acceleration of that scan, not
+    /// a new data model. Permitted under the AGENTS.md HashMap rule (3)
+    /// because it is a derived index — its sole invariant is that
+    /// `get(pos)` equals `input_ops.iter().rfind(|o| o.pos == pos)`
+    /// (last occurrence wins), enforced by rebuilding forward (a later
+    /// `insert` at the same key overwrites the earlier) and covered by
+    /// `input_ops_index_last_occurrence_wins`.
+    pub(crate) input_ops_index: std::collections::HashMap<OpRef, majit_ir::OpRc>,
     /// optimizer.py:644,679 _last_guard_op — index of the last guard in
     /// new_operations that had full resume data built. Consecutive guards
     /// share resume data via _copy_resume_data_from (ResumeGuardCopiedDescr).
@@ -1534,6 +1565,7 @@ impl OptContext {
     pub fn new(estimated_ops: usize) -> Self {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
+            emitted_operations: majit_ir::vec_set::VecSet::new(),
             num_inputs: 0,
             inputarg_base: 0,
             next_pos: 0,
@@ -1584,6 +1616,7 @@ impl OptContext {
             live_synthetics: Vec::new(),
             phase1_emit_ops: Vec::new(),
             input_ops: Vec::new(),
+            input_ops_index: std::collections::HashMap::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
             cpu: crate::cpu::default_cpu(),
@@ -1748,10 +1781,23 @@ impl OptContext {
         // from the recorder's `Rc<Op>` slice). Full-OpRef match (collision-safe)
         // so a type-tagged value never aliases a different one at the same raw.
         // Consulted last so any live emission / synthetic above wins.
-        self.input_ops
-            .iter()
-            .rfind(|op| op.pos.get() == opref)
-            .cloned()
+        //
+        // `input_ops_index` mirrors the `input_ops.iter().rfind(...)` scan
+        // (last-occurrence-wins) in O(1); `input_ops` is set once at setup so
+        // the index stays consistent for the OptContext's lifetime.
+        self.input_ops_index.get(&opref).cloned()
+    }
+
+    /// Rebuild `input_ops_index` from the current `input_ops`. Must be called
+    /// after the one-shot `input_ops` seeding assignment at optimizer setup.
+    /// Forward iteration with `insert` makes the last occurrence at each
+    /// position win, matching the `rfind` the index replaces.
+    pub(crate) fn rebuild_input_ops_index(&mut self) {
+        self.input_ops_index.clear();
+        self.input_ops_index.reserve(self.input_ops.len());
+        for op in &self.input_ops {
+            self.input_ops_index.insert(op.pos.get(), op.clone());
+        }
     }
 
     /// Mint a `SameAsI/F/R` (or `Jump` for `Void`) synthetic
@@ -2064,6 +2110,7 @@ impl OptContext {
     ) -> Self {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
+            emitted_operations: majit_ir::vec_set::VecSet::new(),
             num_inputs: num_inputs as u32,
             inputarg_base,
             next_pos: start_next_pos,
@@ -2114,6 +2161,7 @@ impl OptContext {
             live_synthetics: Vec::new(),
             phase1_emit_ops: Vec::new(),
             input_ops: Vec::new(),
+            input_ops_index: std::collections::HashMap::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
             cpu: crate::cpu::default_cpu(),
@@ -2673,6 +2721,8 @@ impl OptContext {
                 crate::r#box::BoxRef::from_bound_op(&synth).set_forwarded_op(&op_rc);
             }
         }
+        // optimizer.py:674 `self._emittedoperations[op] = None`.
+        self.emitted_operations.insert(op_pos);
         self.new_operations.push(op_rc);
         pos_ref
     }
@@ -4388,6 +4438,15 @@ impl OptContext {
         self.heal_arg_to_canonical(arg);
         if arg.bound_op().is_some() || arg.is_constant() {
             let resolved = arg.get_box_replacement(false);
+            // A non-canonical duplicate operand box resolves to itself
+            // box-native while its position's canonical forwarding lives in
+            // the `OpRef` store (see `resolve_box_box_opt`); defer to the
+            // store, which returns the box unchanged when it holds no entry.
+            if resolved.same_box(arg) {
+                return self.get_box_replacement(arg.to_opref());
+            }
+            // The box-native walk forwarded: that chain is canonical and the
+            // `OpRef` store must agree (migration tripwire).
             #[cfg(debug_assertions)]
             {
                 let legacy = self.get_box_replacement(arg.to_opref());
@@ -4416,6 +4475,23 @@ impl OptContext {
         self.heal_arg_to_canonical(arg);
         if arg.bound_op().is_some() || arg.is_constant() {
             let resolved = arg.get_box_replacement(false);
+            // A non-canonical duplicate operand box (short-preamble replay
+            // handle / position-only export box — the bound-ResOp analog of
+            // the stale `InputArgRc` duplicate documented on `resolve_box_box`)
+            // carries no forwarding on its own `_forwarded` chain, so the
+            // box-native walk resolves it to itself even though the canonical
+            // forwarding for its position lives in the `OpRef` store. When the
+            // box resolves to itself the store is the canonical position
+            // resolution — defer to it, as the InputArg `else` arm and the
+            // "resolve positionally" short-preamble export both do.
+            if resolved.same_box(arg) {
+                return Some(
+                    self.get_box_replacement_box(arg.to_opref())
+                        .unwrap_or(resolved),
+                );
+            }
+            // The box-native walk forwarded: that chain is canonical and the
+            // `OpRef` store must agree (migration tripwire).
             #[cfg(debug_assertions)]
             {
                 let legacy = self.get_box_replacement_box(arg.to_opref());
@@ -5808,17 +5884,25 @@ impl OptContext {
     /// needed.
     fn force_box_inline(&mut self, opref: OpRef) -> OpRef {
         let resolved = self.get_replacement_opref(opref);
-        let tracked = self
-            .take_potential_extra_op(resolved)
-            .or_else(|| self.take_potential_extra_op(opref));
-        if let Some(preamble_op) = tracked {
-            // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
-            // — the resolved Box itself is handed to the builder.
-            let resolved_for_pop = self.resolve_box_box(&preamble_op.op);
-            if let Some(builder) = self.active_short_preamble_producer_mut() {
-                builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
-            } else if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
-                builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
+        // optimizer.py:351-359: a result that folded to an inline Const can
+        // never be a `potential_extra_ops` key (the pool is keyed by the pure
+        // op's result Box; the Const inlines at use sites instead of being
+        // produced by a short box), so skip the short-preamble recording for
+        // const-resolved results — otherwise the Const reaches `used_boxes`
+        // and the carried label slot trips `OpRef::raw()` in unroll.rs.
+        if !resolved.is_constant() {
+            let tracked = self
+                .take_potential_extra_op(resolved)
+                .or_else(|| self.take_potential_extra_op(opref));
+            if let Some(preamble_op) = tracked {
+                // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
+                // — the resolved Box itself is handed to the builder.
+                let resolved_for_pop = self.resolve_box_box(&preamble_op.op);
+                if let Some(builder) = self.active_short_preamble_producer_mut() {
+                    builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
+                } else if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
+                    builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
+                }
             }
         }
         let resolved_box = self.get_box_replacement_box(opref);
@@ -6206,14 +6290,26 @@ impl OptContext {
     /// Look up the operation that produces a given box.
     /// Used for pattern matching nested operations (e.g., int_add(int_add(x, C1), C2)).
     /// Returns a clone to avoid borrow conflicts with mutable ctx methods.
+    ///
+    /// optimizer.py:369-377 `as_operation` ("You should never check
+    /// isinstance(op, AbstractResOp) directly. Instead, use this
+    /// helper.") admits a producer only when `op in
+    /// self._emittedoperations` — ops emitted by THIS optimizer run.
+    /// Without the gate, a Phase-2 rule can follow a label arg to its
+    /// Phase-1 producer and re-express a per-iteration value in terms
+    /// of the preamble's entry box (e.g. int_add reassociation turning
+    /// `loop_arg - 1` into `preamble_entry - 2`), a box the loop header
+    /// does not carry per-iteration.
     pub fn get_producing_op(&self, op: &crate::r#box::BoxRef) -> Option<Op> {
         // resoperation.py:233 `_forwarded` host: a box's producing op is its
         // bound op (set at emit, mod.rs bind_op before new_operations.push).
         // Walk the forwarding chain first (resoperation.py:58) so the
         // replacement box's producer is read.
-        op.get_box_replacement(false)
-            .bound_op()
-            .map(|rc| (*rc).clone())
+        let producer = op.get_box_replacement(false).bound_op()?;
+        if !self.emitted_operations.contains(&producer.pos.get()) {
+            return None;
+        }
+        Some((*producer).clone())
     }
 
     /// Number of emitted operations so far.
@@ -8237,6 +8333,52 @@ where
 #[cfg(test)]
 pub(crate) fn seed_empty_guard_snapshots(ops: &[Op]) -> (Vec<Op>, SnapshotBoxes) {
     seed_guard_snapshots_with(ops, |_| Vec::new())
+}
+
+#[cfg(test)]
+mod input_ops_index_tests {
+    use super::*;
+    use majit_ir::OpRef;
+    use majit_ir::resoperation::{Op, OpCode};
+    use std::rc::Rc;
+
+    fn op_at(pos: OpRef) -> majit_ir::OpRc {
+        let op = Op::new(OpCode::SameAsI, &[]);
+        op.pos.set(pos);
+        Rc::new(op)
+    }
+
+    /// `input_ops_index` is a derived O(1) acceleration of
+    /// `input_ops.iter().rfind(|o| o.pos == pos)`. Its sole invariant is
+    /// that when two seeded producers share a position, the LATER one wins —
+    /// matching the `rfind` it replaces and `find_producer_op`'s "a later
+    /// emission at the same position always wins" priority. The forward
+    /// rebuild guarantees this because a later `insert` at the same key
+    /// overwrites the earlier.
+    #[test]
+    fn input_ops_index_last_occurrence_wins() {
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 0, 0, 0);
+        // A position outside any higher-priority store (new_operations,
+        // phase1_emit_ops, resop_refs are all empty here) so the lookup
+        // falls through to input_ops_index.
+        let pos = OpRef::int_op(100);
+        let first = op_at(pos);
+        let last = op_at(pos);
+        ctx.input_ops = vec![first.clone(), last.clone()];
+        ctx.rebuild_input_ops_index();
+
+        let producer = ctx
+            .find_producer_op(pos)
+            .expect("a producer must be found at the seeded position");
+        assert!(
+            Rc::ptr_eq(&producer, &last),
+            "the last occurrence at a shared position must win"
+        );
+        assert!(
+            !Rc::ptr_eq(&producer, &first),
+            "the earlier occurrence must be shadowed by the later one"
+        );
+    }
 }
 
 #[cfg(test)]

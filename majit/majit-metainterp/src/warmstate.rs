@@ -396,6 +396,14 @@ pub enum HotResult {
 }
 
 impl WarmEnterState {
+    /// warmstate.py:485-496: a `JC_DONT_TRACE_HERE` cell that has never seen
+    /// a procedure token is retried — immediately the first time
+    /// (`tick = True` when `JC_TRACING_OCCURRED` is unset), then by the
+    /// back-edge counter on subsequent entries. The retry is gated purely on
+    /// `has_seen_a_procedure_token` and `JC_TRACING_OCCURRED`; upstream
+    /// applies no abort-count ceiling here (the abort lifecycle lives in
+    /// `abort_tracing`, which flips the cell to permanent `DONT_TRACE_HERE`),
+    /// so neither does this.
     fn should_start_dont_trace_here_trace(
         &mut self,
         green_key_hash: u64,

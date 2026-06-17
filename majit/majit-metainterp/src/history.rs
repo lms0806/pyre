@@ -2726,14 +2726,14 @@ impl TraceCtx {
     /// value seen at trace time.
     pub fn promote_int(&mut self, opref: OpRef, runtime_value: i64, num_live: usize) -> OpRef {
         let const_ref = self.const_int(runtime_value);
-        self.record_guard(OpCode::GuardValue, &[opref, const_ref], num_live);
+        self.record_guard_with_snapshot(OpCode::GuardValue, &[opref, const_ref], num_live);
         const_ref
     }
 
     /// Record a ref-typed promote (GUARD_VALUE for GC references).
     pub fn promote_ref(&mut self, opref: OpRef, runtime_value: i64, num_live: usize) -> OpRef {
         let const_ref = self.const_ref(runtime_value);
-        self.record_guard(OpCode::GuardValue, &[opref, const_ref], num_live);
+        self.record_guard_with_snapshot(OpCode::GuardValue, &[opref, const_ref], num_live);
         const_ref
     }
 
@@ -2742,8 +2742,59 @@ impl TraceCtx {
     /// pyjitpl.py:1515 opimpl_float_guard_value = _opimpl_guard_value
     pub fn promote_float(&mut self, opref: OpRef, runtime_value: i64, num_live: usize) -> OpRef {
         let const_ref = self.const_float(runtime_value);
-        self.record_guard(OpCode::GuardValue, &[opref, const_ref], num_live);
+        self.record_guard_with_snapshot(OpCode::GuardValue, &[opref, const_ref], num_live);
         const_ref
+    }
+
+    /// `pyjitpl.py:2548-2602 generate_guard` + `:2610 capture_resumedata`:
+    /// record a guard AND attach a resume snapshot so the optimizer's
+    /// `store_final_boxes_in_guard` (`optimizeopt/mod.rs:5897`) reads a
+    /// valid `rd_resume_position >= 0` — `resume.py:396-397` asserts that,
+    /// and the pyre port hard-panics a guard that reaches finish() with
+    /// neither a snapshot nor a patchguardop ancestor (`mod.rs:5938`). The
+    /// single-frame snapshot here is therefore **load-bearing**: removing
+    /// it (reverting to a bare `record_guard`, as on main) panics the
+    /// optimizer for these interpreter-side promotes.
+    ///
+    /// The frame `boxes` / `vable_boxes` / `vref_boxes` are empty because
+    /// `capture_resumedata` (`pyjitpl.py:2610-2625`) walks
+    /// `self.framestack` + `self.virtualizable_boxes` +
+    /// `self.virtualref_boxes`, and `TraceCtx` is the recorder-side trace
+    /// buffer — it holds no `MIFrameStack`, so the live boxes are not
+    /// reachable at this layer. The parity-complete capture lives at the
+    /// dispatch layer: `record_state_guard`
+    /// (`pyjitpl/dispatch.rs`) builds a full snapshot via
+    /// `build_state_field_snapshot(frames, …, virtualizable_boxes,
+    /// virtualref_boxes)` for the state-field JIT guards.
+    ///
+    /// Convergence (forward-resume epic, task #208): when the
+    /// interpreter-side promote path threads the live framestack /
+    /// virtualizable / virtualref boxes into this recorder (the same
+    /// `framestack`-walk `record_state_guard` already performs), the empty
+    /// vectors below are replaced by that capture and this hook matches
+    /// `generate_guard` 1:1. Until then a partial box list would be
+    /// positionally misaligned against the resume reader's per-frame
+    /// register layout, so the snapshot stays minimal rather than
+    /// half-populated.
+    fn record_guard_with_snapshot(
+        &mut self,
+        opcode: OpCode,
+        args: &[OpRef],
+        num_live: usize,
+    ) -> OpRef {
+        let snapshot_idx = self.snapshots.len() as i32;
+        self.snapshots.push(crate::recorder::Snapshot {
+            frames: vec![crate::recorder::SnapshotFrame {
+                jitcode_index: 0,
+                pc: self.last_traced_pc as u32,
+                boxes: Vec::new(),
+            }],
+            vable_boxes: Vec::new(),
+            vref_boxes: Vec::new(),
+        });
+        let opref = self.record_guard(opcode, args, num_live);
+        self.recorder.set_last_op_resume_position(snapshot_idx);
+        opref
     }
 
     /// Record a call to an elidable (pure) function.

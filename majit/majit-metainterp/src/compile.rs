@@ -1151,12 +1151,33 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
         }
         entry.gc_ref_slots = layout.gc_ref_slots.clone();
         entry.force_token_slots = layout.force_token_slots.clone();
-        entry.recovery_layout = layout.recovery_layout.clone();
-        // compile.py:861 copy_all_attributes_from parity: fill missing
-        // resume storage from the backend-side rd_* propagation. Entries
-        // already primed by the frontend keep their Arc (same bytes
-        // either way, but preserving the handle avoids dropping shared
-        // downstream references).
+        // Merge recovery_layout: preserve header_pc from the frontend's
+        // rd_numb-based layout when the backend doesn't provide it.
+        // The frontend populates header_pc from the guard's snapshot
+        // frame.pc; the backend may only have slot layouts.
+        // copy_all_attributes_from parity: reconcile every backend frame,
+        // not only the common prefix. Overlapping frames keep the
+        // frontend's authoritative header_pc/slot_types and back-fill gaps
+        // from the backend; backend frames the frontend layout lacks are
+        // appended so no recovery frame is dropped.
+        if let Some(ref backend_recovery) = layout.recovery_layout {
+            if let Some(ref mut existing) = entry.recovery_layout {
+                for (i, source) in backend_recovery.frames.iter().enumerate() {
+                    if let Some(target) = existing.frames.get_mut(i) {
+                        if target.header_pc.is_none() {
+                            target.header_pc = source.header_pc;
+                        }
+                        if target.slot_types.is_none() {
+                            target.slot_types = source.slot_types.clone();
+                        }
+                    } else {
+                        existing.frames.push(source.clone());
+                    }
+                }
+            } else {
+                entry.recovery_layout = layout.recovery_layout.clone();
+            }
+        }
         if entry.storage.is_none() {
             entry.storage = storage_from_backend.clone();
         }
@@ -2018,6 +2039,18 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         };
         let (item_opcode, item_descr, item_base) = match array_info.storage {
             crate::virtualizable::VableArrayStorage::DirectPointer => {
+                (item_opcode, item_descr, item_base)
+            }
+            crate::virtualizable::VableArrayStorage::RustVec { .. } => {
+                // The field embeds a Rust `Vec<i64>` by value; the
+                // `GetfieldGcR` at `field_offset` projects the Vec's data
+                // pointer (its first word) and a flat `GetarrayitemGc*`
+                // reads the items — the same shape as `DirectPointer`. The
+                // resume/sync ABI reads the same data through the RustVec
+                // extractor (`Vec::as_ptr`/`Vec::len`) to avoid relying on
+                // the unspecified field order; this in-trace backend IR
+                // cannot call Vec methods, so it reads the data pointer at
+                // the Vec's first word.
                 (item_opcode, item_descr, item_base)
             }
             crate::virtualizable::VableArrayStorage::EmbeddedArray { ptr_offset } => {
