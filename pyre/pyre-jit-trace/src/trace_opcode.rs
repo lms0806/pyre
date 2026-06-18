@@ -1391,8 +1391,16 @@ impl MIFrame {
             } else {
                 let marker_call_pc = if in_a_call {
                     self.residual_call_pc
-                } else {
+                } else if after_residual_call {
                     top_frame_marker_call_pc
+                } else {
+                    // Pre-call top-frame guard: resume at the plain `live_pc`
+                    // `-live-`, matching `marker_aware_resume_pc`'s
+                    // `wants_marker = after_residual_call && ...`.  Routing
+                    // through the post-call marker here would make the box list
+                    // shorter than the box count the decoder reads at the
+                    // recorded (pre-call) snapshot position.
+                    None
                 };
                 match marker_call_pc
                     .and_then(|call_pc| jc.payload.after_residual_call_resume_pc_for(call_pc))

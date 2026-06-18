@@ -518,20 +518,27 @@ pub fn init_typeobjects() {
         );
 
         // types.UnionType — PyPy: _pypy_generic_alias.py UnionType, bases=(object,)
+        // `__slots__` includes `__weakref__` (`_pypy_generic_alias.py:247`),
+        // so a union is weak-referenceable.
+        let union_type = new_typeobject_with_base("types.UnionType", init_union_type, object_type);
+        unsafe { pyre_object::w_type_set_weakrefable(union_type, true) };
         reg.insert(
             &pyre_object::UNION_TYPE as *const PyType as usize,
-            new_typeobject_with_base("types.UnionType", init_union_type, object_type) as usize,
+            union_type as usize,
         );
 
         // types.GenericAlias — PyPy: _pypy_generic_alias.py GenericAlias,
-        // bases=(object,)
+        // bases=(object,).  `__slots__` includes `__weakref__`
+        // (`_pypy_generic_alias.py:17`), so an alias is weak-referenceable.
+        let generic_alias_type = new_typeobject_with_base(
+            "types.GenericAlias",
+            crate::genericalias::init_generic_alias_type,
+            object_type,
+        );
+        unsafe { pyre_object::w_type_set_weakrefable(generic_alias_type, true) };
         reg.insert(
             &pyre_object::GENERIC_ALIAS_TYPE as *const PyType as usize,
-            new_typeobject_with_base(
-                "types.GenericAlias",
-                crate::genericalias::init_generic_alias_type,
-                object_type,
-            ) as usize,
+            generic_alias_type as usize,
         );
 
         // slice — PyPy: sliceobject.py, bases=(object,)
@@ -4233,6 +4240,41 @@ fn init_slice_type(ns: &mut DictStorage) {
     );
 }
 
+/// `UnionType.__getitem__` (`_pypy_generic_alias.py:312`) — substitute the
+/// free parameters with `items`, then fold the substituted members back into
+/// a union with `|`.
+fn union_getitem(args: &[PyObjectRef]) -> crate::PyResult {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if !unsafe { pyre_object::is_union(self_) } {
+        return Err(crate::PyError::type_error(
+            "descriptor '__getitem__' requires a 'types.UnionType' object",
+        ));
+    }
+    let items_raw = args.get(1).copied().unwrap_or_else(pyre_object::w_none);
+    let items = if unsafe { pyre_object::is_tuple(items_raw) } {
+        items_raw
+    } else {
+        pyre_object::w_tuple_new(vec![items_raw])
+    };
+    let params = unsafe { pyre_object::w_union_get_parameters(self_) };
+    let union_args = unsafe { pyre_object::w_union_get_args(self_) };
+    let newargs = crate::genericalias::subs_parameters(self_, union_args, params, items)?;
+    if newargs.is_empty() {
+        // `if len(newargs) == 0: return UnionType(())` — unreachable for a
+        // real union (always ≥1 member), kept for parity.
+        return Ok(pyre_object::w_union_from_members(
+            Vec::new(),
+            pyre_object::w_tuple_new(vec![]),
+        ));
+    }
+    // `curr = newargs[0]; for i in range(1, ...): curr |= newargs[i]`.
+    let mut curr = newargs[0];
+    for &next in &newargs[1..] {
+        curr = crate::objspace::descroperation::or_(curr, next)?;
+    }
+    Ok(curr)
+}
+
 fn init_union_type(ns: &mut DictStorage) {
     // UnionType.__args__ — returns the tuple of union member types
     let args_getter = make_builtin_function_with_arity(
@@ -4248,15 +4290,15 @@ fn init_union_type(ns: &mut DictStorage) {
         2,
     );
     dict_storage_store(ns, "__args__", make_getset_descriptor(args_getter));
-    // UnionType.__parameters__ — pyre has no TypeVar, so a constructed
-    // union always carries an empty parameter tuple
-    // (`_pypy_generic_alias.py:264` `_collect_parameters`).
+    // UnionType.__parameters__ — the slot stored at construction from the raw
+    // constructor operands (`_pypy_generic_alias.py:264`
+    // `self.__parameters__ = _collect_parameters(args)`).
     let params_getter = make_builtin_function_with_arity(
         "__parameters__",
         |args| {
             let self_ = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
             if unsafe { pyre_object::is_union(self_) } {
-                Ok(w_tuple_new(Vec::new()))
+                Ok(unsafe { pyre_object::w_union_get_parameters(self_) })
             } else {
                 Ok(pyre_object::PY_NULL)
             }
@@ -4264,6 +4306,14 @@ fn init_union_type(ns: &mut DictStorage) {
         2,
     );
     dict_storage_store(ns, "__parameters__", make_getset_descriptor(params_getter));
+    // UnionType.__getitem__ (`_pypy_generic_alias.py:312`) — substitute the
+    // free parameters with `items`, then fold the results back into a union
+    // with `|`.
+    dict_storage_store(
+        ns,
+        "__getitem__",
+        make_builtin_function("__getitem__", union_getitem),
+    );
     // UnionType.__or__ — PyPy: UnionType.__or__ → _create_union
     dict_storage_store(
         ns,
@@ -4879,16 +4929,11 @@ fn init_type_type(ns: &mut DictStorage) {
         "__new__",
         make_new_descr(crate::builtins::type_descr_new),
     );
-    // typeobject.py — `__class_getitem__ = interp2app(generic_alias_class_getitem,
-    // as_classmethod=True)` so `type[int]` builds a GenericAlias.
-    dict_storage_store(
-        ns,
-        "__class_getitem__",
-        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
-            "__class_getitem__",
-            crate::genericalias::generic_alias_class_getitem,
-        )),
-    );
+    // `type[int]` builds a GenericAlias, but `type` carries no
+    // `__class_getitem__` in its dict — `descroperation.getitem` special-cases
+    // `is_w(w_obj, w_type)` (`descroperation.py:362`).  The wiring lives in
+    // `baseobjspace::getitem_type`, so `hasattr(type, "__class_getitem__")`
+    // stays False to match.
     // type.__init__ — no-op for now
     dict_storage_store(
         ns,

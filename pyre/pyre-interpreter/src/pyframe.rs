@@ -764,7 +764,7 @@ pub fn deref_unbound_error(code: &CodeObject, idx: usize) -> crate::PyError {
     } else {
         format!("local variable '{name}' referenced before assignment")
     };
-    crate::PyError::new(crate::PyErrorKind::NameError, message)
+    crate::PyError::name_error_with_name(message, name)
 }
 
 /// Whether calling a code object with these flags produces a suspended

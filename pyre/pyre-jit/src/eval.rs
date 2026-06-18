@@ -1796,6 +1796,13 @@ thread_local! {
         majit_gc::shadow_stack::register_extra_root_walker(
             pyre_jit_trace::jitcode_dispatch::fbw_store_journal_root_walker,
         );
+        // The no-replay portal exit stashes a `Ref` return value (the
+        // walk's concrete result) that must survive the post-walk compile's
+        // allocations until the portal consumes it. See
+        // `pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_root_walker`.
+        majit_gc::shadow_stack::register_extra_root_walker(
+            pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_root_walker,
+        );
         // pyre's temporary mapdict side table mirrors PyPy fields that are
         // normally traced by the translated GC. Walk its value slots
         // explicitly until the table is folded into the object layout.
@@ -2698,6 +2705,7 @@ fn init_callbacks() {
                             crate::jit::codewriter::ensure_trace_jitcode_for_w_code(code, w_code);
                     }
                 },
+                drain_backend_jit_exc: crate::call_jit::drain_backend_jit_exc,
             }));
             callbacks::init(cb);
         }
@@ -3681,6 +3689,24 @@ fn jit_merge_point_hook(
         // after trace compilation, restart so maybe_compile_and_run
         // (try_function_entry_jit) dispatches to compiled code.
         if was_tracing {
+            // No-replay portal exit for a loop-free function trace: when the
+            // walk captured its concrete return (the `run_perfn_walk`
+            // epilogue kept the stash only when the walk's eager side
+            // effects stand and no symbolic-only effect needs the replay),
+            // hand that result back directly.  Re-running the freshly
+            // compiled trace for THIS invocation would re-read the heap the
+            // walk already consumed (a side-effecting residual ran once) and
+            // deopt; the compiled trace serves only subsequent invocations.
+            // No capture → the legacy ContinueRunningNormally replay.
+            if let Some(cv) = pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
+                let result = match cv {
+                    // A void return stashes `Null`, i.e. Python `None`
+                    // (`ConcreteValue::to_pyobj` would map it to PY_NULL).
+                    pyre_jit_trace::state::ConcreteValue::Null => w_none(),
+                    other => other.to_pyobj(),
+                };
+                return Some(LoopResult::Done(Ok(result)));
+            }
             return Some(LoopResult::ContinueRunningNormally);
         }
     }

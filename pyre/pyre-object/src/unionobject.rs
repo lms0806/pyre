@@ -12,15 +12,20 @@ use pyre_macros::pyre_class;
 
 /// Python union type object (PEP 604).
 ///
-/// Layout: `[ob_type | args]`
+/// Layout: `[ob_type | args | parameters]`
 ///
 /// - `args`: tuple of the union members (deduplicated, flattened)
+/// - `parameters`: tuple of free type variables — `__parameters__`
 ///
 /// PyPy equivalent: UnionType in _pypy_generic_alias.py
 #[pyre_class("types.UnionType", type_id = 22, static_name = "UNION")]
 pub struct W_UnionType {
     /// Tuple of union member types — PyPy: UnionType._args
     pub args: PyObjectRef,
+    /// Tuple of free type variables, `_collect_parameters(args)` computed at
+    /// construction from the raw constructor operands — PyPy:
+    /// `UnionType.__parameters__`.
+    pub parameters: PyObjectRef,
 }
 
 /// Check if an object is a UnionType.
@@ -29,65 +34,24 @@ pub unsafe fn is_union(obj: PyObjectRef) -> bool {
     py_type_check(obj, &UNION_TYPE)
 }
 
-/// Create a union type from two operands.
-///
-/// PyPy equivalent: _create_union(self, other) in _pypy_generic_alias.py
-///
-/// Handles deduplication and flattening of nested unions.
-pub fn w_union_new(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
-    let mut members = Vec::new();
-    collect_union_args(a, &mut members);
-    collect_union_args(b, &mut members);
-    dedup_members(&mut members);
-
+/// Allocate a UnionType from already-flattened/deduplicated members and a
+/// precomputed parameters tuple — the body of `UnionType.__init__` after
+/// `add_recurse`.  `UnionType(())` (the empty-substitution case of
+/// `UnionType.__getitem__`) uses this with an empty member list.
+pub fn w_union_from_members(members: Vec<PyObjectRef>, parameters: PyObjectRef) -> PyObjectRef {
     let args = crate::w_tuple_new(members);
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(args);
+    crate::gc_roots::pin_root(parameters);
     W_UnionType::allocate(W_UnionType {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
         },
         args,
+        parameters,
     })
-}
-
-/// Flatten nested UnionType args, or add a single type.
-///
-/// PyPy equivalent: add_recurse in UnionType.__init__
-fn collect_union_args(obj: PyObjectRef, out: &mut Vec<PyObjectRef>) {
-    if obj.is_null() {
-        return;
-    }
-    unsafe {
-        if is_union(obj) {
-            let union = &*(obj as *const W_UnionType);
-            let n = crate::w_tuple_len(union.args);
-            for i in 0..n {
-                if let Some(item) = crate::w_tuple_getitem(union.args, i as i64) {
-                    out.push(item);
-                }
-            }
-        } else {
-            out.push(obj);
-        }
-    }
-}
-
-/// Remove duplicate type entries (pointer identity).
-///
-/// PyPy equivalent: deduplication in UnionType.__init__
-fn dedup_members(members: &mut Vec<PyObjectRef>) {
-    let mut seen = Vec::new();
-    members.retain(|&item| {
-        if seen.contains(&item) {
-            false
-        } else {
-            seen.push(item);
-            true
-        }
-    });
 }
 
 /// Get the `__args__` tuple of a UnionType.
@@ -96,6 +60,14 @@ fn dedup_members(members: &mut Vec<PyObjectRef>) {
 /// `obj` must point to a valid `W_UnionType`.
 pub unsafe fn w_union_get_args(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const W_UnionType)).args
+}
+
+/// Get the `__parameters__` tuple of a UnionType.
+///
+/// # Safety
+/// `obj` must point to a valid `W_UnionType`.
+pub unsafe fn w_union_get_parameters(obj: PyObjectRef) -> PyObjectRef {
+    (*(obj as *const W_UnionType)).parameters
 }
 
 /// Check if `instance` is an instance of any type in the union.
@@ -131,39 +103,22 @@ mod tests {
     use super::*;
     use crate::intobject::w_int_new;
 
+    fn no_params() -> PyObjectRef {
+        crate::w_tuple_new(vec![])
+    }
+
     #[test]
     fn test_union_create() {
-        // Simulate int | str
+        // Flatten/dedup happens in the interp layer (`create_union` →
+        // `add_recurse`, which needs `compare`); this wraps already-prepared
+        // members.
         let a = w_int_new(1); // stand-in for int type
         let b = w_int_new(2); // stand-in for str type
-        let union = w_union_new(a, b);
+        let union = w_union_from_members(vec![a, b], no_params());
         unsafe {
             assert!(is_union(union));
             let args = w_union_get_args(union);
             assert_eq!(crate::w_tuple_len(args), 2);
-        }
-    }
-
-    #[test]
-    fn test_union_dedup() {
-        let a = w_int_new(42);
-        let union = w_union_new(a, a);
-        unsafe {
-            let args = w_union_get_args(union);
-            assert_eq!(crate::w_tuple_len(args), 1);
-        }
-    }
-
-    #[test]
-    fn test_union_flatten() {
-        let a = w_int_new(1);
-        let b = w_int_new(2);
-        let c = w_int_new(3);
-        let inner = w_union_new(a, b);
-        let outer = w_union_new(inner, c);
-        unsafe {
-            let args = w_union_get_args(outer);
-            assert_eq!(crate::w_tuple_len(args), 3);
         }
     }
 

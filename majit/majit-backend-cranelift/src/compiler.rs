@@ -890,7 +890,7 @@ thread_local! {
 // ── Exception state shims called from JIT-compiled code ──
 
 /// Clear the current exception state.
-extern "C" fn jit_exc_clear() {
+pub extern "C" fn jit_exc_clear() {
     JIT_EXC_VALUE.store(0, std::sync::atomic::Ordering::Relaxed);
     JIT_EXC_TYPE.store(0, std::sync::atomic::Ordering::Relaxed);
 }

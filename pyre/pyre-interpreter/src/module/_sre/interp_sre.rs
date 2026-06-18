@@ -682,9 +682,40 @@ fn pattern_is_known_unicode(pat: PyObjectRef) -> bool {
     !unsafe { is_none(w_pattern) } && unsafe { is_str(w_pattern) }
 }
 
+/// `readbuf_w` (interp_sre.py:283) — the buffer-providing object backing a
+/// read-buffer subject that is not itself `bytes`/`bytearray`.  pyre's only
+/// such producer is `memoryview` (a stub carrying its backing buffer in the
+/// `__pyre_buf__` slot); the returned `bytes` plays the captured
+/// `BufMatchContext._buffer`.  `PY_NULL` if `obj` exposes no such buffer.
+unsafe fn readbuf_obj(obj: PyObjectRef) -> PyObjectRef {
+    let Some(w_type) = crate::typedef::r#type(obj) else {
+        return pyre_object::PY_NULL;
+    };
+    if unsafe { pyre_object::w_type_get_name(w_type) } != "memoryview" {
+        return pyre_object::PY_NULL;
+    }
+    match crate::baseobjspace::getattr_str(obj, "__pyre_buf__") {
+        Ok(buf) if unsafe { pyre_object::bytesobject::is_bytes_like(buf) } => buf,
+        _ => pyre_object::PY_NULL,
+    }
+}
+
+/// The raw bytes of [`readbuf_obj`] — `BufMatchContext` matches against these.
+unsafe fn readbuf_bytes(obj: PyObjectRef) -> Option<&'static [u8]> {
+    let buf = unsafe { readbuf_obj(obj) };
+    if buf.is_null() {
+        None
+    } else {
+        Some(unsafe { pyre_object::bytesobject::bytes_like_data(buf) })
+    }
+}
+
 /// `make_ctx` (interp_sre.py:220-285) — resolve the subject and reject a
 /// pattern/subject type mismatch (a bytes pattern on a str, or a str
-/// pattern on a bytes-like object).
+/// pattern on a bytes-like object).  A `str` (or subclass) becomes a
+/// character subject; `bytes`/`bytearray` (or subclass) a byte subject; any
+/// other read-buffer object (a `memoryview`) a `BufMatchContext`-style byte
+/// subject.
 fn make_subject(pat: PyObjectRef, string: PyObjectRef) -> Result<Subject, crate::PyError> {
     if unsafe { is_str(string) } {
         if pattern_is_known_bytes(pat) {
@@ -702,6 +733,13 @@ fn make_subject(pat: PyObjectRef, string: PyObjectRef) -> Result<Subject, crate:
         Ok(Subject::Bytes(unsafe {
             pyre_object::bytesobject::bytes_like_data(string)
         }))
+    } else if let Some(buf) = unsafe { readbuf_bytes(string) } {
+        if pattern_is_known_unicode(pat) {
+            return Err(crate::PyError::type_error(
+                "can't use a string pattern on a bytes-like object",
+            ));
+        }
+        Ok(Subject::Bytes(buf))
     } else {
         Err(crate::PyError::type_error(
             "expected string or bytes-like object",
@@ -709,13 +747,19 @@ fn make_subject(pat: PyObjectRef, string: PyObjectRef) -> Result<Subject, crate:
     }
 }
 
-/// Re-resolve the subject stored on a produced match for slicing — its
-/// type was already validated by [`make_subject`].
-unsafe fn subject_of(string: PyObjectRef) -> Subject {
+/// Re-resolve the subject of a produced match/scanner for slicing or
+/// re-driving — its type was validated by [`make_subject`].  A buffer
+/// subject's validated buffer is captured in `w_buffer` (`ctx._buffer`,
+/// interp_sre.py:61-64), so slicing reads it directly instead of re-reading
+/// the original object; a `str`/`bytes`/`bytearray` subject is the `string`
+/// itself (`w_buffer` is `PY_NULL` and unused).
+unsafe fn subject_of(string: PyObjectRef, w_buffer: PyObjectRef) -> Subject {
     if unsafe { is_str(string) } {
         Subject::Str(unsafe { w_str_get_value(string) })
-    } else {
+    } else if unsafe { pyre_object::bytesobject::is_bytes_like(string) } {
         Subject::Bytes(unsafe { pyre_object::bytesobject::bytes_like_data(string) })
+    } else {
+        Subject::Bytes(unsafe { pyre_object::bytesobject::bytes_like_data(w_buffer) })
     }
 }
 
@@ -831,17 +875,56 @@ fn collect_matches<S: StrDrive>(
     out
 }
 
+/// Drive the `SearchIter` over a subject of a concrete [`StrDrive`] type,
+/// invoking `on_match` for each non-overlapping match as it is found and
+/// stopping once `cap` matches have been processed (`cap == 0` is unlimited;
+/// a negative `cap` processes none).  This streams `search → callback →
+/// search` like `subx`/`split_w` (interp_sre.py:421-558/378-407) rather than
+/// materialising every match first, so a callable replacement's side effects
+/// interleave with the search and a `count`/`maxsplit` bound short-circuits
+/// the remaining scan.  Returns the number of matches processed.
+fn stream_matches<S: StrDrive>(
+    drive: S,
+    pos: usize,
+    endpos: usize,
+    code: &[u32],
+    pat: PyObjectRef,
+    cap: i64,
+    mut on_match: impl FnMut(&MatchSnapshot) -> Result<(), crate::PyError>,
+) -> Result<i64, crate::PyError> {
+    let req = Request::new(drive, pos, endpos, code, false);
+    let mut iter = SearchIter {
+        req,
+        state: State::default(),
+    };
+    let mut n: i64 = 0;
+    while cap == 0 || n < cap {
+        if iter.next().is_none() {
+            break;
+        }
+        let li = iter.state.marks.last_index();
+        let snap = MatchSnapshot {
+            lastindex: if li >= 0 { li as i64 } else { -1 },
+            spans: flatten_spans(pat, &iter.state),
+        };
+        on_match(&snap)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
 /// `W_SRE_Match(self, ctx)` (e.g. interp_sre.py:286-288) from a collected
 /// [`MatchSnapshot`].
 fn make_match_from_snapshot(
     pat: PyObjectRef,
     string: PyObjectRef,
+    w_buffer: PyObjectRef,
     snap: &MatchSnapshot,
     pos: i64,
     endpos: i64,
 ) -> PyObjectRef {
     let spans: &'static [(i64, i64)] = Box::leak(snap.spans.clone().into_boxed_slice());
-    w_sre_match_new(pat, string, pos, endpos, snap.lastindex, spans)
+    w_sre_match_new(pat, string, w_buffer, pos, endpos, snap.lastindex, spans)
 }
 
 fn do_match(
@@ -857,6 +940,7 @@ fn do_match(
     let string = args[1];
     let code = get_code(pat).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
     let subj = make_subject(pat, string)?;
+    let w_buffer = unsafe { readbuf_obj(string) };
 
     let (pos, endpos) = normalize_bounds(
         subj.len(),
@@ -870,7 +954,7 @@ fn do_match(
     };
 
     if matched {
-        Ok(make_match(pat, string, &state, pos as i64, endpos as i64))
+        Ok(make_match(pat, string, w_buffer, &state, pos as i64, endpos as i64))
     } else {
         Ok(w_none())
     }
@@ -911,6 +995,7 @@ fn flatten_spans(pat: PyObjectRef, state: &State) -> Vec<(i64, i64)> {
 fn make_match(
     pat: PyObjectRef,
     string: PyObjectRef,
+    w_buffer: PyObjectRef,
     state: &State,
     pos: i64,
     endpos: i64,
@@ -923,7 +1008,7 @@ fn make_match(
     let spans = flatten_spans(pat, state);
     let spans: &'static [(i64, i64)] = Box::leak(spans.into_boxed_slice());
 
-    w_sre_match_new(pat, string, pos, endpos, lastindex, spans)
+    w_sre_match_new(pat, string, w_buffer, pos, endpos, lastindex, spans)
 }
 
 fn sre_pattern_match(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -1028,6 +1113,7 @@ fn sre_pattern_finditer(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     // Validate the compiled code is present (matches do_match's guard).
     get_code(pat).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
     let subj = make_subject(pat, string)?;
+    let w_buffer = unsafe { readbuf_obj(string) };
     let (pos, endpos) = normalize_bounds(
         subj.len(),
         arg_int_kw(args, 2, kwargs, "pos", 0)?,
@@ -1036,6 +1122,7 @@ fn sre_pattern_finditer(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     Ok(w_sre_scanner_new(
         pat,
         string,
+        w_buffer,
         pos as i64,
         endpos as i64,
     ))
@@ -1067,6 +1154,7 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
     let string = args[2];
     let code = get_code(pat).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
     let subj = make_subject(pat, string)?;
+    let w_buffer = unsafe { readbuf_obj(string) };
     let count = arg_int_kw(args, 3, kwargs, "count", 0)?;
 
     // interp_sre.py:437-472 — a callable filter is applied per match; a
@@ -1098,28 +1186,16 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
                 )
             }
         };
-        Some(parse_template(
-            repl_bytes,
-            pat as *const W_SRE_Pattern,
-            is_bytes,
-        )?)
+        Some(parse_replacement_template(w_repl, repl_bytes, pat, is_bytes)?)
     };
 
     let endpos = subj.len();
-    let matches = match subj {
-        Subject::Str(s) => collect_matches(s, 0, endpos, code, pat),
-        Subject::Bytes(b) => collect_matches(b, 0, endpos, code, pat),
-    };
-
     let mut out: Vec<u8> = Vec::new();
-    let mut n: i64 = 0;
     let mut last = 0i64;
-    for snap in &matches {
-        // interp_sre.py:494 — `while not count or n < count`: 0 is unlimited,
-        // a negative count performs no substitutions at all.
-        if count != 0 && n >= count {
-            break;
-        }
+    // interp_sre.py:494 `while not count or n < count` — 0 is unlimited, a
+    // negative count performs no substitutions; the matching itself streams so
+    // a callable filter's side effects interleave with `search`.
+    let on_match = |snap: &MatchSnapshot| -> Result<(), crate::PyError> {
         let (mstart, mend) = snap.spans[0];
         // interp_sre.py:499-502 — copy the gap before this match.
         if let Some(gap) = subject_span_bytes(subj, (last, mstart)) {
@@ -1127,17 +1203,13 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
         }
         last = mend;
         if let Some(items) = &template {
-            let m = make_match_from_snapshot(pat, string, snap, 0, endpos as i64);
+            let m = make_match_from_snapshot(pat, string, w_buffer, snap, 0, endpos as i64);
             expand_into(&mut out, items, m as *const W_SRE_Match, subj);
         } else {
             // interp_sre.py:505-513 — callable filter; None means "no
             // piece" (treated as empty), otherwise the returned string.
-            let m = make_match_from_snapshot(pat, string, snap, 0, endpos as i64);
-            let w_piece = crate::baseobjspace::call_function(w_repl, &[m]);
-            if w_piece.is_null() {
-                return Err(crate::call::take_call_error()
-                    .unwrap_or_else(|| crate::PyError::runtime_error("sub callable failed")));
-            }
+            let m = make_match_from_snapshot(pat, string, w_buffer, snap, 0, endpos as i64);
+            let w_piece = crate::call::call_function_impl_result(w_repl, &[m])?;
             if !unsafe { is_none(w_piece) } {
                 match subj {
                     Subject::Str(_) => {
@@ -1161,13 +1233,43 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
                 }
             }
         }
-        n += 1;
+        Ok(())
+    };
+    let n = match subj {
+        Subject::Str(s) => stream_matches(s, 0, endpos, code, pat, count, on_match)?,
+        Subject::Bytes(b) => stream_matches(b, 0, endpos, code, pat, count, on_match)?,
+    };
+    // interp_sre.py:478-484 — no substitution was made (no occurrence, or a
+    // non-positive `count`): the result is the subject itself.  An exact
+    // `str`/`bytes` is returned verbatim (identity preserved); any other type
+    // (`str`/`bytes` subclass or buffer input) is normalized to a base-type
+    // slice of the whole subject.
+    if n == 0 {
+        let w_result = if is_exact_str_or_bytes(string) {
+            string
+        } else {
+            slice_subject(subj, (0, endpos as i64), empty_subject(subj))
+        };
+        return Ok((w_result, 0));
     }
     // interp_sre.py:535-537 — append the trailing gap.
     if let Some(tail) = subject_span_bytes(subj, (last, endpos as i64)) {
         out.extend_from_slice(tail);
     }
     Ok((finish_output(subj, out), n))
+}
+
+/// `type(w_string) is unicode` / `is bytes` — the exact-type gate of the
+/// `subx` n==0 shortcut (interp_sre.py:481-482).  A `str`/`bytes` subclass or
+/// a buffer object fails this and is normalized to a base-type slice.
+fn is_exact_str_or_bytes(w: PyObjectRef) -> bool {
+    match crate::typedef::r#type(w) {
+        Some(t) => unsafe {
+            std::ptr::eq(t, pyre_object::get_instantiate(&pyre_object::STR_TYPE))
+                || std::ptr::eq(t, pyre_object::get_instantiate(&pyre_object::BYTES_TYPE))
+        },
+        None => false,
+    }
 }
 
 /// `split_w` (interp_sre.py:378-407) — split `string` by the
@@ -1191,19 +1293,12 @@ fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let w_empty = empty_subject(subj);
 
     let endpos = subj.len();
-    let matches = match subj {
-        Subject::Str(s) => collect_matches(s, 0, endpos, code, pat),
-        Subject::Bytes(b) => collect_matches(b, 0, endpos, code, pat),
-    };
     let mut results: Vec<PyObjectRef> = Vec::new();
-    let mut n: i64 = 0;
     let mut last = 0i64;
-    for snap in &matches {
-        // interp_sre.py:388 — `while not maxsplit or n < maxsplit`: 0 is
-        // unlimited, a negative cap performs no splits at all.
-        if maxsplit != 0 && n >= maxsplit {
-            break;
-        }
+    // interp_sre.py:387 `while not maxsplit or n < maxsplit` — 0 is unlimited,
+    // a negative cap performs no splits; matching streams so `maxsplit` bounds
+    // the scan rather than discarding already-found matches.
+    let on_match = |snap: &MatchSnapshot| -> Result<(), crate::PyError> {
         let (mstart, mend) = snap.spans[0];
         // interp_sre.py:393 — the slice preceding this match.
         results.push(slice_subject(subj, (last, mstart), w_empty));
@@ -1213,8 +1308,12 @@ fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             results.push(slice_subject(subj, snap.spans[g], w_none()));
         }
         last = mend;
-        n += 1;
-    }
+        Ok(())
+    };
+    match subj {
+        Subject::Str(s) => stream_matches(s, 0, endpos, code, pat, maxsplit, on_match)?,
+        Subject::Bytes(b) => stream_matches(b, 0, endpos, code, pat, maxsplit, on_match)?,
+    };
     // interp_sre.py:405 — the trailing remainder after the last match.
     results.push(slice_subject(subj, (last, endpos as i64), w_empty));
     Ok(w_list_new(results))
@@ -1231,190 +1330,69 @@ enum TemplateItem {
     Group(usize),
 }
 
-#[inline]
-fn is_octdigit(c: u8) -> bool {
-    (b'0'..=b'7').contains(&c)
+/// Convert `re._parser.parse_template`'s flat result list — a sequence of
+/// literal `str`/`bytes` runs interleaved with integer group references — into
+/// the [`TemplateItem`] stream `expand_into` consumes.
+fn template_items_from_list(w_result: PyObjectRef) -> Result<Vec<TemplateItem>, crate::PyError> {
+    let n = unsafe { pyre_object::w_list_len(w_result) };
+    let mut items: Vec<TemplateItem> = Vec::with_capacity(n);
+    for i in 0..n {
+        let Some(elem) = (unsafe { pyre_object::w_list_getitem(w_result, i as i64) }) else {
+            continue;
+        };
+        if unsafe { is_int(elem) } {
+            items.push(TemplateItem::Group(
+                unsafe { pyre_object::w_int_get_value(elem) } as usize,
+            ));
+        } else if unsafe { is_str(elem) } {
+            items.push(TemplateItem::Literal(
+                unsafe { w_str_get_value(elem) }.as_bytes().to_vec(),
+            ));
+        } else if unsafe { pyre_object::bytesobject::is_bytes_like(elem) } {
+            items.push(TemplateItem::Literal(
+                unsafe { pyre_object::bytesobject::bytes_like_data(elem) }.to_vec(),
+            ));
+        }
+    }
+    Ok(items)
 }
 
-/// Flush the accumulated literal then append a validated group reference —
-/// `parse_template.addgroup` (`re/_parser.py:1006-1010`).  A reference
-/// past `num_groups` is an "invalid group reference".
-fn push_group(
-    result: &mut Vec<TemplateItem>,
-    literal: &mut Vec<u8>,
-    index: i64,
-    num_groups: i64,
-) -> Result<(), crate::PyError> {
-    if index < 0 || index > num_groups {
-        return Err(crate::PyError::value_error(format!(
-            "invalid group reference {index}"
-        )));
-    }
-    if !literal.is_empty() {
-        result.push(TemplateItem::Literal(std::mem::take(literal)));
-    }
-    result.push(TemplateItem::Group(index as usize));
-    Ok(())
-}
-
-/// `re._parser.parse_template` (`re/_parser.py:990-1066`) — split a
-/// replacement string into literal runs and group references.  `\g<name>`
-/// resolves names through the pattern's `groupindex`; `\1`..`\99` are
-/// group references (or 3-digit octal escapes); `\0NN` is octal;
-/// `\a\b\f\n\r\t\v\\` are character escapes; other letter escapes are an
-/// error and other punctuation escapes are kept verbatim.
-fn parse_template(
-    template: &[u8],
-    pat: *const W_SRE_Pattern,
+/// Parse a replacement template into [`TemplateItem`]s by delegating to the
+/// app-level `re._parser.parse_template(source, pattern)` (`re/_parser.py:990`)
+/// — owning the parser there keeps `\g<name>`/octal/group-reference handling
+/// and the `re.error` diagnostics identical to the stdlib.  Mirrors
+/// `import_re` (interp_sre.py:108-109, `subx` :469): `__import__("re")` runs
+/// `from . import _parser`, so the parser is always reachable as
+/// `re._parser` once `re` is imported.
+fn parse_replacement_template(
+    w_template: PyObjectRef,
+    template_bytes: &[u8],
+    pat: PyObjectRef,
     is_bytes: bool,
 ) -> Result<Vec<TemplateItem>, crate::PyError> {
-    let num_groups = unsafe { (*pat).num_groups }.max(0);
-    let w_groupindex = unsafe { (*pat).w_groupindex };
-    let n = template.len();
-    let mut i = 0usize;
-    let mut result: Vec<TemplateItem> = Vec::new();
-    let mut literal: Vec<u8> = Vec::new();
-
-    // Append an escaped code value: the raw byte for a bytes template, the
-    // codepoint's UTF-8 for a str template (so `\xff` → U+00FF).
-    let push_char_value = |literal: &mut Vec<u8>, val: u32| {
-        if is_bytes {
-            literal.push(val as u8);
-        } else {
-            let mut buf = [0u8; 4];
-            let enc = char::from_u32(val).unwrap_or('\0').encode_utf8(&mut buf);
-            literal.extend_from_slice(enc.as_bytes());
+    let w_parser = match crate::importing::get_sys_module("re._parser") {
+        Some(w_parser) => w_parser,
+        None => {
+            let w_re = crate::importing::importhook(
+                "re",
+                pyre_object::w_none(),
+                pyre_object::w_none(),
+                0,
+                std::ptr::null(),
+            )?;
+            crate::baseobjspace::getattr_str(w_re, "_parser")?
         }
     };
-
-    while i < n {
-        let c = template[i];
-        if c != b'\\' {
-            literal.push(c);
-            i += 1;
-            continue;
-        }
-        i += 1; // consume the backslash
-        if i >= n {
-            return Err(crate::PyError::value_error("bad escape (end of pattern)"));
-        }
-        let c1 = template[i];
-        i += 1;
-        if c1 == b'g' {
-            // `\g<name>` / `\g<number>`.
-            if i >= n || template[i] != b'<' {
-                return Err(crate::PyError::value_error("missing <"));
-            }
-            i += 1;
-            let mut name: Vec<u8> = Vec::new();
-            loop {
-                if i >= n {
-                    return Err(crate::PyError::value_error(
-                        "missing >, unterminated name",
-                    ));
-                }
-                let ch = template[i];
-                i += 1;
-                if ch == b'>' {
-                    break;
-                }
-                name.push(ch);
-            }
-            if name.is_empty() {
-                return Err(crate::PyError::value_error("missing group name"));
-            }
-            let name_str = String::from_utf8_lossy(&name).into_owned();
-            let index: i64 = if name.iter().all(u8::is_ascii_digit) {
-                name_str
-                    .parse::<i64>()
-                    .map_err(|_| crate::PyError::value_error("invalid group reference"))?
-            } else {
-                let w_name = w_str_new(&name_str);
-                let found = if unsafe { is_dict(w_groupindex) } {
-                    unsafe { pyre_object::w_dict_lookup(w_groupindex, w_name) }
-                } else {
-                    None
-                };
-                match found {
-                    Some(w_num) => unsafe { w_int_get_value(w_num) },
-                    None => {
-                        return Err(crate::PyError::index_error(format!(
-                            "unknown group name {name_str:?}"
-                        )));
-                    }
-                }
-            };
-            push_group(&mut result, &mut literal, index, num_groups)?;
-        } else if c1 == b'0' {
-            // Octal escape `\0`, `\0N`, `\0NN`.
-            let mut octal = String::from("0");
-            if i < n && is_octdigit(template[i]) {
-                octal.push(template[i] as char);
-                i += 1;
-                if i < n && is_octdigit(template[i]) {
-                    octal.push(template[i] as char);
-                    i += 1;
-                }
-            }
-            let val = (i64::from_str_radix(&octal, 8).unwrap_or(0) & 0xff) as u32;
-            push_char_value(&mut literal, val);
-        } else if c1.is_ascii_digit() {
-            // `\1`..`\99` group reference, or a 3-digit octal escape.
-            let mut num = String::new();
-            num.push(c1 as char);
-            let mut isoctal = false;
-            if i < n && template[i].is_ascii_digit() {
-                let c2 = template[i];
-                num.push(c2 as char);
-                i += 1;
-                if is_octdigit(c1) && is_octdigit(c2) && i < n && is_octdigit(template[i]) {
-                    num.push(template[i] as char);
-                    i += 1;
-                    isoctal = true;
-                    let val = i64::from_str_radix(&num, 8).unwrap_or(0);
-                    if val > 0o377 {
-                        return Err(crate::PyError::value_error(format!(
-                            "octal escape value \\{num} outside of range 0-0o377"
-                        )));
-                    }
-                    push_char_value(&mut literal, val as u32);
-                }
-            }
-            if !isoctal {
-                let index = num
-                    .parse::<i64>()
-                    .map_err(|_| crate::PyError::value_error("invalid group reference"))?;
-                push_group(&mut result, &mut literal, index, num_groups)?;
-            }
-        } else {
-            // Character escape (`ESCAPES`), kept-verbatim punctuation, or
-            // an invalid letter escape.
-            match c1 {
-                b'a' => literal.push(0x07),
-                b'b' => literal.push(0x08),
-                b'f' => literal.push(0x0c),
-                b'n' => literal.push(b'\n'),
-                b'r' => literal.push(b'\r'),
-                b't' => literal.push(b'\t'),
-                b'v' => literal.push(0x0b),
-                b'\\' => literal.push(b'\\'),
-                _ => {
-                    if c1.is_ascii_alphabetic() {
-                        return Err(crate::PyError::value_error(format!(
-                            "bad escape \\{}",
-                            c1 as char
-                        )));
-                    }
-                    literal.push(b'\\');
-                    literal.push(c1);
-                }
-            }
-        }
-    }
-    if !literal.is_empty() {
-        result.push(TemplateItem::Literal(literal));
-    }
-    Ok(result)
+    let w_parse = crate::baseobjspace::getattr_str(w_parser, "parse_template")?;
+    // `_parser.parse_template` indexes the source as a string; a buffer
+    // template (e.g. `bytearray`) must be a real `bytes` first.
+    let w_source = if is_bytes && !unsafe { pyre_object::is_bytes(w_template) } {
+        pyre_object::bytesobject::w_bytes_from_bytes(template_bytes)
+    } else {
+        w_template
+    };
+    let w_result = crate::call::call_function_impl_result(w_parse, &[w_source, pat])?;
+    template_items_from_list(w_result)
 }
 
 /// Expand the parsed template against a match, appending into `out` — the
@@ -1488,7 +1466,7 @@ fn do_span(m: *const W_SRE_Match, w_arg: Option<PyObjectRef>) -> Result<(i64, i6
 /// `slice_w` (interp_sre.py): the span sliced out of the subject
 /// string, or `w_default` for an unmatched group.
 unsafe fn slice_w(m: *const W_SRE_Match, span: (i64, i64), w_default: PyObjectRef) -> PyObjectRef {
-    let subj = unsafe { subject_of((*m).w_string) };
+    let subj = unsafe { subject_of((*m).w_string, (*m).w_buffer) };
     slice_subject(subj, span, w_default)
 }
 
@@ -1596,7 +1574,7 @@ fn sre_match_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 fn sre_match_expand(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let m = sre_match_self(args)?;
     let w_template = args.get(1).copied().unwrap_or_else(w_none);
-    let subj = unsafe { subject_of((*m).w_string) };
+    let subj = unsafe { subject_of((*m).w_string, (*m).w_buffer) };
     let (template, is_bytes): (&[u8], bool) = match subj {
         Subject::Str(_) => {
             if !unsafe { is_str(w_template) } {
@@ -1614,8 +1592,8 @@ fn sre_match_expand(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             )
         }
     };
-    let pat = unsafe { (*m).w_srepat as *const W_SRE_Pattern };
-    let items = parse_template(template, pat, is_bytes)?;
+    let w_pat = unsafe { (*m).w_srepat };
+    let items = parse_replacement_template(w_template, template, w_pat, is_bytes)?;
     let mut out: Vec<u8> = Vec::new();
     expand_into(&mut out, &items, m, subj);
     Ok(finish_output(subj, out))
@@ -1629,7 +1607,7 @@ pub(crate) fn sre_match_repr_str(m: PyObjectRef) -> Result<String, crate::PyErro
     let mp = m as *const W_SRE_Match;
     let span = unsafe { w_sre_match_get_span(m, 0) }.unwrap_or((-1, -1));
     let (start, end) = span;
-    let subj = unsafe { subject_of((*mp).w_string) };
+    let subj = unsafe { subject_of((*mp).w_string, (*mp).w_buffer) };
     let w_match_str = slice_subject(subj, span, w_none());
     let matchrepr: String = unsafe { crate::py_repr(w_match_str) }?
         .chars()
@@ -1787,9 +1765,10 @@ fn sre_scanner_step(
     }
     let w_srepat = unsafe { (*sc).w_srepat };
     let string = unsafe { (*sc).w_string };
+    let w_buffer = unsafe { (*sc).w_buffer };
     let original_pos = unsafe { (*sc).original_pos };
     let endpos = unsafe { (*sc).endpos }.max(0) as usize;
-    let subj = unsafe { subject_of(string) };
+    let subj = unsafe { subject_of(string, w_buffer) };
     let code = get_code(w_srepat).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
     let must_advance = unsafe { (*sc).must_advance } != 0;
 
@@ -1812,6 +1791,7 @@ fn sre_scanner_step(
     Ok(Some(make_match(
         w_srepat,
         string,
+        w_buffer,
         &state,
         original_pos,
         endpos as i64,

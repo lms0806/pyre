@@ -666,9 +666,10 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     // Built in dependency order: each subclass refers to its already-built
     // parent. PyPy: each typedef.py W_<Exception>.typedef registers a real
     // W_TypeObject in space.builtin.
-    let base_exc = make_exc_type(
+    let base_exc = make_exc_type_with_init(
         "BaseException",
         exc_base_exception_new,
+        Some(exc_base_exception_init),
         crate::typedef::w_object(),
     );
     crate::dict_storage_store(namespace, "BaseException", base_exc);
@@ -710,7 +711,12 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     crate::dict_storage_store(
         namespace,
         "AttributeError",
-        make_exc_type("AttributeError", exc_attribute_error_new, exception),
+        make_exc_type_with_init(
+            "AttributeError",
+            exc_attribute_error_new,
+            Some(exc_attribute_error_init),
+            exception,
+        ),
     );
     crate::dict_storage_store(
         namespace,
@@ -722,7 +728,12 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     crate::dict_storage_store(
         namespace,
         "NameError",
-        make_exc_type("NameError", exc_name_error_new, exception),
+        make_exc_type_with_init(
+            "NameError",
+            exc_name_error_new,
+            Some(exc_name_error_init),
+            exception,
+        ),
     );
 
     let runtime_error = make_exc_type("RuntimeError", exc_runtime_error_new, exception);
@@ -768,7 +779,12 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         make_exc_type("KeyboardInterrupt", exc_base_exception_new, base_exc),
     );
 
-    let import_error = make_exc_type("ImportError", exc_import_error_new, exception);
+    let import_error = make_exc_type_with_init(
+        "ImportError",
+        exc_import_error_new,
+        Some(exc_import_error_init),
+        exception,
+    );
     crate::dict_storage_store(namespace, "ImportError", import_error);
     crate::dict_storage_store(
         namespace,
@@ -781,7 +797,12 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         make_exc_type("AssertionError", exc_assertion_error_new, exception),
     );
 
-    let os_error = make_exc_type("OSError", exc_os_error_new, exception);
+    let os_error = make_exc_type_with_init(
+        "OSError",
+        exc_os_error_new,
+        Some(exc_os_error_init),
+        exception,
+    );
     crate::dict_storage_store(namespace, "OSError", os_error);
     crate::dict_storage_store(namespace, "IOError", os_error);
     crate::dict_storage_store(
@@ -1963,6 +1984,44 @@ exc_constructor!(
     pyre_object::excobject::ExcKind::SystemError
 );
 
+/// `interp_exceptions.py:121-124 W_BaseException.descr_init` — store the
+/// constructor positional arguments on `self.args_w`.  Installed as
+/// `BaseException.__init__` so the type-call `__new__` ⇒ `__init__`
+/// protocol re-stamps `args` to the values forwarded by a subclass's
+/// `super().__init__(*args)`, instead of leaving the full original
+/// argument list captured by `__new__`.  `args[0]` is `self`.
+///
+/// `descr_init`'s `(self, args_w)` interp2app signature is positional-only,
+/// so the argument matcher rejects any keyword with "takes no keyword
+/// arguments".  pyre's flat builtin ABI has no signature to enforce that,
+/// so the keyword dict is policed here directly; the type name comes from
+/// `self`, matching `_PyArg_NoKeywords(Py_TYPE(self)->tp_name, kwds)`.
+fn exc_base_exception_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let w_self = *args.first().ok_or_else(|| {
+        crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
+    })?;
+    let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
+    if let Some(dict) = kwargs {
+        let has_keyword = unsafe { pyre_object::w_dict_str_entries(dict) }
+            .iter()
+            .any(|(key, _)| key != "__pyre_kw__");
+        if has_keyword {
+            let type_name = unsafe {
+                match crate::typedef::r#type(w_self) {
+                    Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+                    None => "BaseException".to_string(),
+                }
+            };
+            return Err(crate::PyError::type_error(format!(
+                "{type_name}() takes no keyword arguments"
+            )));
+        }
+    }
+    let args_list = pyre_object::w_list_new(positional.to_vec());
+    unsafe { pyre_object::excobject::w_exception_set_args(w_self, args_list) };
+    Ok(pyre_object::w_none())
+}
+
 /// `interp_exceptions.py:551-652 W_OSError._parse_init_args` + `_init_error`.
 /// A 2..=5 positional-argument call fills the `errno` / `strerror` /
 /// `filename` / `filename2` slots; when a filename is present it is
@@ -1995,6 +2054,17 @@ fn os_error_init(kind: pyre_object::excobject::ExcKind, args: &[PyObjectRef]) ->
         };
         excobject::w_exception_new(kind, &msg)
     };
+    os_error_fill_slots(exc, args);
+    exc
+}
+
+/// `_parse_init_args` slot assignment shared by `__new__` (after the
+/// kind-aware allocation) and `__init__` (re-stamping an already-allocated
+/// `self`).  Sets `args_w` and, for a 2..=5 argument call, the
+/// errno/strerror/filename/filename2 slots — dropping the filename from
+/// `args_w` per `_init_error` (line 652).
+fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) {
+    use pyre_object::excobject;
     let args_list = pyre_object::w_list_new(args.to_vec());
     unsafe { excobject::w_exception_set_args(exc, args_list) };
     // `_parse_init_args`: only a 2..=5 argument call carries
@@ -2018,7 +2088,307 @@ fn os_error_init(kind: pyre_object::excobject::ExcKind, args: &[PyObjectRef]) ->
             }
         }
     }
-    exc
+}
+
+/// `W_OSError._use_init` (`interp_exceptions.py:531-549`): the slots are
+/// already filled by `__new__`, so `descr_init` does extra work only when
+/// the instance's type defines its own `__init__` while keeping
+/// `OSError.__new__`.  Returns `False` for the exact `OSError` type, for
+/// builtin subclasses, and for user subclasses that do not override
+/// `__init__` — every other case routes `descr_init` to a no-op
+/// (`descr_init` early-return at line 618-620).
+///
+/// The base `__init__` / `__new__` are read from the registered runtime
+/// `OSError` class object (`lookup_exc_class`), not the static layout
+/// `PyType`, which carries no namespace dict; comparing them by identity
+/// against the instance type's MRO-resolved entries detects an override.
+fn os_error_use_init(w_self: PyObjectRef) -> bool {
+    let Some(w_type) = crate::typedef::r#type(w_self) else {
+        return false;
+    };
+    let Some(w_os_error) = lookup_exc_class("OSError") else {
+        return false;
+    };
+    // The exact OSError type is never `_use_init` (line 542-543).
+    if std::ptr::eq(w_type, w_os_error) {
+        return false;
+    }
+    let self_init = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__init__") };
+    let base_init = unsafe { crate::baseobjspace::lookup_in_type(w_os_error, "__init__") };
+    let overrides_init = match (self_init, base_init) {
+        (Some(a), Some(b)) => !std::ptr::eq(a, b),
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if !overrides_init {
+        return false;
+    }
+    // `_use_init` also requires `__new__` to be the inherited `OSError.__new__`
+    // (line 546-547): a subclass overriding `__new__` keeps `descr_init` a
+    // no-op even when it also defines `__init__`.
+    let self_new = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") };
+    let base_new = unsafe { crate::baseobjspace::lookup_in_type(w_os_error, "__new__") };
+    matches!((self_new, base_new), (Some(a), Some(b)) if std::ptr::eq(a, b))
+}
+
+/// `interp_exceptions.py:551-652 W_OSError._parse_init_args` as the
+/// `descr_init` half: re-stamp the errno/strerror/filename slots and the
+/// trimmed `args_w` onto an already-allocated `self`.  Installed as
+/// `OSError.__init__` so the inherited `W_BaseException.descr_init` (which
+/// would overwrite `args_w` with the full, untrimmed argument list) does
+/// not run for the OSError family.  `args[0]` is `self`.
+fn exc_os_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let w_self = *args.first().ok_or_else(|| {
+        crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
+    })?;
+    // `descr_init` early-return (line 618-620): when the type does not
+    // override `OSError.__init__`, every slot is already filled by `__new__`
+    // (`os_error_init`), so re-stamping here would corrupt the args/errno
+    // that construction already set.
+    if !os_error_use_init(w_self) {
+        return Ok(pyre_object::w_none());
+    }
+    os_error_fill_slots(w_self, &args[1..]);
+    Ok(pyre_object::w_none())
+}
+
+/// `interp_exceptions.py:233-237 BaseException.descr_reduce` —
+/// `(cls, args[, dict])`: a 2-tuple normally, a 3-tuple when the instance
+/// dict is non-empty.  Inherited by every builtin exception class through
+/// the MRO, so a subclass pickles via its own class object.
+fn base_exception_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let w_self = *args.first().ok_or_else(|| {
+        crate::PyError::type_error("__reduce__() missing 1 required positional argument: 'self'")
+    })?;
+    let cls = crate::typedef::r#type(w_self)
+        .unwrap_or_else(|| crate::baseobjspace::exception_getclass(w_self));
+    let w_args = unsafe { pyre_object::excobject::w_exception_get_args(w_self) };
+    let w_dict = unsafe { pyre_object::excobject::w_exception_peek_dict(w_self) };
+    if !w_dict.is_null() && unsafe { pyre_object::w_dict_len(w_dict) } > 0 {
+        Ok(pyre_object::w_tuple_new(vec![cls, w_args, w_dict]))
+    } else {
+        Ok(pyre_object::w_tuple_new(vec![cls, w_args]))
+    }
+}
+
+/// `interp_exceptions.py:239-241 BaseException.descr_setstate` —
+/// `self.getdict(space).update(state)`.
+fn base_exception_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let w_self = *args.first().ok_or_else(|| {
+        crate::PyError::type_error("__setstate__() missing 1 required positional argument: 'self'")
+    })?;
+    let w_state = *args.get(1).ok_or_else(|| {
+        crate::PyError::type_error("__setstate__() missing 1 required positional argument: 'state'")
+    })?;
+    let w_olddict = unsafe { pyre_object::excobject::w_exception_getdict(w_self) };
+    if crate::baseobjspace::call_method(w_olddict, "update", &[w_state]).is_null() {
+        if let Some(e) = crate::call::take_call_error() {
+            return Err(e);
+        }
+    }
+    Ok(pyre_object::w_none())
+}
+
+/// `interp_exceptions.py:379-391 W_ImportError.descr_reduce` plus the
+/// 3.14 `name_from` field: the reduce-state dict carries
+/// `name`/`path`/`name_from` (each only when set), merged over any
+/// instance-dict entries.
+fn import_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    use pyre_object::excobject;
+    let w_self = *args.first().ok_or_else(|| {
+        crate::PyError::type_error("__reduce__() missing 1 required positional argument: 'self'")
+    })?;
+    let cls = crate::typedef::r#type(w_self)
+        .unwrap_or_else(|| crate::baseobjspace::exception_getclass(w_self));
+    let w_args = unsafe { excobject::w_exception_get_args(w_self) };
+    let stored = unsafe { excobject::w_exception_peek_dict(w_self) };
+    let w_dict = if !stored.is_null() && unsafe { pyre_object::w_dict_len(stored) } > 0 {
+        let copy = crate::baseobjspace::call_method(stored, "copy", &[]);
+        if copy.is_null() {
+            if let Some(e) = crate::call::take_call_error() {
+                return Err(e);
+            }
+        }
+        copy
+    } else {
+        pyre_object::w_dict_new()
+    };
+    for (key, w_value) in [
+        ("name", unsafe { excobject::w_exception_get_name(w_self) }),
+        ("path", unsafe {
+            excobject::w_exception_get_import_path(w_self)
+        }),
+        ("name_from", unsafe {
+            excobject::w_exception_get_import_name_from(w_self)
+        }),
+    ] {
+        if !w_value.is_null() && !unsafe { pyre_object::is_none(w_value) } {
+            unsafe { pyre_object::w_dict_setitem_str(w_dict, key, w_value) };
+        }
+    }
+    if unsafe { pyre_object::w_dict_len(w_dict) } > 0 {
+        Ok(pyre_object::w_tuple_new(vec![cls, w_args, w_dict]))
+    } else {
+        Ok(pyre_object::w_tuple_new(vec![cls, w_args]))
+    }
+}
+
+/// `interp_exceptions.py:393-397 W_ImportError.descr_setstate` plus
+/// `name_from`: pop `name`/`path`/`name_from` into their slots, then update
+/// the instance dict with whatever remains.
+fn import_error_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    use pyre_object::excobject;
+    let w_self = *args.first().ok_or_else(|| {
+        crate::PyError::type_error("__setstate__() missing 1 required positional argument: 'self'")
+    })?;
+    let w_state = *args.get(1).ok_or_else(|| {
+        crate::PyError::type_error("__setstate__() missing 1 required positional argument: 'state'")
+    })?;
+    type ExcSetter = unsafe fn(PyObjectRef, PyObjectRef);
+    for (key, set) in [
+        ("name", excobject::w_exception_set_name as ExcSetter),
+        ("path", excobject::w_exception_set_import_path),
+        ("name_from", excobject::w_exception_set_import_name_from),
+    ] {
+        let popped = crate::baseobjspace::call_method(
+            w_state,
+            "pop",
+            &[pyre_object::w_str_new(key), pyre_object::w_none()],
+        );
+        if popped.is_null() {
+            if let Some(e) = crate::call::take_call_error() {
+                return Err(e);
+            }
+        }
+        unsafe { set(w_self, popped) };
+    }
+    let w_olddict = unsafe { excobject::w_exception_getdict(w_self) };
+    if crate::baseobjspace::call_method(w_olddict, "update", &[w_state]).is_null() {
+        if let Some(e) = crate::call::take_call_error() {
+            return Err(e);
+        }
+    }
+    Ok(pyre_object::w_none())
+}
+
+/// `interp_exceptions.py:655-665 W_OSError.descr_reduce` — re-append the
+/// `filename`/`filename2` that `os_error_fill_slots` stripped from `args_w`
+/// so the reconstruction call receives the full positional list.  OSError
+/// has no own `__setstate__`; it inherits `BaseException.__setstate__`.
+fn os_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    use pyre_object::excobject;
+    let w_self = *args.first().ok_or_else(|| {
+        crate::PyError::type_error("__reduce__() missing 1 required positional argument: 'self'")
+    })?;
+    let cls = crate::typedef::r#type(w_self)
+        .unwrap_or_else(|| crate::baseobjspace::exception_getclass(w_self));
+    let w_args = unsafe { excobject::w_exception_get_args(w_self) };
+    let n = unsafe { pyre_object::w_tuple_len(w_args) };
+    let mut items: Vec<PyObjectRef> = (0..n as i64)
+        .filter_map(|i| unsafe { pyre_object::w_tuple_getitem(w_args, i) })
+        .collect();
+    let w_filename = unsafe { excobject::w_exception_get_filename(w_self) };
+    if !w_filename.is_null() && !unsafe { pyre_object::is_none(w_filename) } {
+        items.push(w_filename);
+        let w_filename2 = unsafe { excobject::w_exception_get_filename2(w_self) };
+        if !w_filename2.is_null() && !unsafe { pyre_object::is_none(w_filename2) } {
+            items.push(pyre_object::w_none());
+            items.push(w_filename2);
+        }
+    }
+    let w_full_args = pyre_object::w_tuple_new(items);
+    let w_dict = unsafe { excobject::w_exception_peek_dict(w_self) };
+    if !w_dict.is_null() && unsafe { pyre_object::w_dict_len(w_dict) } > 0 {
+        Ok(pyre_object::w_tuple_new(vec![cls, w_full_args, w_dict]))
+    } else {
+        Ok(pyre_object::w_tuple_new(vec![cls, w_full_args]))
+    }
+}
+
+/// `ImportError.__init__` — consume the `name` / `path` / `name_from`
+/// keyword arguments into their typed slots and store the single
+/// positional argument as `msg`, then pass the positional arguments to
+/// `W_BaseException.descr_init` (`args_w`).  Every slot is re-stamped on
+/// each call (kwarg value or `None`; `msg` the lone positional else
+/// `None`) so a repeated `__init__` resets stale values.  Any other
+/// keyword raises `ImportError() got an unexpected keyword argument`
+/// (the name hard-codes `ImportError` even for `ModuleNotFoundError`).
+/// Installed as `ImportError.__init__` and inherited by
+/// `ModuleNotFoundError`.  `args[0]` is `self`.
+fn exc_import_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    use pyre_object::excobject;
+    let w_self = *args.first().ok_or_else(|| {
+        crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
+    })?;
+    let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
+    kwarg_reject_unknown(kwargs, &["name", "path", "name_from"], "ImportError")?;
+    let w_name = kwarg_get(kwargs, "name").unwrap_or_else(pyre_object::w_none);
+    let w_path = kwarg_get(kwargs, "path").unwrap_or_else(pyre_object::w_none);
+    let w_name_from = kwarg_get(kwargs, "name_from").unwrap_or_else(pyre_object::w_none);
+    let w_msg = if positional.len() == 1 {
+        positional[0]
+    } else {
+        pyre_object::w_none()
+    };
+    unsafe {
+        // Unconditional re-stamp so a repeated `__init__` resets stale slots.
+        excobject::w_exception_set_name(w_self, w_name);
+        excobject::w_exception_set_import_path(w_self, w_path);
+        excobject::w_exception_set_import_name_from(w_self, w_name_from);
+        excobject::w_exception_set_import_msg(w_self, w_msg);
+        // Only the positional arguments reach `args_w`.
+        let args_list = pyre_object::w_list_new(positional.to_vec());
+        excobject::w_exception_set_args(w_self, args_list);
+    }
+    Ok(pyre_object::w_none())
+}
+
+/// `W_NameError.descr_init` (Python 3.10+) — consume the `name` keyword
+/// into the shared name slot and pass the positional arguments to
+/// `W_BaseException.descr_init`.  Any other keyword raises
+/// `NameError() got an unexpected keyword argument`.  Installed as
+/// `NameError.__init__`.  `args[0]` is `self`.
+fn exc_name_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    use pyre_object::excobject;
+    let w_self = *args.first().ok_or_else(|| {
+        crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
+    })?;
+    let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
+    kwarg_reject_unknown(kwargs, &["name"], "NameError")?;
+    let w_name = kwarg_get(kwargs, "name").unwrap_or_else(pyre_object::w_none);
+    unsafe {
+        // `self.w_name = w_name` (WrappedDefault(None)) — unconditional
+        // re-stamp so a repeated `__init__` resets a stale name.
+        excobject::w_exception_set_name(w_self, w_name);
+        let args_list = pyre_object::w_list_new(positional.to_vec());
+        excobject::w_exception_set_args(w_self, args_list);
+    }
+    Ok(pyre_object::w_none())
+}
+
+/// `W_AttributeError.descr_init` (Python 3.10+) — consume the `name` and
+/// `obj` keywords into their slots and pass the positional arguments to
+/// `W_BaseException.descr_init`.  Any other keyword raises
+/// `AttributeError() got an unexpected keyword argument`.  Installed as
+/// `AttributeError.__init__`.  `args[0]` is `self`.
+fn exc_attribute_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    use pyre_object::excobject;
+    let w_self = *args.first().ok_or_else(|| {
+        crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
+    })?;
+    let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
+    kwarg_reject_unknown(kwargs, &["name", "obj"], "AttributeError")?;
+    let w_name = kwarg_get(kwargs, "name").unwrap_or_else(pyre_object::w_none);
+    let w_obj = kwarg_get(kwargs, "obj").unwrap_or_else(pyre_object::w_none);
+    unsafe {
+        // `self.w_name = w_name` / `self.w_obj = w_obj` (WrappedDefault(None))
+        // — unconditional re-stamp so a repeated `__init__` resets stale slots.
+        excobject::w_exception_set_name(w_self, w_name);
+        excobject::w_exception_set_attr_obj(w_self, w_obj);
+        let args_list = pyre_object::w_list_new(positional.to_vec());
+        excobject::w_exception_set_args(w_self, args_list);
+    }
+    Ok(pyre_object::w_none())
 }
 
 fn exc_os_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -2474,6 +2844,44 @@ fn make_exc_type_with_init(
                         },
                         2,
                     ),
+                );
+                // `interp_exceptions.py:233-241` — `descr_reduce` /
+                // `descr_setstate`, installed on `BaseException` so every
+                // subclass inherits them through the MRO.
+                crate::dict_storage_store(
+                    ns,
+                    "__reduce__",
+                    make_builtin_function_with_arity("__reduce__", base_exception_reduce, 1),
+                );
+                crate::dict_storage_store(
+                    ns,
+                    "__setstate__",
+                    make_builtin_function_with_arity("__setstate__", base_exception_setstate, 2),
+                );
+            }
+            // `interp_exceptions.py:379-397` — ImportError overrides reduce
+            // and setstate to carry the `name`/`path`/`name_from` slots.
+            // ModuleNotFoundError (built via `make_exc_type`) inherits these
+            // through the MRO.
+            if name == "ImportError" {
+                crate::dict_storage_store(
+                    ns,
+                    "__reduce__",
+                    make_builtin_function_with_arity("__reduce__", import_error_reduce, 1),
+                );
+                crate::dict_storage_store(
+                    ns,
+                    "__setstate__",
+                    make_builtin_function_with_arity("__setstate__", import_error_setstate, 2),
+                );
+            }
+            // `interp_exceptions.py:655-665` — OSError overrides reduce to
+            // re-append the filename(s); its subclasses inherit it.
+            if name == "OSError" {
+                crate::dict_storage_store(
+                    ns,
+                    "__reduce__",
+                    make_builtin_function_with_arity("__reduce__", os_error_reduce, 1),
                 );
             }
         },
@@ -4160,7 +4568,7 @@ unsafe fn classdir_recurse(
 /// Without argument: names in the current local scope (not supported).
 /// With argument: sorted list of attribute names from obj.__dict__ plus
 /// type MRO. Modules expose their namespace via w_module_get_namespace.
-fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         // Return empty list — pyre doesn't currently expose locals here.
         return Ok(w_list_new(vec![]));
@@ -4180,6 +4588,11 @@ fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 unsafe { crate::baseobjspace::get_and_call_function(dir_meth, obj, w_type, &[]) }?;
             return builtin_sorted(&[result]);
         }
+    }
+    // `GenericAlias.__dir__` (`_pypy_generic_alias.py:85`) merges the alias's
+    // own attribute names with `dir(__origin__)`.
+    if unsafe { pyre_object::is_generic_alias(obj) } {
+        return crate::genericalias::dir_list(obj);
     }
     let mut names: Vec<Wtf8Buf> = Vec::new();
     unsafe {
@@ -4799,6 +5212,21 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
             let origin = pyre_object::w_generic_alias_get_origin(obj);
             let args = pyre_object::w_generic_alias_get_args(obj);
             return hash_value(origin) ^ hash_value(args);
+        }
+        if pyre_object::is_union(obj) {
+            // UnionType.__hash__ (`_pypy_generic_alias.py:275`) —
+            // `hash(frozenset(self.__args__))`.  Resolved here too so the
+            // infallible `hash_w`/`hash_value` path agrees with the
+            // fallible `try_hash_value` one.
+            let args = pyre_object::w_union_get_args(obj);
+            let n = w_tuple_len(args);
+            let mut members = Vec::with_capacity(n);
+            for i in 0..n {
+                if let Some(item) = w_tuple_getitem(args, i as i64) {
+                    members.push(item);
+                }
+            }
+            return hash_value(pyre_object::w_frozenset_from_items(&members));
         }
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);

@@ -8730,6 +8730,7 @@ mod tests {
                 jit_create_self_recursive_callee_frame_1_raw_int: std::ptr::null(),
                 driver_pair: || TEST_JIT_DRIVER.with(|cell| cell.get() as *mut u8),
                 ensure_majit_jitcode: |_, _| {},
+                drain_backend_jit_exc: || {},
             }));
             crate::callbacks::init(cb);
         });

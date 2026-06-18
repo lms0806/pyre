@@ -81,6 +81,13 @@ pub struct W_SRE_Match {
     pub w_srepat: PyObjectRef,
     /// interp_sre.py:682 `self.w_string`.
     pub w_string: PyObjectRef,
+    /// The buffer captured at match time for slicing — `self.ctx._buffer`
+    /// (interp_sre.py:61-64).  Upstream's match holds `self.ctx`, which keeps
+    /// the validated `BufMatchContext._buffer` so group slices never re-read
+    /// the original object.  Pyre keeps that buffer object (`memoryview`'s
+    /// backing `bytes`) here; `PY_NULL` when `w_string` is itself the subject
+    /// (a `str`/`bytes`/`bytearray`), where slicing reads `w_string` directly.
+    pub w_buffer: PyObjectRef,
     /// `ctx.original_pos` (fget_pos, interp_sre.py:851-852).
     pub pos: i64,
     /// `ctx.end` (fget_endpos, interp_sre.py:854-855).
@@ -98,6 +105,7 @@ pub struct W_SRE_Match {
 pub fn w_sre_match_new(
     w_srepat: PyObjectRef,
     w_string: PyObjectRef,
+    w_buffer: PyObjectRef,
     pos: i64,
     endpos: i64,
     lastindex: i64,
@@ -107,6 +115,7 @@ pub fn w_sre_match_new(
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_srepat);
     crate::gc_roots::pin_root(w_string);
+    crate::gc_roots::pin_root(w_buffer);
     W_SRE_Match::allocate(W_SRE_Match {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -114,6 +123,7 @@ pub fn w_sre_match_new(
         },
         w_srepat,
         w_string,
+        w_buffer,
         pos,
         endpos,
         lastindex,
@@ -164,6 +174,10 @@ pub struct W_SRE_Scanner {
     pub w_srepat: PyObjectRef,
     /// interp_sre.py:910 `self.w_string`.
     pub w_string: PyObjectRef,
+    /// The buffer captured at scanner creation — `self.ctx._buffer`.  Threaded
+    /// into each produced `W_SRE_Match` so the matches slice the same validated
+    /// buffer; `PY_NULL` for a `str`/`bytes`/`bytearray` subject.
+    pub w_buffer: PyObjectRef,
     /// Original search position (`ctx.original_pos`) exposed by each match.
     pub original_pos: i64,
     /// Character position of the next search (`ctx.match_start`); `-1` once
@@ -180,12 +194,14 @@ pub struct W_SRE_Scanner {
 pub fn w_sre_scanner_new(
     w_srepat: PyObjectRef,
     w_string: PyObjectRef,
+    w_buffer: PyObjectRef,
     pos: i64,
     endpos: i64,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_srepat);
     crate::gc_roots::pin_root(w_string);
+    crate::gc_roots::pin_root(w_buffer);
     W_SRE_Scanner::allocate(W_SRE_Scanner {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -193,6 +209,7 @@ pub fn w_sre_scanner_new(
         },
         w_srepat,
         w_string,
+        w_buffer,
         original_pos: pos,
         pos,
         endpos,

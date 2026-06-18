@@ -6267,6 +6267,18 @@ fn read_list_f(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (Vec<i64>,
 /// `2823-2925`) which already perform the same handshake; the wired
 /// `dispatch_table` handlers must do the same so the table path does not
 /// silently swallow exceptions raised by `cpu.bh_call_*`.
+///
+/// `next_pos` is the position of the opcode immediately following the
+/// residual call (the handler's normal return value).  The dispatch loop
+/// has not advanced `bh.position` past the call's operands yet, so the
+/// catch lookup must be primed at the post-call coordinate — the call's
+/// own post-call `-live-`/`catch_exception` sits there, exactly where
+/// RPython's already-advanced `self.position` points when `cpu.bh_call_*`
+/// raises (`blackhole.py:83-100` advances position before executing the
+/// instruction).  Leaving `bh.position` at the operand start makes
+/// `handle_exception_in_frame` scan backward past the pre-call `-live-`
+/// and miss the catch, so a value-guard deopt that re-executes a raising
+/// residual call (e.g. `int_floordiv` by zero) escapes its try-block.
 #[inline]
 fn check_residual_call_exception_after(
     bh: &mut BlackholeInterpreter,

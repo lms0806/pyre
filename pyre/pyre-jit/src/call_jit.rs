@@ -499,6 +499,29 @@ fn publish_residual_call_exception(exc_obj: i64) {
     majit_backend_dynasm::jit_exc_raise(exc_obj);
 }
 
+/// Drain the backend `_store_exception` cells (`jit_exc_clear`) without
+/// touching `BH_LAST_EXC_VALUE`.
+///
+/// `pyjitpl.py:2763 execute_raised` records a raise from a residual call
+/// into `metainterp.last_exc_value` only — the backend `_store_exception`
+/// cells (`llmodel.py:194` `_store_exception`) are written exclusively by
+/// compiled / blackhole execution, never by metainterp tracing.  Pyre's
+/// authoritative full-body walk shares the `bh_*` residual helpers with
+/// the blackhole, so a raising helper publishes to BOTH cells
+/// ([`publish_residual_call_exception`]).  The walker's `execute_raised`
+/// analogue (`jitcode_dispatch.rs` residual-executor Err arm) keeps the
+/// raise in `BH_LAST_EXC_VALUE` (= `last_exc_value`) but must drain the
+/// backend cells so the recording leaves them pristine; otherwise an
+/// aborted trace's snapshot-side raise leaks into the live frame's
+/// re-run, where compiled `GUARD_NO_EXCEPTION` reads it as a spurious
+/// pending exception.
+pub(crate) fn drain_backend_jit_exc() {
+    #[cfg(feature = "cranelift")]
+    majit_backend_cranelift::jit_exc_clear();
+    #[cfg(feature = "dynasm")]
+    majit_backend_dynasm::jit_exc_clear();
+}
+
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     #[cfg(feature = "cranelift")]
@@ -3930,14 +3953,6 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
 pub extern "C" fn bh_binary_op_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
     let lhs = lhs as PyObjectRef;
     let rhs = rhs as PyObjectRef;
-    if lhs.is_null() || rhs.is_null() {
-        let err = pyre_interpreter::PyError::new(
-            pyre_interpreter::PyErrorKind::TypeError,
-            "binary op on null operand".to_string(),
-        );
-        publish_residual_call_exception(err.to_exc_object() as i64);
-        return 0;
-    }
 
     // op_code is the compact tag from binary_op_tag (0-12), NOT the raw
     // BinaryOperator discriminant. Reverse the mapping to get the enum.

@@ -1111,8 +1111,13 @@ unsafe fn getitem_type(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             return get_and_call_function(method, obj, w_meta, &[index]);
         }
     }
-    // Python 3.9+ generic subscript: type[X] → __class_getitem__(X)
-    // typeobject.py type.__class_getitem__
+    // descroperation.py:362 — `type[X]` (the operand is exactly `type`) builds
+    // a GenericAlias even though `type` defines no `__class_getitem__`.
+    if std::ptr::eq(obj, crate::typedef::w_type()) {
+        return crate::genericalias::generic_alias_class_getitem(&[obj, index]);
+    }
+    // Python 3.9+ generic subscript: cls[X] → cls.__class_getitem__(X)
+    // (`descroperation.py:366` getattr lookup).
     if let Some(method) = lookup_in_type_where(obj, "__class_getitem__") {
         return get_and_call_function(method, obj, obj, &[index]);
     }
@@ -2793,12 +2798,13 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                 w_type,
                 obj,
                 name,
-                PyError::new(
-                    PyErrorKind::AttributeError,
+                PyError::attribute_error_with_context(
                     format!(
                         "'{}' object has no attribute '{name}'",
                         w_type_get_name(w_type)
                     ),
+                    obj,
+                    name,
                 ),
             );
         }
@@ -3227,10 +3233,13 @@ fn attr_error_wtf8(obj: PyObjectRef, name: &Wtf8) -> PyError {
         }
     };
     let name_repr = crate::display::format_wtf8_repr(name);
-    PyError::new(
+    let mut err = PyError::new(
         PyErrorKind::AttributeError,
         format!("'{tp_name}' object has no attribute {name_repr}"),
-    )
+    );
+    err.w_name_context = pyre_object::w_str_from_wtf8(name.to_wtf8_buf());
+    err.w_obj_context = obj;
+    err
 }
 
 /// `object.__getattribute__` terminal — the default descriptor protocol
@@ -3275,12 +3284,13 @@ pub fn object_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
             }
             // descroperation.py:88 — object.__getattribute__ raises
             // AttributeError on miss. __getattr__ is space.getattr's job.
-            return Err(PyError::new(
-                PyErrorKind::AttributeError,
+            return Err(PyError::attribute_error_with_context(
                 format!(
                     "'{}' object has no attribute '{name}'",
                     w_type_get_name(w_type),
                 ),
+                obj,
+                name,
             ));
         }
     }
@@ -3600,17 +3610,18 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             // descroperation.py:243-252 _handle_getattribute: on the terminal
             // miss, consult `__getattr__` on the metaclass (gated off for the
             // bare object.__getattribute__ slot by `call_getattr`); otherwise
-            // raise.
+            // raise. The terminal AttributeError carries the obj/name context.
             return type_getattr_hook_or_err(
                 obj,
                 &w_metaclasses,
                 name,
-                PyError::new(
-                    PyErrorKind::AttributeError,
+                PyError::attribute_error_with_context(
                     format!(
                         "type object '{}' has no attribute '{name}'",
                         w_type_get_name(obj)
                     ),
+                    obj,
+                    name,
                 ),
                 call_getattr,
             );
@@ -4036,6 +4047,63 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                     return Ok(w_none());
                 }
             }
+            // `interp_exceptions.py:409-411 W_ImportError` exposes
+            // `msg` / `path` / `name_from` as `readwrite_attrproperty_w`
+            // slots stamped by `descr_init` from the keyword/positional
+            // arguments, with class default `None` (`:360`).  Each is a
+            // plain slot read: an instance allocated via `__new__` (which
+            // never touches the slot) reads `None`.  Gated on the
+            // ImportError kind (which also tags ModuleNotFoundError).
+            // `name` is handled by the shared arm below since NameError /
+            // AttributeError expose it too.
+            "msg" | "path" | "name_from" => {
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if kind == pyre_object::excobject::ExcKind::ImportError {
+                    let stored = unsafe {
+                        match name {
+                            "msg" => pyre_object::excobject::w_exception_get_import_msg(obj),
+                            "path" => pyre_object::excobject::w_exception_get_import_path(obj),
+                            _ => pyre_object::excobject::w_exception_get_import_name_from(obj),
+                        }
+                    };
+                    if !stored.is_null() {
+                        return Ok(stored);
+                    }
+                    return Ok(w_none());
+                }
+            }
+            // Shared `name` attribute for the kinds that expose it —
+            // `W_ImportError`, `W_NameError`, and `W_AttributeError`
+            // (Python 3.10+).  Read from the shared `w_exc_name` slot
+            // (default `None`); falls through to normal attribute lookup
+            // on every other exception kind.
+            "name" => {
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if matches!(
+                    kind,
+                    pyre_object::excobject::ExcKind::ImportError
+                        | pyre_object::excobject::ExcKind::NameError
+                        | pyre_object::excobject::ExcKind::AttributeError
+                ) {
+                    let stored = unsafe { pyre_object::excobject::w_exception_get_name(obj) };
+                    if !stored.is_null() {
+                        return Ok(stored);
+                    }
+                    return Ok(w_none());
+                }
+            }
+            // `W_AttributeError.obj` (Python 3.10+) — the object whose
+            // attribute lookup failed; default `None`.
+            "obj" => {
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if kind == pyre_object::excobject::ExcKind::AttributeError {
+                    let stored = unsafe { pyre_object::excobject::w_exception_get_attr_obj(obj) };
+                    if !stored.is_null() {
+                        return Ok(stored);
+                    }
+                    return Ok(w_none());
+                }
+            }
             // `interp_exceptions.py:468-471`
             // `readwrite_attrproperty_w('w_object', W_UnicodeTranslateError)`
             // (and `:1081-1083` / `:1201-1203` for Decode / Encode).
@@ -4192,9 +4260,10 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
         } else {
             (*(*obj).ob_type).name
         };
-        Err(PyError::new(
-            PyErrorKind::AttributeError,
+        Err(PyError::attribute_error_with_context(
             format!("'{tp_name}' object has no attribute '{name}'"),
+            obj,
+            name,
         ))
     }
 }
@@ -6194,6 +6263,50 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                     return Ok(w_none());
                 }
             }
+            // `interp_exceptions.py:679-681 W_ImportError` writable
+            // `msg` / `name` / `path` (plus `name_from`) slots; the
+            // matching getattr arm reads them back.  Gated on the
+            // ImportError kind (covers ModuleNotFoundError).  `name` is
+            // handled by the shared arm below.
+            "msg" | "path" | "name_from" => {
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if kind == pyre_object::excobject::ExcKind::ImportError {
+                    unsafe {
+                        match name {
+                            "msg" => pyre_object::excobject::w_exception_set_import_msg(obj, value),
+                            "path" => {
+                                pyre_object::excobject::w_exception_set_import_path(obj, value)
+                            }
+                            _ => {
+                                pyre_object::excobject::w_exception_set_import_name_from(obj, value)
+                            }
+                        }
+                    };
+                    return Ok(w_none());
+                }
+            }
+            // Shared writable `name` slot for ImportError / NameError /
+            // AttributeError; the matching getattr arm reads it back.
+            "name" => {
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if matches!(
+                    kind,
+                    pyre_object::excobject::ExcKind::ImportError
+                        | pyre_object::excobject::ExcKind::NameError
+                        | pyre_object::excobject::ExcKind::AttributeError
+                ) {
+                    unsafe { pyre_object::excobject::w_exception_set_name(obj, value) };
+                    return Ok(w_none());
+                }
+            }
+            // Writable `obj` slot (W_AttributeError).
+            "obj" => {
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if kind == pyre_object::excobject::ExcKind::AttributeError {
+                    unsafe { pyre_object::excobject::w_exception_set_attr_obj(obj, value) };
+                    return Ok(w_none());
+                }
+            }
             _ => {}
         }
     }
@@ -6277,9 +6390,10 @@ fn raiseattrerror(obj: PyObjectRef, name: &str) -> PyError {
             format!("'{}' object", tp_name)
         }
     };
-    PyError::new(
-        PyErrorKind::AttributeError,
+    PyError::attribute_error_with_context(
         format!("{} has no attribute '{}'", subject, name),
+        obj,
+        name,
     )
 }
 
@@ -7934,6 +8048,13 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if is_tuple(obj) {
             return Ok(pyre_object::w_seq_iter_new(obj, w_tuple_len(obj)));
         }
+        if pyre_object::is_generic_alias(obj) {
+            // GenericAlias.__iter__ (`_pypy_generic_alias.py:108`) — `yield
+            // _make_starred(self)`, a one-shot iterator over the starred copy.
+            let starred = crate::genericalias::make_starred(obj)?;
+            let list = w_list_new(vec![starred]);
+            return Ok(pyre_object::w_seq_iter_new(list, 1));
+        }
         if is_str(obj) {
             // Code-point count (not byte count) seeds the sequence
             // iterator, read straight from the cached length so a
@@ -8149,13 +8270,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 iter.index += 1;
                 return Ok(v);
             }
-            return Err(PyError {
-                kind: PyErrorKind::StopIteration,
-                message: "".to_string(),
-                exc_object: std::ptr::null_mut(),
-                attach_tb: true,
-                reraise_lasti: -1,
-            });
+            return Err(PyError::stop_iteration());
         }
         // Range iterator
         if is_range_iter(obj) {
@@ -8172,26 +8287,14 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 iter.current += iter.step;
                 return Ok(val);
             }
-            return Err(PyError {
-                kind: PyErrorKind::StopIteration,
-                message: "".to_string(),
-                exc_object: std::ptr::null_mut(),
-                attach_tb: true,
-                reraise_lasti: -1,
-            });
+            return Err(PyError::stop_iteration());
         }
         // `iterobject.py W_LongRangeIterator.descr_next` — bignum-bound
         // range cursor (`start + index*step`).
         if pyre_object::is_long_range_iter(obj) {
             return match pyre_object::w_long_range_iter_next(obj) {
                 Some(v) => Ok(v),
-                None => Err(PyError {
-                    kind: PyErrorKind::StopIteration,
-                    message: "".to_string(),
-                    exc_object: std::ptr::null_mut(),
-                    attach_tb: true,
-                    reraise_lasti: -1,
-                }),
+                None => Err(PyError::stop_iteration()),
             };
         }
         // Generator __next__ — PyPy: generator.py GeneratorIterator.next
@@ -8841,13 +8944,7 @@ fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
             return Ok(w_none());
         }
     }
-    let err = PyError {
-        kind: PyErrorKind::GeneratorExit,
-        message: String::new(),
-        exc_object: std::ptr::null_mut(),
-        attach_tb: true,
-        reraise_lasti: -1,
-    };
+    let err = PyError::new(PyErrorKind::GeneratorExit, String::new());
     match generator_send_ex(gen_obj, w_none(), Some(err)) {
         Ok(_) => {
             // Generator yielded after GeneratorExit — RuntimeError
@@ -8886,13 +8983,7 @@ fn normalize_throw_args(w_type: PyObjectRef, w_val: PyObjectRef) -> PyError {
                 } else {
                     String::new()
                 };
-                return PyError {
-                    kind: PyError::kind_from_exc(kind),
-                    message: msg,
-                    exc_object: std::ptr::null_mut(),
-                    attach_tb: true,
-                    reraise_lasti: -1,
-                };
+                return PyError::new(PyError::kind_from_exc(kind), msg);
             }
         }
 

@@ -998,12 +998,8 @@ pub fn dict_storage_get(namespace: &DictStorage, name: &str) -> Option<PyObjectR
 }
 
 pub fn dict_storage_load(namespace: &DictStorage, name: &str) -> Result<PyObjectRef, PyError> {
-    dict_storage_get(namespace, name).ok_or_else(|| {
-        PyError::new(
-            PyErrorKind::NameError,
-            format!("name '{name}' is not defined"),
-        )
-    })
+    dict_storage_get(namespace, name)
+        .ok_or_else(|| PyError::name_error_with_name(format!("name '{name}' is not defined"), name))
 }
 
 pub fn dict_storage_store(namespace: &mut DictStorage, name: &str, value: PyObjectRef) {

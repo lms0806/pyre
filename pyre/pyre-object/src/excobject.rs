@@ -307,6 +307,32 @@ pub struct W_ExceptionObject {
     /// argument, the args tuple for several) when the slot is unset, and
     /// a later `e.code = x` write persists here ahead of that fallback.
     pub w_code: PyObjectRef,
+    /// Shared `w_name` slot for the exception kinds that expose a
+    /// `name` attribute: `W_ImportError.w_name`
+    /// (`interp_exceptions.py:643`, `:680
+    /// readwrite_attrproperty_w('w_name', W_ImportError)`),
+    /// `W_NameError.w_name` and `W_AttributeError.w_name` (Python
+    /// 3.10+).  An exception is exactly one kind, so a single slot
+    /// serves all three.  `PY_NULL` is the class default `None`; set
+    /// from the `name=` keyword by `descr_init` and writable via
+    /// `e.name = ...`.
+    pub w_exc_name: PyObjectRef,
+    /// `W_AttributeError.w_obj` — the object whose attribute lookup
+    /// failed, set from the `obj=` keyword (Python 3.10+), default
+    /// `None`.
+    pub w_attr_obj: PyObjectRef,
+    /// `interp_exceptions.py:644 W_ImportError.w_path` /
+    /// `:681 readwrite_attrproperty_w('w_path', W_ImportError)`, set
+    /// from the `path=` keyword.
+    pub w_import_path: PyObjectRef,
+    /// `W_ImportError.w_name_from` — set from the `name_from=` keyword,
+    /// exposed as the `name_from` attribute (default `None`).
+    pub w_import_name_from: PyObjectRef,
+    /// `interp_exceptions.py:409-411 W_ImportError.w_msg` /
+    /// `readwrite_attrproperty_w('w_msg', W_ImportError)`.  Set to the
+    /// single positional argument by `descr_init`; read back by the `msg`
+    /// attrproperty; class default `None`.
+    pub w_import_msg: PyObjectRef,
     /// `interp_exceptions.py:113 W_BaseException.w_dict = None` — the
     /// per-instance attribute dict, lazily allocated by `getdict`
     /// (`:222-225`) and replaced wholesale by `setdict` (`:227-231`).
@@ -330,6 +356,12 @@ pub const EXC_W_STRERROR_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject,
 pub const EXC_W_FILENAME_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_filename);
 pub const EXC_W_FILENAME2_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_filename2);
 pub const EXC_W_CODE_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_code);
+pub const EXC_W_NAME_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_exc_name);
+pub const EXC_W_ATTR_OBJ_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_attr_obj);
+pub const EXC_W_IMPORT_PATH_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_import_path);
+pub const EXC_W_IMPORT_NAME_FROM_OFFSET: usize =
+    std::mem::offset_of!(W_ExceptionObject, w_import_name_from);
+pub const EXC_W_IMPORT_MSG_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_import_msg);
 pub const EXC_W_DICT_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_dict);
 
 /// GC trace offsets for `W_ExceptionObject` — `args_w` plus the three
@@ -340,11 +372,15 @@ pub const EXC_W_DICT_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_d
 /// W_UnicodeTranslateError / W_UnicodeDecodeError / W_UnicodeEncodeError
 /// subclasses, plus the four W_OSError per-class slots (w_errno /
 /// w_strerror / w_filename / w_filename2), plus the W_SystemExit
-/// `w_code` slot, plus the lazily-allocated `w_dict`
+/// `w_code` slot, plus the shared `w_exc_name` slot (ImportError /
+/// NameError / AttributeError) and the W_AttributeError `w_attr_obj`
+/// slot, plus the three remaining W_ImportError per-class slots
+/// (w_import_path / w_import_name_from / w_import_msg), plus the
+/// lazily-allocated `w_dict`
 /// (interp_exceptions.py:113/222-231).  `kind` is a `u8` tag, `message`
 /// is a `*mut String` (raw heap), and `suppress_context` is a bool —
 /// none of those are GC-traced.
-pub const W_EXCEPTION_GC_PTR_OFFSETS: [usize; 15] = [
+pub const W_EXCEPTION_GC_PTR_OFFSETS: [usize; 20] = [
     EXC_ARGS_W_OFFSET,
     EXC_W_CAUSE_OFFSET,
     EXC_W_CONTEXT_OFFSET,
@@ -359,6 +395,11 @@ pub const W_EXCEPTION_GC_PTR_OFFSETS: [usize; 15] = [
     EXC_W_FILENAME_OFFSET,
     EXC_W_FILENAME2_OFFSET,
     EXC_W_CODE_OFFSET,
+    EXC_W_NAME_OFFSET,
+    EXC_W_ATTR_OBJ_OFFSET,
+    EXC_W_IMPORT_PATH_OFFSET,
+    EXC_W_IMPORT_NAME_FROM_OFFSET,
+    EXC_W_IMPORT_MSG_OFFSET,
     EXC_W_DICT_OFFSET,
 ];
 
@@ -466,6 +507,15 @@ pub fn w_exception_new_empty(kind: ExcKind) -> PyObjectRef {
         // `interp_exceptions.py:990` W_SystemExit class default
         // `w_code = None`.
         w_code: PY_NULL,
+        // Shared `name` slot (ImportError / NameError / AttributeError)
+        // + W_AttributeError `obj`; class default `None`.
+        w_exc_name: PY_NULL,
+        w_attr_obj: PY_NULL,
+        // `interp_exceptions.py:642-644` W_ImportError class defaults
+        // `w_msg = w_path = None` (plus `w_name_from`).
+        w_import_path: PY_NULL,
+        w_import_name_from: PY_NULL,
+        w_import_msg: PY_NULL,
         // `interp_exceptions.py:113 w_dict = None` — allocated on the
         // first `getdict` (`:222-225`).
         w_dict: PY_NULL,
@@ -700,6 +750,17 @@ pub unsafe fn w_exception_getdict(obj: PyObjectRef) -> PyObjectRef {
         }
         (*exc).w_dict
     }
+}
+
+/// `descr_reduce` reads `self.w_dict` WITHOUT allocating it — returns the
+/// raw slot (`PY_NULL` when unset), so a `__reduce__` over an attribute-less
+/// exception does not leave behind a fresh empty instance dict.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_peek_dict(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_ExceptionObject)).w_dict }
 }
 
 /// `interp_exceptions.py:227-231 setdict` parity — writes the `w_dict`
@@ -989,6 +1050,116 @@ pub unsafe fn w_exception_get_code(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_set_code(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_ExceptionObject)).w_code = value;
+        exception_write_barrier(obj);
+    }
+}
+
+/// Shared `e.name` reader for ImportError / NameError / AttributeError
+/// (`readwrite_attrproperty_w('w_name', ...)`).
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_get_name(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_ExceptionObject)).w_exc_name }
+}
+
+/// Shared `e.name = ...` writer for ImportError / NameError /
+/// AttributeError.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_set_name(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_ExceptionObject)).w_exc_name = value;
+        exception_write_barrier(obj);
+    }
+}
+
+/// `e.obj` reader (W_AttributeError).
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_get_attr_obj(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_ExceptionObject)).w_attr_obj }
+}
+
+/// `e.obj = ...` writer (W_AttributeError).
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_set_attr_obj(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_ExceptionObject)).w_attr_obj = value;
+        exception_write_barrier(obj);
+    }
+}
+
+/// `interp_exceptions.py:681 readwrite_attrproperty_w('w_path', ...)`
+/// — `e.path` reader (W_ImportError).
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_get_import_path(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_ExceptionObject)).w_import_path }
+}
+
+/// `e.path = ...` writer (W_ImportError).
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_set_import_path(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_ExceptionObject)).w_import_path = value;
+        exception_write_barrier(obj);
+    }
+}
+
+/// `e.name_from` reader (W_ImportError).
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_get_import_name_from(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_ExceptionObject)).w_import_name_from }
+}
+
+/// `e.name_from = ...` writer (W_ImportError).
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_set_import_name_from(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_ExceptionObject)).w_import_name_from = value;
+        exception_write_barrier(obj);
+    }
+}
+
+/// `interp_exceptions.py:679 readwrite_attrproperty_w('w_msg', ...)`
+/// — `e.msg` reader (W_ImportError).  `PY_NULL` means the slot was never
+/// written (the `msg` getattr arm then derives the value from `args_w`).
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_get_import_msg(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_ExceptionObject)).w_import_msg }
+}
+
+/// `e.msg = ...` writer (W_ImportError).
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_set_import_msg(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_ExceptionObject)).w_import_msg = value;
         exception_write_barrier(obj);
     }
 }

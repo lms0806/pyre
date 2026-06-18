@@ -402,10 +402,19 @@ fn run_perfn_walk(
         return None;
     };
     let Some(entry) = pjc.resume_jitcode_pc_for(start_pc) else {
-        eprintln!(
-            "[walk-perfn] no jitcode entry for start_pc={start_pc} (pc_map_len={})",
-            pjc.metadata.pc_map.len()
-        );
+        // The frozen pc_map of this already-built body does not encode
+        // `start_pc` as a resume coordinate, so the same body walked from
+        // the same entry recurs identically on every retrace.  Decline the
+        // key (route its retraces to the trait tracer via FBW_DECLINED_KEYS)
+        // instead of re-walking and re-aborting each iteration; mirrors the
+        // `built_as_portal=false` structural decline below.
+        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!(
+                "[walk-perfn] no jitcode entry for start_pc={start_pc} (pc_map_len={}); declining walk",
+                pjc.metadata.pc_map.len()
+            );
+        }
+        fbw_decline(crate::driver::make_green_key(w_code, start_pc));
         return None;
     };
     // The full-body walk drives a PORTAL trace, so the body must carry
@@ -784,12 +793,37 @@ fn run_perfn_walk(
         }
     }
 
+    // No-replay portal exit for a loop-free function trace: a `Terminate`
+    // walk whose top-level `*_return` captured a concrete result hands that
+    // result to the portal directly (`eval.rs` consumes the stash) instead
+    // of re-running the freshly compiled trace for the SAME invocation —
+    // the walk already executed every residual call concretely, consuming
+    // any side-effecting callee (e.g. a tokenizer's `get`), so a re-run
+    // would re-read the mutated heap and deopt.  Declined when an
+    // unjournaled effect (a symbolically recorded residual only the legacy
+    // replay applies) is present: drop the capture so the portal degrades
+    // to `ContinueRunningNormally`.  This shares its predicate with the
+    // store-journal commit below so the two decisions never disagree.
+    let terminate_no_replay = crate::jitcode_dispatch::fbw_no_replay_exit_enabled()
+        && matches!(
+            &walk_result,
+            Ok((crate::jitcode_dispatch::DispatchOutcome::Terminate, _))
+        )
+        && crate::jitcode_dispatch::fbw_finish_concrete_peek().is_some()
+        && !crate::jitcode_dispatch::fbw_has_unjournaled_effect();
+    if !terminate_no_replay {
+        crate::jitcode_dispatch::fbw_finish_concrete_reset();
+    }
+
     // Store-journal epilogue, on EVERY walk exit (commit, declined
     // commit, walk error): a committed walk keeps its eagerly executed
     // list stores (drop the undo log); any other exit returns control to
     // a replay-from-start path, which re-executes the walked region and
-    // must find the pre-walk heap — roll the stores back.
-    if WALK_END_FLUSH_COMMITTED.with(|c| c.get()) {
+    // must find the pre-walk heap — roll the stores back.  A
+    // `terminate_no_replay` exit also keeps the stores: the portal returns
+    // the walk's result without replaying, exactly like the loop-flush
+    // commit.
+    if WALK_END_FLUSH_COMMITTED.with(|c| c.get()) || terminate_no_replay {
         crate::jitcode_dispatch::fbw_store_journal_commit();
     } else {
         crate::jitcode_dispatch::fbw_store_journal_rollback();

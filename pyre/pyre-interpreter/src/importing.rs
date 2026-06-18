@@ -509,6 +509,30 @@ pub unsafe fn walk_module_dicts_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     });
 }
 
+/// Forward the `sys.modules` dict pointer cached in `SYS_MODULES_DICT`.
+///
+/// The same dict object is also reachable as `sys.__dict__["modules"]`
+/// (forwarded by [`walk_module_dicts_gc`]), but this fast-path cell holds an
+/// independent raw copy.  `w_dict_new` allocates the dict in the movable
+/// nursery, so a collection relocates it and leaves this cell pointing at the
+/// vacated (reclaimed) slot; the next `check_sys_modules` would then run
+/// `w_dict_lookup` against dead memory.  Forward the cell in place so it
+/// tracks the relocation, mirroring the EC-slot forwarding in
+/// `eval::walk_pyframe_roots`.
+///
+/// # Safety
+/// `visitor` must tolerate a non-nursery or already-forwarded pointer.
+pub unsafe fn walk_sys_modules_dict_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+    SYS_MODULES_DICT.with(|d| {
+        let mut dict = d.get();
+        if dict.is_null() {
+            return;
+        }
+        visitor(&mut dict);
+        d.set(dict);
+    });
+}
+
 /// Set the Python-visible sys.modules dict reference. Called during sys
 /// module initialization so subsequent set_sys_module calls keep it in sync.
 /// Also copies all previously cached modules into the dict.
@@ -940,12 +964,11 @@ fn load_part(
         let m = if modulename == "builtins" && !execution_context.is_null() {
             unsafe { (*execution_context).get_builtin() }
         } else {
-            load_builtin_module(modulename).ok_or_else(|| crate::PyError {
-                kind: crate::PyErrorKind::ImportError,
-                message: format!("builtin module '{modulename}' failed to initialize"),
-                exc_object: std::ptr::null_mut(),
-                attach_tb: true,
-                reraise_lasti: -1,
+            load_builtin_module(modulename).ok_or_else(|| {
+                crate::PyError::new(
+                    crate::PyErrorKind::ImportError,
+                    format!("builtin module '{modulename}' failed to initialize"),
+                )
             })?
         };
         set_sys_module(modulename, m);
@@ -977,12 +1000,11 @@ fn load_part(
             let m = if partname == "builtins" && !execution_context.is_null() {
                 unsafe { (*execution_context).get_builtin() }
             } else {
-                load_builtin_module(partname).ok_or_else(|| crate::PyError {
-                    kind: crate::PyErrorKind::ImportError,
-                    message: format!("builtin module '{modulename}' failed to initialize"),
-                    exc_object: std::ptr::null_mut(),
-                    attach_tb: true,
-                    reraise_lasti: -1,
+                load_builtin_module(partname).ok_or_else(|| {
+                    crate::PyError::new(
+                        crate::PyErrorKind::ImportError,
+                        format!("builtin module '{modulename}' failed to initialize"),
+                    )
                 })?
             };
             // Store builtin modules in cache immediately
@@ -1100,12 +1122,11 @@ fn relative_import(
 ) -> Result<PyObjectRef, crate::PyError> {
     // Get the package name from the calling module's globals.
     // PyPy: pkgname = globals.get('__package__') or globals.get('__name__')
-    let package = resolve_package_name(w_globals)?.ok_or_else(|| crate::PyError {
-        kind: crate::PyErrorKind::ImportError,
-        message: "attempted relative import with no known parent package".to_string(),
-        exc_object: std::ptr::null_mut(),
-        attach_tb: true,
-        reraise_lasti: -1,
+    let package = resolve_package_name(w_globals)?.ok_or_else(|| {
+        crate::PyError::new(
+            crate::PyErrorKind::ImportError,
+            "attempted relative import with no known parent package",
+        )
     })?;
 
     // Strip (level - 1) trailing components from package
@@ -1113,15 +1134,12 @@ fn relative_import(
     let mut parts: Vec<&str> = package.split('.').collect();
     let strips = (level - 1) as usize;
     if strips >= parts.len() {
-        return Err(crate::PyError {
-            kind: crate::PyErrorKind::ImportError,
-            message: format!(
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::ImportError,
+            format!(
                 "attempted relative import beyond top-level package (package='{package}', level={level})"
             ),
-            exc_object: std::ptr::null_mut(),
-            attach_tb: true,
-            reraise_lasti: -1,
-        });
+        ));
     }
     for _ in 0..strips {
         parts.pop();

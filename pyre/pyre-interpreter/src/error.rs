@@ -276,6 +276,8 @@ impl From<OperationError> for PyError {
             exc_object: value.w_value,
             attach_tb: true,
             reraise_lasti: -1,
+            w_name_context: std::ptr::null_mut(),
+            w_obj_context: std::ptr::null_mut(),
         }
     }
 }
@@ -318,6 +320,19 @@ pub struct PyError {
     /// restore `last_instr` for correct `f_lineno`.  `-1` means "no
     /// reraise lasti carried" (default for primary raises).
     pub reraise_lasti: i32,
+    /// The `name` context attribute for a freshly raised NameError or
+    /// AttributeError (Python 3.10+): the undefined name (NameError) or
+    /// the failed attribute name (AttributeError).  Exception
+    /// materialisation is deferred to `to_exc_object`, so the raise site
+    /// records the context here (`PY_NULL` = unset) and `to_exc_object`
+    /// stamps it onto the built instance — the lazy equivalent of
+    /// setting `exc.name` right after the raise
+    /// (`_PyEval_FormatExcCheckArg` / `set_attribute_error_context`).
+    pub w_name_context: PyObjectRef,
+    /// The `obj` context attribute for a freshly raised AttributeError
+    /// (Python 3.10+): the object whose attribute lookup failed.
+    /// Carried and applied alongside `w_name_context`; `PY_NULL` = unset.
+    pub w_obj_context: PyObjectRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -415,97 +430,72 @@ impl PyError {
             exc_object: std::ptr::null_mut(),
             attach_tb: true,
             reraise_lasti: -1,
+            w_name_context: std::ptr::null_mut(),
+            w_obj_context: std::ptr::null_mut(),
         }
     }
 
     pub fn type_error(msg: impl Into<String>) -> Self {
-        PyError {
-            kind: PyErrorKind::TypeError,
-            message: msg.into(),
-            exc_object: std::ptr::null_mut(),
-            attach_tb: true,
-            reraise_lasti: -1,
-        }
+        Self::new(PyErrorKind::TypeError, msg)
     }
 
     pub fn attribute_error(msg: impl Into<String>) -> Self {
-        PyError {
-            kind: PyErrorKind::AttributeError,
-            message: msg.into(),
-            exc_object: std::ptr::null_mut(),
-            attach_tb: true,
-            reraise_lasti: -1,
-        }
+        Self::new(PyErrorKind::AttributeError, msg)
+    }
+
+    /// `set_attribute_error_context` parity — an AttributeError raised by
+    /// a failed attribute lookup, carrying the failed attribute `name`
+    /// and the `obj` it was looked up on so `e.name` / `e.obj` read back
+    /// once the instance is materialised (Python 3.10+).
+    pub fn attribute_error_with_context(
+        msg: impl Into<String>,
+        w_obj: PyObjectRef,
+        name: &str,
+    ) -> Self {
+        let mut err = Self::new(PyErrorKind::AttributeError, msg);
+        err.w_name_context = pyre_object::w_str_new(name);
+        err.w_obj_context = w_obj;
+        err
     }
 
     pub fn value_error(msg: impl Into<String>) -> Self {
-        PyError {
-            kind: PyErrorKind::ValueError,
-            message: msg.into(),
-            exc_object: std::ptr::null_mut(),
-            attach_tb: true,
-            reraise_lasti: -1,
-        }
+        Self::new(PyErrorKind::ValueError, msg)
     }
 
     pub fn zero_division(msg: impl Into<String>) -> Self {
-        PyError {
-            kind: PyErrorKind::ZeroDivisionError,
-            message: msg.into(),
-            exc_object: std::ptr::null_mut(),
-            attach_tb: true,
-            reraise_lasti: -1,
-        }
+        Self::new(PyErrorKind::ZeroDivisionError, msg)
     }
 
     pub fn overflow_error(msg: impl Into<String>) -> Self {
-        PyError {
-            kind: PyErrorKind::OverflowError,
-            message: msg.into(),
-            exc_object: std::ptr::null_mut(),
-            attach_tb: true,
-            reraise_lasti: -1,
-        }
+        Self::new(PyErrorKind::OverflowError, msg)
     }
 
     pub fn runtime_error(msg: impl Into<String>) -> Self {
-        PyError {
-            kind: PyErrorKind::RuntimeError,
-            message: msg.into(),
-            exc_object: std::ptr::null_mut(),
-            attach_tb: true,
-            reraise_lasti: -1,
-        }
+        Self::new(PyErrorKind::RuntimeError, msg)
     }
 
     pub fn not_implemented(msg: impl Into<String>) -> Self {
-        PyError {
-            kind: PyErrorKind::NotImplementedError,
-            message: msg.into(),
-            exc_object: std::ptr::null_mut(),
-            attach_tb: true,
-            reraise_lasti: -1,
-        }
+        Self::new(PyErrorKind::NotImplementedError, msg)
+    }
+
+    /// `_PyEval_FormatExcCheckArg` parity — a NameError (or
+    /// UnboundLocalError, which pyre maps to NameError) carrying the
+    /// undefined `name` so `e.name` reads back once the instance is
+    /// materialised (Python 3.10+).
+    pub fn name_error_with_name(msg: impl Into<String>, name: &str) -> Self {
+        let mut err = Self::new(PyErrorKind::NameError, msg);
+        err.w_name_context = pyre_object::w_str_new(name);
+        err
     }
 
     pub fn internal_trace_abort(reason: impl Into<String>) -> Self {
-        PyError {
-            kind: PyErrorKind::TraceAbort,
-            message: reason.into(),
-            exc_object: std::ptr::null_mut(),
-            attach_tb: false,
-            reraise_lasti: -1,
-        }
+        let mut err = Self::new(PyErrorKind::TraceAbort, reason);
+        err.attach_tb = false;
+        err
     }
 
     pub fn key_error(msg: impl Into<String>) -> Self {
-        PyError {
-            kind: PyErrorKind::KeyError,
-            message: msg.into(),
-            exc_object: std::ptr::null_mut(),
-            attach_tb: true,
-            reraise_lasti: -1,
-        }
+        Self::new(PyErrorKind::KeyError, msg)
     }
 
     /// `baseobjspace.py:1284 raise_key_error(w_key)` parity — builds
@@ -531,37 +521,21 @@ impl PyError {
             exc_object: exc,
             attach_tb: true,
             reraise_lasti: -1,
+            w_name_context: std::ptr::null_mut(),
+            w_obj_context: std::ptr::null_mut(),
         }
     }
 
     pub fn index_error(msg: impl Into<String>) -> Self {
-        PyError {
-            kind: PyErrorKind::IndexError,
-            message: msg.into(),
-            exc_object: std::ptr::null_mut(),
-            attach_tb: true,
-            reraise_lasti: -1,
-        }
+        Self::new(PyErrorKind::IndexError, msg)
     }
 
     pub fn lookup_error(msg: impl Into<String>) -> Self {
-        PyError {
-            kind: PyErrorKind::LookupError,
-            message: msg.into(),
-            exc_object: std::ptr::null_mut(),
-            attach_tb: true,
-            reraise_lasti: -1,
-        }
+        Self::new(PyErrorKind::LookupError, msg)
     }
 
     pub fn os_error(msg: impl Into<String>) -> Self {
-        PyError {
-            kind: PyErrorKind::OSError,
-            message: msg.into(),
-            exc_object: std::ptr::null_mut(),
-            attach_tb: true,
-            reraise_lasti: -1,
-        }
+        Self::new(PyErrorKind::OSError, msg)
     }
 
     /// Raise an OSError (or FileNotFoundError when errno is ENOENT) with
@@ -572,13 +546,7 @@ impl PyError {
         } else {
             PyErrorKind::OSError
         };
-        PyError {
-            kind,
-            message: msg.into(),
-            exc_object: std::ptr::null_mut(),
-            attach_tb: true,
-            reraise_lasti: -1,
-        }
+        Self::new(kind, msg)
     }
 
     /// Raise an OSError carrying the C-level `(errno, strerror)` pair,
@@ -611,29 +579,19 @@ impl PyError {
             exc_object: exc,
             attach_tb: true,
             reraise_lasti: -1,
+            w_name_context: std::ptr::null_mut(),
+            w_obj_context: std::ptr::null_mut(),
         }
     }
 
     /// pypy/module/_weakref/interp__weakref.py:347 — raised by `force()`
     /// when the referent of a proxy is no longer alive.
     pub fn reference_error(msg: impl Into<String>) -> Self {
-        PyError {
-            kind: PyErrorKind::ReferenceError,
-            message: msg.into(),
-            exc_object: std::ptr::null_mut(),
-            attach_tb: true,
-            reraise_lasti: -1,
-        }
+        Self::new(PyErrorKind::ReferenceError, msg)
     }
 
     pub fn recursion_error(msg: impl Into<String>) -> Self {
-        PyError {
-            kind: PyErrorKind::RecursionError,
-            message: msg.into(),
-            exc_object: std::ptr::null_mut(),
-            attach_tb: true,
-            reraise_lasti: -1,
-        }
+        Self::new(PyErrorKind::RecursionError, msg)
     }
 
     /// rpython/jit/metainterp/compile.py:1090 `memory_error = MemoryError()`
@@ -641,23 +599,11 @@ impl PyError {
     /// `PropagateExceptionDescr.handle_fail` when a malloc helper
     /// returns NULL.
     pub fn memory_error(msg: impl Into<String>) -> Self {
-        PyError {
-            kind: PyErrorKind::MemoryError,
-            message: msg.into(),
-            exc_object: std::ptr::null_mut(),
-            attach_tb: true,
-            reraise_lasti: -1,
-        }
+        Self::new(PyErrorKind::MemoryError, msg)
     }
 
     pub fn stop_iteration() -> Self {
-        PyError {
-            kind: PyErrorKind::StopIteration,
-            message: String::new(),
-            exc_object: std::ptr::null_mut(),
-            attach_tb: true,
-            reraise_lasti: -1,
-        }
+        Self::new(PyErrorKind::StopIteration, String::new())
     }
 
     /// Convert to a W_ExceptionObject for pushing onto the value stack.
@@ -681,6 +627,16 @@ impl PyError {
             let msg = pyre_object::w_str_new(&self.message);
             let args_list = pyre_object::w_list_new(vec![msg]);
             unsafe { pyre_object::excobject::w_exception_set_args(exc, args_list) };
+        }
+        // Stamp the deferred `name` / `obj` context onto the freshly
+        // materialised NameError / AttributeError instance, the lazy
+        // equivalent of `_PyEval_FormatExcCheckArg` /
+        // `set_attribute_error_context` (Python 3.10+).
+        if !self.w_name_context.is_null() {
+            unsafe { pyre_object::excobject::w_exception_set_name(exc, self.w_name_context) };
+        }
+        if !self.w_obj_context.is_null() {
+            unsafe { pyre_object::excobject::w_exception_set_attr_obj(exc, self.w_obj_context) };
         }
         exc
     }
@@ -745,6 +701,8 @@ impl PyError {
                 exc_object: obj,
                 attach_tb: true,
                 reraise_lasti: -1,
+                w_name_context: std::ptr::null_mut(),
+                w_obj_context: std::ptr::null_mut(),
             }
         }
     }

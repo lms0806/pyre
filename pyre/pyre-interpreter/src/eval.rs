@@ -556,6 +556,12 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                 walk_raw_getset_roots(*slot, visitor);
             };
             crate::importing::walk_module_dicts_gc(&mut forward);
+            // The `sys.modules` dict is cached in a fast-path cell
+            // (`importing::SYS_MODULES_DICT`) that is independent of the
+            // `sys.__dict__["modules"]` slot the walk above forwards; forward
+            // the cell too so a relocated modules dict is not read back stale
+            // on the next import / `check_sys_modules` lookup.
+            crate::importing::walk_sys_modules_dict_gc(&mut forward);
             // Box-immortal heap types' namespace dicts hold movable
             // methods / class attributes / descriptor copies that no
             // custom trace reaches; root them the same way.
@@ -1312,9 +1318,9 @@ impl LocalOpcodeHandler for PyFrame {
     fn load_local_checked_value(&mut self, idx: usize, name: &str) -> Result<Self::Value, PyError> {
         let value = self.locals_w()[idx];
         if value.is_null() {
-            return Err(PyError::new(
-                PyErrorKind::NameError,
+            return Err(PyError::name_error_with_name(
                 format!("local variable '{name}' referenced before assignment"),
+                name,
             ));
         }
         // Cell objects are valid even if their contents are PY_NULL
@@ -1483,9 +1489,9 @@ impl NamespaceOpcodeHandler for PyFrame {
             }
         }
         // `pyopcode.py:970 _load_global_failed`: NameError.
-        Err(PyError::new(
-            PyErrorKind::NameError,
+        Err(PyError::name_error_with_name(
             format!("name '{name}' is not defined"),
+            name,
         ))
     }
 
@@ -2820,9 +2826,9 @@ impl OpcodeStepExecutor for PyFrame {
                 }
             }
         }
-        Err(PyError::new(
-            crate::PyErrorKind::NameError,
+        Err(PyError::name_error_with_name(
             format!("name '{name}' is not defined"),
+            name,
         ))
     }
 
@@ -2949,10 +2955,7 @@ impl OpcodeStepExecutor for PyFrame {
             let key = unsafe { pyre_object::w_str_new(name) };
             crate::baseobjspace::delitem(w_locals_object, key).map_err(|err| {
                 if matches!(err.kind, PyErrorKind::KeyError) {
-                    PyError::new(
-                        PyErrorKind::NameError,
-                        format!("name '{name}' is not defined"),
-                    )
+                    PyError::name_error_with_name(format!("name '{name}' is not defined"), name)
                 } else {
                     err
                 }
@@ -2976,9 +2979,9 @@ impl OpcodeStepExecutor for PyFrame {
             unsafe { pyre_object::w_dict_delitem_str(w_globals_obj, name) }
         };
         if !found {
-            return Err(PyError::new(
-                PyErrorKind::NameError,
+            return Err(PyError::name_error_with_name(
                 format!("name '{name}' is not defined"),
+                name,
             ));
         }
         Ok(())

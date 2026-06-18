@@ -1113,6 +1113,36 @@ pub fn walk(
                 return Ok((outcome, pc));
             }
             DispatchOutcome::SubRaise { exc, exc_concrete } => {
+                // RPython `pyjitpl.py:2506-2538 finishframe_exception`: before
+                // unwinding to the caller, scan THIS frame for a matching
+                // `catch_exception/L` handler at the post-op position. A
+                // residual call that raised inside a try-block resumes its own
+                // except body here; only when the current frame has no handler
+                // does the exception unwind further. The `inline_call` SubRaise
+                // arm performs the symmetric scan for caller frames, so a raise
+                // routes to the nearest enclosing handler regardless of whether
+                // it sits in the raising frame or an inlining ancestor. Without
+                // this current-frame scan, a top-level walk whose raising op
+                // sits in a try-block (e.g. a standalone-traced callee whose
+                // getitem raises) skipped its own handler and recorded
+                // `exit_frame_with_exception`, letting the exception escape a
+                // frame that actually catches it.
+                if let Some(target) = try_catch_exception_at(code, pc) {
+                    ctx.last_exc_value = Some(exc);
+                    ctx.last_exc_value_concrete = exc_concrete;
+                    // The exception is now caught by this frame's handler, so
+                    // drain the standing residual-call exception flag the
+                    // raising helper published (`try_execute_residual_call_via_
+                    // executor` Err arm restores `BH_LAST_EXC_VALUE` so the
+                    // interpreter's walker-skip path can re-raise an *uncaught*
+                    // exception). Leaving it set would make that path spuriously
+                    // re-raise the now-handled exception after the walk ends.
+                    // Mirrors `blackhole.rs route_to_catch`'s `BH_LAST_EXC_VALUE
+                    // = 0` on handler entry.
+                    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+                    pc = target;
+                    continue;
+                }
                 if ctx.is_top_level {
                     // RPython parity: framestack exhausted with no
                     // handler match → `compile_exit_frame_with_exception(
@@ -4650,6 +4680,19 @@ fn try_execute_residual_call_via_executor(
             ctx.last_exc_value_concrete =
                 ConcreteValue::Ref(bh_exc as usize as pyre_object::PyObjectRef);
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(bh_exc));
+            // `execute_raised` records the raise into `last_exc_value`
+            // (above) only.  The shared `bh_*` residual helper also
+            // published into the backend `_store_exception` cells
+            // (`publish_residual_call_exception`), but RPython tracing never
+            // touches them — they belong to compiled / blackhole execution.
+            // Drain them so an aborted trace's snapshot-side raise cannot
+            // leak into the live frame's re-run, where compiled
+            // `GUARD_NO_EXCEPTION` would read it as a spurious pending
+            // exception (the standing exception lives in `last_exc_value`
+            // for the walk's `reraise` / `catch_exception` consumers).
+            if let Some(cb) = crate::callbacks::try_get() {
+                (cb.drain_backend_jit_exc)();
+            }
         }
     }
     Ok(Some(exec_result))
@@ -4958,6 +5001,13 @@ fn write_residual_call_result_to_dst(
 /// Returns an empty vector when no liveness is registered for the
 /// `(jitcode_index, pc)` pair (skeleton payload or out-of-range PC);
 /// the downstream optimizer surfaces the empty snapshot as a no-op.
+/// `true` when `op` is a `ConstPtr` carrying the NULL gcref (`GcRef(0)`) —
+/// the encoding an unset vable shadow slot decodes to.  Distinct from
+/// `OpRef::NONE` (no value at all).
+fn opref_is_null_const_ptr(op: OpRef) -> bool {
+    op.as_const_ptr().is_some_and(|g| g.is_null())
+}
+
 fn collect_outer_active_boxes(
     sym: &crate::state::PyreSym,
     trace_ctx: &TraceCtx,
@@ -5248,9 +5298,41 @@ fn collect_outer_active_boxes(
             match semantic_idx {
                 Some(s_idx) if s_idx < nlocals + valid_stack_only => {
                     let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
-                    trace_ctx
-                        .virtualizable_box_at(nvs + s_idx)
-                        .unwrap_or_else(fallback)
+                    let vbox = trace_ctx.virtualizable_box_at(nvs + s_idx);
+                    let walk_box = regs_r.get(color).copied();
+                    if s_idx >= nlocals {
+                        // Operand-stack slot.  The vable shadow is synced to
+                        // the stack only at merge points (`close_loop_args_at`),
+                        // so a slot pushed mid-opcode (the two operands a
+                        // `BINARY_OP` / `BINARY_SUBSCR` value-guard resumes
+                        // before) is stale in the shadow — either an unset
+                        // NULL `ConstPtr` or a stale `getfield` ResOp that
+                        // evaluates to NULL at the guard.  The walk register
+                        // file holds the live SSA box; read it directly
+                        // (trait `get_list_of_active_boxes` parity).  Without
+                        // this the snapshot encodes a NULL operand that the
+                        // blackhole re-executes the opcode with (`bh_binary_op_fn`
+                        // "binary op on null operand") and the bridge re-trace
+                        // constant-folds into `CallR(binop, null, null, ...)`.
+                        match walk_box {
+                            Some(v) if v != OpRef::NONE => v,
+                            _ => vbox.unwrap_or_else(fallback),
+                        }
+                    } else {
+                        // Local slot.  Written to the shadow on every
+                        // `STORE_FAST`, so the shadow is authoritative; fall
+                        // back to the walk register bank only when the shadow
+                        // slot is unset / NULL and the bank holds a real value.
+                        let shadow_is_real = vbox.is_some_and(|b| !opref_is_null_const_ptr(b));
+                        if shadow_is_real {
+                            vbox.unwrap_or_else(fallback)
+                        } else {
+                            match walk_box {
+                                Some(v) if v != OpRef::NONE && !opref_is_null_const_ptr(v) => v,
+                                _ => vbox.unwrap_or_else(fallback),
+                            }
+                        }
+                    }
                 }
                 // Under the canonical splice a single `-live-` marker is
                 // SHARED across a range of Python PCs at different
@@ -5565,6 +5647,29 @@ thread_local! {
     /// stale payload from a prior aborted walk cannot leak into this one.
     static FBW_FINISH_PAYLOAD: std::cell::Cell<Option<(OpRef, Type)>> =
         const { std::cell::Cell::new(None) };
+
+    /// The CONCRETE return value a top-level `*_return` arm produced, set
+    /// alongside [`FBW_FINISH_PAYLOAD`] for a loop-free portal exit
+    /// (`DispatchOutcome::Terminate`).  Unlike `FBW_FINISH_PAYLOAD` (the
+    /// symbolic re-boxed `OpRef` the compile consumer records into the
+    /// trace), this holds the value the walk *concretely* computed.
+    ///
+    /// A function trace that fully unrolls to `done_with_this_frame`
+    /// executed every residual call concretely (consuming side-effecting
+    /// callees like a tokenizer's `get`), so re-running the freshly
+    /// compiled trace for the SAME invocation (`ContinueRunningNormally`)
+    /// would re-read the already-mutated heap and deopt.  The portal
+    /// instead returns this captured value directly (no replay); the
+    /// compiled trace serves only subsequent invocations.  See the
+    /// consume site in `eval.rs` (`maybe_compile_and_run` portal exit).
+    ///
+    /// `ConcreteValue::Ref` payloads hold a nursery-resident object across
+    /// the post-walk compile (which allocates), so the slot is GC-rooted
+    /// via [`fbw_finish_concrete_root_walker`].  `None` for ungated /
+    /// loop-closing / float (no concrete float shadow bank) walks → the
+    /// portal degrades to the legacy `ContinueRunningNormally` replay.
+    static FBW_FINISH_CONCRETE: std::cell::Cell<Option<ConcreteValue>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Whether the slice-b Finish-portal compile route is enabled.  Cached so
@@ -5575,6 +5680,16 @@ thread_local! {
 pub(crate) fn fbw_call_assembler_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("PYRE_FBW_CALL_ASSEMBLER").as_deref() != Ok("0"))
+}
+
+/// Whether the no-replay portal exit is enabled (a loop-free function
+/// trace that reached `done_with_this_frame` returns its captured concrete
+/// result directly instead of re-running the freshly compiled trace for
+/// the SAME invocation).  Default ON; `PYRE_FBW_NO_REPLAY_EXIT=0` opts
+/// back into the legacy `ContinueRunningNormally` replay for bisection.
+pub(crate) fn fbw_no_replay_exit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("PYRE_FBW_NO_REPLAY_EXIT").as_deref() != Ok("0"))
 }
 
 /// Whether `PYRE_FBW_DEBUG_ABORT` is set.  When on, `full_body_walk_trace`
@@ -5590,14 +5705,63 @@ pub(crate) fn fbw_debug_abort_enabled() -> bool {
 }
 
 /// Clear any stashed Finish payload before a walk begins (mirrors
-/// [`bool_box_truth_reset`]).
+/// [`bool_box_truth_reset`]).  Also clears the concrete-return cell so a
+/// stale value from a prior aborted walk cannot leak into this one.
 pub(crate) fn fbw_finish_payload_reset() {
     FBW_FINISH_PAYLOAD.with(|c| c.set(None));
+    FBW_FINISH_CONCRETE.with(|c| c.set(None));
 }
 
 /// Consume the Finish payload stashed by a top-level `*_return` arm.
 pub(crate) fn fbw_finish_payload_take() -> Option<(OpRef, Type)> {
     FBW_FINISH_PAYLOAD.with(|c| c.take())
+}
+
+/// Stash the concrete return value of a top-level value-returning
+/// `*_return` arm (see [`FBW_FINISH_CONCRETE`]).
+pub(crate) fn fbw_finish_concrete_set(value: ConcreteValue) {
+    FBW_FINISH_CONCRETE.with(|c| c.set(Some(value)));
+}
+
+/// Peek at the stashed concrete return value without consuming it (the
+/// `run_perfn_walk` epilogue uses this to decide whether to commit the
+/// store journal and keep the no-replay shortcut).
+pub(crate) fn fbw_finish_concrete_peek() -> Option<ConcreteValue> {
+    FBW_FINISH_CONCRETE.with(|c| c.get())
+}
+
+/// Clear the stashed concrete return value.  The `run_perfn_walk`
+/// epilogue calls this when the no-replay shortcut is declined (not a
+/// `Terminate` walk, or an unjournaled effect only the replay applies) so
+/// the portal degrades to `ContinueRunningNormally`.
+pub(crate) fn fbw_finish_concrete_reset() {
+    FBW_FINISH_CONCRETE.with(|c| c.set(None));
+}
+
+/// Consume the stashed concrete return value (the portal exit in
+/// `eval.rs` takes it to return the walk's result directly).
+pub fn fbw_finish_concrete_take() -> Option<ConcreteValue> {
+    FBW_FINISH_CONCRETE.with(|c| c.take())
+}
+
+/// `framework.py root_walker.walk_roots` parity for the concrete return
+/// value: a `Ref` payload holds a nursery-resident object across the
+/// post-walk compile (which allocates and may trigger a minor collection
+/// that moves nursery objects), so the slot is forwarded as a root.
+/// Registered once via `register_extra_root_walker` at JIT init, mirroring
+/// [`fbw_store_journal_root_walker`].
+pub fn fbw_finish_concrete_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    FBW_FINISH_CONCRETE.with(|c| {
+        if let Some(ConcreteValue::Ref(ptr)) = c.get() {
+            let mut gcref = majit_ir::GcRef(ptr as usize);
+            visitor(&mut gcref);
+            // The visitor may forward (relocate) the ref; write it back so
+            // the stashed value points at the moved object.
+            c.set(Some(ConcreteValue::Ref(
+                gcref.0 as pyre_object::PyObjectRef,
+            )));
+        }
+    });
 }
 
 thread_local! {
@@ -6246,7 +6410,64 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     Value::Int(vsd_value),
                 );
             }
+            // Sync the live operand-stack registers into the vable shadow for
+            // THIS snapshot only.  The walker keeps the operand stack in the
+            // walk register file (`ctx.registers_r`); the vable shadow array
+            // syncs the operand stack only at merge points
+            // (`close_loop_args_at`) and is otherwise NULL for the slots a
+            // mid-opcode guard resumes before (the two operands a
+            // value-guarded `BINARY_OP` / `BINARY_SUBSCR` pops).  The
+            // blackhole rebuilds those from the frame snapshot
+            // (`collect_outer_active_boxes`), but the bridge re-trace reads
+            // them back from the resumed vable shadow — without this overlay it
+            // constant-folds NULL operands into the residual call
+            // (`CallR(binop, null, null, ...)`) and the compiled bridge then
+            // dereferences a null operand.  Overlay the live operands, build
+            // the snapshot, then restore the shadow so this transient write
+            // never leaks into a later op or merge-point sync.
+            let stack_sync: Vec<(usize, OpRef)> = if sym.owns_virtualizable_shadow() {
+                let (depth, stack_color_map) = unsafe {
+                    let jc = &*sym.jitcode;
+                    if jc.payload.code_ptr.is_null() {
+                        (0usize, Vec::new())
+                    } else {
+                        let d = crate::liveness::liveness_for(jc.payload.code_ptr)
+                            .depth_at_py_pc()
+                            .get(py_pc as usize)
+                            .copied()
+                            .unwrap_or(0) as usize;
+                        (d, jc.payload.metadata.stack_slot_color_map.clone())
+                    }
+                };
+                let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+                let nlocals = sym.nlocals;
+                (0..depth.min(stack_color_map.len()))
+                    .filter_map(|s| {
+                        let color = stack_color_map[s] as usize;
+                        let v = ctx.registers_r.get(color).copied().unwrap_or(OpRef::NONE);
+                        if v != OpRef::NONE && !opref_is_null_const_ptr(v) {
+                            Some((nvs + nlocals + s, v))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let saved_shadow: Vec<(usize, Option<OpRef>)> = stack_sync
+                .iter()
+                .map(|&(idx, _)| (idx, ctx.trace_ctx.virtualizable_box_at(idx)))
+                .collect();
+            for &(idx, v) in &stack_sync {
+                ctx.trace_ctx.set_virtualizable_box_at(idx, v);
+            }
             let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
+            for (idx, old) in saved_shadow {
+                if let Some(old) = old {
+                    ctx.trace_ctx.set_virtualizable_box_at(idx, old);
+                }
+            }
             // #124 kept-stack recovery: map the guard's own jitcode pc (set
             // by the branch handler) to its Python opcode so the encoder can
             // read the guard-pc liveness — the resume `py_pc` is a not-taken
@@ -11379,6 +11600,17 @@ fn handle(
                     // the FINISH from `finish_args`.  Re-box to Type::Ref +
                     // store_token_in_vable, then stash the payload; do NOT
                     // call `ctx.trace_ctx.finish()` here (would double-record).
+                    //
+                    // No-replay portal exit: also stash the CONCRETE return
+                    // so `eval.rs` returns the walk's result directly instead
+                    // of re-running the compiled trace against the already
+                    // side-effected heap (the walk consumed it).  A null /
+                    // unknown concrete leaves the cell `None` → degrade.
+                    if let ConcreteValue::Ref(ptr) = read_ref_reg_concrete(code, op, 0, ctx) {
+                        if !ptr.is_null() {
+                            fbw_finish_concrete_set(ConcreteValue::Ref(ptr));
+                        }
+                    }
                     fbw_terminate_with_finish(ctx, result, op.pc)?;
                 } else {
                     ctx.trace_ctx
@@ -11416,6 +11648,13 @@ fn handle(
                     // Slice b: portal-exit FINISH carries Type::Ref even for
                     // an int return (the eval_loop_jit result_type is REF),
                     // so `fbw_ensure_boxed_for_ca` re-boxes via wrapint.
+                    //
+                    // No-replay portal exit: stash the concrete int so
+                    // `eval.rs` returns the walk's result directly (re-boxed
+                    // via `ConcreteValue::to_pyobj`).
+                    if let ConcreteValue::Int(v) = read_int_reg_concrete(code, op, 0, ctx) {
+                        fbw_finish_concrete_set(ConcreteValue::Int(v));
+                    }
                     fbw_terminate_with_finish(ctx, result, op.pc)?;
                 } else {
                     ctx.trace_ctx
@@ -11512,6 +11751,12 @@ fn handle(
                     // assembler token in the vable + GUARD_NOT_FORCED_2 like
                     // those arms, then stash a void-marked payload; do NOT
                     // call `ctx.trace_ctx.finish()` here (would double-record).
+                    //
+                    // No-replay portal exit: stash `Null` (= void → None at
+                    // the consume site) so a side-effecting void function
+                    // returns directly instead of re-running its already
+                    // applied effects.
+                    fbw_finish_concrete_set(ConcreteValue::Null);
                     fbw_terminate_void_with_finish(ctx, op.pc)?;
                 } else {
                     ctx.trace_ctx
