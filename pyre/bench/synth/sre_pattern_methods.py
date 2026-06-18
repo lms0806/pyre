@@ -1,6 +1,12 @@
 import re
 
-N = 30000
+# Regex work runs through the `re` layer and native `_sre`, which the trace
+# cannot fold into the loop, so this fixture is interpreter-bound (~100x the
+# per-iteration cost of a JIT-compiled arithmetic loop).  The JIT pipeline it
+# guards (loop compile, guard-failure bridge, resume paths) and its GC-rooting
+# pressure saturate well below this count, so it stays a regression sentinel
+# while finishing in ~1-3s instead of brushing the suite timeout.
+N = 5000
 
 pair = re.compile(r"([a-z]+)(\d+)")
 digit = re.compile(r"\d")
