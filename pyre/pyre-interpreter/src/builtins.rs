@@ -1270,6 +1270,18 @@ pub(crate) fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Opt
     (args, None)
 }
 
+/// True when the kwargs dict from [`split_builtin_kwargs`] carries a real
+/// keyword (any entry other than the `__pyre_kw__` marker).  An empty
+/// `**{}` therefore reports `false`.
+pub(crate) fn has_real_kwargs(kwargs: Option<PyObjectRef>) -> bool {
+    let Some(dict) = kwargs else {
+        return false;
+    };
+    unsafe { pyre_object::w_dict_str_entries(dict) }
+        .iter()
+        .any(|(key, _)| key != "__pyre_kw__")
+}
+
 /// Look up a single keyword argument from the kwargs dict produced by
 /// `split_builtin_kwargs`. Returns `None` when no kwargs dict is present
 /// or the requested key is absent.
@@ -2031,7 +2043,7 @@ fn exc_base_exception_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// modelled.  `kind` is `OSError` for the base type and `FileNotFoundError`
 /// for that dedicated kind; every other OSError subclass routes here as
 /// `OSError` with its `w_class` retagged by `exc_new_wrapper!`.
-fn os_error_init(kind: pyre_object::excobject::ExcKind, args: &[PyObjectRef]) -> PyObjectRef {
+fn os_error_build(kind: pyre_object::excobject::ExcKind, args: &[PyObjectRef]) -> PyObjectRef {
     use pyre_object::excobject;
     let exc = if args.len() == 1 && unsafe { pyre_object::is_str(args[0]) } {
         let w = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
@@ -2040,10 +2052,9 @@ fn os_error_init(kind: pyre_object::excobject::ExcKind, args: &[PyObjectRef]) ->
         let msg: String = if args.is_empty() {
             String::new()
         } else if args.len() == 1 {
-            // os_error_init returns PyObjectRef (exception construction is
-            // non-raising machinery, per the F7 display policy); a raising
-            // __str__/__repr__ on the args degrades to the empty string
-            // rather than propagating.
+            // exception construction is non-raising machinery, per the F7
+            // display policy; a raising __str__/__repr__ on the args degrades
+            // to the empty string rather than propagating.
             unsafe { crate::display::py_str(args[0]) }.unwrap_or_default()
         } else {
             let parts: Vec<String> = args
@@ -2054,15 +2065,30 @@ fn os_error_init(kind: pyre_object::excobject::ExcKind, args: &[PyObjectRef]) ->
         };
         excobject::w_exception_new(kind, &msg)
     };
-    os_error_fill_slots(exc, args);
+    // Seed `args_w` so a deferred-init instance (`_use_init`, no `__new__`
+    // slot fill) still reports the empty tuple until `__init__` runs.
+    let args_list = pyre_object::w_list_new(args.to_vec());
+    unsafe { excobject::w_exception_set_args(exc, args_list) };
     exc
 }
 
-/// `_parse_init_args` slot assignment shared by `__new__` (after the
-/// kind-aware allocation) and `__init__` (re-stamping an already-allocated
-/// `self`).  Sets `args_w` and, for a 2..=5 argument call, the
-/// errno/strerror/filename/filename2 slots — dropping the filename from
-/// `args_w` per `_init_error` (line 652).
+/// `Py_IS_TYPE(self, BlockingIOError)` — the exact-type test `_init_error`
+/// uses to read a numeric third argument as `characters_written` rather than
+/// a filename.
+fn exc_is_blocking_io_error(exc: PyObjectRef) -> bool {
+    matches!(
+        (crate::typedef::r#type(exc), lookup_exc_class("BlockingIOError")),
+        (Some(c), Some(b)) if std::ptr::eq(c, b)
+    )
+}
+
+/// `_parse_init_args` + `_init_error` slot assignment shared by `__new__`
+/// (after the kind-aware allocation and `w_class` retag) and `__init__`
+/// (re-stamping an already-allocated `self`).  Sets `args_w` and, for a 2..=5
+/// argument call, the errno/strerror/filename/filename2 slots — dropping the
+/// filename from `args_w` per `_init_error` (line 652).  Must run after the
+/// `w_class` retag so the `BlockingIOError` numeric-filename special-case can
+/// see the resolved class.
 fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) {
     use pyre_object::excobject;
     let args_list = pyre_object::w_list_new(args.to_vec());
@@ -2078,6 +2104,12 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) {
             // idx 4 = filename2.
             let w_filename = args.get(2).copied().filter(|&f| !pyre_object::is_none(f));
             if let Some(fname) = w_filename {
+                // `_init_error` line 636-643: for an exact `BlockingIOError`, a
+                // numeric third argument is `characters_written`, not a
+                // filename — it stays in `args_w` and the tuple is not trimmed.
+                if exc_is_blocking_io_error(exc) && pyre_object::is_int(fname) {
+                    return;
+                }
                 excobject::w_exception_set_filename(exc, fname);
                 if let Some(f2) = args.get(4).copied().filter(|&f| !pyre_object::is_none(f)) {
                     excobject::w_exception_set_filename2(exc, f2);
@@ -2088,6 +2120,60 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) {
             }
         }
     }
+}
+
+/// `interp_exceptions.py:1207-1227 ERRNO_MAP` — the OSError subclass the
+/// exact `OSError` constructor selects for a recognised errno, by
+/// registered class name.  Returns `None` for an unmapped errno.
+fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
+    let Ok(e) = i32::try_from(errno) else {
+        return None;
+    };
+    let name = if e == libc::EAGAIN
+        || e == libc::EALREADY
+        || e == libc::EINPROGRESS
+        || e == libc::EWOULDBLOCK
+    {
+        "BlockingIOError"
+    } else if e == libc::EPIPE || e == libc::ESHUTDOWN {
+        "BrokenPipeError"
+    } else if e == libc::ECHILD {
+        "ChildProcessError"
+    } else if e == libc::ECONNABORTED {
+        "ConnectionAbortedError"
+    } else if e == libc::ECONNREFUSED {
+        "ConnectionRefusedError"
+    } else if e == libc::ECONNRESET {
+        "ConnectionResetError"
+    } else if e == libc::EEXIST {
+        "FileExistsError"
+    } else if e == libc::ENOENT {
+        "FileNotFoundError"
+    } else if e == libc::EISDIR {
+        "IsADirectoryError"
+    } else if e == libc::ENOTDIR {
+        "NotADirectoryError"
+    } else if e == libc::EINTR {
+        "InterruptedError"
+    } else if e == libc::EACCES || e == libc::EPERM {
+        "PermissionError"
+    } else if e == libc::ESRCH {
+        "ProcessLookupError"
+    } else if e == libc::ETIMEDOUT {
+        "TimeoutError"
+    } else {
+        return None;
+    };
+    Some(name)
+}
+
+/// `_parse_init_args` yields an errno only for a 2..=5 argument call whose
+/// first argument is an int; map that errno to its OSError subclass name.
+fn os_error_errno_subclass_for(args: &[PyObjectRef]) -> Option<&'static str> {
+    if !(2..=5).contains(&args.len()) || !unsafe { pyre_object::is_int(args[0]) } {
+        return None;
+    }
+    os_error_errno_subclass(unsafe { pyre_object::w_int_get_value(args[0]) })
 }
 
 /// `W_OSError._use_init` (`interp_exceptions.py:531-549`): the slots are
@@ -2106,6 +2192,12 @@ fn os_error_use_init(w_self: PyObjectRef) -> bool {
     let Some(w_type) = crate::typedef::r#type(w_self) else {
         return false;
     };
+    os_error_type_use_init(w_type)
+}
+
+/// `_use_init` keyed on the type object directly (the `__new__` half has the
+/// subtype, not yet an instance).
+fn os_error_type_use_init(w_type: PyObjectRef) -> bool {
     let Some(w_os_error) = lookup_exc_class("OSError") else {
         return false;
     };
@@ -2125,10 +2217,31 @@ fn os_error_use_init(w_self: PyObjectRef) -> bool {
     }
     // `_use_init` also requires `__new__` to be the inherited `OSError.__new__`
     // (line 546-547): a subclass overriding `__new__` keeps `descr_init` a
-    // no-op even when it also defines `__init__`.
-    let self_new = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") };
-    let base_new = unsafe { crate::baseobjspace::lookup_in_type(w_os_error, "__new__") };
-    matches!((self_new, base_new), (Some(a), Some(b)) if std::ptr::eq(a, b))
+    // no-op even when it also defines `__init__`.  Every builtin OSError type
+    // carries its own `__new__` Function wrapping the shared native
+    // constructor, so an identity comparison against `OSError.__new__` is
+    // unreliable; instead detect a *Python-level* override — a user
+    // `def __new__` resolves to a Function backed by a code object, while the
+    // inherited family `__new__` is a builtin function backed by a `BuiltinCode`.
+    let Some(self_new) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") }) else {
+        return false;
+    };
+    unsafe {
+        crate::function::is_function(self_new)
+            && crate::gateway::is_builtin_code(
+                crate::function::function_get_code(self_new) as PyObjectRef
+            )
+    }
+}
+
+/// `_PyArg_NoKeywords(type_name, kwds)` message — `OSError` and its family
+/// take only positional arguments.
+fn os_error_no_keywords_error(w_type: Option<PyObjectRef>) -> crate::PyError {
+    let type_name = match w_type {
+        Some(t) => unsafe { pyre_object::w_type_get_name(t) }.to_string(),
+        None => "OSError".to_string(),
+    };
+    crate::PyError::type_error(format!("{type_name}() takes no keyword arguments"))
 }
 
 /// `interp_exceptions.py:551-652 W_OSError._parse_init_args` as the
@@ -2143,12 +2256,17 @@ fn exc_os_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     })?;
     // `descr_init` early-return (line 618-620): when the type does not
     // override `OSError.__init__`, every slot is already filled by `__new__`
-    // (`os_error_init`), so re-stamping here would corrupt the args/errno
+    // (`os_error_fill_slots`), so re-stamping here would corrupt the args/errno
     // that construction already set.
     if !os_error_use_init(w_self) {
         return Ok(pyre_object::w_none());
     }
-    os_error_fill_slots(w_self, &args[1..]);
+    let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
+    // `descr_init` line 621-623: OSError takes no keyword arguments.
+    if has_real_kwargs(kwargs) {
+        return Err(os_error_no_keywords_error(crate::typedef::r#type(w_self)));
+    }
+    os_error_fill_slots(w_self, positional);
     Ok(pyre_object::w_none())
 }
 
@@ -2392,17 +2510,80 @@ fn exc_attribute_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 fn exc_os_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(os_error_init(
+    Ok(os_error_build(
         pyre_object::excobject::ExcKind::OSError,
         args,
     ))
 }
 
 fn exc_file_not_found_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(os_error_init(
+    Ok(os_error_build(
         pyre_object::excobject::ExcKind::FileNotFoundError,
         args,
     ))
+}
+
+/// `interp_exceptions.py:583-614 W_OSError.descr_new` — the `__new__` shared
+/// by `OSError` and every errno subclass.  For the exact `OSError` type it
+/// rejects keyword arguments (line 591-593) and remaps a recognised errno to
+/// the matching subclass (line 596-608), so `OSError(ENOENT, ...)`
+/// constructs a `FileNotFoundError`.  A subclass call keeps its own class,
+/// `w_class`-retagged like `exc_new_wrapper!`.  `ctor` builds the base object
+/// with the called type's `ExcKind` (`OSError` for the base type and every
+/// retagged subclass, `FileNotFoundError` for that dedicated kind).
+fn os_error_family_new(
+    args: &[PyObjectRef],
+    ctor: impl Fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+) -> Result<PyObjectRef, crate::PyError> {
+    let cls = args.first().copied();
+    let rest: &[PyObjectRef] = if args.is_empty() { args } else { &args[1..] };
+    let is_exact_os_error = matches!(
+        (cls, lookup_exc_class("OSError")),
+        (Some(c), Some(w_os)) if std::ptr::eq(c, w_os)
+    );
+    let use_init = matches!(cls, Some(c) if os_error_type_use_init(c));
+    let (positional, kwargs) = split_builtin_kwargs(rest);
+    // `descr_new` line 590-593: only when `_use_init` is false (exact OSError
+    // and builtin subclasses) does `__new__` parse the args and reject
+    // keywords; a user subclass overriding `__init__` while keeping the
+    // inherited `__new__` defers both to `__init__`.
+    if !use_init && has_real_kwargs(kwargs) {
+        return Err(os_error_no_keywords_error(cls));
+    }
+    // When `_use_init`, `__new__` allocates without parsing the args — the
+    // errno/strerror/filename slots and `args_w` stay unset for `__init__` to
+    // fill (line 608-611).  Otherwise `__new__` parses them itself.
+    let exc = ctor(if use_init { &[] } else { positional })?;
+    // Only the exact OSError type remaps the errno to a subclass; resolve the
+    // retag target (subclass on a recognised errno, else the called class).
+    let w_target = if is_exact_os_error {
+        os_error_errno_subclass_for(positional)
+            .and_then(lookup_exc_class)
+            .or(cls)
+    } else {
+        cls
+    };
+    if let Some(w_target) = w_target {
+        unsafe {
+            (*(exc as *mut pyre_object::PyObject)).w_class = w_target;
+        }
+    }
+    // Fill the slots after the retag so `os_error_fill_slots` can see the
+    // resolved class (the `BlockingIOError` numeric-filename special-case).
+    if !use_init {
+        os_error_fill_slots(exc, positional);
+    }
+    Ok(exc)
+}
+
+pub(crate) fn exc_os_error_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    os_error_family_new(args, exc_os_error)
+}
+
+pub(crate) fn exc_file_not_found_error_new(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    os_error_family_new(args, exc_file_not_found_error)
 }
 
 /// `pypy/module/exceptions/interp_exceptions.py:274-284 _new`'s shape
@@ -2673,8 +2854,6 @@ macro_rules! exc_new_wrapper {
 
 exc_new_wrapper!(exc_base_exception_new, exc_base_exception);
 exc_new_wrapper!(exc_exception_new, exc_exception);
-exc_new_wrapper!(exc_os_error_new, exc_os_error);
-exc_new_wrapper!(exc_file_not_found_error_new, exc_file_not_found_error);
 exc_new_wrapper!(exc_arithmetic_error_new, exc_arithmetic_error);
 exc_new_wrapper!(exc_zero_division_new, exc_zero_division);
 exc_new_wrapper!(exc_type_error_new, exc_type_error);

@@ -238,6 +238,29 @@ pub fn exception_getclass(w_obj: PyObjectRef) -> PyObjectRef {
     crate::typedef::r#type(w_obj).unwrap_or(pyre_object::PY_NULL)
 }
 
+/// True when `obj` is a `BlockingIOError` whose constructor took the numeric
+/// third argument as `characters_written` — recognised by `args_w[2]` still
+/// being an int (every other 2..=5-argument form trims `args_w` to two
+/// elements).  Gates the `characters_written` reader and suppresses the
+/// `filename` derivation for that argument (`interp_exceptions.py` `_init_error`).
+fn exc_blocking_written(obj: PyObjectRef) -> bool {
+    let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+    let n = unsafe { pyre_object::w_tuple_len(args) };
+    if n < 3 {
+        return false;
+    }
+    let Some(v) = (unsafe { pyre_object::w_tuple_getitem(args, 2) }) else {
+        return false;
+    };
+    if !unsafe { pyre_object::is_int(v) } {
+        return false;
+    }
+    let Some(blocking) = crate::builtins::lookup_exc_class("BlockingIOError") else {
+        return false;
+    };
+    unsafe { isinstance_w(obj, blocking) }
+}
+
 /// pypy/interpreter/baseobjspace.py:1370-1371 `exception_issubclass_w`.
 ///
 ///   def exception_issubclass_w(self, w_cls1, w_cls2):
@@ -4036,6 +4059,11 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                     if !stored.is_null() {
                         return Ok(stored);
                     }
+                    // A `BlockingIOError` keeps `characters_written` (a number)
+                    // in `args_w[2]`; it is not a filename (`_init_error`).
+                    if name == "filename" && exc_blocking_written(obj) {
+                        return Ok(w_none());
+                    }
                     let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
                     let n = unsafe { pyre_object::w_tuple_len(args) };
                     let idx: usize = if name == "filename" { 2 } else { 4 };
@@ -4045,6 +4073,16 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                         }
                     }
                     return Ok(w_none());
+                }
+            }
+            // `interp_exceptions.py:704-707 descr_get_written` — a
+            // `BlockingIOError` constructed with a numeric third argument keeps
+            // it in `args_w[2]` as `characters_written`; otherwise the slot is
+            // unset (`written == -1`) and the attribute raises `AttributeError`.
+            "characters_written" if exc_blocking_written(obj) => {
+                let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+                if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, 2) } {
+                    return Ok(v);
                 }
             }
             // `interp_exceptions.py:409-411 W_ImportError` exposes
