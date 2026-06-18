@@ -1801,8 +1801,8 @@ impl IterOpcodeHandler for PyFrame {
                 return Ok(());
             }
             // User-defined __iter__ — PyPy: space.iter → __iter__()
-            // Delegates to baseobjspace::iter which handles type MRO,
-            // ATTR_TABLE, and __getitem__ fallback (PyPy: space.iter →
+            // Delegates to baseobjspace::iter which handles type MRO
+            // and __getitem__ fallback (PyPy: space.iter →
             // PyObject_GetIter → tp_iter or PySeqIter_New).
             if pyre_object::is_instance(iter) {
                 let result = crate::baseobjspace::iter(iter)?;

@@ -4681,8 +4681,7 @@ fn builtin_vars(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             || pyre_object::is_type(obj)
             || crate::is_function(obj)
             || pyre_object::is_module(obj)
-    } || crate::baseobjspace::ATTR_TABLE
-        .with(|table| table.borrow().contains_key(&(obj as usize)));
+    };
     if !has_dict {
         return Err(crate::PyError::type_error(
             "vars() argument must have __dict__ attribute",

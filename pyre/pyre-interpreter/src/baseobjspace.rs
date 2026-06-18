@@ -2121,7 +2121,7 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
                 return get_and_call_function(method, obj, w_type, &[]);
             }
         }
-        // Per-instance __len__ via the unified getattr path (live dict + ATTR_TABLE).
+        // Per-instance __len__ via the unified getattr path (live dict).
         if let Ok(method) = getattr_str(obj, "__len__") {
             return crate::builtins::call_and_check(method, &[obj]);
         }
@@ -2133,15 +2133,6 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
 }
 
 // ── Attribute operations ──────────────────────────────────────────────
-
-thread_local! {
-    /// Side table mapping object addresses to their instance __dict__.
-    ///
-    /// Every object can have attributes stored here. This avoids modifying
-    /// the repr(C) layout of existing object types.
-    pub static ATTR_TABLE: RefCell<HashMap<usize, HashMap<String, PyObjectRef>>> =
-        RefCell::new(HashMap::new());
-}
 
 // `INSTANCE_DICT` and `WEAKREF_TABLE` live in `objspace/std/mapdict.rs`,
 // mirroring PyPy's `MapdictDictSupport` and `MapdictWeakrefSupport`.
@@ -3425,7 +3416,7 @@ pub fn object_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
             }
             // Instance dict is the sole authority for instance attributes
             // (mapdict map+storage via the MapDictStrategy view); no
-            // ATTR_TABLE fallback (mapdict.py:846-847, 1168-1175).
+            // side-table fallback (mapdict.py:846-847, 1168-1175).
             let w_dict = getdict_backing(obj);
             if !w_dict.is_null() {
                 if let Some(value) = pyre_object::w_dict_getitem_str(w_dict, name) {
@@ -3840,22 +3831,13 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
 
     // Function object attributes — PyPy: funcobject.py W_Function
     // Check the live W_DictObject (functions are hasdict per typedef.py:735
-    // __dict__ = getset_func_dict) before falling through to legacy ATTR_TABLE.
+    // __dict__ = getset_func_dict).
     if unsafe { crate::is_function(obj) } {
         let w_dict = getdict_backing(obj);
         if !w_dict.is_null() {
             if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
                 return Ok(v);
             }
-        }
-        let found = ATTR_TABLE.with(|table| {
-            table
-                .borrow()
-                .get(&(obj as usize))
-                .and_then(|d| d.get(name).copied())
-        });
-        if let Some(v) = found {
-            return Ok(v);
         }
     }
     unsafe {
@@ -4040,22 +4022,15 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
         || name == "__annotations__"
     {
         // baseobjspace.py:46-50 W_Root.getdictvalue — consult the
-        // instance dict (exception `w_dict` slot, hasdict objects)
-        // before the legacy fallbacks.
+        // instance dict (exception `w_dict` slot, hasdict objects),
+        // else None.
         let w_dict = getdict_backing(obj);
         if !w_dict.is_null() {
             if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
                 return Ok(value);
             }
         }
-        // Check ATTR_TABLE first, then return None as default
-        let found = ATTR_TABLE.with(|table| {
-            let table = table.borrow();
-            table
-                .get(&(obj as usize))
-                .and_then(|d| d.get(name).copied())
-        });
-        return Ok(found.unwrap_or(w_none()));
+        return Ok(w_none());
     }
     // Exception attributes — PyPy: W_BaseException attributes
     if unsafe { pyre_object::is_exception(obj) } {
@@ -4396,24 +4371,12 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     //
     // Check the per-instance W_DictObject here (same API PyPy's
     // `descr__getattribute__` uses at descroperation.py:50). This is the
-    // second half of the "hasdict instance dict" protocol and must fire
-    // before the legacy `ATTR_TABLE` fallback.
+    // second half of the "hasdict instance dict" protocol.
     let w_dict = getdict_backing(obj);
     if !w_dict.is_null() {
         if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
             return Ok(value);
         }
-    }
-
-    // Instance attributes from side table (excludes __class__ which lives
-    // in the w_class header field, not ATTR_TABLE).
-    let found = ATTR_TABLE.with(|table| {
-        let table = table.borrow();
-        let key = obj as usize;
-        table.get(&key).and_then(|dict| dict.get(name).copied())
-    });
-    if let Some(value) = found {
-        return Ok(value);
     }
 
     // MRO lookup on the object's Python class (w_class) for method resolution.
@@ -5593,8 +5556,8 @@ pub(crate) unsafe fn compute_mro(w_type: PyObjectRef) -> Vec<PyObjectRef> {
 /// PyPy: descroperation.py `space.is_data_descr(w_descr)`
 ///
 /// In Python, a data descriptor is any object whose type defines __set__
-/// or __delete__. For pyre's current object model, we check the ATTR_TABLE
-/// and type dict for these names.
+/// or __delete__. For pyre's current object model, we check the type dict
+/// for these names.
 /// baseobjspace.py isinstance_w: check if w_obj is instance of w_cls
 /// by walking the MRO of type(w_obj) and comparing with w_cls.
 pub unsafe fn isinstance_w(w_obj: PyObjectRef, w_cls: PyObjectRef) -> bool {
@@ -6260,7 +6223,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
         // input before storing into the matching typed slot
         // (`w_cause`/`w_context`/`w_traceback`/`suppress_context`,
         // line 113-117).  Storage lives on `W_ExceptionObject`
-        // directly — no ATTR_TABLE side store for these four names.
+        // directly — no side store for these four names.
         match name {
             "__dict__" => {
                 // `interp_exceptions.py:293` registers
@@ -6709,12 +6672,12 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     // `pypy/module/exceptions/interp_exceptions.py:159-161
     // W_BaseException.descr_delargs` → unconditional TypeError
     // ("args may not be deleted").  Reject `del e.args` before the
-    // generic dict/ATTR_TABLE removal path, which would otherwise
+    // generic instance-dict removal path, which would otherwise
     // succeed silently when an entry existed there.
     if unsafe { pyre_object::is_exception(obj) } && name == "args" {
         return Err(PyError::type_error("args may not be deleted"));
     }
-    // Instance/general: remove from instance dict, then ATTR_TABLE
+    // Instance/general: remove from the instance dict.
     let w_dict = getdict_backing(obj);
     if !w_dict.is_null() {
         let removed = unsafe { pyre_object::w_dict_delitem_str(w_dict, name) };
@@ -6722,22 +6685,11 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
             return Ok(w_none());
         }
     }
-    let removed = ATTR_TABLE.with(|table| {
-        let mut table = table.borrow_mut();
-        table
-            .get_mut(&(obj as usize))
-            .and_then(|d| d.remove(name))
-            .is_some()
-    });
-    if removed {
-        Ok(w_none())
-    } else {
-        let tp_name = unsafe { (*(*obj).ob_type).name };
-        Err(PyError::new(
-            PyErrorKind::AttributeError,
-            format!("'{tp_name}' object has no attribute '{name}'"),
-        ))
-    }
+    let tp_name = unsafe { (*(*obj).ob_type).name };
+    Err(PyError::new(
+        PyErrorKind::AttributeError,
+        format!("'{tp_name}' object has no attribute '{name}'"),
+    ))
 }
 
 /// PyPy: baseobjspace.py `call`.
@@ -7878,7 +7830,7 @@ pub fn object_functionstr(w_function: PyObjectRef) -> Result<String, crate::PyEr
     if !w_function.is_null() && unsafe { crate::function::is_function(w_function) } {
         // function.py:2108 `qualname = w_function.qualname` — match
         // PyPy's stored `qualname` field via the helper that walks
-        // ATTR_TABLE → `code.qualname` → `name`.
+        // the stored `qualname` → `code.qualname` → `name`.
         let qualname = unsafe { crate::function::function_get_qualname(w_function) };
         let w_module = unsafe { crate::function::fget___module__(w_function) };
         if !is_w(w_module, w_none()) && unsafe { pyre_object::is_str(w_module) } {
@@ -8320,8 +8272,8 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // — `space.lookup(w_obj, '__iter__')` is type-MRO-only; PyPy never
         // consults the instance dict for special-method lookup (CPython
         // issue 5985 / typeobject `__iter__` slot resolution).  Earlier
-        // pyre revisions also walked `getdict(obj)` and `ATTR_TABLE`,
-        // which surfaced per-instance `__iter__` writes (e.g.
+        // pyre revisions also walked `getdict(obj)` and a per-object side
+        // table, which surfaced per-instance `__iter__` writes (e.g.
         // `obj.__iter__ = method`); those paths are non-orthodox in
         // both CPython and PyPy and have been removed.
         if is_instance(obj) {
@@ -9756,7 +9708,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                 let result = crate::builtins::call_and_check(method, &[haystack, needle])?;
                 return Ok(is_true(result)?);
             }
-            // Also check per-instance attributes (ATTR_TABLE)
+            // Also check per-instance attributes
             if let Ok(method) = getattr_str(haystack, "__contains__") {
                 let result = crate::builtins::call_and_check(method, &[haystack, needle])?;
                 return Ok(is_true(result)?);

@@ -2546,7 +2546,8 @@ fn build_class_inner(
     // Create class namespace — use __prepare__ result or fresh namespace.
     // __prepare__ may return a dict subclass (e.g. EnumDict).
     // dict subclass instances created by w_instance_new store entries in
-    // ATTR_TABLE, not in W_DictObject.entries. We handle both cases.
+    // their mapdict instance storage, not in W_DictObject.entries. We
+    // handle both cases.
     // `w_dict_items` dispatches through `is_module_dict`, so the
     // rare `__prepare__` returning a W_ModuleDictObject still walks
     // correctly.  Both branches share the same shape; collapse them

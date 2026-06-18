@@ -773,7 +773,7 @@ fn make_std_stream(name: &'static str, is_stderr: bool) -> PyObjectRef {
         crate::baseobjspace::setattr_str(stream, "mode", w_str_new(if is_stderr { "w" } else { "r" }));
     let _ = crate::baseobjspace::setattr_str(stream, "closed", w_bool_from(false));
     let _ = crate::baseobjspace::setattr_str(stream, "buffer", w_none());
-    // ATTR_TABLE-stored builtin methods do not get `self` prepended (see
+    // Instance-stored builtin methods do not get `self` prepended (see
     // pyopcode load_method dispatch), so the first arg may be the string
     // directly. Pick whichever element is a real str.
     fn pick_str(args: &[PyObjectRef]) -> Option<&str> {

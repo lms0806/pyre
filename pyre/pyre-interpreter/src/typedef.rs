@@ -4976,17 +4976,6 @@ fn init_type_type(ns: &mut DictStorage) {
             // GetSetProperty fget callbacks receive (descriptor_self, w_obj),
             // so the cls is at args[1].
             let cls = args[1];
-            // First try a directly stored __annotations__ dict — pyre's legacy
-            // path stashes it on the type's ATTR_TABLE entry.
-            let stored = crate::baseobjspace::ATTR_TABLE.with(|table| {
-                table
-                    .borrow()
-                    .get(&(cls as usize))
-                    .and_then(|d| d.get("__annotations__").copied())
-            });
-            if let Some(v) = stored {
-                return Ok(v);
-            }
             // PEP 649 path: bytecode emits `__annotate_func__` (== `__annotate__`).
             // Call it with format=1 (VALUE) to materialise the dict.
             if let Some(annotate_fn) =
