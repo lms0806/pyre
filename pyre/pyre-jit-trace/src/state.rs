@@ -9778,8 +9778,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
-                debug-only fallback was removed; needs a populated-jitcode harness."]
     fn test_pypyjit_collect_jump_args_inserts_ec_after_frame() {
         let mut ctx = TraceCtx::for_test(0);
         let frame_ref = ctx.const_ref(0x1000);
@@ -9817,8 +9815,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
-                debug-only fallback was removed; needs a populated-jitcode harness."]
     fn test_pypyjit_create_sym_shifts_virtualizable_indices_after_ec() {
         let meta = PyreMeta {
             num_locals: 2,
