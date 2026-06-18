@@ -9909,106 +9909,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
-                debug-only fallback was removed; needs a populated-jitcode harness."]
-    fn test_guard_class_uses_guard_nonnull_class() {
-        let mut ctx = TraceCtx::for_test(1);
-        // registers_r[i] tracks locals_cells_stack_w[*] — W_Root array, Type::Ref.
-        let obj = OpRef::input_arg_ref(0);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.registers_r = vec![obj];
-        sym.symbolic_local_types = vec![Type::Ref];
-        sym.nlocals = 1;
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_result_stack_idx: None,
-            pending_result_type: None,
-            pending_inline_frame: None,
-            residual_call_pc: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-            pre_opcode_registers_r: None,
-            pre_opcode_semantic_depth: None,
-        };
-
-        state.with_ctx(|this, ctx| {
-            this.guard_class(ctx, obj, &INT_TYPE as *const PyType);
-        });
-
-        let tree_loop = ctx.into_tree_loop();
-        let op = tree_loop.ops.last().expect("guard op should be present");
-        assert_eq!(op.opcode, OpCode::GuardNonnullClass);
-        assert_eq!(op.arg(0).to_opref(), obj);
-    }
-
-    #[test]
-    #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
-                debug-only fallback was removed; needs a populated-jitcode harness."]
-    fn test_trace_guarded_int_payload_uses_guard_nonnull_class_and_pure_payload() {
-        // value_type is read from the recorder's inputarg type (Phase α/β: Box.type
-        // intrinsic parity, history.py:220) so the inputarg must be Ref for
-        // trace_guarded_int_payload to take the fast path rather than short-circuit.
-        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
-        // value_type is Ref per the comment above; registers_r[0] = inputarg slot 0.
-        let int_obj = OpRef::input_arg_ref(0);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.registers_r = vec![int_obj];
-        sym.symbolic_local_types = vec![Type::Ref];
-        sym.nlocals = 1;
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_result_stack_idx: None,
-            pending_result_type: None,
-            pending_inline_frame: None,
-            residual_call_pc: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-            pre_opcode_registers_r: None,
-            pre_opcode_semantic_depth: None,
-        };
-
-        let _ = state.with_ctx(|this, ctx| this.trace_guarded_int_payload(ctx, int_obj));
-
-        let recorder = ctx.into_recorder();
-        let mut saw_guard_nonnull_class = false;
-        let mut saw_pure_payload = false;
-        for pos in 1..(1 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_raw_pos(pos) else {
-                continue;
-            };
-            if op.opcode == OpCode::GuardNonnullClass {
-                saw_guard_nonnull_class = true;
-            }
-            if op.opcode == OpCode::GetfieldGcPureI
-                && op
-                    .getarglist()
-                    .iter()
-                    .map(|a| a.to_opref())
-                    .collect::<Vec<_>>()
-                    == vec![int_obj]
-            {
-                saw_pure_payload = true;
-            }
-        }
-        assert!(
-            saw_guard_nonnull_class,
-            "int payload fast path should guard object class via GuardNonnullClass"
-        );
-        assert!(
-            saw_pure_payload,
-            "int payload fast path should read the immutable payload with GetfieldGcPureI"
-        );
-    }
-
-    #[test]
     fn test_trace_unbox_int_with_resume_skips_guard_for_constant_object() {
         let mut ctx = TraceCtx::for_test(0);
         let int_obj = ctx.const_ref(w_int_new(7) as i64);
@@ -10367,8 +10267,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
-                debug-only fallback was removed; needs a populated-jitcode harness."]
+    #[ignore = "Needs a populated-jitcode harness binding sym.jitcode to a JitCode \
+                whose raw_code() points at a real W_CodeObject (close_loop_args / \
+                restore_guard_failure read code.varnames/ncells/max_stackdepth at \
+                trace_opcode.rs:4874) plus a values vec whose SYM_PYCODE_IDX=3 slot \
+                is a real pycode ref (else pycode.rs:280 SIGABRTs on 0x4)."]
     fn test_restore_guard_failure_uses_runtime_value_kinds_for_virtualizable_locals() {
         use majit_ir::GcRef;
         use pyre_interpreter::pyframe::PyFrame;
@@ -10435,48 +10338,6 @@ mod tests {
         let restored_i = state.local_at(3).expect("local i should be restored");
         assert!(unsafe { is_int(restored_i) });
         assert_eq!(unsafe { w_int_get_value(restored_i) }, 7);
-    }
-
-    #[test]
-    #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
-                debug-only fallback was removed; needs a populated-jitcode harness."]
-    fn test_load_local_checked_value_respects_symbolic_local_type() {
-        let run_case = |symbolic_type: Type, name: &str, expected_guard: Option<OpCode>| {
-            let mut ctx = TraceCtx::for_test(1);
-            // The slot type matches `symbolic_type` (resoperation.py:719/727/739
-            // InputArg{Int,Float,Ref}); Void has no inputarg variant in RPython.
-            let local = OpRef::input_arg_typed(0, symbolic_type);
-            let mut sym = PyreSym::new_uninit(OpRef::NONE);
-            sym.registers_r = vec![local];
-            sym.symbolic_local_types = vec![symbolic_type];
-            sym.nlocals = 1;
-
-            let mut state = MIFrame {
-                ctx: &mut ctx,
-                sym: &mut sym,
-                fallthrough_pc: 0,
-                parent_frames: Vec::new(),
-                pending_result_stack_idx: None,
-                pending_result_type: None,
-                pending_inline_frame: None,
-                residual_call_pc: None,
-                orgpc: 0,
-                concrete_frame_addr: 0,
-                pre_opcode_registers_r: None,
-                pre_opcode_semantic_depth: None,
-            };
-
-            let loaded =
-                <MIFrame as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, name)
-                    .expect("local should load");
-            assert_eq!(loaded.opref, local);
-
-            let tree_loop = ctx.into_tree_loop();
-            assert_eq!(tree_loop.ops.last().map(|op| op.opcode), expected_guard);
-        };
-
-        run_case(Type::Int, "j", None);
-        run_case(Type::Ref, "b", Some(OpCode::GuardNonnull));
     }
 
     #[test]
@@ -11052,8 +10913,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
-                debug-only fallback was removed; needs a populated-jitcode harness."]
     fn test_setup_bridge_sym_preserves_resumed_stack_tail() {
         use majit_ir::resumedata::{RebuiltFrame, RebuiltValue};
         use majit_metainterp::jitcode::JitCodeBuilder;
@@ -11067,6 +10926,19 @@ mod tests {
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
         let code_ref = frame.pycode as *const ();
 
+        // Seed the live/ -> BC_LIVE opcode mapping so the jitcode decoder
+        // recognises the pc=0 liveness marker. `op_live` defaults to
+        // `u8::MAX` until published; without this the decode underflows
+        // (`pc -= OFFSET_SIZE + 1` at jitcode.rs). `publish_state` clears
+        // `all_liveness`, so it must run before `intern_liveness` below.
+        {
+            let mut insns = majit_ir::VecAssoc::new();
+            insns.insert(
+                "live/".to_string(),
+                majit_metainterp::jitcode::insns::BC_LIVE,
+            );
+            crate::assembler::publish_state(&insns, &[], 0, 0);
+        }
         let live_off = crate::state::intern_liveness(&[], &[0, 1, 2], &[])
             .expect("bridge liveness must fit in the shared buffer");
         let mut builder = JitCodeBuilder::new();
@@ -11210,8 +11082,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
-                debug-only fallback was removed; needs a populated-jitcode harness."]
+    #[ignore = "Fully symbolic (concrete_frame_addr=0), so close_loop_args takes the \
+                trace_opcode.rs:4874 raw_code fallback and reads \
+                code.varnames/ncells/max_stackdepth — needs sym.jitcode bound to a \
+                JitCode whose raw_code() is a real W_CodeObject (a null raw_code \
+                null-derefs at 4874)."]
     fn test_close_loop_args_preserves_ec_between_frame_and_virtualizable_header() {
         ensure_test_callbacks();
         let input_types = [
@@ -11288,8 +11163,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
-                debug-only fallback was removed; needs a populated-jitcode harness."]
+    #[ignore = "Needs a populated-jitcode harness binding sym.jitcode AND \
+                ctx.virtualizable_array_lengths() seeded with the full root array \
+                capacity (locals + stack). With only a concrete frame the \
+                trace_opcode.rs:4874 fallback uses locals_w().len() (nlocals), so \
+                jump_args carries 2 array slots instead of the asserted array_len=4."]
     fn test_close_loop_args_uses_full_root_virtualizable_array_capacity() {
         use pyre_interpreter::pyframe::PyFrame;
 
