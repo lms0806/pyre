@@ -8768,6 +8768,21 @@ mod tests {
     /// (jitcode.py:80-93), so the test fixture must satisfy that
     /// liveness lookup.
     fn install_test_jitcode(code: &CodeObject, code_ref: *const ()) {
+        install_test_jitcode_with_liveness(code, code_ref, &[0, 0, 0], 1);
+    }
+
+    /// Register a skeleton jitcode for `code_ref` in `METAINTERP_SD` (keyed
+    /// on the W_CodeObject wrapper), publishing `all_liveness` so the
+    /// resume/blackhole decoder (`restore_guard_failure_values`) reads the
+    /// caller's `[length_i, length_r, length_f, <colors…>]` buffer at offset
+    /// 0 instead of the empty `[0, 0, 0]` default. The single `live/` op the
+    /// builder emits patches to liveness offset 0.
+    fn install_test_jitcode_with_liveness(
+        code: &CodeObject,
+        code_ref: *const (),
+        all_liveness: &[u8],
+        num_liveness_ops: usize,
+    ) {
         let raw_code = unsafe {
             pyre_interpreter::w_code_get_ptr(code_ref as pyre_object::PyObjectRef)
                 as *const CodeObject
@@ -8780,7 +8795,7 @@ mod tests {
             "live/".to_string(),
             majit_metainterp::jitcode::insns::BC_LIVE,
         );
-        crate::assembler::publish_state(&insns, &[0, 0, 0], 3, 1);
+        crate::assembler::publish_state(&insns, all_liveness, all_liveness.len(), num_liveness_ops);
         let mut pyjit = crate::PyJitCode::skeleton(raw_code, code_ref, None);
         pyjit.jitcode = std::sync::Arc::new(builder.finish());
         pyjit.metadata.pc_map.resize(code.instructions.len(), 0);
@@ -8788,6 +8803,76 @@ mod tests {
             r.borrow_mut()
                 .set_jitcodes_from_make_result(vec![std::sync::Arc::new(pyjit)]);
         });
+    }
+
+    /// Bind `sym.jitcode` to a populated `JitCode` whose `raw_code()`
+    /// resolves to a real `W_CodeObject` (derived from `w_code`), so the
+    /// methods that hard-deref `(*sym.jitcode).raw_code()` — notably the
+    /// `close_loop_args` snapshot encoder at trace_opcode.rs:4874 — do not
+    /// null-deref. Mirrors the
+    /// `get_list_of_active_boxes_reads_kind_specific_register_banks`
+    /// harness (trace_opcode.rs:11151) but with a non-null `JitCode.code`.
+    ///
+    /// `w_code` must be a real `W_CodeObject` wrapper (e.g. `frame.pycode`,
+    /// or `w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())`
+    /// for the no-frame case). `live_{i,r,f}` are the live color indices
+    /// per kind bank; they seed the published `BC_LIVE` buffer so the
+    /// snapshot/active-box readers find the expected registers.
+    ///
+    /// Returns the leaked `JitCode` pointer; the caller must reclaim it via
+    /// `unsafe { Box::from_raw(ptr) }` after the test to avoid the leak.
+    fn bind_real_jitcode(
+        sym: &mut PyreSym,
+        w_code: *const (),
+        live_i: &[u8],
+        live_r: &[u8],
+        live_f: &[u8],
+    ) -> *mut JitCode {
+        use majit_translate::liveness::encode_liveness;
+        let raw_code = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                as *const CodeObject
+        };
+        let mut all_liveness = vec![live_i.len() as u8, live_r.len() as u8, live_f.len() as u8];
+        all_liveness.extend(encode_liveness(live_i));
+        all_liveness.extend(encode_liveness(live_r));
+        all_liveness.extend(encode_liveness(live_f));
+        let mut insns: majit_ir::VecAssoc<String, u8> = majit_ir::VecAssoc::new();
+        insns.insert(
+            "live/".to_string(),
+            majit_metainterp::jitcode::insns::BC_LIVE,
+        );
+        crate::assembler::publish_state(&insns, &all_liveness, all_liveness.len(), 1);
+
+        let num_regs = |live: &[u8]| {
+            live.iter()
+                .copied()
+                .max()
+                .map_or(4u16, |m| (m as u16 + 1).max(4))
+        };
+        let runtime_jc = {
+            let inner = majit_metainterp::jitcode::JitCode::new("close_loop_args_test");
+            inner.set_body(majit_translate::jitcode::JitCodeBody {
+                code: vec![majit_metainterp::jitcode::insns::BC_LIVE, 0, 0],
+                c_num_regs_i: num_regs(live_i),
+                c_num_regs_r: num_regs(live_r),
+                c_num_regs_f: num_regs(live_f),
+                startpoints: Some([0_usize].into_iter().collect()),
+                ..Default::default()
+            });
+            inner
+        };
+        let mut pyjit = crate::PyJitCode::skeleton(raw_code, w_code, None);
+        pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+        pyjit.metadata.pc_map.push(0);
+        let inner_jc = JitCode {
+            code: w_code,
+            index: 0,
+            payload: std::sync::Arc::new(pyjit),
+        };
+        let inner_jc_ptr = Box::into_raw(Box::new(inner_jc));
+        sym.jitcode = inner_jc_ptr;
+        inner_jc_ptr
     }
 
     #[test]
@@ -10267,13 +10352,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Needs a populated-jitcode harness binding sym.jitcode to a JitCode \
-                whose raw_code() points at a real W_CodeObject (close_loop_args / \
-                restore_guard_failure read code.varnames/ncells/max_stackdepth at \
-                trace_opcode.rs:4874) plus a values vec whose SYM_PYCODE_IDX=3 slot \
-                is a real pycode ref (else pycode.rs:280 SIGABRTs on 0x4)."]
     fn test_restore_guard_failure_uses_runtime_value_kinds_for_virtualizable_locals() {
         use majit_ir::GcRef;
+        use majit_translate::liveness::encode_liveness;
         use pyre_interpreter::pyframe::PyFrame;
         use pyre_interpreter::{ConstantData, compile_exec};
 
@@ -10290,13 +10371,30 @@ mod tests {
             })
             .expect("test source should contain function code");
 
-        let mut frame = PyFrame::new(code);
+        let mut frame = PyFrame::new(code.clone());
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
+        // Register a jitcode keyed on frame.pycode so jitcode_lookup is
+        // non-null (else restore_guard_failure_values panics unconditionally
+        // at state.rs:8115). Publish a liveness buffer marking all four
+        // locals live in the Ref bank (length_r=4, colors 0..3): with a
+        // skeleton jitcode's empty color map, semantic_ref_slot_for_reg_color
+        // maps reg→slot identity (state.rs:1649), so the four array values
+        // land in locals 0..3. Local 3 carries Value::Int(7); the runtime
+        // value kind boxes it back as a real int regardless of the stale
+        // Ref slot type.
+        let mut all_liveness = vec![0u8, 4, 0];
+        all_liveness.extend(encode_liveness(&[0, 1, 2, 3]));
+        install_test_jitcode_with_liveness(&code, frame.pycode, &all_liveness, 1);
+
+        // Resume at the jitcode's single BC_LIVE (jit byte 0). In production
+        // resume_pc is the rd_numb pc; here next_instr would otherwise become
+        // last_instr+1 = 9 (out of the function's pc_map range) before the
+        // liveness lookup, so pin the lookup pc explicitly.
         let mut state = PyreJitState {
             frame: frame_ptr,
-            resume_pc: None,
+            resume_pc: Some(0),
         };
         state.set_next_instr(0);
         state.set_valuestackdepth(4);
@@ -10314,6 +10412,7 @@ mod tests {
         };
         let values = vec![
             Value::Ref(GcRef(frame_ptr)),             // frame
+            Value::Ref(GcRef(0)),                     // ec (extra_red)
             Value::Int(8),                            // last_instr
             Value::Ref(GcRef(frame.pycode as usize)), // pycode
             Value::Int(4),                            // valuestackdepth
@@ -11082,11 +11181,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Fully symbolic (concrete_frame_addr=0), so close_loop_args takes the \
-                trace_opcode.rs:4874 raw_code fallback and reads \
-                code.varnames/ncells/max_stackdepth — needs sym.jitcode bound to a \
-                JitCode whose raw_code() is a real W_CodeObject (a null raw_code \
-                null-derefs at 4874)."]
     fn test_close_loop_args_preserves_ec_between_frame_and_virtualizable_header() {
         ensure_test_callbacks();
         let input_types = [
@@ -11130,6 +11224,15 @@ mod tests {
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack_types = vec![Type::Ref, Type::Ref];
         sym.concrete_stack = vec![ConcreteValue::Null, ConcreteValue::Null];
+        // Bind a populated jitcode with a real W_CodeObject so the
+        // close_loop_args snapshot encoder (trace_opcode.rs:4874) reads
+        // code.varnames/ncells/max_stackdepth instead of null-derefing. No
+        // frame here, so build a standalone wrapper (pattern B). The three
+        // live Ref colors map to local0/stack0/stack1 in registers_r.
+        let code = compile_exec("len(x)").expect("test code should compile");
+        let w_code = pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
+            as *const ();
+        let jc_ptr = bind_real_jitcode(&mut sym, w_code, &[], &[0, 1, 2], &[]);
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -11160,14 +11263,13 @@ mod tests {
             ]
         );
         assert_eq!(state.sym().execution_context, OpRef::input_arg_ref(1));
+
+        unsafe {
+            let _ = Box::from_raw(jc_ptr);
+        }
     }
 
     #[test]
-    #[ignore = "Needs a populated-jitcode harness binding sym.jitcode AND \
-                ctx.virtualizable_array_lengths() seeded with the full root array \
-                capacity (locals + stack). With only a concrete frame the \
-                trace_opcode.rs:4874 fallback uses locals_w().len() (nlocals), so \
-                jump_args carries 2 array slots instead of the asserted array_len=4."]
     fn test_close_loop_args_uses_full_root_virtualizable_array_capacity() {
         use pyre_interpreter::pyframe::PyFrame;
 
@@ -11217,6 +11319,33 @@ mod tests {
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack_types = Vec::new();
         sym.concrete_vable_ptr = frame_ptr as *mut u8;
+        // Bind a populated jitcode (real W_CodeObject = frame.pycode) so
+        // any sym.jitcode/payload read is well-formed; the single live Ref
+        // color 0 maps to local0 in registers_r.
+        let jc_ptr = bind_real_jitcode(&mut sym, frame.pycode, &[], &[0], &[]);
+        // Seed ctx.virtualizable_array_lengths with the full root array
+        // capacity so close_loop_args' target_array_capacity equals the
+        // concrete array length (the nlocals+stack_only fallback would only
+        // yield 1). Empty input_values disables the concrete shadow; the
+        // non-owner path then reads local0 from registers_r and PY_NULLs the
+        // dead stack tail (trace_opcode.rs:3470).
+        seed_virtualizable_boxes(
+            &mut ctx,
+            OpRef::input_arg_ref(0),
+            majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr)),
+            &[
+                OpRef::input_arg_int(1),
+                OpRef::input_arg_ref(2),
+                OpRef::input_arg_int(3),
+                OpRef::input_arg_ref(4),
+                OpRef::input_arg_ref(5),
+                OpRef::input_arg_ref(6),
+            ],
+            &[OpRef::input_arg_ref(7)],
+            array_len,
+            &[],
+            std::ptr::null(),
+        );
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -11244,6 +11373,10 @@ mod tests {
             jump_args[n..].iter().all(|arg| !arg.is_none()),
             "full-capacity root jump args must materialize missing stack slots"
         );
+
+        unsafe {
+            let _ = Box::from_raw(jc_ptr);
+        }
     }
 }
 
