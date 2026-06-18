@@ -102,6 +102,14 @@ pub struct JitInterpConfig {
     /// tracked state fields from shared mutable state after the compiled
     /// loop's residual calls have mutated it.
     pub recover: Option<Path>,
+    /// Optional concrete fallback for `recursive_portal_call!` (a recursive
+    /// portal re-entry).  The function is the runtime analog of the portal
+    /// runner (`jd.portal_runner_ptr`, call.py:363): the transformed
+    /// (concrete) function calls it with the macro greens forwarded
+    /// positionally (jitdriver declaration order), while the dispatch JitCode
+    /// emits `BC_RECURSIVE_CALL_*`.  Required iff the body uses
+    /// `recursive_portal_call!`.
+    pub recursive_entry: Option<Path>,
 }
 
 /// Virtualizable frame field declaration for `#[jit_interp]`.
@@ -412,6 +420,7 @@ impl Parse for JitInterpConfig {
         let mut virtualizable_decl = None;
         let mut state_fields = None;
         let mut recover: Option<Path> = None;
+        let mut recursive_entry: Option<Path> = None;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -455,6 +464,9 @@ impl Parse for JitInterpConfig {
                 "recover" => {
                     recover = Some(input.parse::<Path>()?);
                 }
+                "recursive_entry" => {
+                    recursive_entry = Some(input.parse::<Path>()?);
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -497,6 +509,7 @@ impl Parse for JitInterpConfig {
             virtualizable_decl,
             state_fields,
             recover,
+            recursive_entry,
         })
     }
 }
@@ -862,23 +875,32 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                 // TraceCtx and a `jitcell_token_by_number` resolver so
                 // the dispatcher's BC_CALL_ASSEMBLER_* path can route
                 // through the production `Arc<JitCellToken>` rather
-                // than the synth-Arc `_by_number_typed` fallback.
+                // than the synth-Arc `_by_number_typed` fallback.  The
+                // helper also hands over the #184 recursive-call seams
+                // (green-key target resolver, inline decision, and the
+                // `execute_token_raw` concrete executor) wired to the
+                // production warmstate / backend.
                 let __result = __meta
-                    .with_trace_ctx_and_token_resolver(|__ctx, __resolve| {
-                        let __runtime =
-                            majit_metainterp::ClosureRuntimeWithResolver::new(
-                                |pc: usize| pc,
-                                __resolve,
-                            );
-                        #trace_fn_name(
-                            __ctx,
-                            __sym,
-                            __env,
-                            __pc,
-                            &__runtime,
-                            __dispatch_jitcode.as_ref(),
-                        )
-                    })
+                    .with_trace_ctx_and_token_resolver(
+                        |__ctx, __resolve, __rec_target, __rec_decision, __rec_exec| {
+                            let __runtime =
+                                majit_metainterp::ClosureRuntimeWithResolver::new(
+                                    |pc: usize| pc,
+                                    __resolve,
+                                    __rec_target,
+                                    __rec_decision,
+                                    __rec_exec,
+                                );
+                            #trace_fn_name(
+                                __ctx,
+                                __sym,
+                                __env,
+                                __pc,
+                                &__runtime,
+                                __dispatch_jitcode.as_ref(),
+                            )
+                        },
+                    )
                     .expect("merge_point invariant: tracing must be Some");
                 __sym.trace_started = true;
                 // pyjitpl.py:2843 blackhole_if_trace_too_long — check
@@ -913,6 +935,7 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
         &config.green_type_tags,
         &config.calls,
         &config.io_shims,
+        config.recursive_entry.as_ref(),
     );
 
     quote! {
@@ -931,6 +954,7 @@ fn rewrite_body(
     default_green_type_tags: &[Option<green_type_tag::GreenTypeTag>],
     call_policies: &[CallEntry],
     io_shims: &[(Path, Ident)],
+    recursive_entry: Option<&Path>,
 ) -> TokenStream {
     use syn::visit_mut::VisitMut;
 
@@ -1421,6 +1445,7 @@ fn rewrite_body(
         default_green_type_tags: Vec<Option<green_type_tag::GreenTypeTag>>,
         call_policies: Vec<(Vec<String>, Option<CallPolicyKind>)>,
         io_shims: Vec<(Vec<String>, Ident)>,
+        recursive_entry: Option<Path>,
     }
 
     impl VisitMut for MarkerRewriter {
@@ -1476,6 +1501,45 @@ fn rewrite_body(
         fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
             // First recurse
             syn::visit_mut::visit_expr_mut(self, expr);
+
+            // `recursive_portal_call!(driver, green0, green1, ...)` — the
+            // concrete (non-JIT) path re-enters the portal via the declared
+            // `recursive_entry` function, forwarding the greens positionally
+            // (jitdriver declaration order).  The dispatch JitCode lowers the
+            // same intrinsic to `BC_RECURSIVE_CALL_*`.
+            if let Expr::Macro(em) = expr {
+                let path_str = em
+                    .mac
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                if path_str == "recursive_portal_call"
+                    || path_str.ends_with("::recursive_portal_call")
+                {
+                    let args = em
+                        .mac
+                        .parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+                        .expect("recursive_portal_call! takes `driver, green0, green1, ...`");
+                    let mut iter = args.into_iter();
+                    let _driver = iter
+                        .next()
+                        .expect("recursive_portal_call! requires a driver argument");
+                    let greens: Vec<Expr> = iter.collect();
+                    let entry = self.recursive_entry.as_ref().unwrap_or_else(|| {
+                        panic!(
+                            "recursive_portal_call! used but `#[jit_interp(..)]` declares no \
+                             `recursive_entry = <fn path>` for the concrete fallback"
+                        )
+                    });
+                    let new_tokens = quote! { #entry(#(#greens),*) };
+                    *expr = syn::parse2(new_tokens)
+                        .expect("failed to parse recursive_portal_call concrete fallback");
+                    return;
+                }
+            }
 
             if let Expr::Call(call) = expr {
                 if let Some(replay) =
@@ -1631,6 +1695,7 @@ fn rewrite_body(
             .iter()
             .map(|(path, shim)| (path_segments(path), shim.clone()))
             .collect(),
+        recursive_entry: recursive_entry.cloned(),
     };
     rewriter.visit_block_mut(&mut cloned_block);
 

@@ -3745,6 +3745,21 @@ mod tests {
     use crate::*;
     use std::rc::Rc;
 
+    /// The JIT compiler state — warmstate, the compiled-loop registry, and the
+    /// executable-code buffers — is a process-global singleton driven on a
+    /// single thread by design. The `cargo test` harness runs tests on a thread
+    /// pool, so two loops crossing the compile threshold at once race on that
+    /// shared state and one of them reads a half-installed trace. Tests that
+    /// drive JIT compilation serialise on this lock so only one compiles at a
+    /// time. Poison is recovered: a panicking test must not wedge the others.
+    static JIT_COMPILE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn jit_compile_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        JIT_COMPILE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn run_eval(source: &str) -> PyResult {
         let code = compile_eval(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
@@ -4091,6 +4106,7 @@ r = acc",
 
     #[test]
     fn test_hot_range_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "s = 0\nfor i in range(3000):\n    s = s + i";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
@@ -4103,6 +4119,7 @@ r = acc",
 
     #[test]
     fn test_hot_module_branch_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 i = 0
 acc = 0
@@ -4125,6 +4142,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_tuple_unpack_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 i = 0
 acc = 0
@@ -4145,6 +4163,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_list_index_store_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 lst = [0]
 i = 0
@@ -4168,6 +4187,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_bitwise_or_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 i = 0
 acc = 0
@@ -4187,6 +4207,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_unary_invert_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 i = 0
 acc = 0
@@ -4206,6 +4227,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_positive_floordiv_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 i = 0
 acc = 0
@@ -4225,6 +4247,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_positive_mod_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 i = 0
 acc = 0
@@ -4244,6 +4267,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_builtin_abs_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 i = 0
 acc = 0
@@ -4263,6 +4287,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_list_truth_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 lst = [1]
 i = 0
@@ -4284,6 +4309,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_empty_tuple_truth_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 tpl = ()
 i = 0
@@ -4307,6 +4333,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_none_truth_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 value = None
 i = 0
@@ -4330,6 +4357,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_float_truth_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 value = 0.5
 i = 0
@@ -4351,6 +4379,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_string_truth_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 value = \"pyre\"
 i = 0
@@ -4372,6 +4401,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_empty_string_truth_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 value = \"\"
 i = 0
@@ -4395,6 +4425,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_dict_truth_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 value = {1: 2}
 i = 0
@@ -4416,6 +4447,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_builtin_len_string_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 value = \"pyre\"
 i = 0
@@ -4436,6 +4468,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_builtin_len_dict_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 value = {1: 2, 3: 4}
 i = 0
@@ -4456,6 +4489,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_builtin_isinstance_true_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 x = 42
 i = 0
@@ -4477,6 +4511,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_builtin_isinstance_false_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 x = []
 i = 0
@@ -4500,6 +4535,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_builtin_type_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 x = []
 i = 0
@@ -4521,6 +4557,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_builtin_min_small_int_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 i = 0
 acc = 0
@@ -4540,6 +4577,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_builtin_max_small_int_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 i = 0
 acc = 0
@@ -4559,6 +4597,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_empty_dict_truth_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 value = {}
 i = 0
@@ -4582,6 +4621,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_list_negative_index_store_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 lst = [0, 1]
 i = 0
@@ -4605,6 +4645,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_tuple_negative_index_load_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 tpl = (3, 5)
 i = 0
@@ -4625,6 +4666,7 @@ while i < 3000:
 
     #[test]
     fn test_hot_user_function_loop_survives_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
         let source = "\
 def inc(x):
     return x + 1

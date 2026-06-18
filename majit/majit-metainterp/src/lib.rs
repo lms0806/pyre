@@ -212,6 +212,34 @@ macro_rules! can_enter_jit {
     ($($tt:tt)*) => {};
 }
 
+/// Marker macro for a recursive portal re-entry (a self-recursive JIT call).
+///
+/// `recursive_portal_call!(driver, green0, green1, ...)` re-enters the
+/// enclosing `#[jit_interp]` portal with the given green key (the greens in
+/// jitdriver declaration order). It is the explicit-intrinsic analog of
+/// tl.py:177 `res = interp(code, pc + offset)` and of the codewriter's
+/// `recursive_call_*` opcode (jtransform.py:522 `handle_recursive_call`,
+/// recognised upstream by `funcptr is jd.portal_runner_ptr`, call.py:363).
+///
+/// Inside `#[jit_interp]` the proc macro rewrites every occurrence:
+/// - the transformed (concrete) function calls the `recursive_entry`
+///   function declared in the attribute, forwarding the greens positionally;
+/// - the dispatch JitCode emits `BC_RECURSIVE_CALL_*`, which the metainterp
+///   routes through the inline / CALL_ASSEMBLER / residual decision seams.
+///
+/// So this `macro_rules!` body is never expanded in a correctly-configured
+/// portal; it fails loud if the intrinsic is used without a `recursive_entry`
+/// declaration (or outside `#[jit_interp]`).
+#[macro_export]
+macro_rules! recursive_portal_call {
+    ($($tt:tt)*) => {
+        ::core::compile_error!(
+            "recursive_portal_call! is only valid inside a #[jit_interp] portal \
+             declaring `recursive_entry = <fn path>`"
+        )
+    };
+}
+
 /// Assure the JIT that `func(args...)` will produce `result`.
 /// `func` must be an elidable function.
 ///

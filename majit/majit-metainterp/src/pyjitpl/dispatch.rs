@@ -721,6 +721,47 @@ pub trait JitCodeSym {
     /// value-mirror seeding from `JitState::initialize_sym`) is
     /// removed.
     fn populate_frame_int_regs(&self, _frame: &mut MIFrame) {}
+
+    /// #184 recursive CALL_ASSEMBLER portal entry: build the fresh-frame
+    /// reds for a recursive callee run.
+    ///
+    /// Returns the typed `Value` reds in `extract_live` order for a freshly
+    /// allocated callee frame (scalars zeroed, arrays re-allocated at the
+    /// caller's live capacity — read from this symbolic state's cached array
+    /// lengths), together with an owner box keeping that freshly-allocated
+    /// state alive for the callee's `execute_token_raw` run.  The fresh
+    /// state's `&state` address is the vable identity embedded in the
+    /// returned `Value::Ref` slots, so a guard failure inside the callee
+    /// resumes into this scratch frame rather than the caller's state.
+    ///
+    /// `None` (the default, and for state shapes carrying ref scalars whose
+    /// fresh value cannot be synthesized generically) means no portal-entry
+    /// support, so the recursive dispatcher aborts to the interpreter
+    /// fallback.
+    fn recursive_fresh_entry_reds(&self) -> Option<(Vec<majit_ir::Value>, Box<dyn std::any::Any>)> {
+        None
+    }
+
+    /// #184 recursive CALL_ASSEMBLER portal entry: the host-Rust allocator and
+    /// deallocator for a fresh callee state.
+    ///
+    /// Returns `(alloc, free)` raw function addresses where
+    /// `alloc: extern "C" fn(capacity: i64) -> i64` returns a freshly
+    /// `Box::into_raw`-ed state pointer (scalars zeroed, the single virt array
+    /// allocated at `capacity`) and `free: extern "C" fn(ptr: i64)` drops it.
+    /// The recursive dispatcher records a residual `CallR(alloc)` whose result
+    /// feeds the CALL_ASSEMBLER `&state` red and a paired `CallN(free)` after
+    /// the call, so the compiled caller loop allocates and frees the callee's
+    /// scratch frame at runtime — the host-Rust analog of `gen_malloc_frame`
+    /// (rewrite.py:665) for a callee whose vable is a host struct the IR cannot
+    /// `New`.
+    ///
+    /// `None` (the default, and for any shape other than zero ref scalars + no
+    /// fixed arrays + exactly one virt array) means the dispatcher aborts to
+    /// the interpreter fallback.
+    fn recursive_fresh_alloc_free_targets(&self) -> Option<(*const (), *const ())> {
+        None
+    }
 }
 
 pub trait JitCodeRuntime {
@@ -738,6 +779,83 @@ pub trait JitCodeRuntime {
         &self,
         _token_number: u64,
     ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
+        None
+    }
+
+    /// Recursive portal-call inline decision (pyjitpl.py:1376
+    /// `opimpl_recursive_call` → `should_unroll_one_iteration` /
+    /// `max_unroll_recursion`).  When the dispatcher meets a
+    /// `BC_RECURSIVE_CALL_*` opcode it asks the runtime whether to inline
+    /// the self-recursive portal call.  The production runtime mirrors
+    /// `should_inline_core` through the shared `decide_recursive_inline`,
+    /// which needs the callee green key (hashed from `green_values` against
+    /// the driver's green spec) plus the trace's `inline_depth` and
+    /// `recursive_depth`.  The default is `ResidualCall` so standalone test
+    /// runtimes — and any consumer that has not opted in — never enter the
+    /// inline path: the dispatcher aborts the trace, exactly as it did
+    /// before this opcode family existed.
+    fn recursive_inline_decision(
+        &self,
+        _jd_index: usize,
+        _green_values: &[i64],
+        _inline_depth: usize,
+        _recursive_depth: usize,
+    ) -> crate::pyjitpl::InlineDecision {
+        crate::pyjitpl::InlineDecision::ResidualCall
+    }
+
+    /// Resolve the self-recursive portal jitcode for a `BC_RECURSIVE_CALL_*`
+    /// opcode.  A recursive portal call targets the portal jitcode itself,
+    /// which is not yet compiled at emit time (self-recursion), so the
+    /// opcode carries the jitdriver index rather than a compiled target;
+    /// the runtime maps that index back to the portal `JitCode` the
+    /// metainterp is currently tracing.  Returns `None` for runtimes with
+    /// no portal, in which case the dispatcher aborts the trace.
+    fn portal_jitcode(&self, _jd_index: usize) -> Option<std::sync::Arc<JitCode>> {
+        None
+    }
+
+    /// Resolve the CALL_ASSEMBLER target for a `BC_RECURSIVE_CALL_*`
+    /// opcode whose inline decision came back `CallAssembler`
+    /// (pyjitpl.py:1376 → `do_recursive_call(assembler_call=True)`).  The
+    /// recursive portal call targets the portal's own compiled loop, keyed
+    /// by the green values (the portal green key, pyjitpl.py:3593-3599
+    /// `get_assembler_token(greenargs)`).  The runtime hashes the greens
+    /// to that key and resolves the production `Arc<JitCellToken>` — used
+    /// both for the recorded descr's token identity (compile.py:187 via
+    /// `call_assembler_int_arc_typed`) and to drive the concrete loop
+    /// through [`Self::execute_recursive_assembler_int`].  The `u64` is the
+    /// resolved green key (compile.py:186 `rd_loop_token`), returned so the
+    /// concrete leg keys the same loop the descr names.  Returns `None` for
+    /// runtimes with no warmstate / no compiled callee, in which case the
+    /// dispatcher aborts the trace and retries.
+    fn recursive_call_assembler_target(
+        &self,
+        _jd_index: usize,
+        _green_values: &[i64],
+    ) -> Option<(std::sync::Arc<majit_backend::JitCellToken>, u64)> {
+        None
+    }
+
+    /// Run the recursive callee's compiled loop concretely and return its
+    /// integer result, advancing the concrete-shadow state so the caller's
+    /// trace continues past the call with the real return value.  A
+    /// compiled state-field portal loop exposes only a JITFRAME-ABI entry
+    /// (`token._ll_function_addr`, invoked via `backend.execute_token_raw`
+    /// which calloc's a frame and passes the frame ptr in reg0) — it is NOT
+    /// a positional C-ABI function, so it cannot be called through
+    /// `call_int_function`.  The runtime drives `execute_token_raw(token,
+    /// reds)` (mirroring `run_compiled_raw_detailed_with_values`
+    /// mod.rs:7312) and decodes the single int FINISH output.  `reds` are
+    /// the marshalled red call args (greens are baked into the loop the
+    /// `token` already names).  Returns `None` when the loop did not finish
+    /// with an int result or when the runtime has no backend (the default,
+    /// for standalone test runtimes), in which case the caller aborts.
+    fn execute_recursive_assembler_int(
+        &self,
+        _token: &majit_backend::JitCellToken,
+        _reds: &[Value],
+    ) -> Option<i64> {
         None
     }
 }
@@ -761,29 +879,51 @@ where
     }
 }
 
-/// Slice X-D-aware `JitCodeRuntime` carrying both the `label_at` and
-/// the `jitcell_token_arc_for_number` closures.  Used by
-/// `MetaInterp::trace_jitcode_with_framestack` so the dispatcher can
-/// resolve CALL_ASSEMBLER targets to their production Arcs via
-/// `MetaInterp::jitcell_token_by_number`.
-pub struct ClosureRuntimeWithResolver<FLabel, FResolve> {
+/// Slice X-D-aware `JitCodeRuntime` carrying the `label_at` /
+/// `jitcell_token_arc_for_number` closures plus the #184 recursive-call
+/// seams (inline decision, green-key target resolver, concrete loop
+/// executor).  Used by `MetaInterp::trace_jitcode_with_framestack` so the
+/// dispatcher resolves CALL_ASSEMBLER targets to their production Arcs via
+/// `MetaInterp::jitcell_token_by_number` and routes recursive portal calls
+/// through the production warmstate / backend.  All closures are built by
+/// `MetaInterp::with_trace_ctx_and_token_resolver`, which split-borrows the
+/// MetaInterp fields they read.
+pub struct ClosureRuntimeWithResolver<FLabel, FResolve, FTarget, FDecision, FExec> {
     label_at: FLabel,
     resolve_token: FResolve,
+    recursive_target: FTarget,
+    recursive_decision: FDecision,
+    recursive_exec: FExec,
 }
 
-impl<FLabel, FResolve> ClosureRuntimeWithResolver<FLabel, FResolve> {
-    pub fn new(label_at: FLabel, resolve_token: FResolve) -> Self {
+impl<FLabel, FResolve, FTarget, FDecision, FExec>
+    ClosureRuntimeWithResolver<FLabel, FResolve, FTarget, FDecision, FExec>
+{
+    pub fn new(
+        label_at: FLabel,
+        resolve_token: FResolve,
+        recursive_target: FTarget,
+        recursive_decision: FDecision,
+        recursive_exec: FExec,
+    ) -> Self {
         Self {
             label_at,
             resolve_token,
+            recursive_target,
+            recursive_decision,
+            recursive_exec,
         }
     }
 }
 
-impl<FLabel, FResolve> JitCodeRuntime for ClosureRuntimeWithResolver<FLabel, FResolve>
+impl<FLabel, FResolve, FTarget, FDecision, FExec> JitCodeRuntime
+    for ClosureRuntimeWithResolver<FLabel, FResolve, FTarget, FDecision, FExec>
 where
     FLabel: Fn(usize) -> usize,
     FResolve: Fn(u64) -> Option<std::sync::Arc<majit_backend::JitCellToken>>,
+    FTarget: Fn(usize, &[i64]) -> Option<(std::sync::Arc<majit_backend::JitCellToken>, u64)>,
+    FDecision: Fn(usize, &[i64], usize, usize) -> crate::pyjitpl::InlineDecision,
+    FExec: Fn(&majit_backend::JitCellToken, &[Value]) -> Option<i64>,
 {
     fn label_at(&self, pc: usize) -> usize {
         (self.label_at)(pc)
@@ -794,6 +934,32 @@ where
         token_number: u64,
     ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
         (self.resolve_token)(token_number)
+    }
+
+    fn recursive_inline_decision(
+        &self,
+        jd_index: usize,
+        green_values: &[i64],
+        inline_depth: usize,
+        recursive_depth: usize,
+    ) -> crate::pyjitpl::InlineDecision {
+        (self.recursive_decision)(jd_index, green_values, inline_depth, recursive_depth)
+    }
+
+    fn recursive_call_assembler_target(
+        &self,
+        jd_index: usize,
+        green_values: &[i64],
+    ) -> Option<(std::sync::Arc<majit_backend::JitCellToken>, u64)> {
+        (self.recursive_target)(jd_index, green_values)
+    }
+
+    fn execute_recursive_assembler_int(
+        &self,
+        token: &majit_backend::JitCellToken,
+        reds: &[Value],
+    ) -> Option<i64> {
+        (self.recursive_exec)(token, reds)
     }
 }
 
@@ -1087,6 +1253,7 @@ where
             // two per live vref).
             let virtualizable_snapshot = ctx.virtualizable_boxes.clone().unwrap_or_default();
             let virtualref_snapshot = ctx.virtualref_boxes.clone();
+            let identity_const = ctx.state_field_identity_const();
             let snapshot = build_state_field_snapshot(
                 self.frames,
                 op_live,
@@ -1094,6 +1261,7 @@ where
                 after_residual_call,
                 &virtualizable_snapshot,
                 &virtualref_snapshot,
+                identity_const,
             );
             for idx in 0..n {
                 // RPython pyjitpl.py:180-193 leaves the parent frame's
@@ -1823,6 +1991,370 @@ where
             sym.commit_portal_op();
             TraceAction::Continue
         }
+    }
+
+    /// Execute a `BC_RECURSIVE_CALL_*` opcode (pyjitpl.py:1376
+    /// `opimpl_recursive_call`).
+    ///
+    /// Payload (little-endian, emitted by
+    /// `JitCodeBuilder::recursive_call_int` and siblings):
+    ///   jd_index:u16, result_dst:u16 (`u16::MAX` = no result / void),
+    ///   num_green:u16, (green_kind:u8, green_src:u16) × num_green,
+    ///   num_args:u16, (kind:u8, caller_src:u16, callee_dst:u16) × num_args.
+    ///
+    /// `result_kind` is `Some(Int/Ref/Float)` for the typed opcodes and
+    /// `None` for the void opcode.  The green register sources carry the
+    /// portal green key in green declaration order; each green's
+    /// `JitArgKind` selects the register bank it is read from (a ref
+    /// `program` green from the ref bank, an int `pc` green from the int
+    /// bank), so the concrete green value hashes against
+    /// `green_args_spec`.  `green_pc` (the concrete of the first green,
+    /// or 0) keys the per-depth `recursive_depth` count and seeds the
+    /// portal frame's entry pc — the first green is the int portal pc.
+    ///
+    /// This mirrors the `BC_INLINE_CALL` machinery (frame push, argument
+    /// marshalling, return-slot wiring), but resolves both the callee and
+    /// the inline decision through `JitCodeRuntime` because the portal is
+    /// self-recursive and has no compiled target in any descrs slot at
+    /// emit time.  With the default `JitCodeRuntime` (decision
+    /// `ResidualCall`, `portal_jitcode` `None`) it aborts the trace, so
+    /// only a runtime that overrides both methods reaches the inline path.
+    fn exec_recursive_call(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        runtime: &R,
+        result_kind: Option<JitArgKind>,
+    ) -> TraceAction {
+        // Decode the payload off the caller frame, advancing its cursor
+        // past the whole instruction.  As in BC_INLINE_CALL, the caller's
+        // `pc` is set to `code_cursor` so a later `make_result_of_lastop`
+        // (driven by the portal's typed return) keys `resulttypes[pc]` at
+        // the post-operand offset the emitter recorded.
+        let (jd_index, result_dst, green_srcs, arg_triples) = {
+            let frame = self.frames.current_mut();
+            let jd_index = frame.next_u16() as usize;
+            let result_dst_raw = frame.next_u16() as usize;
+            let result_dst = if result_dst_raw == u16::MAX as usize {
+                None
+            } else {
+                Some(result_dst_raw)
+            };
+            let num_green = frame.next_u16() as usize;
+            let mut green_srcs = Vec::with_capacity(num_green);
+            for _ in 0..num_green {
+                let kind = JitArgKind::decode(frame.next_u8());
+                let src = frame.next_u16() as usize;
+                green_srcs.push((kind, src));
+            }
+            let num_args = frame.next_u16() as usize;
+            let mut arg_triples = Vec::with_capacity(num_args);
+            for _ in 0..num_args {
+                let kind = JitArgKind::decode(frame.next_u8());
+                let caller_src = frame.next_u16() as usize;
+                let callee_dst = frame.next_u16() as usize;
+                arg_triples.push((kind, caller_src, callee_dst));
+            }
+            // Caller-side result-slot bookkeeping (BC_INLINE_CALL:3298-3300).
+            frame._result_argcode = match (result_kind, result_dst) {
+                (Some(JitArgKind::Int), Some(_)) => b'i',
+                (Some(JitArgKind::Ref), Some(_)) => b'r',
+                (Some(JitArgKind::Float), Some(_)) => b'f',
+                _ => b'v',
+            };
+            frame.result_arg_index = result_dst;
+            frame.pc = frame.code_cursor;
+            (jd_index, result_dst, green_srcs, arg_triples)
+        };
+
+        // Read each green from the register bank its `JitArgKind` names: a
+        // ref green (e.g. tl's `program`) from the ref bank, an int green
+        // (e.g. `pc`) from the int bank.  The values are collected in green
+        // declaration order so they hash against `green_args_spec`.
+        // `green_pc` is the first green (the int portal entry pc), or 0 when
+        // the call carries no greens.
+        let green_values: Vec<i64> = green_srcs
+            .iter()
+            .map(|&(kind, src)| match kind {
+                JitArgKind::Ref => self.read_ref_reg(src).1,
+                JitArgKind::Int | JitArgKind::Float => self.read_int_reg(src).1,
+            })
+            .collect();
+        let green_pc = green_values.first().copied().unwrap_or(0) as usize;
+
+        let recursive_depth = ctx.recursive_depth((jd_index, green_pc));
+        let inline_depth = ctx.inline_depth();
+        let decision = runtime.recursive_inline_decision(
+            jd_index,
+            &green_values,
+            inline_depth,
+            recursive_depth,
+        );
+        if decision == crate::pyjitpl::InlineDecision::CallAssembler {
+            // pyjitpl.py:1376 `_opimpl_recursive_call` →
+            // `do_recursive_call(assembler_call=True)`: instead of inlining
+            // the portal frame, force the caller vable to heap, record a
+            // CALL_ASSEMBLER into the callee's own compiled loop (resolved
+            // by green key), and reload on return.  Mirrors the
+            // `BC_CALL_ASSEMBLER_INT` arm verbatim except for token
+            // resolution (green key, not the jitcode fn_ptr_idx slot).
+            return self.exec_recursive_call_assembler(
+                ctx,
+                sym,
+                runtime,
+                result_kind,
+                jd_index,
+                result_dst,
+                &green_values,
+                &arg_triples,
+            );
+        }
+        if decision != crate::pyjitpl::InlineDecision::Inline {
+            // `ResidualCall` is not wired in this epic; abort so the trace
+            // is retried rather than recording an unhandled call
+            // (pyjitpl.py falls to `do_residual_call`; pyre retries).
+            return TraceAction::Abort;
+        }
+        let portal = match runtime.portal_jitcode(jd_index) {
+            Some(portal) => portal,
+            None => return TraceAction::Abort,
+        };
+
+        // Build the portal frame entering at `green_pc`.  `code_cursor`
+        // must be set explicitly because `MIFrame::new` always starts the
+        // cursor at 0 regardless of the entry pc.
+        //
+        // NOTE: this `code_cursor = green_pc` entry models a *pc-aligned*
+        // portal jitcode (one jitcode per interpreter pc, the full-portal
+        // shape `opimpl_recursive_call` assumes).  The `#[jit_interp]`
+        // state-field JIT instead compiles a single dispatch-body jitcode
+        // entered at offset 0 with the interpreter pc carried as a
+        // green/red value (`trace_jitcode_with_args_and_runtime` resets
+        // `frame.pc = 0` via `setup_call` and tracks the interpreter pc as
+        // `outer_program_pc`).  For that shape this frame setup must instead
+        // enter at offset 0, seed the dispatch body's `program` / `pc` /
+        // fresh-vable reds, and let the inline-frame merge point walk the
+        // callee opcodes to its RETURN.  The state-field production runtime
+        // (`ClosureRuntimeWithResolver`) therefore leaves `portal_jitcode`
+        // at the `None` default so this path aborts cleanly (graceful
+        // interpreter fallback) until that re-entry rework lands; the
+        // pc-aligned form below is exercised only by pc-aligned-portal
+        // runtimes.
+        let mut portal_frame = MIFrame::setup(portal, green_pc, None, Some(ctx));
+        portal_frame.code_cursor = green_pc;
+        ctx.push_inline_frame((jd_index, green_pc), u32::MAX);
+        portal_frame.inline_frame = true;
+
+        for (kind, caller_src, callee_dst) in arg_triples {
+            match kind {
+                JitArgKind::Int => {
+                    let (value, concrete) = self.read_int_reg(caller_src);
+                    portal_frame.int_regs[callee_dst] = Some(value);
+                    portal_frame.int_values[callee_dst] = Some(concrete);
+                }
+                JitArgKind::Ref => {
+                    let (value, concrete) = self.read_ref_reg(caller_src);
+                    portal_frame.ref_regs[callee_dst] =
+                        Some(crate::r#box::BoxRef::from_opref(value));
+                    portal_frame.ref_values[callee_dst] = Some(concrete);
+                }
+                JitArgKind::Float => {
+                    let (value, concrete) = self.read_float_reg(caller_src);
+                    portal_frame.float_regs[callee_dst] = Some(value);
+                    portal_frame.float_values[callee_dst] = Some(concrete);
+                }
+            }
+        }
+
+        // Wire the return slot so the portal's `*_return` writes its
+        // result back into the caller's destination register
+        // (BC_INLINE_CALL:3348-3350).
+        match result_kind {
+            Some(JitArgKind::Int) => portal_frame.return_i = result_dst,
+            Some(JitArgKind::Ref) => portal_frame.return_r = result_dst,
+            Some(JitArgKind::Float) => portal_frame.return_f = result_dst,
+            None => {}
+        }
+
+        self.frames.push(portal_frame);
+        TraceAction::Continue
+    }
+
+    /// pyjitpl.py:1425-1432 `do_recursive_call(assembler_call=True)` for a
+    /// `BC_RECURSIVE_CALL_*` opcode whose inline decision was
+    /// `CallAssembler`.  Runs the 8-step `do_residual_call` /
+    /// CALL_ASSEMBLER protocol (force caller vable → concrete call →
+    /// reload → record `CallAssembler*`), reusing the same vable helpers the
+    /// `BC_CALL_ASSEMBLER_INT` arm (dispatch.rs:5252) uses, but resolving
+    /// the callee loop token by GREEN KEY via the `JitCodeRuntime` seam
+    /// (the portal is self-recursive and has no `fn_ptr_idx` slot) and
+    /// driving the concrete leg through `execute_recursive_assembler_int`
+    /// (`execute_token_raw`, JITFRAME-ABI) rather than `call_int_function`
+    /// (positional C-ABI) — a compiled state-field loop has no C-ABI entry.
+    /// Because the callee runs as its own compiled loop with its caller's
+    /// state forced to the heap, there is no shared-shadow aliasing and no
+    /// caller-frame resume coupling — the callee's guards resume in its own
+    /// blackhole.  Wires the `Int` result kind only; `Ref` / `Float` /
+    /// `Void` recursive assembler calls are a follow-on slice.
+    #[allow(clippy::too_many_arguments)]
+    fn exec_recursive_call_assembler(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        runtime: &R,
+        result_kind: Option<JitArgKind>,
+        jd_index: usize,
+        result_dst: Option<usize>,
+        green_values: &[i64],
+        // A recursive portal call runs the callee with a FRESH frame, so the
+        // caller's red-arg mapping does not flow into the callee's reds (the
+        // fresh state supersedes it); kept for the opcode's decode shape.
+        _arg_triples: &[(JitArgKind, usize, usize)],
+    ) -> TraceAction {
+        // S1 supports only the `Int` result kind through CALL_ASSEMBLER.
+        let result_dst = match (result_kind, result_dst) {
+            (Some(JitArgKind::Int), Some(dst)) => dst,
+            _ => return TraceAction::Abort,
+        };
+
+        // The greens carry the portal green key (pyjitpl.py:3593-3599
+        // `get_assembler_token(greenargs)`), already read from the correct
+        // register bank per `JitArgKind` by the caller in green declaration
+        // order.
+        // The seam returns the callee loop token (for both the recorded
+        // descr's identity and the concrete entry) plus the resolved green
+        // key (compile.py:186 `rd_loop_token`).  The concrete int leg keys
+        // off the token; the green key is the loop identity S3's
+        // resume-layout enrichment will need.
+        let (token_arc, _green_key) =
+            match runtime.recursive_call_assembler_target(jd_index, green_values) {
+                Some(target) => target,
+                None => return TraceAction::Abort,
+            };
+
+        // Build the callee's red args.  A recursive portal call runs the
+        // callee as its own compiled loop with a FRESH frame
+        // (`direct_assembler_call` mod.rs:12454 passes red args positionally;
+        // tl.py:76 `Stack(len(code))` is a fresh stack), so the reds are the
+        // freshly-allocated callee state — not the caller's live registers.
+        // Greens are baked into the callee loop's green key, not passed as
+        // call args.  `recursive_fresh_entry_reds` yields the fresh reds in
+        // `extract_live` order (scalars zeroed, then per virt array the
+        // `&state` identity Ref + length) together with an owner box keeping
+        // that state alive for the concrete `execute_recursive_assembler_int`
+        // run.
+        let (fresh_values, fresh_owner) = match sym.recursive_fresh_entry_reds() {
+            Some(pair) => pair,
+            None => return TraceAction::Abort,
+        };
+        let (alloc_fp, free_fp) = match sym.recursive_fresh_alloc_free_targets() {
+            Some(targets) => targets,
+            None => return TraceAction::Abort,
+        };
+        // The trace-time fresh state stands in for the residual allocator's
+        // result (byte-identical by construction — both build a fresh state,
+        // scalars zeroed, the virt array at the captured capacity).  Held
+        // alive across the concrete leg; dropped at function exit (the
+        // compiled loop's recorded `CallN` free owns runtime deallocation).
+        let _fresh_owner = fresh_owner;
+        // The compiled caller loop cannot `New` a host state through the IR,
+        // so each virt-array `&state` red is recorded as a residual `CallR`
+        // to the macro-generated host allocator (the host analog of
+        // `gen_malloc_frame`, rewrite.py:665), paired with a residual `CallN`
+        // free after the call.  The allocator EI cannot raise (`Box::new`
+        // aborts on OOM, never raising a pyre exception), is non-elidable and
+        // non-loop-invariant (each call yields a distinct frame; eliding or
+        // hoisting would alias frames), and `can_collect = false` (a host
+        // `Box` allocation never triggers pyre's GC).
+        let fresh_call_ei = majit_ir::EffectInfo {
+            can_collect: false,
+            ..majit_ir::EffectInfo::new(
+                majit_ir::descr::ExtraEffect::CannotRaise,
+                majit_ir::descr::OopSpecIndex::None,
+            )
+        };
+        let mut args = Vec::with_capacity(fresh_values.len());
+        let mut red_values = Vec::with_capacity(fresh_values.len());
+        let mut arg_types = Vec::with_capacity(fresh_values.len());
+        let mut alloc_results: Vec<OpRef> = Vec::new();
+        let mut idx = 0;
+        while idx < fresh_values.len() {
+            match fresh_values[idx] {
+                majit_ir::Value::Int(n) => {
+                    args.push(OpRef::const_int(n));
+                    red_values.push(majit_ir::Value::Int(n));
+                    arg_types.push(majit_ir::Type::Int);
+                    idx += 1;
+                }
+                majit_ir::Value::Ref(_) => {
+                    // A virt array contributes a (`&state` Ref, length Int)
+                    // pair; the length is the allocator's capacity argument.
+                    let cap = match fresh_values.get(idx + 1) {
+                        Some(majit_ir::Value::Int(cap)) => *cap,
+                        _ => return TraceAction::Abort,
+                    };
+                    let cap_arg = OpRef::const_int(cap);
+                    let alloc_result = ctx.call_ref_typed_with_effect(
+                        alloc_fp,
+                        &[cap_arg],
+                        &[majit_ir::Type::Int],
+                        fresh_call_ei.clone(),
+                    );
+                    alloc_results.push(alloc_result);
+                    args.push(alloc_result);
+                    red_values.push(fresh_values[idx]);
+                    arg_types.push(majit_ir::Type::Ref);
+                    args.push(cap_arg);
+                    red_values.push(majit_ir::Value::Int(cap));
+                    arg_types.push(majit_ir::Type::Int);
+                    idx += 2;
+                }
+                _ => return TraceAction::Abort,
+            }
+        }
+
+        // 8-step `do_residual_call(assembler_call=True)` protocol, mirroring
+        // `BC_CALL_ASSEMBLER_INT` (dispatch.rs:5107-5133), except the
+        // concrete leg runs the callee's compiled loop through the
+        // JITFRAME-ABI `execute_recursive_assembler_int` seam (which wraps
+        // `execute_token_raw`) rather than a positional C-ABI call — a
+        // compiled state-field loop has no C-ABI entry.
+        self.clear_exception();
+        // pyjitpl.py:2017 — vrefs walk + vinfo stamp before the call.
+        ctx.vrefs_before_residual_call();
+        let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
+        let concrete = match runtime.execute_recursive_assembler_int(&token_arc, &red_values) {
+            Some(value) => value,
+            None => return TraceAction::Abort,
+        };
+        // pyjitpl.py:2046-2049 vrefs_after_residual_call.
+        ctx.vrefs_after_residual_call();
+        let traced = ctx.call_assembler_int_arc_typed(token_arc, &args, &arg_types);
+        self.set_int_reg(result_dst, Some(traced), Some(concrete));
+        // Free each fresh allocation after the call: the compiled loop's
+        // residual `CallN`.  Recorded after CALL_ASSEMBLER so the callee has
+        // the state for the duration of its run; the trace-time owner box is
+        // dropped at function exit.
+        for alloc_result in &alloc_results {
+            ctx.call_void_typed_with_effect(
+                free_fp,
+                &[*alloc_result],
+                &[majit_ir::Type::Ref],
+                fresh_call_ei.clone(),
+            );
+        }
+        let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
+        if matches!(
+            Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
+            TraceAction::Abort
+        ) {
+            return TraceAction::Abort;
+        }
+        // pyjitpl.py:2080-2081 KEEPALIVE on the vable box.
+        if let Some(vbox) = vable_opref {
+            ctx.record_op(majit_ir::OpCode::Keepalive, &[vbox]);
+        }
+        self.finish_call_assembler_exception_path(ctx, sym)
     }
 
     pub fn run_one_step(&mut self, ctx: &mut TraceCtx, sym: &mut S, _runtime: &R) -> TraceAction {
@@ -3354,6 +3886,30 @@ where
                 sub_frame.return_r = return_r;
                 sub_frame.return_f = return_f;
                 self.frames.push(sub_frame);
+            }
+            // Recursive portal call (self-recursion).  Unlike
+            // BC_INLINE_CALL — which resolves its callee from the parent
+            // frame's `descrs` pool — a recursive portal call targets the
+            // portal jitcode itself, which is in no descrs slot at emit
+            // time.  The opcode therefore carries the jitdriver index, and
+            // `exec_recursive_call` resolves both the depth-gated inline
+            // decision and the portal jitcode through `JitCodeRuntime`.
+            // The result bank is selected by the opcode (`INT`/`REF`/
+            // `FLOAT` → typed result; `VOID` → no result).
+            jitcode::insns::BC_RECURSIVE_CALL_INT
+            | jitcode::insns::BC_RECURSIVE_CALL_REF
+            | jitcode::insns::BC_RECURSIVE_CALL_FLOAT
+            | jitcode::insns::BC_RECURSIVE_CALL_VOID => {
+                let result_kind = match bytecode {
+                    jitcode::insns::BC_RECURSIVE_CALL_INT => Some(JitArgKind::Int),
+                    jitcode::insns::BC_RECURSIVE_CALL_REF => Some(JitArgKind::Ref),
+                    jitcode::insns::BC_RECURSIVE_CALL_FLOAT => Some(JitArgKind::Float),
+                    _ => None,
+                };
+                match self.exec_recursive_call(ctx, sym, _runtime, result_kind) {
+                    TraceAction::Continue => {}
+                    action => return action,
+                }
             }
             // ── Typed return arms (Slice C.1) ──
             //
@@ -6354,6 +6910,7 @@ pub fn build_state_field_snapshot(
     after_residual_call: bool,
     virtualizable_boxes: &[OpRef],
     virtualref_boxes: &[(OpRef, usize)],
+    identity_const: Option<i64>,
 ) -> crate::recorder::Snapshot {
     let frame_count = frames.frames.len();
     let mut snapshot_frames = Vec::with_capacity(frame_count);
@@ -6412,7 +6969,7 @@ pub fn build_state_field_snapshot(
     // requiring `OpRef::ty()` to be `Some` rather than silently dropping
     // misshapen entries (which would shrink the snapshot relative to
     // upstream and desync the resume reader).
-    let vable_boxes_snap = build_vable_snapshot_boxes(virtualizable_boxes);
+    let vable_boxes_snap = build_vable_snapshot_boxes(virtualizable_boxes, identity_const);
     let vref_boxes_snap = build_vref_snapshot_boxes(virtualref_boxes);
     crate::recorder::Snapshot {
         frames: snapshot_frames,
@@ -6431,14 +6988,31 @@ pub fn build_state_field_snapshot(
 /// snapshot relative to upstream.
 pub fn build_vable_snapshot_boxes(
     virtualizable_boxes: &[OpRef],
+    identity_const: Option<i64>,
 ) -> Vec<crate::recorder::SnapshotTagged> {
     let mut vable_boxes_snap: Vec<crate::recorder::SnapshotTagged> = Vec::new();
     if !virtualizable_boxes.is_empty() {
         let last = virtualizable_boxes.last().copied().unwrap();
-        let last_ty = last
-            .ty()
-            .expect("build_vable_snapshot_boxes: virtualizable identity must be typed");
-        vable_boxes_snap.push(crate::recorder::SnapshotTagged::Box(last, last_ty));
+        // The identity is encoded identity-FIRST.  For the state-field JIT the
+        // `&state` identity is a loop-invariant constant the backend drops from
+        // live registers, so its deadframe slot decodes null at resume; encode
+        // it as a `Ref` constant (rd_consts TAGCONST) so `consume_vable_info`'s
+        // `next_ref()` returns the real pointer, matching RPython `_encode`'s
+        // `isinstance(box, Const)` arm (opencoder.py:603-640).  `None` keeps the
+        // genuinely-live box (heap-object virtualizables like PyFrame, whose
+        // identity flows through the trace and may be forced/mutated).
+        match identity_const {
+            Some(ptr) => vable_boxes_snap.push(crate::recorder::SnapshotTagged::Const(
+                ptr,
+                majit_ir::Type::Ref,
+            )),
+            None => {
+                let last_ty = last
+                    .ty()
+                    .expect("build_vable_snapshot_boxes: virtualizable identity must be typed");
+                vable_boxes_snap.push(crate::recorder::SnapshotTagged::Box(last, last_ty));
+            }
+        }
         for opref in &virtualizable_boxes[..virtualizable_boxes.len() - 1] {
             let ty = opref
                 .ty()
@@ -6490,6 +7064,302 @@ mod tests {
         fn fail_args(&self) -> Option<Vec<OpRef>> {
             None
         }
+    }
+
+    /// Test `JitCodeRuntime` that opts a synthetic portal into the
+    /// `BC_RECURSIVE_CALL_*` inline path: it always inlines and resolves
+    /// the portal to a fixed jitcode.  Production consumers use the
+    /// default (`ResidualCall` / `None`) and never reach the inline path.
+    struct RecursivePortalRuntime {
+        portal: std::sync::Arc<JitCode>,
+    }
+
+    impl JitCodeRuntime for RecursivePortalRuntime {
+        fn label_at(&self, _pc: usize) -> usize {
+            0
+        }
+
+        fn recursive_inline_decision(
+            &self,
+            _jd_index: usize,
+            _green_values: &[i64],
+            _inline_depth: usize,
+            _recursive_depth: usize,
+        ) -> crate::pyjitpl::InlineDecision {
+            crate::pyjitpl::InlineDecision::Inline
+        }
+
+        fn portal_jitcode(&self, _jd_index: usize) -> Option<std::sync::Arc<JitCode>> {
+            Some(self.portal.clone())
+        }
+    }
+
+    /// #184 SLICE 0 — a `BC_RECURSIVE_CALL_INT` whose runtime inlines the
+    /// portal must push the portal frame, trace into it, marshal the
+    /// argument into the portal's register, and write the portal's typed
+    /// return back into the caller's destination register.  The portal
+    /// returns its single incoming argument, so the end-to-end value (42)
+    /// proves both the argument marshalling and the return writeback.
+    #[test]
+    fn recursive_call_inlines_portal_and_returns_marshalled_arg() {
+        // Portal jitcode: `int_return(reg0)` — returns its incoming arg.
+        let mut portal_builder = JitCodeBuilder::new();
+        portal_builder.int_return(0);
+        let portal = std::sync::Arc::new(portal_builder.finish());
+
+        // Caller jitcode: load 42 into reg 5, recurse into the portal
+        // moving reg 5 → portal reg 0 with the result landing in reg 0,
+        // then return reg 0.
+        let mut caller_builder = JitCodeBuilder::new();
+        caller_builder.load_const_i_value(5, 42);
+        caller_builder.recursive_call_int(0, 0, &[], &[(JitArgKind::Int, 5, 0)]);
+        caller_builder.int_return(0);
+        let caller = caller_builder.finish();
+
+        let runtime = RecursivePortalRuntime {
+            portal: portal.clone(),
+        };
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = DummySym::default();
+        let action =
+            trace_jitcode_with_args_and_runtime(&mut ctx, &mut sym, &caller, 0, &runtime, &[]);
+
+        let (finish_args, finish_arg_types) = match action {
+            TraceAction::Finish {
+                finish_args,
+                finish_arg_types,
+                exit_with_exception: false,
+            } => (finish_args, finish_arg_types),
+            other => panic!("expected Finish[Int] from recursive-call portal, got {other:?}"),
+        };
+        assert_eq!(finish_arg_types, vec![majit_ir::Type::Int]);
+        assert_eq!(finish_args.len(), 1);
+        assert_eq!(ctx.const_value(finish_args[0]), Some(42));
+    }
+
+    thread_local! {
+        /// Captures the concrete argument the synthetic compiled callee
+        /// was invoked with, so the test can assert the marshalled red arg
+        /// reached the `execute_recursive_assembler_int` seam.
+        static RECURSIVE_CALLEE_ARG: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
+    }
+
+    /// Test `JitCodeRuntime` that routes a `BC_RECURSIVE_CALL_INT` through
+    /// the CALL_ASSEMBLER path: it decides `CallAssembler`, resolves the
+    /// callee loop to a fixed `(token, green_key)` pair, and runs the
+    /// concrete leg by recording the marshalled red arg and returning
+    /// `arg + 100` (so the result, 105 for arg 5, is distinguishable from
+    /// the input).  Production consumers use the trait defaults (`None`)
+    /// and never reach this path.
+    struct RecursiveAssemblerRuntime {
+        token: std::sync::Arc<majit_backend::JitCellToken>,
+    }
+
+    impl JitCodeRuntime for RecursiveAssemblerRuntime {
+        fn label_at(&self, _pc: usize) -> usize {
+            0
+        }
+
+        fn recursive_inline_decision(
+            &self,
+            _jd_index: usize,
+            _green_values: &[i64],
+            _inline_depth: usize,
+            _recursive_depth: usize,
+        ) -> crate::pyjitpl::InlineDecision {
+            crate::pyjitpl::InlineDecision::CallAssembler
+        }
+
+        fn recursive_call_assembler_target(
+            &self,
+            _jd_index: usize,
+            _green_values: &[i64],
+        ) -> Option<(std::sync::Arc<majit_backend::JitCellToken>, u64)> {
+            // The test ignores greens (S3 exercises green-key hashing); a
+            // fixed green key stands in for the resolved loop identity.
+            Some((self.token.clone(), 0))
+        }
+
+        fn execute_recursive_assembler_int(
+            &self,
+            _token: &majit_backend::JitCellToken,
+            reds: &[Value],
+        ) -> Option<i64> {
+            let arg = match reds.first() {
+                Some(Value::Int(v)) => *v,
+                _ => return None,
+            };
+            RECURSIVE_CALLEE_ARG.with(|c| c.set(arg));
+            Some(arg + 100)
+        }
+    }
+
+    /// Test `JitCodeSym` for the recursive CALL_ASSEMBLER fresh-frame path: a
+    /// single-virt-array state (one zeroed scalar + a `&state` Ref + capacity),
+    /// mirroring the `tl` shape.  `recursive_fresh_entry_reds` allocates a
+    /// fresh backing `Vec<i64>` (kept alive by the returned owner) and reports
+    /// its address as the `&state` identity; `recursive_fresh_alloc_free_targets`
+    /// exposes host alloc/free addresses the dispatcher records as residual
+    /// `CallR`/`CallN`.  The dispatcher uses the owner box as the trace-time
+    /// fresh state and records — but does not invoke — the alloc/free targets,
+    /// so trivial stand-ins suffice here (the real helpers are exercised by the
+    /// `tl` example's `recursive_fresh_alloc_free_roundtrip`).
+    #[derive(Default)]
+    struct RecursiveFreshSym;
+
+    extern "C" fn test_recursive_fresh_alloc(_cap: i64) -> i64 {
+        0
+    }
+
+    extern "C" fn test_recursive_fresh_free(_ptr: i64) {}
+
+    impl JitCodeSym for RecursiveFreshSym {
+        fn total_slots(&self) -> usize {
+            0
+        }
+
+        fn loop_header_pc(&self) -> usize {
+            0
+        }
+
+        fn fail_args(&self) -> Option<Vec<OpRef>> {
+            None
+        }
+
+        fn recursive_fresh_entry_reds(&self) -> Option<(Vec<Value>, Box<dyn std::any::Any>)> {
+            let fresh: Box<Vec<i64>> = Box::new(vec![0i64; 12]);
+            let base = &*fresh as *const Vec<i64> as usize;
+            Some((
+                vec![
+                    Value::Int(0),
+                    Value::Ref(majit_ir::GcRef(base)),
+                    Value::Int(12),
+                ],
+                fresh as Box<dyn std::any::Any>,
+            ))
+        }
+
+        fn recursive_fresh_alloc_free_targets(&self) -> Option<(*const (), *const ())> {
+            Some((
+                test_recursive_fresh_alloc as usize as *const (),
+                test_recursive_fresh_free as usize as *const (),
+            ))
+        }
+    }
+
+    /// #184 S3f — a `BC_RECURSIVE_CALL_INT` whose runtime decides
+    /// `CallAssembler` must run the callee with a FRESH frame: the reds are
+    /// the freshly-allocated callee state (`recursive_fresh_entry_reds`), not
+    /// the caller's registers.  Each virt-array `&state` red is recorded as a
+    /// residual `CallR` to the host allocator, the CALL_ASSEMBLER carries the
+    /// fresh reds, and a residual `CallN` frees afterwards.  The concrete leg
+    /// sees the fresh `stackpos = 0` (not the caller's value), and the call
+    /// result is wired into the caller's destination register.
+    #[test]
+    fn recursive_call_assembler_records_fresh_frame_and_returns_result() {
+        RECURSIVE_CALLEE_ARG.with(|c| c.set(-1));
+
+        // Caller jitcode: recurse (decision = CallAssembler), result into reg
+        // 0, then return reg 0.  The callee runs with a fresh frame, so no
+        // caller reds flow in (the arg-triple is ignored).
+        let mut caller_builder = JitCodeBuilder::new();
+        caller_builder.recursive_call_int(0, 0, &[], &[]);
+        caller_builder.int_return(0);
+        let caller = caller_builder.finish();
+
+        let runtime = RecursiveAssemblerRuntime {
+            token: std::sync::Arc::new(majit_backend::JitCellToken::new(7)),
+        };
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = RecursiveFreshSym;
+        let action =
+            trace_jitcode_with_args_and_runtime(&mut ctx, &mut sym, &caller, 0, &runtime, &[]);
+
+        let finish_args = match action {
+            TraceAction::Finish {
+                finish_args,
+                finish_arg_types,
+                exit_with_exception: false,
+            } => {
+                assert_eq!(finish_arg_types, vec![majit_ir::Type::Int]);
+                finish_args
+            }
+            other => panic!("expected Finish[Int] from recursive CALL_ASSEMBLER, got {other:?}"),
+        };
+        assert_eq!(finish_args.len(), 1);
+
+        // The callee's concrete entry ran with the FRESH reds: the first red
+        // is the zeroed `stackpos`, not the caller's register.
+        assert_eq!(RECURSIVE_CALLEE_ARG.with(|c| c.get()), 0);
+
+        let recorder = ctx.into_recorder();
+        let ops = recorder.ops();
+        // One residual alloc (CallR) for the single virt array, ...
+        let alloc_ops: Vec<_> = ops.iter().filter(|o| o.opcode == OpCode::CallR).collect();
+        assert_eq!(alloc_ops.len(), 1, "one residual fresh-state alloc CallR");
+        // ... one residual free (CallN), ...
+        let free_ops: Vec<_> = ops.iter().filter(|o| o.opcode == OpCode::CallN).collect();
+        assert_eq!(free_ops.len(), 1, "one residual fresh-state free CallN");
+        // ... and exactly one CallAssemblerI carrying the three fresh reds
+        // (`stackpos`, `&state`, length).
+        let call_ops: Vec<_> = ops
+            .iter()
+            .filter(|o| o.opcode == OpCode::CallAssemblerI)
+            .collect();
+        assert_eq!(
+            call_ops.len(),
+            1,
+            "recursive CALL_ASSEMBLER must record exactly one CallAssemblerI op",
+        );
+        let call_op = call_ops[0];
+        assert_eq!(
+            call_op.args.borrow().len(),
+            3,
+            "fresh reds in extract_live order: stackpos, &state, length",
+        );
+        // The alloc is recorded before, and the free after, the call.
+        let alloc_idx = ops.iter().position(|o| o.opcode == OpCode::CallR).unwrap();
+        let call_idx = ops
+            .iter()
+            .position(|o| o.opcode == OpCode::CallAssemblerI)
+            .unwrap();
+        let free_idx = ops.iter().position(|o| o.opcode == OpCode::CallN).unwrap();
+        assert!(
+            alloc_idx < call_idx,
+            "alloc CallR must precede CALL_ASSEMBLER"
+        );
+        assert!(call_idx < free_idx, "free CallN must follow CALL_ASSEMBLER");
+        // The call result (the op), not a marshalled input, is wired into the
+        // caller's return register.
+        assert_eq!(
+            finish_args[0],
+            call_op.pos.get(),
+            "the recursive CALL_ASSEMBLER result must be wired into the caller's return register",
+        );
+    }
+
+    /// A state shape that does not support fresh-frame portal entry (the
+    /// `recursive_fresh_entry_reds` default `None`) makes the recursive
+    /// CALL_ASSEMBLER abort to the interpreter fallback rather than passing
+    /// the caller's live registers as the callee's reds.
+    #[test]
+    fn recursive_call_assembler_without_fresh_reds_aborts() {
+        let mut caller_builder = JitCodeBuilder::new();
+        caller_builder.recursive_call_int(0, 0, &[], &[]);
+        caller_builder.int_return(0);
+        let caller = caller_builder.finish();
+
+        let runtime = RecursiveAssemblerRuntime {
+            token: std::sync::Arc::new(majit_backend::JitCellToken::new(7)),
+        };
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = DummySym::default();
+        let action =
+            trace_jitcode_with_args_and_runtime(&mut ctx, &mut sym, &caller, 0, &runtime, &[]);
+        assert!(
+            matches!(action, TraceAction::Abort),
+            "recursive CALL_ASSEMBLER without fresh-frame support must abort, got {action:?}",
+        );
     }
 
     fn make_test_vable_info() -> VirtualizableInfo {
@@ -7651,6 +8521,7 @@ mod tests {
             false,
             &[],
             &[],
+            None,
         );
 
         assert_eq!(snapshot.frames.len(), 1);
@@ -7711,6 +8582,7 @@ mod tests {
             false,
             &[],
             &[],
+            None,
         );
 
         let f = &snapshot.frames[0];
@@ -7766,6 +8638,7 @@ mod tests {
             false,
             &[],
             &[],
+            None,
         );
         assert_eq!(snapshot.frames.len(), 2);
         let root_frame = &snapshot.frames[0];
@@ -7823,6 +8696,7 @@ mod tests {
             false,
             &[],
             &[],
+            None,
         );
 
         let f = &snapshot.frames[0];
@@ -7831,6 +8705,41 @@ mod tests {
             vec![crate::recorder::SnapshotTagged::Const(
                 0,
                 majit_ir::Type::Int
+            )]
+        );
+    }
+
+    #[test]
+    fn build_vable_snapshot_boxes_encodes_identity_const_as_ref_const() {
+        // State-field JIT: the loop-invariant `&state` identity (at `[-1]`) is
+        // folded out of live registers, so it is supplied as a concrete pointer
+        // and encoded identity-FIRST as a `Ref` constant.  `consume_vable_info`
+        // then reads the real pointer via `next_ref()` (resume.py:1404) with no
+        // `LIVE_VABLE_PTR` recovery.  Non-identity entries keep their `Box` tag.
+        let other = majit_ir::OpRef::int_op(3);
+        let identity = majit_ir::OpRef::ref_op(7);
+        let snap = build_vable_snapshot_boxes(&[other, identity], Some(0xdead_beef));
+        assert_eq!(
+            snap,
+            vec![
+                crate::recorder::SnapshotTagged::Const(0xdead_beef, majit_ir::Type::Ref),
+                crate::recorder::SnapshotTagged::Box(other, majit_ir::Type::Int),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_vable_snapshot_boxes_keeps_live_identity_as_box_when_no_const() {
+        // Heap-object virtualizables (e.g. PyFrame) pass `None`: the
+        // genuinely-live identity box stays a `Box` snapshot entry because its
+        // pointer is present in the deadframe and decodes non-null.
+        let identity = majit_ir::OpRef::ref_op(7);
+        let snap = build_vable_snapshot_boxes(&[identity], None);
+        assert_eq!(
+            snap,
+            vec![crate::recorder::SnapshotTagged::Box(
+                identity,
+                majit_ir::Type::Ref
             )]
         );
     }

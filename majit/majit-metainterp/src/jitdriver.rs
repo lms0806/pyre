@@ -1365,13 +1365,14 @@ impl<S: JitState> JitDriver<S> {
                 // active trace ctx before borrowing `self.meta.framestack`
                 // mutably below.  Cloning is acceptable because this is
                 // the segmented-loop force path (slow path).
-                let (vable_boxes, vref_boxes) = self
+                let (vable_boxes, vref_boxes, identity_const) = self
                     .meta
                     .trace_ctx()
                     .map(|ctx| {
                         (
                             ctx.virtualizable_boxes.clone().unwrap_or_default(),
                             ctx.virtualref_boxes.clone(),
+                            ctx.state_field_identity_const(),
                         )
                     })
                     .unwrap_or_default();
@@ -1383,6 +1384,7 @@ impl<S: JitState> JitDriver<S> {
                         &all_liveness,
                         &vable_boxes,
                         &vref_boxes,
+                        identity_const,
                     )
                 });
                 let mut current_live = self
@@ -2313,11 +2315,6 @@ impl<S: JitState> JitDriver<S> {
                     self.meta_interp().staticdata.op_rvmprof_code,
                 );
                 let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
-                // Publish the live `&state` identity so consume_vable_info can
-                // recover the folded-constant virtualizable pointer (absent
-                // from the deadframe for the state-field JIT). Re-set before
-                // every resume so the value is always fresh for this thread.
-                crate::resume::set_live_vable_ptr(self.meta_interp().vable_ptr as i64);
                 let bh = crate::resume::blackhole_from_resumedata(
                     &mut bh_builder,
                     &resolve_jitcode,
@@ -4244,11 +4241,6 @@ impl<S: JitState> JitDriver<S> {
                     self.meta_interp().staticdata.op_rvmprof_code,
                 );
                 let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
-                // Publish the live `&state` identity so consume_vable_info can
-                // recover the folded-constant virtualizable pointer (absent
-                // from the deadframe for the state-field JIT). Re-set before
-                // every resume so the value is always fresh for this thread.
-                crate::resume::set_live_vable_ptr(self.meta_interp().vable_ptr as i64);
                 let bh = crate::resume::blackhole_from_resumedata(
                     &mut bh_builder,
                     &resolve_jitcode,

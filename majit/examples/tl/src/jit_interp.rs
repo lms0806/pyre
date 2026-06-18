@@ -99,6 +99,7 @@ const PUSHARG: u8 = 22;
         stackpos: int,
         stack: [int; virt],
     },
+    recursive_entry = crate::interp::interpret_recursive,
 )]
 #[allow(unused_assignments, unused_variables)]
 pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
@@ -264,11 +265,15 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
                     continue;
                 }
             }
-            // tl.py:174-178
+            // tl.py:174-178 — `res = interp(code, pc + offset)`, a recursive
+            // portal re-entry.  Greens in declaration order [pc, program];
+            // the concrete fallback is `interpret_recursive` (declared via
+            // `recursive_entry`), the JIT path emits BC_RECURSIVE_CALL_INT.
             CALL => {
                 let offset = program[pc] as i8 as i64;
                 pc += 1;
-                let res = crate::interp::interpret_at(program, (pc as i64 + offset) as usize, 0);
+                let target = (pc as i64 + offset) as usize;
+                let res = recursive_portal_call!(driver, target, program);
                 state.stack[state.stackpos as usize] = res;
                 state.stackpos = state.stackpos + 1;
             }
@@ -357,6 +362,137 @@ mod tests {
         let prog = vec![PUSH, 42, RETURN];
         let mut jit = JitTlInterp::new();
         assert_eq!(jit.run(&prog, 0), 42);
+    }
+
+    /// A hot loop whose body issues a recursive `CALL` to a constant-returning
+    /// subroutine — exercises `recursive_portal_call!` → BC_RECURSIVE_CALL_INT
+    /// end to end.  The loop runs `N` times, each iteration adds the
+    /// subroutine's result (3) to the accumulator, so `interpret(prog, N) ==
+    /// 3 * N`.  The JIT must match the interpreter on every input.
+    fn call_loop_bytecode() -> Vec<u8> {
+        vec![
+            PUSHARG, // counter = N                       [counter]
+            PUSH, 0, // acc = 0                           [counter, acc]
+            // loop (offset 3):
+            SWAP, // [acc, counter]
+            PICK, 0, // dup counter   [acc, counter, counter]
+            BR_COND, 2, // pop top; if counter != 0 → body (offset 10)
+            // exit (counter == 0):  [acc, counter]
+            POP,    // [acc]
+            RETURN, // return acc
+            // body (offset 10):     [acc, counter]
+            SWAP, // [counter, acc]
+            CALL, 10,   // call subroutine (offset 23) → [counter, acc, 3]
+            ADD,  // [counter, acc+3]
+            SWAP, // [acc+3, counter]
+            PUSH, 1, SUB,  // counter -= 1   [acc+3, counter-1]
+            SWAP, // [counter-1, acc+3]   (loop-top stack shape)
+            PUSH, 1, BR_COND, 236, // -20: jump back to loop (offset 3)
+            // subroutine (offset 23): fresh stack, returns 3
+            PUSH, 3, RETURN,
+        ]
+    }
+
+    #[test]
+    fn jit_recursive_call_matches_interp() {
+        let bc = call_loop_bytecode();
+        // Sanity: the interpreter computes 3 * N.
+        assert_eq!(interp::interpret(&bc, 4), 12);
+        for a in [1, 2, 3, 5, 10, 50, 100] {
+            let expected = interp::interpret(&bc, a);
+            let mut jit = JitTlInterp::new();
+            let got = jit.run(&bc, a);
+            assert_eq!(got, expected, "recursive-call mismatch for a={a}");
+        }
+    }
+
+    /// #184 recursive CALL_ASSEMBLER portal entry: the macro-generated
+    /// `JitCodeSym::recursive_fresh_entry_reds` yields fresh-frame reds in
+    /// `extract_live` order — stackpos zeroed, a fresh vable identity Ref
+    /// distinct from the caller, and the stack re-allocated at the caller's
+    /// captured capacity (read from the sym's `stack_len_value` cache).
+    #[test]
+    fn recursive_fresh_entry_reds_layout() {
+        use majit_metainterp::{JitCodeSym as _, JitState as _};
+        let program = sum_bytecode();
+        let caller = TlState {
+            stackpos: 7,
+            stack: vec![1, 2, 3, 4, 5, 6, 7, 0, 0, 0, 0, 0],
+        };
+        let meta = caller.build_meta(0, program.as_slice());
+        let mut sym = <TlState as majit_metainterp::JitState>::create_sym(&meta, 0);
+        // Seeds `sym.stack_len_value` from the caller's live capacity.
+        caller.initialize_sym(&mut sym, &meta);
+        let (values, _owner) = sym
+            .recursive_fresh_entry_reds()
+            .expect("ref-scalar-free state-field interp must support portal entry");
+        // tl extract_live order: [stackpos (Int), &state (Ref), stack.len() (Int)].
+        assert_eq!(values.len(), 3, "stackpos + vable ptr + stack len");
+        assert_eq!(values[0], majit_ir::Value::Int(0), "fresh stackpos zeroed");
+        match values[1] {
+            majit_ir::Value::Ref(majit_ir::GcRef(p)) => {
+                assert_ne!(p, 0, "fresh vable base must be non-null");
+                assert_ne!(
+                    p, &caller as *const TlState as usize,
+                    "fresh base must differ from the caller's state",
+                );
+            }
+            ref other => panic!("slot 1 must be the vable identity Ref, got {other:?}"),
+        }
+        assert_eq!(
+            values[2],
+            majit_ir::Value::Int(caller.stack.len() as i64),
+            "fresh stack re-allocated at the caller's captured capacity",
+        );
+    }
+
+    /// #184 S3f-1: the host alloc/free targets the recursive dispatcher records
+    /// as residual `CallR`/`CallN` for the compiled caller loop.  Exercises the
+    /// macro-generated `extern "C"` pair directly through the `JitCodeSym` seam:
+    /// `alloc(cap)` returns a fresh `Box::into_raw`-ed `TlState` (stackpos 0,
+    /// `stack` of length `cap`, all zero), `free` drops it without crashing.
+    #[test]
+    fn recursive_fresh_alloc_free_roundtrip() {
+        use majit_metainterp::{JitCodeSym as _, JitState as _};
+        let program = sum_bytecode();
+        let caller = TlState {
+            stackpos: 3,
+            stack: vec![9, 8, 7, 0, 0, 0, 0, 0],
+        };
+        let meta = caller.build_meta(0, program.as_slice());
+        let mut sym = <TlState as majit_metainterp::JitState>::create_sym(&meta, 0);
+        caller.initialize_sym(&mut sym, &meta);
+        let (alloc_fp, free_fp) = sym
+            .recursive_fresh_alloc_free_targets()
+            .expect("single-virt-array state-field interp must support portal alloc/free");
+        let alloc: extern "C" fn(i64) -> i64 = unsafe { core::mem::transmute(alloc_fp) };
+        let free: extern "C" fn(i64) = unsafe { core::mem::transmute(free_fp) };
+
+        let cap: i64 = 12;
+        let raw = alloc(cap);
+        assert_ne!(raw, 0, "fresh alloc must return a non-null pointer");
+        assert_ne!(
+            raw as usize, &caller as *const TlState as usize,
+            "fresh state must differ from the caller's state",
+        );
+        unsafe {
+            let fresh = &*(raw as *const TlState);
+            assert_eq!(fresh.stackpos, 0, "fresh stackpos zeroed");
+            assert_eq!(
+                fresh.stack.len(),
+                cap as usize,
+                "fresh stack sized at the requested capacity",
+            );
+            assert!(
+                fresh.stack.iter().all(|&x| x == 0),
+                "fresh stack zero-initialised",
+            );
+        }
+        // Must reclaim the Box::into_raw allocation without double-free / crash.
+        free(raw);
+        // A null free is a no-op (the dispatcher never frees a null, but the
+        // compiled guard-fail path must tolerate it).
+        free(0);
     }
 
     #[test]

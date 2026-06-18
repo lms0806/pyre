@@ -60,6 +60,26 @@ pub const BC_NEW: u8 = 217;
 pub const BC_NEW_ARRAY: u8 = 218;
 pub const BC_NEW_WITH_VTABLE: u8 = 219;
 
+// Recursive-portal call (`#[jit_interp]` mainloop calling itself, e.g. tl.py:177
+// `interp(code, pc+offset)`).  Siblings of the `BC_CALL_ASSEMBLER_*` family
+// (bytes 50-53): the depth-exceeded branch of a recursive call records one of
+// these as an assembler call into the same green-key loop, while the
+// depth-bounded branch inline-traces the callee (`should_inline_core`).  Bytes
+// continue the above-high-water sequence (223-226, above the `setfield_gc_i/rcd`
+// C-form byte 222) so existing serialised byte assignments are undisturbed.
+// These consts only DECLARE the intended byte
+// numbers; a byte is not actually reserved (`is_reserved_opcode_byte`) until its
+// key joins `pyre_extension_insns()`, and the blackhole handler is bound there.
+// That registration + the macro lowering + the `run_one_step` dispatch arm are
+// wired together (the registration may shift dynamic byte assignments, so it is
+// verified against the serialised `opcode_*.bin` at that point, not here).  The
+// `recursive_call_bytes_reserved_without_collision` test guards these chosen
+// numbers against the currently-reserved tables.
+pub const BC_RECURSIVE_CALL_INT: u8 = 223;
+pub const BC_RECURSIVE_CALL_REF: u8 = 224;
+pub const BC_RECURSIVE_CALL_FLOAT: u8 = 225;
+pub const BC_RECURSIVE_CALL_VOID: u8 = 226;
+
 pub const BC_LOOP_HEADER: u8 = 12;
 pub const BC_ABORT: u8 = 13;
 pub const BC_ABORT_PERMANENT: u8 = 14;
@@ -1236,6 +1256,56 @@ mod tests {
                 }
                 byte_to_key.insert(byte, key);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod recursive_call_byte_tests {
+    use super::*;
+
+    /// The reserved `BC_RECURSIVE_CALL_*` bytes (223-226) must be mutually
+    /// distinct, sit above the prior high-water (`BC_NEW_WITH_VTABLE` = 219),
+    /// and not collide with any byte already registered in `wellknown_bh_insns`
+    /// or `pyre_extension_insns`.  Guards against the #199-class byte-collision
+    /// (BC_INT_BETWEEN vs BC_NEW) at the point the bytes are reserved, before
+    /// the recursive-call lowering/handlers are wired.
+    #[test]
+    fn recursive_call_bytes_reserved_without_collision() {
+        let reserved = [
+            BC_RECURSIVE_CALL_INT,
+            BC_RECURSIVE_CALL_REF,
+            BC_RECURSIVE_CALL_FLOAT,
+            BC_RECURSIVE_CALL_VOID,
+        ];
+
+        let mut sorted: Vec<u8> = reserved.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            reserved.len(),
+            "recursive_call bytes must be mutually distinct"
+        );
+
+        for b in reserved {
+            assert!(
+                b > BC_NEW_WITH_VTABLE,
+                "recursive_call byte {b} must be above the prior high-water {}",
+                BC_NEW_WITH_VTABLE
+            );
+        }
+
+        let registered: Vec<u8> = wellknown_bh_insns()
+            .values()
+            .chain(pyre_extension_insns().values())
+            .copied()
+            .collect();
+        for b in reserved {
+            assert!(
+                !registered.contains(&b),
+                "recursive_call byte {b} collides with an already-registered insn"
+            );
         }
     }
 }

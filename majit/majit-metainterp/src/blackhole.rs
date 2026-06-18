@@ -7171,10 +7171,13 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("int_deref/i>i", handler_int_deref_pyre);
     builder.wire_handler("abort/", handler_abort_marker_pyre);
 
-    // pyre-only state_field family (no RPython counterpart). Blackhole
-    // treats these as no-ops; handlers exist only to advance position past
-    // the operand bytes so strict dispatch sees a real handler instead of
-    // the unwired placeholder.
+    // pyre-only state_field family (no RPython counterpart). The handlers do
+    // real work: they map a logical field/array index to its flat register
+    // slot via `state_field_layout` and move the value between that slot
+    // (seeded by the resume reader from the guard resumedata) and a working
+    // register, advancing position past the operands.  This re-fills the
+    // state into the blackhole register file the way RPython's setarg/getarg
+    // bytecodes feed its own resume.
     builder.wire_handler("load_state_field_ref/dr", handler_load_state_field_ref_dr);
     builder.wire_handler("store_state_field_ref/dr", handler_store_state_field_ref_dr);
     builder.wire_handler("load_state_field/di", handler_load_state_field_di);

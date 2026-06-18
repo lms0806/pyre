@@ -3106,6 +3106,13 @@ impl Descr for VableArrayDescr {
     }
 }
 
+/// Number of `OnceLock<DescrRef>` slots reserved per array-descr index.
+/// `rpython/jit/metainterp/virtualizable.py:58/73` sizes `array_descrs` /
+/// `array_field_descrs` to `len(array_fields)`. Pyre's PyFrame has one
+/// array (`locals_cells_stack_w`); the state-field JIT may declare several
+/// `[int; virt]` arrays. Bump this if a virtualizable grows past it.
+const VABLE_ARRAY_DESCR_SLOTS: usize = 8;
+
 /// Singleton accessor for `array_field_descrs[idx]`.
 ///
 /// `rpython/jit/metainterp/virtualizable.py:73` constructs one
@@ -3113,45 +3120,63 @@ impl Descr for VableArrayDescr {
 /// and caches it on the `VirtualizableInfo` instance — every later
 /// reference (`vable_array_vars[var]` in jtransform, the optimizer,
 /// the assembler) uses Python object identity to dedup. Pyre mirrors
-/// this with a process-global `OnceLock<DescrRef>` per array index so
-/// `Arc::ptr_eq` over two `vable_array_field_descr(idx)` calls returns
-/// true. Currently only `idx=0` is supported (pyre's single
-/// virtualizable array).
+/// this with a per-`idx` `OnceLock<DescrRef>` so `Arc::ptr_eq` over two
+/// `vable_array_field_descr(idx)` calls with matching `idx` returns true.
 pub fn vable_array_field_descr(idx: u16) -> DescrRef {
-    assert_eq!(
-        idx, 0,
-        "pyre's PyFrame currently has only one virtualizable array \
-         (locals_cells_stack_w, idx=0); multi-array virtualizables \
-         are a future extension"
+    static SLOTS: [OnceLock<DescrRef>; VABLE_ARRAY_DESCR_SLOTS] = [
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+    ];
+    let i = idx as usize;
+    assert!(
+        i < VABLE_ARRAY_DESCR_SLOTS,
+        "vable_array_field_descr: idx={idx} exceeds \
+         VABLE_ARRAY_DESCR_SLOTS={VABLE_ARRAY_DESCR_SLOTS}",
     );
-    static SLOT: OnceLock<DescrRef> = OnceLock::new();
-    SLOT.get_or_init(|| {
-        Arc::new(VableArrayFieldDescr {
-            idx: 0,
-            ei_index: AtomicU32::new(u32::MAX),
-        }) as DescrRef
-    })
-    .clone()
+    SLOTS[i]
+        .get_or_init(|| {
+            Arc::new(VableArrayFieldDescr {
+                idx,
+                ei_index: AtomicU32::new(u32::MAX),
+            }) as DescrRef
+        })
+        .clone()
 }
 
 /// Singleton accessor for `array_descrs[idx]` — counterpart of
 /// `vable_array_field_descr` carrying the GcArray layout descr.
-/// Same identity-preservation invariant via `OnceLock<DescrRef>`.
+/// Same identity-preservation invariant via a per-`idx` `OnceLock<DescrRef>`.
 pub fn vable_array_descr(idx: u16) -> DescrRef {
-    assert_eq!(
-        idx, 0,
-        "pyre's PyFrame currently has only one virtualizable array \
-         (locals_cells_stack_w, idx=0); multi-array virtualizables \
-         are a future extension"
+    static SLOTS: [OnceLock<DescrRef>; VABLE_ARRAY_DESCR_SLOTS] = [
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+    ];
+    let i = idx as usize;
+    assert!(
+        i < VABLE_ARRAY_DESCR_SLOTS,
+        "vable_array_descr: idx={idx} exceeds \
+         VABLE_ARRAY_DESCR_SLOTS={VABLE_ARRAY_DESCR_SLOTS}",
     );
-    static SLOT: OnceLock<DescrRef> = OnceLock::new();
-    SLOT.get_or_init(|| {
-        Arc::new(VableArrayDescr {
-            idx: 0,
-            ei_index: AtomicU32::new(u32::MAX),
-        }) as DescrRef
-    })
-    .clone()
+    SLOTS[i]
+        .get_or_init(|| {
+            Arc::new(VableArrayDescr {
+                idx,
+                ei_index: AtomicU32::new(u32::MAX),
+            }) as DescrRef
+        })
+        .clone()
 }
 
 /// `rpython/jit/metainterp/virtualizable.py:71` —

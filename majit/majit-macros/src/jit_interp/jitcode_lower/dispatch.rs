@@ -2990,7 +2990,18 @@ pub(crate) fn lower_dispatch_body(
     } else {
         config.ref_identity_base() + config.state_ref_scalars.len() as u16
     };
-    let int_identity_end = config.int_identity_base() + config.state_scalars.len() as u16;
+    // After the scalars the dispatch frame seeds two int slots per virt array
+    // (`<arr>_ptr`, `<arr>_len`); `populate_frame_int_regs` / `total_slots`
+    // count `2 * num_virt_arrays`.  Reserve them in the working-register floor:
+    // a working register landing on a seeded `ptr`/`len` slot is overwritten by
+    // the guard-failure resume seeder, corrupting the live state the snapshot
+    // captures.  Fixed `[int]` arrays seed one slot per live element, but their
+    // length is only known at runtime (tlr reassigns `regs = vec![0; n]`), so
+    // this compile-time floor cannot reserve those element slots; that residual
+    // affects only fixed-array consumers (none of which also carry a virt array).
+    let int_identity_end = config.int_identity_base()
+        + config.state_scalars.len() as u16
+        + 2 * config.state_virt_arrays.len() as u16;
     lowerer.next_reg = lowerer.next_reg.max(int_identity_end).max(ref_identity_end);
 
     // A.3.6.1 (jtransform.py:1693): bind body-local `let` stmts that

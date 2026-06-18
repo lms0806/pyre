@@ -484,6 +484,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dualtape"
+version = "0.0.2"
+dependencies = [
+ "majit-ir",
+ "majit-macros",
+ "majit-metainterp",
+]
+
+[[package]]
 name = "dynasm"
 version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -2521,12 +2521,14 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
         if vable_ptr.is_null() {
             return;
         }
-        // virtualizable.py:131-133: ALL static fields
-        for field in &self.static_fields {
+        // virtualizable.py:131-133: ALL static fields.  Route through
+        // `write_field` so the resume bits are specialized back to the field
+        // type (`f64::from_bits` for `Float`); a raw `i64` write would store a
+        // float's bit pattern as an integer and corrupt the field.
+        for (field_index, field) in self.static_fields.iter().enumerate() {
             let value = reader.next_value_of_type(field.field_type);
             unsafe {
-                let dest = vable_ptr.add(field.offset);
-                std::ptr::write(dest as *mut i64, value);
+                self.write_field(vable_ptr, field_index, value);
             }
         }
         // virtualizable.py:134-137: array items

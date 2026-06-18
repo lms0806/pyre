@@ -2079,6 +2079,58 @@ impl JitCodeBuilder {
         self.push_u8(src as u8);
     }
 
+    /// Emit a recursive portal call returning an int (pyjitpl.py:1376
+    /// `opimpl_recursive_call`).  The payload is consumed by
+    /// `JitCodeMachine::exec_recursive_call`:
+    ///   jd_index:u16, result_dst:u16, num_green:u16,
+    ///   (green_kind:u8, green_src:u16) × num_green, num_args:u16,
+    ///   (kind:u8, caller_src:u16, callee_dst:u16) × num_args.
+    /// The portal is self-recursive, so the opcode carries the jitdriver
+    /// index rather than a compiled target.  `greens` are the caller
+    /// registers holding the portal green key, in the jitdriver's green
+    /// declaration order so they hash against `green_args_spec`; each
+    /// carries its own `JitArgKind` so the dispatcher reads it from the
+    /// matching register bank (an int `pc` green from the int bank, a ref
+    /// `program` green from the ref bank).  The first green seeds the
+    /// portal entry pc.  Each arg moves caller register `caller_src` into
+    /// portal register `callee_dst`.
+    pub fn recursive_call_int(
+        &mut self,
+        jd_index: u16,
+        result_dst: u16,
+        greens: &[(JitArgKind, u16)],
+        args: &[(JitArgKind, u16, u16)],
+    ) {
+        self.touch_reg(result_dst);
+        for &(kind, src) in greens {
+            match kind {
+                JitArgKind::Ref => self.touch_ref_reg(src),
+                JitArgKind::Int | JitArgKind::Float => self.touch_reg(src),
+            }
+        }
+        for &(kind, caller_src, _callee_dst) in args {
+            self.touch_call_arg(JitCallArg {
+                kind,
+                reg: caller_src,
+            });
+        }
+        self.start_instr(jitcode::insns::BC_RECURSIVE_CALL_INT);
+        self.push_u16(jd_index);
+        self.push_u16(result_dst);
+        self.push_u16(greens.len() as u16);
+        for &(kind, src) in greens {
+            self.push_u8(kind.encode());
+            self.push_u16(src);
+        }
+        self.push_u16(args.len() as u16);
+        for &(kind, caller_src, callee_dst) in args {
+            self.push_u8(kind.encode());
+            self.push_u16(caller_src);
+            self.push_u16(callee_dst);
+        }
+        self.record_resulttype('i');
+    }
+
     /// Constant-operand form of `ref_return`. `flatten.py:130-146
     /// make_return` emits `ref_return` with `getcolor(v)`, and
     /// `flatten.py:382-384 getcolor` passes a `Constant` through
@@ -4797,10 +4849,11 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
 ///
 /// # Panics
 ///
-/// Panics if `total_slots > 255`.  RPython jitcode register indices are
-/// `chr(...)`-encoded `u8`s (`assembler.py:241`,
-/// `liveness.py:148-159`); a state-field JIT with more than 256 live
-/// slots would overflow that encoding.
+/// Panics if either bank's highest slot index would exceed 255, i.e.
+/// `base + count > 256` (the ranges are end-exclusive, so an end of 256
+/// fills indices 0..=255 and is legal).  RPython jitcode register indices
+/// are `chr(...)`-encoded `u8`s (`assembler.py:241`, `liveness.py:148-159`);
+/// a 257th slot would overflow that encoding.
 pub fn live_slots_for_state_field_jit(
     num_scalars: usize,
     array_lens: &[usize],
@@ -4818,8 +4871,11 @@ pub fn live_slots_for_state_field_jit(
     // encoded (the re-executed jit_merge_point op then reads the state
     // scalar where it expects the green `pc`).
     let int_scalar_end = int_scalar_base + total_slots;
+    // End-exclusive: `int_scalar_base..int_scalar_end` fills indices up to
+    // `int_scalar_end - 1`, so an end of exactly 256 (highest index 255) is
+    // legal; only an end past 256 overflows the u8 register index.
     assert!(
-        int_scalar_end < 256,
+        int_scalar_end <= 256,
         "live_slots_for_state_field_jit: int_scalar_base={int_scalar_base} + \
          total_slots={total_slots} exceeds RPython jitcode u8 register-index \
          limit (assembler.py:241, liveness.py:148-159)",
@@ -4832,7 +4888,7 @@ pub fn live_slots_for_state_field_jit(
     // one would clobber it at resume-decode time.
     let ref_scalar_end = ref_scalar_base + num_ref_scalars;
     assert!(
-        ref_scalar_end < 256,
+        ref_scalar_end <= 256,
         "live_slots_for_state_field_jit: ref_scalar_base={ref_scalar_base} + \
          num_ref_scalars={num_ref_scalars} exceeds the u8 register-index limit",
     );
@@ -5406,6 +5462,17 @@ mod tests {
     }
 
     #[test]
+    fn state_field_canonical_slots_fills_max_index_255() {
+        // End-exclusive boundary: base 1 + 255 scalars → int_scalar_end = 256,
+        // filling indices i1..=i255 (the highest u8). This must NOT panic.
+        let (live_i, live_r, live_f) = super::live_slots_for_state_field_jit(255, &[], 0, 0, 0, 1);
+        assert_eq!(live_i.len(), 255);
+        assert_eq!(*live_i.last().unwrap(), 255u8);
+        assert!(live_r.is_empty());
+        assert!(live_f.is_empty());
+    }
+
+    #[test]
     fn state_field_canonical_slots_feeds_assembler_encode() {
         // The triple plumbs straight into `Assembler::_encode_liveness`
         // / `JitCodeBuilder::live` without further reshaping.  Two
@@ -5428,9 +5495,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "exceeds RPython jitcode u8 register-index limit")]
     fn state_field_canonical_slots_panics_on_overflow() {
-        // 256 slots overflows the u8 register-index encoding upstream
-        // jitcode bytes are written through (assembler.py:241).
-        let _ = super::live_slots_for_state_field_jit(256, &[], 0, 0, 0, 0);
+        // 257 slots needs index 256, past the u8 register-index ceiling the
+        // jitcode bytes are written through (assembler.py:241); 256 slots
+        // (end-exclusive, indices 0..=255) is the valid maximum.
+        let _ = super::live_slots_for_state_field_jit(257, &[], 0, 0, 0, 0);
     }
 
     #[test]

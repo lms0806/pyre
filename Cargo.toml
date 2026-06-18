@@ -29,6 +29,7 @@ members = [
     "majit/examples/tiny3",
     "majit/examples/tinyframe",
     "majit/examples/braininterp",
+    "majit/examples/dualtape",
     "majit/examples/tlc",
     "majit/examples/calc",
     # pyre

@@ -3631,19 +3631,41 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Slice X-D production wire-up: split-borrow helper that lets a
     /// caller (typically the macro-generated `__merge_*` wrapper) hold
-    /// the active `TraceCtx` mutably while a `jitcell_token_by_number`
-    /// resolver closure borrows `compiled_loops` and `warm_state`
-    /// immutably.  The closure is what dispatches `BC_CALL_ASSEMBLER_*`
-    /// against the production `Arc<JitCellToken>` rather than the
-    /// `_by_number_typed` synth-Arc fallback path.  Returns `None` when
-    /// no trace is active.
+    /// the active `TraceCtx` mutably while closures borrow disjoint
+    /// MetaInterp fields immutably.  Hands the caller, in order:
+    ///
+    /// 1. the active `&mut TraceCtx`;
+    /// 2. `resolve_token` — `jitcell_token_by_number`, so the dispatcher
+    ///    routes `BC_CALL_ASSEMBLER_*` against the production
+    ///    `Arc<JitCellToken>` rather than the `_by_number_typed` synth-Arc
+    ///    fallback (borrows `compiled_loops` + `warm_state`);
+    /// 3. `recursive_target` — #184 green-key → `(Arc<JitCellToken>,
+    ///    green_key)` resolver for a recursive CALL_ASSEMBLER (mirrors
+    ///    `get_loop_token_arc`; only already-compiled callees, the
+    ///    pending-token window returns `None` → the dispatcher aborts);
+    /// 4. `recursive_decision` — the recursive-portal inline decision,
+    ///    sharing `decide_recursive_inline` with `should_inline_core`;
+    /// 5. `recursive_exec` — runs a recursive callee's compiled loop via
+    ///    `backend.execute_token_raw` and decodes the int FINISH output.
+    ///
+    /// Returns `None` when no trace is active.
     pub fn with_trace_ctx_and_token_resolver<R>(
         &mut self,
-        f: impl FnOnce(&mut TraceCtx, &dyn Fn(u64) -> Option<Arc<JitCellToken>>) -> R,
+        f: impl FnOnce(
+            &mut TraceCtx,
+            &dyn Fn(u64) -> Option<Arc<JitCellToken>>,
+            &dyn Fn(usize, &[i64]) -> Option<(Arc<JitCellToken>, u64)>,
+            &dyn Fn(usize, &[i64], usize, usize) -> InlineDecision,
+            &dyn Fn(&JitCellToken, &[Value]) -> Option<i64>,
+        ) -> R,
     ) -> Option<R> {
         let tracing = self.tracing.as_mut()?;
         let compiled_loops = &self.compiled_loops;
         let warm_state = &self.warm_state;
+        let backend = &self.backend;
+        let staticdata = &self.staticdata;
+        let pending_token = self.pending_token;
+        let max_unroll = self.max_unroll_recursion;
         let resolver = |n: u64| -> Option<Arc<JitCellToken>> {
             for compiled in compiled_loops.values() {
                 if let Some(tok) = compiled.token.upgrade() {
@@ -3661,7 +3683,66 @@ impl<M: Clone> MetaInterp<M> {
             }
             warm_state.find_token_by_number(n).map(Arc::clone)
         };
-        Some(f(tracing, &resolver))
+        // #184 green-key → token resolver (pyjitpl.py:3593-3599
+        // `get_assembler_token`).  Resolves only already-compiled callees
+        // through `warm_state.get_compiled`; the pending-token convergence
+        // window returns `None` so the dispatcher aborts and retries (a
+        // later slice wires the `compile_tmp_callback` stand-in).
+        let recursive_target =
+            |jd_index: usize, green_values: &[i64]| -> Option<(Arc<JitCellToken>, u64)> {
+                let jd = staticdata.jitdrivers_sd.get(jd_index)?;
+                let green_key = crate::green_key_hash_typed(green_values, &jd.green_args_spec());
+                warm_state
+                    .get_compiled(green_key)
+                    .map(|arc| (Arc::clone(arc), green_key))
+            };
+        // #184 recursive-portal inline decision, sharing
+        // `decide_recursive_inline` with `should_inline_core` so the
+        // dispatch-side and metainterp-side decisions cannot drift.  The
+        // `should_disable` (`dont_trace_here` → `disable_noninlinable_function`)
+        // side-effect is deferred: it needs `&mut warm_state` (unavailable
+        // under this split-borrow) and only matters once a producer makes
+        // this path reachable, so it is wired with the producer slice; the
+        // decision itself is identical with or without it.
+        let recursive_decision = |jd_index: usize,
+                                  green_values: &[i64],
+                                  inline_depth: usize,
+                                  recursive_depth: usize|
+         -> InlineDecision {
+            let Some(jd) = staticdata.jitdrivers_sd.get(jd_index) else {
+                return InlineDecision::ResidualCall;
+            };
+            let green_key = crate::green_key_hash_typed(green_values, &jd.green_args_spec());
+            let callee_compiled = compiled_loops.contains_key(&green_key)
+                || pending_token.map_or(false, |(k, _)| k == green_key);
+            let can_inline = warm_state.can_inline_callable(green_key);
+            let (decision, _should_disable) = decide_recursive_inline(
+                callee_compiled,
+                can_inline,
+                inline_depth,
+                recursive_depth,
+                max_unroll,
+            );
+            decision
+        };
+        // #184 concrete recursive-callee execution: run the compiled loop
+        // through the JITFRAME-ABI `execute_token_raw` and decode the int
+        // FINISH output (mirrors `run_compiled_raw_detailed_with_values`).
+        let recursive_exec = |token: &JitCellToken, reds: &[Value]| -> Option<i64> {
+            let result = backend.execute_token_raw(token, reds);
+            if result.is_finish {
+                result.outputs.first().copied()
+            } else {
+                None
+            }
+        };
+        Some(f(
+            tracing,
+            &resolver,
+            &recursive_target,
+            &recursive_decision,
+            &recursive_exec,
+        ))
     }
 
     pub fn force_finish_trace_enabled(&self) -> bool {
@@ -10625,42 +10706,32 @@ impl<M: Clone> MetaInterp<M> {
         // `max_unroll_recursion`) or when `can_never_inline` is True.
         // When False, pyjitpl.py:1417 sets `assembler_call = True`
         // and falls through to `do_recursive_call`.
-        if !self.warm_state.can_inline_callable(callee_key) {
-            if callee_compiled {
-                return InlineDecision::CallAssembler;
-            }
-            return InlineDecision::ResidualCall;
-        }
+        let can_inline = self.warm_state.can_inline_callable(callee_key);
 
-        // pyre-only safety guard. RPython imposes no cap on
-        // `metainterp.framestack` depth beyond `rstack`; this bound
-        // exists to protect the Rust interpreter thread from
-        // runaway native-stack usage when a trace keeps inlining.
-        if inline_depth >= MAX_INLINE_DEPTH {
-            if callee_compiled {
-                return InlineDecision::CallAssembler;
-            }
-            return InlineDecision::ResidualCall;
-        }
+        // Gates 1382/native-depth/1404/1415 are the pure decision shared
+        // with the production runtime closure
+        // (`ClosureRuntimeWithResolver::recursive_inline_decision`) via
+        // `decide_recursive_inline`, so the tracer-side and metainterp-side
+        // decisions cannot drift.
+        let (decision, should_disable) = decide_recursive_inline(
+            callee_compiled,
+            can_inline,
+            inline_depth,
+            recursive_depth,
+            self.max_unroll_recursion,
+        );
 
-        // pyjitpl.py:1404 `count >= max_unroll_recursion` →
-        // `dont_trace_here(greenboxes)` + fall through to
-        // `do_recursive_call(..., assembler_call=True)`. Pyre's
-        // tracer also calls `disable_noninlinable_function` at the
-        // same decision point (trace_opcode.rs:3044-3049); doing it
-        // here too is idempotent and keeps the metainterp path
-        // self-consistent when entered without the tracer wrapper.
-        if recursive_depth >= self.max_unroll_recursion {
+        // pyjitpl.py:1404 `dont_trace_here(greenboxes)` — the only `&mut`,
+        // flagged by `decide_recursive_inline` when recursion reached
+        // `max_unroll_recursion`. Pyre's tracer also calls
+        // `disable_noninlinable_function` at the same decision point
+        // (trace_opcode.rs:3044-3049); doing it here too is idempotent and
+        // keeps the metainterp path self-consistent when entered without
+        // the tracer wrapper.
+        if should_disable {
             self.warm_state.disable_noninlinable_function(callee_key);
-            if callee_compiled {
-                return InlineDecision::CallAssembler;
-            }
-            return InlineDecision::ResidualCall;
         }
-
-        // pyjitpl.py:1415 `perform_call(portal_code, allboxes,
-        // greenkey=greenboxes)`.
-        InlineDecision::Inline
+        decision
     }
 
     /// Begin inlining a function call during tracing.
@@ -13486,6 +13557,52 @@ pub enum InlineDecision {
     CallAssembler,
     /// Emit a residual (opaque) call.
     ResidualCall,
+}
+
+/// pyjitpl.py:1375-1423 `_opimpl_recursive_call` decision gates, factored
+/// out of [`MetaInterp::should_inline_core`] so the tracer-side path and
+/// the production `JitCodeRuntime` closure
+/// (`ClosureRuntimeWithResolver::recursive_inline_decision`) share ONE
+/// source of truth and cannot drift.  Pure given the five scalars; the
+/// caller owns the `disable_noninlinable_function` side-effect that
+/// pyjitpl.py:1404 `dont_trace_here` performs — this returns
+/// `should_disable = true` exactly in that gate.
+///
+/// `callee_compiled` folds `compiled_loops.contains_key || pending_token`
+/// (the pyre `get_assembler_token` stand-in).  `can_inline` is
+/// `warm_state.can_inline_callable` (pyjitpl.py:1382).
+pub(crate) fn decide_recursive_inline(
+    callee_compiled: bool,
+    can_inline: bool,
+    inline_depth: usize,
+    recursive_depth: usize,
+    max_unroll: usize,
+) -> (InlineDecision, bool) {
+    // pyjitpl.py:1417 — a non-inlined recursive call routes to
+    // CALL_ASSEMBLER when the callee has (or is converging on) compiled
+    // code, else to a residual call.
+    let non_inline = if callee_compiled {
+        InlineDecision::CallAssembler
+    } else {
+        InlineDecision::ResidualCall
+    };
+    // pyjitpl.py:1382 `can_inline_callable` False (JC_DONT_TRACE_HERE /
+    // can_never_inline) → assembler_call.
+    if !can_inline {
+        return (non_inline, false);
+    }
+    // pyre-only native-stack guard (no upstream analog beyond rstack).
+    if inline_depth >= MAX_INLINE_DEPTH {
+        return (non_inline, false);
+    }
+    // pyjitpl.py:1404 `count >= max_unroll_recursion` → `dont_trace_here`
+    // (the `should_disable` side-effect the caller applies) + fall through
+    // to `do_recursive_call(assembler_call=True)`.
+    if recursive_depth >= max_unroll {
+        return (non_inline, true);
+    }
+    // pyjitpl.py:1415 `perform_call(...)` — inline-trace the callee.
+    (InlineDecision::Inline, false)
 }
 
 /// pyjitpl.py:2493-2503 routes through `crate::jitexc::DoneWithThisFrame`

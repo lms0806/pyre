@@ -2767,15 +2767,26 @@ impl TraceCtx {
     /// `build_state_field_snapshot(frames, …, virtualizable_boxes,
     /// virtualref_boxes)` for the state-field JIT guards.
     ///
-    /// Convergence (forward-resume epic, task #208): when the
-    /// interpreter-side promote path threads the live framestack /
-    /// virtualizable / virtualref boxes into this recorder (the same
-    /// `framestack`-walk `record_state_guard` already performs), the empty
-    /// vectors below are replaced by that capture and this hook matches
-    /// `generate_guard` 1:1. Until then a partial box list would be
-    /// positionally misaligned against the resume reader's per-frame
-    /// register layout, so the snapshot stays minimal rather than
-    /// half-populated.
+    /// Convergence (task #208): the only callers of this path are the
+    /// interpreter-side vable promotes — `get_arrayitem_vable_index`
+    /// (`trace_ctx.rs`) and the `is_nonstandard_virtualizable` `isstandard`
+    /// PTR_EQ (`trace_ctx.rs`, `pyjitpl/mod.rs`). Both emit a `GUARD_VALUE`
+    /// whose argument is constant-narrowed at optimization time — the array
+    /// index is a function of the already-promoted-constant `stackpos`, and
+    /// `isstandard` folds to `1` under pyre's single standard virtualizable —
+    /// so `optimize_guard_value` removes the guard (`rewrite.rs:653`,
+    /// `actual == expected → Remove`). The removed guard never reaches the
+    /// backend, so these empty boxes are never numbered or consumed: the
+    /// minimal snapshot is load-bearing ONLY for the `rd_resume_position >= 0`
+    /// invariant above, not for any live resume. The genuinely load-bearing
+    /// promote (`state.<scalar> = promote(...)`) does NOT use this path — it
+    /// lowers to `BC_*_GUARD_VALUE → record_state_guard → build_state_field_snapshot`
+    /// (`pyjitpl/dispatch.rs`), the full-framestack capture already at parity
+    /// with `generate_guard`. Threading the live framestack into this recorder
+    /// would only matter at framestack depth > 1 (inlined frames), which
+    /// cannot arise until the trace-into machinery (task #184) exists; a
+    /// partial box list would otherwise positionally misalign the resume
+    /// reader's per-frame register layout, so the snapshot stays minimal.
     fn record_guard_with_snapshot(
         &mut self,
         opcode: OpCode,

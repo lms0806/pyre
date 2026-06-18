@@ -29,6 +29,16 @@ pub fn interpret(code: &[u8], inputarg: i64) -> i64 {
     interpret_at(code, 0, inputarg)
 }
 
+/// Recursive portal re-entry — the concrete fallback for the `CALL` opcode's
+/// `recursive_portal_call!`.  tl.py:177 `res = interp(code, pc + offset)`
+/// re-enters the portal with a fresh stack and `inputarg` defaulting to 0,
+/// returning the sub-program's top-of-stack.  The argument order is the
+/// jitdriver green declaration order `[pc, program]` so the `recursive_entry`
+/// rewrite forwards the macro greens positionally.
+pub fn interpret_recursive(pc: usize, program: &[u8]) -> i64 {
+    interpret_at(program, pc, 0)
+}
+
 #[majit_macros::dont_look_inside]
 pub fn interpret_at(code: &[u8], mut pc: usize, inputarg: i64) -> i64 {
     let mut stack: Vec<i64> = Vec::with_capacity(code.len());

@@ -54,6 +54,10 @@ impl<'c> Lowerer<'c> {
         if let Some(binding) = self.lower_conditional_call_elidable(expr) {
             return Some(binding);
         }
+        // RPython jtransform.py:522 — recursive_portal_call!(driver, greens...)
+        if let Some(binding) = self.lower_recursive_portal_call(expr) {
+            return Some(binding);
+        }
 
         match expr {
             Expr::Lit(ExprLit {

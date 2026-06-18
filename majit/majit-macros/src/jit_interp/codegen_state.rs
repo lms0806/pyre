@@ -99,31 +99,17 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .enumerate()
         .filter(|(_, f)| matches!(f.kind, StateFieldKind::Ref(_)))
         .collect();
-
-    // A jitdriver has at most one virtualizable, whose `virtualizable_boxes`
-    // is one flat block carried whole at the loop header (pyjitpl.py:2982).
-    // pyre models a `[int; virt]` array as a `<arr>_ptr`/`<arr>_len` header
-    // plus its element boxes; the loop-close carries those elements out of
-    // the single shared `collect_virtualizable_boxes()` slice, which has no
-    // per-array boundaries. Two `[int; virt]` arrays would need that flat
-    // slice split per array — a shape with no upstream analogue — so reject
-    // it as unsupported rather than emit a close that silently drops every
-    // element box (a desync between the JUMP and the unroll Label).
-    if virt_arrays.len() > 1 {
-        let names = virt_arrays
-            .iter()
-            .map(|(_, f)| f.name.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let message = format!(
-            "state_fields supports at most one [int; virt] array; found {}: {}",
-            virt_arrays.len(),
-            names
-        );
-        return quote! {
-            compile_error!(#message);
-        };
-    }
+    // opaque(T) fields are pass-through carriers the JIT never enumerates as
+    // inputargs and never reconstructs.  A fresh recursive-portal frame cannot
+    // synthesize an arbitrary `T` generically, so any state shape carrying one
+    // is excluded from the fresh-entry helpers below (they fall back to the
+    // `None` default and the recursive dispatcher aborts to the interpreter).
+    let opaque_fields: Vec<_> = sf
+        .fields
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| matches!(f.kind, StateFieldKind::Opaque(_)))
+        .collect();
 
     let num_scalars = scalars.len();
     let num_virt_arrays = virt_arrays.len();
@@ -333,40 +319,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             }
         })
         .collect();
-    // collect_jump_args_with_boxes (ctx-aware close): carry the live
-    // `virtualizable_boxes[:-1]` element shadow AFTER the `<arr>_ptr`/`<arr>_len`
-    // header (pyjitpl.py:2982-2989 `live_arg_boxes += virtualizable_boxes;
-    // live_arg_boxes.pop()`). `__boxes` = `TraceCtx::collect_virtualizable_boxes()`
-    // = `[arr0_elem0.., identity]` (num_static_extra_boxes==0 for state-field,
-    // identity LAST).
-    //
-    // The JUMP must be slot-for-slot identical to the trace-entry Label, whose
-    // virt-array inputargs are `[ptr, len, elem0..elemN-1]` (`create_sym`
-    // mints `ptr`+`len`; `initialize_virtualizable` mints the N element boxes
-    // right after). So push `ptr` then `len` (both loop-invariant — the
-    // identity base and `program.len()`), then the N symbolically-updated
-    // element boxes in place of the optimizer's trace-entry-seeded tracker
-    // expansion. Dropping `len` here (or putting elements before it) shifts
-    // every later slot and breaks the unroll's Label↔Jump virtual-state match.
-    // Only one `[int; virt]` array is ever present (>1 is rejected at
-    // expansion), so `__boxes[..len-1]` is exactly that array's element
-    // block and needs no per-array split.
-    let collect_virt_array_box_parts: Vec<TokenStream> = virt_arrays
-        .iter()
-        .map(|(_, f)| {
-            let ptr_name = quote::format_ident!("{}_ptr", f.name);
-            let len_name = quote::format_ident!("{}_len", f.name);
-            quote! {
-                args.push(sym.#ptr_name);
-                args.push(sym.#len_name);
-                let __elem_count = __boxes.len().saturating_sub(1);
-                for __i in 0..__elem_count {
-                    args.push(__boxes[__i]);
-                }
-            }
-        })
-        .collect();
-
     // ── populate_frame_int_regs: scalars + flattened arrays ──
     // Matches `live_slots_for_state_field_jit` slot order so a
     // `MIFrame::get_list_of_active_boxes` walk against the canonical
@@ -527,6 +479,156 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             }
         })
         .collect();
+
+    // ── #184 recursive CALL_ASSEMBLER portal entry (JitCodeSym side) ──
+    // A recursive callee runs as its own compiled loop with a fresh frame.
+    // `recursive_fresh_entry_reds` allocates a fresh `#state_type` (scalars
+    // zeroed = empty frame; arrays re-allocated at the caller's live
+    // capacity) and emits its reds in `extract_live` order.  Capacities come
+    // from this symbolic state: a fixed array's sym field is a `Vec<OpRef>`
+    // of the captured length, and a virt array caches its length in
+    // `<arr>_len_value` (seeded at `JitState::initialize_sym`).  The whole
+    // struct equals `state_fields`, so these inits build a complete fresh
+    // `#state_type`.
+    let fresh_entry_scalar_inits: Vec<TokenStream> = scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { #fname: 0, }
+        })
+        .collect();
+    let fresh_entry_array_inits: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { #fname: ::std::vec![0i64; self.#fname.len()], }
+        })
+        .collect();
+    let fresh_entry_virt_array_inits: Vec<TokenStream> = virt_arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let len_value_name = quote::format_ident!("{}_len_value", f.name);
+            quote! { #fname: ::std::vec![0i64; self.#len_value_name as usize], }
+        })
+        .collect();
+    // Reds in `extract_live` order: int scalars, then flattened fixed-array
+    // elements, then per virt array the `&state` identity (Ref) + length
+    // (Int).  Mirrors `extract_scalar_parts` / `extract_array_parts` /
+    // `extract_virt_array_parts` so the fresh reds match the callee loop's
+    // input-arg layout and `live_value_types` routing.
+    let fresh_entry_scalar_value_pushes: Vec<TokenStream> = scalars
+        .iter()
+        .map(|_| quote! { __values.push(majit_ir::Value::Int(0)); })
+        .collect();
+    let fresh_entry_array_value_pushes: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! {
+                for _ in 0..self.#fname.len() {
+                    __values.push(majit_ir::Value::Int(0));
+                }
+            }
+        })
+        .collect();
+    let fresh_entry_virt_array_value_pushes: Vec<TokenStream> = virt_arrays
+        .iter()
+        .map(|(_, f)| {
+            let len_value_name = quote::format_ident!("{}_len_value", f.name);
+            quote! {
+                __values.push(majit_ir::Value::Ref(majit_ir::GcRef(__base as usize)));
+                __values.push(majit_ir::Value::Int(self.#len_value_name));
+            }
+        })
+        .collect();
+    // The freshly-boxed `&state` identity feeds the virt-array Ref slots; only
+    // bound when there is at least one virt array (fixed-array-only reds carry
+    // no pointer).
+    let fresh_entry_base_let: TokenStream = if num_virt_arrays > 0 {
+        quote! { let __base = &*__fresh as *const #state_type as i64; }
+    } else {
+        quote! {}
+    };
+    // Emitted only for state shapes whose whole fresh frame can be synthesized
+    // generically: no ref scalars and no opaque(T) carriers (neither has a
+    // generic fresh value, and the `#state_type` struct literal below omits
+    // opaque fields).  Other shapes fall back to the `JitCodeSym` default
+    // (`None`) and the recursive dispatcher aborts to the interpreter.
+    let recursive_fresh_entry_reds_override: TokenStream =
+        if num_ref_scalars == 0 && opaque_fields.is_empty() {
+            quote! {
+                fn recursive_fresh_entry_reds(
+                    &self,
+                ) -> Option<(Vec<majit_ir::Value>, Box<dyn ::core::any::Any>)> {
+                    let __fresh: Box<#state_type> = Box::new(#state_type {
+                        #(#fresh_entry_scalar_inits)*
+                        #(#fresh_entry_array_inits)*
+                        #(#fresh_entry_virt_array_inits)*
+                    });
+                    #fresh_entry_base_let
+                    let mut __values: Vec<majit_ir::Value> = Vec::new();
+                    #(#fresh_entry_scalar_value_pushes)*
+                    #(#fresh_entry_array_value_pushes)*
+                    #(#fresh_entry_virt_array_value_pushes)*
+                    Some((__values, __fresh as Box<dyn ::core::any::Any>))
+                }
+            }
+        } else {
+            quote! {}
+        };
+
+    // ── #184 recursive CALL_ASSEMBLER portal entry (host alloc/free) ──
+    // The compiled caller loop cannot `New` a host `#state_type` through the
+    // IR, so the recursive dispatcher records a residual call to these host
+    // helpers: `alloc` returns a fresh `Box::into_raw`-ed `#state_type`
+    // (scalars zeroed, the single virt array sized at the caller's live
+    // capacity passed in `__cap`), `free` drops it.  Emitted only for the
+    // shape the single-capacity allocator supports: zero ref scalars, no
+    // opaque carriers, no fixed arrays, exactly one virt array (the `tl`
+    // storage shape).  Other shapes leave `recursive_fresh_alloc_free_targets`
+    // at its `None` default so the dispatcher aborts.
+    let supports_fresh_alloc = num_ref_scalars == 0
+        && opaque_fields.is_empty()
+        && arrays.is_empty()
+        && num_virt_arrays == 1;
+    let recursive_fresh_alloc_free_fns: TokenStream = if supports_fresh_alloc {
+        let virt_name = &virt_arrays[0].1.name;
+        quote! {
+            #[doc(hidden)]
+            #[allow(non_snake_case)]
+            extern "C" fn __majit_recursive_fresh_alloc(__cap: i64) -> i64 {
+                let __fresh: ::std::boxed::Box<#state_type> = ::std::boxed::Box::new(#state_type {
+                    #(#fresh_entry_scalar_inits)*
+                    #virt_name: ::std::vec![0i64; __cap as usize],
+                });
+                ::std::boxed::Box::into_raw(__fresh) as i64
+            }
+            #[doc(hidden)]
+            #[allow(non_snake_case)]
+            extern "C" fn __majit_recursive_fresh_free(__ptr: i64) {
+                if __ptr != 0 {
+                    unsafe {
+                        ::core::mem::drop(::std::boxed::Box::from_raw(__ptr as *mut #state_type));
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+    let recursive_fresh_alloc_free_targets_override: TokenStream = if supports_fresh_alloc {
+        quote! {
+            fn recursive_fresh_alloc_free_targets(&self) -> Option<(*const (), *const ())> {
+                Some((
+                    __majit_recursive_fresh_alloc as usize as *const (),
+                    __majit_recursive_fresh_free as usize as *const (),
+                ))
+            }
+        }
+    } else {
+        quote! {}
+    };
 
     // ── create_sym: assign sequential OpRef::from_raw(0), OpRef::from_raw(1), ... ──
     let create_sym_scalar_inits: Vec<TokenStream> = scalars
@@ -771,7 +873,13 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .enumerate()
         .map(|(ref_idx, (_, f))| {
             let fname = &f.name;
-            quote! { self.#fname = ref_values[#ref_idx] as usize; }
+            // `live_value_types` routes one `Ref` per virt array (the shared
+            // `&state` identity) into the ref bank ahead of the ref scalars, so
+            // ref scalar `j` lives at `ref_values[num_virt_arrays + j]`, not
+            // `ref_values[j]`.  Mirrors `populate_ref_scalar_parts`, which skips
+            // the same prefix in the register bank via `ref_identity_base`.
+            let slot = num_virt_arrays + ref_idx;
+            quote! { self.#fname = ref_values[#slot] as usize; }
         })
         .collect();
     let initialize_sym_ref_scalar_parts: Vec<TokenStream> = ref_scalars
@@ -810,12 +918,28 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             }
         })
         .collect();
-    // Override `JitState::collect_jump_args_with_boxes` only for a single
-    // `[int; virt]` array (tl/tlc/tla/braininterp). With 0 virt arrays
-    // (tlr/tinyframe) the defaulted trait method (scalars + fixed arrays) is
-    // already correct; >1 is rejected above, so the `else` is only the
-    // 0-array case.
-    let collect_jump_args_with_boxes_method: TokenStream = if num_virt_arrays == 1 {
+    // Override `JitState::collect_jump_args_with_boxes` when the state has any
+    // `[int; virt]` array (tl/tlc/tla/braininterp + multi-array interps). With
+    // 0 virt arrays (tlr/tinyframe) the defaulted trait method (scalars + fixed
+    // arrays) is already correct, so the `else` is the 0-array case.
+    //
+    // The JUMP must be slot-for-slot identical to the trace-entry Label, whose
+    // virt-array inputargs are all the `<arr>_ptr`/`<arr>_len` headers (minted
+    // by `create_sym` advancing `__offset`, declaration order) followed by the
+    // element boxes (minted by `initialize_virtualizable` at
+    // `num_reds..num_reds+total`). `__boxes` =
+    // `TraceCtx::collect_virtualizable_boxes()` =
+    // `[arr0_elem0.., arr1_elem0.., .., identity]` (`num_static_extra_boxes==0`
+    // for state-field; `initialize_virtualizable` concatenates the arrays in
+    // declaration order; identity LAST). So push every header first (loop-
+    // invariant identity bases + lengths), then the whole element shadow once,
+    // dropping the trailing identity (pyjitpl.py:2982-2989 `live_arg_boxes +=
+    // virtualizable_boxes; live_arg_boxes.pop()`). The element block is already
+    // in per-array order, so a single contiguous splice reproduces the Label
+    // for any number of arrays; pushing it once-per-array (or putting elements
+    // before a later array's header) would shift every later slot and break the
+    // unroll's Label↔Jump virtual-state match.
+    let collect_jump_args_with_boxes_method: TokenStream = if num_virt_arrays >= 1 {
         quote! {
             fn collect_jump_args_with_boxes(
                 sym: &__JitSym,
@@ -824,7 +948,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 let mut args = Vec::new();
                 #(#collect_scalar_parts)*
                 #(#collect_array_parts)*
-                #(#collect_virt_array_box_parts)*
+                #(#collect_virt_array_parts)*
+                let __elem_count = __boxes.len().saturating_sub(1);
+                for __i in 0..__elem_count {
+                    args.push(__boxes[__i]);
+                }
                 #(#collect_ref_scalar_parts)*
                 args
             }
@@ -1333,6 +1461,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             }
         }
 
+        #recursive_fresh_alloc_free_fns
+
         /// Symbolic state during tracing: per-field OpRefs.
         #[allow(non_camel_case_types)]
         struct __JitSym {
@@ -1450,6 +1580,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 let _ = __slot;
                 #(#populate_ref_scalar_parts)*
             }
+
+            #recursive_fresh_entry_reds_override
+
+            #recursive_fresh_alloc_free_targets_override
         }
 
         impl majit_metainterp::JitState for #state_type {
@@ -1565,6 +1699,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 __all_liveness: &[u8],
                 __virtualizable_boxes: &[majit_ir::OpRef],
                 __virtualref_boxes: &[(majit_ir::OpRef, usize)],
+                __identity_const: Option<i64>,
             ) -> Option<majit_metainterp::recorder::Snapshot> {
                 use majit_metainterp::JitCodeSym as _;
                 if frames.frames.is_empty() {
@@ -1602,6 +1737,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     false,
                     __virtualizable_boxes,
                     __virtualref_boxes,
+                    __identity_const,
                 );
                 let __root = &mut frames.frames[0];
                 __root.int_regs[..__n].copy_from_slice(&__saved_int_regs);

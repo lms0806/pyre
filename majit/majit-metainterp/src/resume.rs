@@ -6561,21 +6561,13 @@ impl<'a> ResumeDataDirectReader<'a> {
         // the identity is the first of the `vable_size` items and the field
         // payload the remaining `vable_size - 1`, read sequentially.
         // resume.py:1404 virtualizable = self.next_ref()
-        let decoded = self.next_ref();
-        // The state-field JIT's `&state` identity is a loop-invariant constant
-        // the optimizer folds out of the live registers, so it is absent from
-        // the deadframe and decodes to null. Recover it from the driver-
-        // published live pointer (mirrors how RPython's metainterp — which IS
-        // the resume context — holds the virtualizable). A null decode never
-        // arises for a heap-object virtualizable whose pointer is genuinely
-        // live in the deadframe, so this only fires for the folded-constant
-        // identity and leaves every other consumer's behavior unchanged.
-        let virtualizable = if decoded == 0 {
-            let live = live_vable_ptr();
-            if live != 0 { live } else { decoded }
-        } else {
-            decoded
-        };
+        //
+        // The state-field JIT's `&state` identity is a loop-invariant the
+        // backend drops from live registers; `build_vable_snapshot_boxes`
+        // encodes it into the resume snapshot as a `Ref` constant, so it decodes
+        // to the real pointer here with no thread-local recovery — matching
+        // resume.py:1404, which reads the identity solely from resume data.
+        let virtualizable = self.next_ref();
         self.virtualizable_ptr = virtualizable;
         // resume.py:1406: assert vinfo.get_total_size(virtualizable) == vable_size - 1
         let expected = vinfo.get_total_size(virtualizable) as i32;
@@ -6830,31 +6822,6 @@ impl<'a> ResumeDataDirectReader<'a> {
     pub fn int_add_const(&self, base: i64, offset: i64) -> i64 {
         base + offset
     }
-}
-
-thread_local! {
-    /// Live virtualizable identity for the in-progress blackhole resume.
-    ///
-    /// The state-field JIT's vable identity (`&state`) is a loop-invariant
-    /// constant the optimizer folds out of the live registers, so it is
-    /// absent from the guard deadframe (decodes to null). The driver
-    /// publishes the live `&state` here around its blackhole resume so
-    /// `consume_vable_info` can recover the null identity. Zero means unset
-    /// — the default for every consumer whose virtualizable pointer is
-    /// genuinely live in the deadframe (e.g. a heap-object frame), which
-    /// never reads this channel because its identity decodes non-null.
-    static LIVE_VABLE_PTR: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
-}
-
-/// Publish the live virtualizable identity for the next blackhole resume.
-/// Pass `0` to clear. See `LIVE_VABLE_PTR`.
-pub fn set_live_vable_ptr(ptr: i64) {
-    LIVE_VABLE_PTR.with(|c| c.set(ptr));
-}
-
-/// Read the driver-published live virtualizable identity (`0` if unset).
-pub fn live_vable_ptr() -> i64 {
-    LIVE_VABLE_PTR.with(|c| c.get())
 }
 
 /// resume.py:1312 blackhole_from_resumedata

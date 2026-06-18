@@ -601,6 +601,81 @@ impl<'c> Lowerer<'c> {
         })
     }
 
+    /// RPython jtransform.py:522 `handle_recursive_call` — recognises
+    /// `recursive_portal_call!(driver, green0, green1, ...)` and emits the
+    /// `recursive_call_int` opcode (pyjitpl.py:1376 `opimpl_recursive_call`
+    /// → BC_RECURSIVE_CALL_INT).
+    ///
+    /// The greens are lowered in jitdriver declaration order and each is
+    /// tagged with its register-bank kind, so the dispatcher reads it from
+    /// the matching bank (an int `pc` green from the int bank, a ref
+    /// `program` green from the ref bank) and hashes the key against
+    /// `green_args_spec`.  The callee's fresh reds are built by the
+    /// dispatcher from `recursive_fresh_entry_reds`, so no caller→callee
+    /// argument moves are recorded here (`args = &[]`).  `jd_index` is the
+    /// runtime `__jdindex` parameter of `__dispatch_jitcode_*`
+    /// (jtransform.py:1704 `portal_jd.index`, threaded exactly like
+    /// `jit_merge_point` / `loop_header`), not a literal 0: when a consumer
+    /// also installs the propagate-descr placeholder driver via
+    /// `ensure_default_driver_sd`, the real portal driver registers at slot
+    /// 1+, so a hardcoded 0 would read the placeholder's empty
+    /// `green_args_spec`.
+    pub(super) fn lower_recursive_portal_call(&mut self, expr: &Expr) -> Option<Binding> {
+        let mac = match expr {
+            Expr::Macro(m) => m,
+            _ => return None,
+        };
+        let name = mac.mac.path.segments.last()?.ident.to_string();
+        if name != "recursive_portal_call" {
+            return None;
+        }
+        let args: syn::punctuated::Punctuated<Expr, syn::Token![,]> = mac
+            .mac
+            .parse_body_with(syn::punctuated::Punctuated::parse_terminated)
+            .ok()?;
+        let args: Vec<&Expr> = args.iter().collect();
+        // `driver`, then one expression per green in declaration order.
+        if args.len() < 2 {
+            panic!("recursive_portal_call! requires a driver and at least one green");
+        }
+        let green_exprs = &args[1..];
+        let mut green_bindings = Vec::with_capacity(green_exprs.len());
+        for g in green_exprs {
+            green_bindings.push(self.lower_value_expr(g)?);
+        }
+        let green_reads: Vec<Register> =
+            green_bindings.iter().map(Register::from_binding).collect();
+        let green_tokens: Vec<proc_macro2::TokenStream> = green_bindings
+            .iter()
+            .map(|b| {
+                let reg = b.reg;
+                let kind = match b.kind {
+                    BindingKind::Int => quote! { majit_metainterp::jitcode::JitArgKind::Int },
+                    BindingKind::Ref => quote! { majit_metainterp::jitcode::JitArgKind::Ref },
+                    BindingKind::Float => quote! { majit_metainterp::jitcode::JitArgKind::Float },
+                };
+                quote! { (#kind, #reg) }
+            })
+            .collect();
+        let result_reg = self.alloc_reg();
+        self.emit_op(
+            OpMeta::linear(OpKind::Call, green_reads, vec![Register::int(result_reg)]),
+            quote! {
+                __builder.recursive_call_int(__jdindex as u16, #result_reg, &[#(#green_tokens),*], &[]);
+            },
+        );
+        // jtransform.py:533 — `recursive_call_*` is always followed by `-live-`.
+        self.emit_op(
+            OpMeta::live_marker(),
+            quote! { let _ = __builder.live_placeholder(); },
+        );
+        Some(Binding {
+            reg: result_reg,
+            kind: BindingKind::Int,
+            depends_on_stack: false,
+        })
+    }
+
     /// RPython jtransform.py:292-313 — `rewrite_op_jit_record_known_result`.
     ///
     /// Recognizes `record_known_result!(result, func, args...)` and emits
