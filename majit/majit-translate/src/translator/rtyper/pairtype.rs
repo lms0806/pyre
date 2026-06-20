@@ -501,6 +501,16 @@ fn dispatch_rtype_op(
         (PtrRepr, IntegerRepr, "getitem") | (InteriorPtrRepr, IntegerRepr, "getitem") => {
             committed(r1.rtype_getitem(hop))
         }
+        // rlist.py:245-267 — pair(AbstractBaseListRepr, IntegerRepr).rtype_getitem.
+        // FixedSizeListRepr (Rust slice / fixed array) handles the nonneg +
+        // checkidx=False branch (bare getarrayitem); the negative-index and
+        // checkidx branches surface a TyperError until those helpers land.
+        (FixedSizeListRepr, IntegerRepr, "getitem") => committed(r1.rtype_getitem(hop)),
+        // rrange.py:34-50 — pair(AbstractRangeRepr, IntegerRepr).rtype_getitem.
+        // RangeRepr handles the constant-step + nonneg + dum_nocheck branch
+        // (start + index*step); the checkidx, negative-index, and
+        // variable-step branches surface a TyperError until those land.
+        (RangeRepr, IntegerRepr, "getitem") => committed(r1.rtype_getitem(hop)),
         // rtuple.py:264-273 — `pairtype(TupleRepr, IntegerRepr).rtype_getitem`.
         (TupleRepr, IntegerRepr, "getitem") => {
             committed(super::rtuple::pair_tuple_int_rtype_getitem(r1, hop))
@@ -584,6 +594,11 @@ fn dispatch_rtype_op(
         (PtrRepr, IntegerRepr, "setitem") | (InteriorPtrRepr, IntegerRepr, "setitem") => {
             committed(r1.rtype_setitem(hop))
         }
+        // rlist.py:272-284 — pair(AbstractBaseListRepr, IntegerRepr).rtype_setitem.
+        // FixedSizeListRepr handles the nonneg + dum_nocheck branch (bare
+        // setarrayitem); the checkidx (IndexError) and negative-index
+        // branches surface a TyperError until those helpers land.
+        (FixedSizeListRepr, IntegerRepr, "setitem") => committed(r1.rtype_setitem(hop)),
 
         // rptr.py:165-184 — pointer comparison accepts any repr on the
         // other side and coerces both args to the pointer repr.
