@@ -2011,8 +2011,11 @@ mod tests {
         let first = ws.alloc_token_number();
         let second = ws.alloc_token_number();
         let third = ws.alloc_token_number();
-        assert_eq!(second, first + 1);
-        assert_eq!(third, second + 1);
+        // The allocator is process-global. Other tests may allocate between
+        // these calls when the harness runs tests in parallel, so only the
+        // monotonic uniqueness contract is local to this test.
+        assert!(first < second);
+        assert!(second < third);
     }
 
     #[test]
