@@ -37,9 +37,8 @@ fn pyre_probe_bh_startup_enabled() -> bool {
 
 use pyre_interpreter::bytecode::{Instruction, OpArgState};
 use pyre_interpreter::{
-    PyResult, function_get_closure, function_get_defaults, function_get_globals,
-    function_get_globals_obj, function_get_name, is_function, register_jit_exc_raiser,
-    register_jit_function_caller,
+    PyResult, function_get_closure, function_get_defaults, function_get_globals_obj,
+    function_get_name, is_function, register_jit_exc_raiser, register_jit_function_caller,
 };
 use pyre_object::intobject::w_int_get_value;
 use pyre_object::intobject::w_int_new;
@@ -554,14 +553,8 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
             as *const *const pyre_interpreter::PyExecutionContext);
         (code, w_globals_obj, ec)
     };
-    let namespace = if !w_globals_obj.is_null() {
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_get_dict_storage_proxy(w_globals_obj)
-                as *mut pyre_interpreter::DictStorage
-        }
-    } else {
-        std::ptr::null_mut()
-    };
+    // Raw storage is recovered from `w_globals_obj` by the frame builder.
+    let namespace = std::ptr::null_mut();
 
     let mut func_frame =
         PyFrame::new_for_call_with_globals_obj(code, &[], namespace, w_globals_obj, exec_ctx);
@@ -2585,7 +2578,8 @@ fn create_callee_frame_impl_1_boxed(
 ) -> i64 {
     let w_code = unsafe { pyre_interpreter::getcode(callable) };
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
-    let globals = unsafe { function_get_globals(callable) };
+    // Raw storage is recovered from `w_globals_obj` by the frame builder.
+    let globals = std::ptr::null_mut();
     let w_globals_obj = unsafe { function_get_globals_obj(callable) };
     let one_arg = [boxed_arg];
     let args = fill_positional_defaults_for_jit_call(callable, w_code, &one_arg);
@@ -2657,10 +2651,8 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let func_code = caller.pycode;
     let w_globals_obj = caller.w_globals_obj;
-    let globals = unsafe {
-        pyre_object::w_dict_get_dict_storage_proxy(w_globals_obj)
-            as *mut pyre_interpreter::DictStorage
-    };
+    // Raw storage is recovered from `w_globals_obj` by the frame builder.
+    let globals = std::ptr::null_mut();
     let execution_context = caller.execution_context;
 
     let arena = arena_ref();
@@ -2740,7 +2732,8 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
     let callable = callable as PyObjectRef;
     let w_code = unsafe { pyre_interpreter::getcode(callable) };
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
-    let globals = unsafe { function_get_globals(callable) };
+    // Raw storage is recovered from `w_globals_obj` by the frame builder.
+    let globals = std::ptr::null_mut();
     let w_globals_obj = unsafe { function_get_globals_obj(callable) };
     let args = fill_positional_defaults_for_jit_call(callable, w_code, args);
     let args = args.as_ref();
@@ -2853,10 +2846,8 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let func_code = caller.pycode;
     let w_globals_obj = caller.w_globals_obj;
-    let globals = unsafe {
-        pyre_object::w_dict_get_dict_storage_proxy(w_globals_obj)
-            as *mut pyre_interpreter::DictStorage
-    };
+    // Raw storage is recovered from `w_globals_obj` by the frame builder.
+    let globals = std::ptr::null_mut();
     let execution_context = caller.execution_context;
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);

@@ -200,8 +200,8 @@ use pyre_interpreter::eval::{attach_raise_cause, normalize_raise_cause};
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_interpreter::{
     OpcodeStepExecutor, PyError, SharedOpcodeHandler, call_function, decode_instruction_at,
-    execute_opcode_step, function_get_defaults, function_get_globals, function_get_globals_obj,
-    is_builtin_code, is_function, range_iter_continues,
+    execute_opcode_step, function_get_defaults, function_get_globals_obj, is_builtin_code,
+    is_function, range_iter_continues,
 };
 
 use pyre_object::PyObjectRef;
@@ -446,13 +446,22 @@ fn emit_call_assembler_callee_frame(
             let nlocals = callee_code.varnames.len();
             let ncells = pyre_interpreter::ncells(callee_code);
             let max_stack = callee_code.max_stackdepth as usize;
-            let callee_globals = unsafe { function_get_globals(concrete_callable) };
-            // R3.3b: also resolve the canonical W_DictObject sibling so the
-            // inline new-PyFrame helper populates `PyFrame.w_globals_obj`
-            // in lockstep with the raw slot, matching what production
-            // Rust constructors do at heap allocation.
+            // Resolve the canonical W_DictObject sibling so the inline
+            // new-PyFrame helper populates `PyFrame.w_globals_obj`, and
+            // recover the legacy raw storage from it via the proxy back-link
+            // for the `frame_stores_global` stamp.  The function's own raw
+            // slot is null (MAKE_FUNCTION captures the object only), so
+            // reading it here would mis-stamp `pycode.w_globals`.
             let callee_globals_obj =
                 unsafe { pyre_interpreter::function_get_globals_obj(concrete_callable) };
+            let callee_globals = if callee_globals_obj.is_null() {
+                std::ptr::null_mut()
+            } else {
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_get_dict_storage_proxy(callee_globals_obj)
+                        as *mut pyre_interpreter::DictStorage
+                }
+            };
             let stores_global = unsafe {
                 pyre_interpreter::w_code_frame_stores_global(
                     w_callee_code as PyObjectRef,
@@ -461,7 +470,6 @@ fn emit_call_assembler_callee_frame(
             };
             if ncells == 0 && !stores_global {
                 let pycode_const = ctx.const_ref(w_callee_code as i64);
-                let w_globals_const = ctx.const_ref(callee_globals as i64);
                 let w_globals_obj_const = ctx.const_ref(callee_globals_obj as i64);
                 let ec = this.ensure_execution_context(ctx);
                 let frame = crate::helpers::emit_new_pyframe_inline_self_recursive(
@@ -470,7 +478,6 @@ fn emit_call_assembler_callee_frame(
                     nlocals + ncells + max_stack,
                     nlocals + ncells,
                     pycode_const,
-                    w_globals_const,
                     w_globals_obj_const,
                     ec,
                 );
@@ -7320,7 +7327,8 @@ impl MIFrame {
         let caller_exec_ctx = self.sym().concrete_execution_context;
         let caller_namespace_ptr = self.sym().concrete_namespace;
         let w_code = unsafe { pyre_interpreter::getcode(concrete_callable) };
-        let globals = unsafe { function_get_globals(concrete_callable) };
+        // Raw storage is recovered from `callee_globals_obj` by the frame builder.
+        let globals = std::ptr::null_mut();
         let callee_globals_obj = unsafe { function_get_globals_obj(concrete_callable) };
         let closure = unsafe { pyre_interpreter::function_get_closure(concrete_callable) };
         // pyjitpl.py:1396-1401 element-wise greenkey — `(code_ptr, 0)`
@@ -10165,6 +10173,31 @@ fn classify_concrete(cv: ConcreteValue) -> (bool, bool) {
     }
 }
 
+/// No-replay portal-exit capture for the trait tracer's top-level
+/// `*_return` / `yield_value`: stash the concrete return value so a
+/// synchronous trace that started at a loop header but fell through to
+/// `done_with_this_frame` (the back-edge counter tripped on the loop's
+/// terminal iteration → the loop test exited immediately and the trace
+/// walked the post-loop tail to the frame return) hands that result back
+/// directly instead of replaying the already-executed tail.  Mirrors the
+/// FBW walker's `*_return` arms (`jitcode_dispatch.rs`
+/// `fbw_finish_concrete_set`); the value is consumed in `eval.rs`.
+///
+/// Only a genuine concrete value is stashed — a `Null` / null `Ref`
+/// (untracked return) leaves the stash empty so the portal degrades to
+/// the legacy `ContinueRunningNormally` replay rather than fabricating a
+/// `None` return.
+fn capture_top_level_finish_concrete(cv: ConcreteValue) {
+    let genuine = match cv {
+        ConcreteValue::Int(_) | ConcreteValue::Float(_) | ConcreteValue::Bool(_) => true,
+        ConcreteValue::Ref(obj) => !obj.is_null(),
+        ConcreteValue::Null => false,
+    };
+    if genuine {
+        crate::jitcode_dispatch::fbw_finish_concrete_set(cv);
+    }
+}
+
 pub(crate) fn trace_step_result_to_action(
     state: &mut MIFrame,
     result: Result<pyre_interpreter::StepResult<FrontendOp>, PyError>,
@@ -10291,6 +10324,9 @@ pub(crate) fn trace_step_result_to_action(
             // unboxed the return value to Int/Float, ensure_boxed_for_ca
             // re-boxes it (NewWithVtable + SetfieldGc).
             let value = fop.opref;
+            // No-replay portal exit: stash the concrete return for the
+            // loop-header-fell-through-to-return case (see helper doc).
+            capture_top_level_finish_concrete(fop.concrete);
             let finish_value =
                 state.with_ctx(|this, ctx| crate::state::ensure_boxed_for_ca(ctx, this, value));
             // pyjitpl.py:3222 store_token_in_vable
@@ -10307,6 +10343,9 @@ pub(crate) fn trace_step_result_to_action(
             // pyjitpl.py:3198 compile_done_with_this_frame parity:
             // Yield uses the same Ref result_type.
             let value = fop.opref;
+            // No-replay portal exit: stash the concrete yielded value for
+            // the loop-header-fell-through-to-yield case (see helper doc).
+            capture_top_level_finish_concrete(fop.concrete);
             let finish_value =
                 state.with_ctx(|this, ctx| crate::state::ensure_boxed_for_ca(ctx, this, value));
             // pyjitpl.py:3222 store_token_in_vable (same as return path)

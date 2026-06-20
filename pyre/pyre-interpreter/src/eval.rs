@@ -1245,10 +1245,14 @@ impl SharedOpcodeHandler for PyFrame {
         // the frame's view — no lazy `dict_storage_to_dict` second
         // resolution that could surface a different W_DictObject.
         let w_globals_obj = self.get_w_globals_obj();
+        // Capture the globals OBJECT only; the raw `*mut DictStorage` is
+        // recovered from the object via the proxy back-link wherever a frame
+        // built from this function still needs it.  Threading a raw here is
+        // what dangled exec-defined functions when the exec temp storage was
+        // freed (the `GlobalsBinding` leak), so it is dropped.
         Ok(
             crate::runtime_ops::make_function_from_code_obj_with_globals_obj(
                 code_obj,
-                self.get_w_globals(),
                 w_globals_obj,
             ),
         )
@@ -1448,18 +1452,20 @@ impl NamespaceOpcodeHandler for PyFrame {
         // on the globals' backing W_ModuleDictObject so a repeated
         // LOAD_GLOBAL miss reuses the cached builtin entry instead of
         // re-walking `__builtins__.w_dict` every iteration.
-        // `celldict.py:285-291 _LOAD_GLOBAL_cached`: when
-        // `debugdata.w_globals is not pycode.w_globals` the entire
+        // `celldict.py:285-291 _LOAD_GLOBAL_cached`: when the frame's
+        // globals is not the pycode's first-seen globals the entire
         // cached path is bypassed via `_load_global_fallback` — both
         // the per-pycode `_globals_caches[nameindex]` slot AND the
         // strategy-level `get_global_cache(varname)` install are
         // skipped, because both would attach a cache to a module that
         // is not the one being executed.  Identity is checked via
-        // `pycode.w_globals == frame.w_globals` (raw pointer equality
-        // mirrors PyPy's `is` on the wrapped dict — `dict_storage_to_dict`
-        // preserves identity via the `mirror_target` invariant so the
-        // PyObjectRef comparison would agree, but the raw form skips a
-        // memoized wrap until the JIT-vable cutover lands).
+        // `pycode.w_globals == frame.get_w_globals()` (raw pointer
+        // equality mirrors PyPy's `is` on the wrapped dict).
+        // `get_w_globals()` recovers the raw storage from the frame's
+        // canonical `w_globals_obj`; `dict_storage_to_dict` /
+        // `w_dict_get_dict_storage_proxy` are mutual inverses under the
+        // `mirror_target` invariant, so this raw comparison agrees with
+        // the object `is` check.
         let pycode_matches_frame: bool = unsafe {
             let cw = crate::pycode::w_code_get_w_globals(self.pycode as PyObjectRef);
             !cw.is_null() && std::ptr::eq(cw, self.get_w_globals())

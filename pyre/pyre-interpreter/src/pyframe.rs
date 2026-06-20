@@ -115,11 +115,13 @@ pub struct PyFrame {
     ///
     /// **Population**: eagerly resolved at frame construction by calling
     /// `dict_storage_to_dict(w_globals)` on the raw storage handed to the
-    /// constructor, so every reader after construction observes the same
-    /// W_DictObject across the frame's lifetime.  `get_w_globals_obj()`'s
-    /// null-check arm remains as a safety net for synthetic test stubs
-    /// that hand-build PyFrame without going through the canonical
-    /// constructors.
+    /// constructor (or threaded through directly by the obj-taking
+    /// constructors), so every reader after construction observes the same
+    /// W_DictObject across the frame's lifetime.  This is the source of
+    /// truth: `get_w_globals_obj()` returns it directly and
+    /// `get_w_globals()` recovers the raw storage from it via
+    /// `w_dict_get_dict_storage_proxy`.  Synthetic test stubs that
+    /// hand-build PyFrame without a real globals leave it `PY_NULL`.
     pub w_globals_obj: PyObjectRef,
 }
 
@@ -493,8 +495,6 @@ pub struct FrameDebugData {
     /// `STORE/LOAD/DELETE_NAME` route through `space.setitem/getitem
     /// /delitem(w_locals_object, ...)` when this field is non-null.
     pub w_locals_object: PyObjectRef,
-    /// pyframe.py:49 — set in __init__ from pycode.w_globals
-    pub w_globals: *mut DictStorage,
     /// pyframe.py:37
     pub w_f_trace: PyObjectRef,
     /// pyframe.py:40
@@ -514,11 +514,14 @@ pub struct FrameDebugData {
 }
 
 impl FrameDebugData {
-    pub fn new(pycode: *const (), init_lineno: isize) -> Self {
+    // `_pycode` keeps the constructor shape of `pyframe.py:48
+    // FrameDebugData.__init__(self, pycode, init_lineno)`.  The frame's
+    // globals object now lives in `PyFrame.w_globals_obj`, so debugdata no
+    // longer snapshots `pycode.w_globals`.
+    pub fn new(_pycode: *const (), init_lineno: isize) -> Self {
         Self {
             w_locals: std::ptr::null_mut(),
             w_locals_object: pyre_object::PY_NULL,
-            w_globals: unsafe { crate::w_code_get_w_globals(pycode as PyObjectRef) },
             w_f_trace: pyre_object::PY_NULL,
             is_being_profiled: false,
             is_in_line_tracing: false,
@@ -824,40 +827,29 @@ impl PyFrame {
         self.code()
     }
 
-    /// pyframe.py:129-133 get_w_globals
+    /// pyframe.py:129-133 get_w_globals — the raw `*mut DictStorage`
+    /// backing this frame's globals.  `pyframe.py:49 self.w_globals =
+    /// w_globals` keeps the canonical W_DictObject as the single field;
+    /// pyre's split layout makes `w_globals_obj` that source of truth and
+    /// recovers the raw storage from it via `w_dict_get_dict_storage_proxy`
+    /// (the inverse of `dict_storage_to_dict`).
     #[inline]
     pub fn get_w_globals(&self) -> *mut DictStorage {
-        match self.getdebug_data() {
-            Some(data) => data.w_globals,
-            None => unsafe { crate::w_code_get_w_globals(self.pycode as PyObjectRef) },
-        }
+        w_globals_obj_storage(self.w_globals_obj)
     }
 
-    /// Resolve the canonical W_DictObject paired with `self.w_globals`,
-    /// caching the result in the adjacent `w_globals_obj` slot.
+    /// The canonical W_DictObject for this frame's globals
+    /// (`pyframe.py:49 self.w_globals = w_globals`).  Every frame
+    /// constructor seeds `w_globals_obj` eagerly, so this is a plain
+    /// field read; callers wanting object identity
+    /// (`function.__globals__ is frame.f_globals`, `globals() is
+    /// module.__dict__`, etc.) read it directly.
     ///
-    /// PyPy `pyframe.py:49 self.w_globals = w_globals` stores the dict
-    /// object directly so the equivalent question never arises there.
-    /// Pyre's split storage / W_DictObject layout means callers that
-    /// want object identity (`function.__globals__ is frame.f_globals`,
-    /// `globals() is module.__dict__`, etc.) need the canonical
-    /// W_DictObject sibling.  `dict_storage_to_dict` returns the same
-    /// instance on every call (`mirror_target` invariant), and the
-    /// cache field skips the lookup on subsequent calls.
-    ///
-    /// Returns `PY_NULL` when `w_globals` is null (test stubs); callers
-    /// that expect a dict should null-check before dereferencing.
-    pub fn get_w_globals_obj(&mut self) -> PyObjectRef {
-        if !self.w_globals_obj.is_null() {
-            return self.w_globals_obj;
-        }
-        let storage = self.get_w_globals();
-        if storage.is_null() {
-            return pyre_object::PY_NULL;
-        }
-        let resolved = crate::baseobjspace::dict_storage_to_dict(storage);
-        self.w_globals_obj = resolved;
-        resolved
+    /// Returns `PY_NULL` when the frame has no globals (test stubs);
+    /// callers that expect a dict should null-check before dereferencing.
+    #[inline]
+    pub fn get_w_globals_obj(&self) -> PyObjectRef {
+        self.w_globals_obj
     }
 
     /// pyframe.py:135 get_w_f_trace
@@ -935,8 +927,11 @@ impl PyFrame {
             clear_debugdata_ptr(&mut self.debugdata);
             clear_block_chain(&mut self.lastblock);
         }
-        if unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) } {
-            self.getorcreate_debug_data(-1).w_globals = w_globals;
+        // pyframe.py:103 — stamp `pycode.w_globals` (the first-globals cache
+        // the LOAD_GLOBAL fast path keys on); side effect only, since the
+        // gated debugdata snapshot retired in favour of `w_globals_obj`.
+        unsafe {
+            crate::w_code_frame_stores_global(code as PyObjectRef, w_globals);
         }
         // `pyframe.py:114-115` — `self.builtin = space.builtin.pick_builtin(
         // w_globals)`.  pyre keeps the picked builtin and the canonical
@@ -1166,8 +1161,11 @@ impl PyFrame {
         let nlocals = unsafe { (&*raw).varnames.len() };
         let ncells = unsafe { ncells(&*raw) };
         let size = nlocals + ncells + 16; // small stack
-        let stores_global =
-            unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) };
+        // pyframe.py:103 — stamp `pycode.w_globals`; side effect only (the
+        // gated debugdata snapshot retired in favour of `w_globals_obj`).
+        unsafe {
+            crate::w_code_frame_stores_global(code as PyObjectRef, w_globals);
+        }
         let w_builtin = crate::baseobjspace::frame_builtin(w_globals, execution_context);
         // `pyframe.py:98 __init__(self, space, code, w_globals, ...)`
         // stores `w_globals` as the canonical W_DictObject directly.
@@ -1199,9 +1197,6 @@ impl PyFrame {
             w_builtin,
             w_globals_obj,
         };
-        if stores_global {
-            frame.getorcreate_debug_data(-1).w_globals = w_globals;
-        }
         frame
     }
 
@@ -1282,8 +1277,11 @@ impl PyFrame {
         let num_cells = ncells(code_ref);
         let max_stack = code_ref.max_stackdepth as usize;
 
-        let stores_global =
-            unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) };
+        // pyframe.py:103 — stamp `pycode.w_globals`; side effect only (the
+        // gated debugdata snapshot retired in favour of `w_globals_obj`).
+        unsafe {
+            crate::w_code_frame_stores_global(code as PyObjectRef, w_globals);
+        }
         let w_builtin = crate::baseobjspace::frame_builtin(w_globals, execution_context);
         // `pyframe.py:98 __init__` — `self.w_globals = w_globals` stores
         // the W_DictObject directly; eager `dict_storage_to_dict`
@@ -1312,9 +1310,6 @@ impl PyFrame {
             w_builtin,
             w_globals_obj,
         };
-        if stores_global {
-            frame.getorcreate_debug_data(-1).w_globals = w_globals;
-        }
         // Module-level w_locals = w_globals binding flows naturally
         // through `createframe → initialize_frame_scopes` since RustPython
         // codegen emits empty flags for the module seed CodeInfo
@@ -2456,6 +2451,17 @@ impl PyFrame {
         closure: PyObjectRef,
         w_builtin: PyObjectRef,
     ) -> Self {
+        // Recover the legacy raw storage from the object (the `mirror_target`
+        // inverse of `dict_storage_to_dict`) so the `frame_stores_global`
+        // stamp and the debug-data snapshot see the canonical storage even
+        // when the caller threads a null raw (obj-only functions, e.g.
+        // MAKE_FUNCTION).  A null `w_globals_obj` (test stubs) keeps the
+        // passed raw.
+        let globals = if w_globals_obj.is_null() {
+            globals
+        } else {
+            unsafe { pyre_object::w_dict_get_dict_storage_proxy(w_globals_obj) as *mut DictStorage }
+        };
         let code_ref = unsafe {
             &*(crate::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject)
         };
@@ -2496,8 +2502,11 @@ impl PyFrame {
             }
         }
 
-        let stores_global =
-            unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, globals) };
+        // pyframe.py:103 — stamp `pycode.w_globals`; side effect only (the
+        // gated debugdata snapshot retired in favour of `w_globals_obj`).
+        unsafe {
+            crate::w_code_frame_stores_global(code as PyObjectRef, globals);
+        }
 
         let mut frame = PyFrame {
             execution_context,
@@ -2517,9 +2526,6 @@ impl PyFrame {
             w_globals_obj,
         };
         frame.init_cells();
-        if stores_global {
-            frame.getorcreate_debug_data(-1).w_globals = globals;
-        }
         frame
     }
 
@@ -2745,6 +2751,29 @@ pub fn createframe(
     execution_context: *const PyExecutionContext,
     outer_func: Option<PyObjectRef>,
 ) -> Result<FrameBox, crate::PyError> {
+    // Legacy raw-storage entry: resolve the canonical W_DictObject sibling
+    // and delegate to `createframe_obj`.  `dict_storage_to_dict` and
+    // `w_dict_get_dict_storage_proxy` are mutual inverses under the
+    // `mirror_target` invariant, so the round-trip preserves identity.
+    let w_globals_obj = if w_globals.is_null() {
+        PY_NULL
+    } else {
+        crate::baseobjspace::dict_storage_to_dict(w_globals)
+    };
+    createframe_obj(code, w_globals_obj, execution_context, outer_func)
+}
+
+/// `baseobjspace.py:796 createframe` with the globals passed as the dict
+/// OBJECT (`pyframe.py:49 self.w_globals = w_globals` stores the object).
+/// The legacy raw `*mut DictStorage` is recovered from the object via the
+/// proxy back-link only for the `frame_stores_global` check and the
+/// FrameDebugData.w_globals snapshot, both of which retire in later steps.
+pub fn createframe_obj(
+    code: *const (),
+    w_globals_obj: PyObjectRef,
+    execution_context: *const PyExecutionContext,
+    outer_func: Option<PyObjectRef>,
+) -> Result<FrameBox, crate::PyError> {
     // pyframe.py:98-119 PyFrame.__init__ — line-by-line.
     //   self.space = space               (pyre: implicit, no field)
     //   self.pycode = code               (pycode field below)
@@ -2757,28 +2786,42 @@ pub fn createframe(
     //   self.valuestackdepth = code.co_nlocals + ncellvars + nfreevars
     //   ...
     //   self.initialize_frame_scopes(outer_func, code)
+    //
+    // Normalize a dict-subclass globals (`exec(src, G())`) to its inner
+    // `__dict_data__` dict.  The storage proxy that LOAD_GLOBAL reads lives
+    // on the `W_DictObject`, and downstream readers key off this object —
+    // `get_w_globals`, MAKE_FUNCTION's `function.__globals__`, and the JIT
+    // inline / callee globals readers — so the frame must hold the
+    // `W_DictObject`, not the subclass instance whose layout has no proxy
+    // slot.  No-op for a plain dict / module dict (`resolve_dict_backing`
+    // returns the argument).  Converges to holding the object directly when
+    // the raw `DictStorage` proxy retires.
+    let w_globals_obj = if w_globals_obj.is_null() {
+        w_globals_obj
+    } else {
+        let backing = crate::type_methods::resolve_dict_backing(w_globals_obj);
+        if backing.is_null() {
+            w_globals_obj
+        } else {
+            backing
+        }
+    };
     let raw = unsafe { crate::w_code_get_ptr(code as PyObjectRef) as *const CodeObject };
     let code_ref = unsafe { &*raw };
     let num_locals = code_ref.varnames.len();
     let num_cells = ncells(code_ref);
     let max_stack = code_ref.max_stackdepth as usize;
-    let stores_global =
-        unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) };
+    // The `frame_stores_global` check and the debug-data snapshot still read
+    // the raw storage; recover it from the object via the proxy back-link.
+    let w_globals = w_globals_obj_storage(w_globals_obj);
+    // pyframe.py:103 — stamp `pycode.w_globals`; side effect only (the gated
+    // debugdata snapshot retired in favour of `w_globals_obj`).
+    unsafe {
+        crate::w_code_frame_stores_global(code as PyObjectRef, w_globals);
+    }
 
     let size = num_locals + num_cells + max_stack;
-    let w_builtin = crate::baseobjspace::frame_builtin(w_globals, execution_context);
-    // `pyframe.py:98 __init__` — `self.w_globals = w_globals` stores the
-    // dict object directly so `frame.w_globals` retains object identity
-    // for the lifetime of the frame.  pyre's split layout pairs the raw
-    // `*mut DictStorage` with the canonical W_DictObject via
-    // `dict_storage_to_dict`; populate the slot eagerly here too (the
-    // legacy `new_with_namespace` constructor already does this) so
-    // callers reading `frame.w_globals_obj` see a non-null PyObjectRef.
-    let w_globals_obj = if w_globals.is_null() {
-        PY_NULL
-    } else {
-        crate::baseobjspace::dict_storage_to_dict(w_globals)
-    };
+    let w_builtin = crate::baseobjspace::frame_builtin_obj(w_globals_obj, execution_context);
     let mut frame = FrameBox::new(PyFrame {
         execution_context,
         pycode: code,
@@ -2796,9 +2839,6 @@ pub fn createframe(
         w_builtin,
         w_globals_obj,
     });
-    if stores_global {
-        frame.getorcreate_debug_data(-1).w_globals = w_globals;
-    }
     // pyframe.py:119 — final step of __init__.  PY_NULL plays the role of
     // Python `None` per the existing `initialize_frame_scopes` convention
     // (pyframe.rs:664).  Top-level module / interactive / expression code
@@ -2816,6 +2856,21 @@ pub fn createframe(
     }
 
     Ok(frame)
+}
+
+/// Recover the str-keyed storage proxy backing a globals OBJECT.  Resolves
+/// a dict subclass to its inner `__dict_data__` dict first: the proxy lives
+/// on the `W_DictObject`, so reading it straight off the subclass instance
+/// would dereference an unrelated offset.
+pub(crate) fn w_globals_obj_storage(w_globals_obj: PyObjectRef) -> *mut DictStorage {
+    if w_globals_obj.is_null() {
+        return std::ptr::null_mut();
+    }
+    let backing = crate::type_methods::resolve_dict_backing(w_globals_obj);
+    if backing.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { pyre_object::w_dict_get_dict_storage_proxy(backing) as *mut DictStorage }
 }
 
 /// `space.finditem_str(w_obj, key)` — `space.getitem` with KeyError
