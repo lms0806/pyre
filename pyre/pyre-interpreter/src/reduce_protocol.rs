@@ -85,10 +85,29 @@ pub fn get_slotvalues(w_obj: PyObjectRef) -> PyResult {
 pub fn object_getstate_default(w_obj: PyObjectRef) -> PyResult {
     let w_objdict = crate::baseobjspace::findattr(w_obj, "__dict__");
     let mut w_ret = match w_objdict {
-        Some(d) if crate::baseobjspace::len_w(d)? > 0 => crate::call::call_function_impl_result(
-            crate::baseobjspace::getattr_str(d, "copy")?,
-            &[],
-        )?,
+        Some(d) if crate::baseobjspace::len_w(d)? > 0 => {
+            // Copy `__dict__`, dropping the internal `__dict_data__` key that a
+            // dict subclass keeps its mapping payload under: that payload is
+            // reconstructed through `dictitems`, not the instance state, so an
+            // attribute-less dict subclass must yield `None` here (matching the
+            // empty instance `__dict__` of a built-in subclass).
+            let w_copy = pyre_object::w_dict_new();
+            let mut count = 0usize;
+            for (k, v) in unsafe { pyre_object::w_dict_items(d) } {
+                if unsafe { pyre_object::is_str(k) }
+                    && unsafe { pyre_object::w_str_get_value(k) } == "__dict_data__"
+                {
+                    continue;
+                }
+                unsafe { pyre_object::w_dict_store(w_copy, k, v) };
+                count += 1;
+            }
+            if count > 0 {
+                w_copy
+            } else {
+                pyre_object::w_none()
+            }
+        }
         _ => pyre_object::w_none(),
     };
     let w_slots = get_slotvalues(w_obj)?;
@@ -161,6 +180,40 @@ pub fn getnewargs(w_obj: PyObjectRef) -> Result<(bool, PyObjectRef, PyObjectRef)
 /// objectobject.py:240 `descr__reduce__(space, w_obj)` — `reduce_1(obj, 0)`.
 pub fn descr_reduce(w_obj: PyObjectRef) -> PyResult {
     reduce_1(w_obj, 0)
+}
+
+/// setobject.c `set_reduce` — `(type(self), (list(self),), state)` where
+/// `state` is `_PyObject_GetState(self)` (`object_getstate_default`).  Both
+/// `set` and `frozenset` expose this as `__reduce__`, so a subclass with a
+/// payload round-trips through `copy`/`pickle` instead of collapsing to the
+/// base type.
+pub fn set_reduce(w_obj: PyObjectRef) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_obj);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+    let w_type = crate::typedef::r#type(w_obj)
+        .ok_or_else(|| PyError::type_error("cannot determine type for __reduce__"))?;
+    pyre_object::gc_roots::pin_root(w_type);
+    let type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+    // PySequence_List(self): no GC between reading the items and `w_list_new`
+    // (which re-pins them).
+    let items = unsafe {
+        pyre_object::setobject::w_set_items(pyre_object::gc_roots::shadow_stack_get(obj_slot))
+    };
+    let w_list = pyre_object::listobject::w_list_new(items);
+    let w_args = pyre_object::w_tuple_new(vec![w_list]);
+    pyre_object::gc_roots::pin_root(w_args);
+    let args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+    let w_state = object_getstate_default(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
+
+    Ok(pyre_object::w_tuple_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(type_slot),
+        pyre_object::gc_roots::shadow_stack_get(args_slot),
+        w_state,
+    ]))
 }
 
 /// objectobject.py:23 `reduce_1(obj, proto)` — app-level handle.

@@ -625,35 +625,7 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         make_module_builtin_function("complex", builtin_complex)
     });
     namespace.get_or_insert_with("filter", || {
-        make_module_builtin_function("filter", |args| {
-            if args.len() < 2 {
-                return Ok(pyre_object::w_seq_iter_new(w_list_new(vec![]), 0));
-            }
-            let func = args[0];
-            let items = collect_iterable(args[1])?;
-            let mut out = Vec::new();
-            let func_is_none = unsafe { pyre_object::is_none(func) };
-            for item in items {
-                let keep = if func_is_none {
-                    crate::baseobjspace::is_true(item)?
-                } else {
-                    // functional.py:936 next_w: `w_pred =
-                    // space.call_function(self.w_predicate, w_obj)` then
-                    // `space.is_true(w_pred)` — a raising predicate or
-                    // truthiness propagates.
-                    let result = crate::call::call_function_impl_result(func, &[item])?;
-                    crate::baseobjspace::is_true(result)?
-                };
-                if keep {
-                    out.push(item);
-                }
-            }
-            // `filter` is a lazy iterator in CPython; pyre eagerly applies
-            // the predicate but still hands back an iterator (matching
-            // `map`/`zip`) so `next(filter(...))` works.
-            let n = out.len();
-            Ok(pyre_object::w_seq_iter_new(w_list_new(out), n))
-        })
+        make_module_builtin_function("filter", builtin_filter)
     });
     namespace.get_or_insert_with("input", || {
         make_module_builtin_function("input", |_| Ok(pyre_object::w_str_new("")))
@@ -3245,7 +3217,14 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             if let Some(s) = crate::display::builtin_subclass_dunder(obj, tp, "__str__")? {
                 return Ok(w_str_new(&s));
             }
-            return Ok(obj);
+            // `str(s) is s` only for an exact `str`; a subclass with no
+            // `__str__` override is copied to a fresh base `str`.
+            if is_exact_type(obj, &STR_TYPE) {
+                return Ok(obj);
+            }
+            return Ok(pyre_object::w_str_from_wtf8(
+                pyre_object::w_str_get_wtf8(obj).to_owned(),
+            ));
         }
     }
     let w = unsafe { crate::py_str_wtf8(obj)? };
@@ -3574,7 +3553,12 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     let obj = args[value_idx];
     unsafe {
         if is_float(obj) {
-            return Ok(obj);
+            // `float(f) is f` only for an exact `float`; a subclass instance
+            // is copied to a fresh base `float`.
+            if is_exact_type(obj, &FLOAT_TYPE) {
+                return Ok(obj);
+            }
+            return Ok(floatobject::w_float_new(w_float_get_value(obj)));
         }
         if is_int(obj) {
             return Ok(floatobject::w_float_new(w_int_get_value(obj) as f64));
@@ -3704,7 +3688,16 @@ pub(crate) fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     let obj = args[0];
     unsafe {
         if is_tuple(obj) {
-            return Ok(obj);
+            // `tuple(t) is t` only when `t` is exactly a tuple; a tuple
+            // subclass instance is copied to a fresh base tuple.
+            if is_exact_type(obj, &TUPLE_TYPE) {
+                return Ok(obj);
+            }
+            let n = w_tuple_len(obj);
+            let items: Vec<_> = (0..n)
+                .filter_map(|i| w_tuple_getitem(obj, i as i64))
+                .collect();
+            return Ok(w_tuple_new(items));
         }
         if is_list(obj) {
             let n = w_list_len(obj);
@@ -5337,118 +5330,76 @@ fn builtin_chr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
 }
 
-/// `map()` — PyPy: functional.py W_Map (returns iterator)
+/// `filter(function or None, iterable)` — `functional.py:980-995
+/// W_Filter___new__`.  A lazy iterator: `function == None` keeps truthy
+/// items, otherwise `function(item)` is the predicate.
+fn builtin_filter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "filter expected 2 arguments, got {}",
+            args.len()
+        )));
+    }
+    let func = args[0];
+    // `functional.py:921-924` — a None predicate is stored as PY_NULL.
+    let w_predicate = if unsafe { pyre_object::is_none(func) } {
+        pyre_object::PY_NULL
+    } else {
+        func
+    };
+    // `functional.py:925 self.w_iterable = space.iter(w_iterable)`.
+    let w_iterable = crate::baseobjspace::iter(args[1])?;
+    Ok(pyre_object::filterobject::w_filter_new(
+        w_predicate,
+        w_iterable,
+    ))
+}
+
+/// `map(func, *iterables, strict=False)` — `functional.py:888-902
+/// W_Map___new__` plus the CPython 3.14 `strict` keyword.  A lazy iterator:
+/// each `next()` pulls one item per iterable and calls `func(*items)`.
 fn builtin_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (args, kwargs) = split_builtin_kwargs(args);
+    kwarg_reject_unknown(kwargs, &["strict"], "map")?;
+    let strict = kwarg_get(kwargs, "strict")
+        .map(|v| crate::baseobjspace::is_true(v))
+        .transpose()?
+        .unwrap_or(false);
     if args.len() < 2 {
         return Err(crate::PyError::type_error(
-            "map() requires at least 2 arguments",
+            "map() must have at least two arguments.",
         ));
     }
     let func = args[0];
-    // `pypy/module/__builtin__/functional.py:336-355 W_Map.descr_new`
-    // accepts any number of iterables; each iteration calls
-    // `func(*tuple_of_one_item_per_iterable)` and stops at the
-    // shortest iterable.  Single-iterable map is the trivial case.
-    let iters: Vec<Vec<PyObjectRef>> = args[1..]
-        .iter()
-        .map(|&it| collect_iterable(it))
-        .collect::<Result<_, _>>()?;
-    let min_len = iters.iter().map(|v| v.len()).min().unwrap_or(0);
-    let mut results = Vec::with_capacity(min_len);
-    for i in 0..min_len {
-        let call_args: Vec<PyObjectRef> = iters.iter().map(|v| v[i]).collect();
-        let result = crate::call_function(func, &call_args);
-        results.push(result);
+    // `functional.py:835-836 build_iterators_from_args` — `iter()` each input.
+    let mut iters = Vec::with_capacity(args.len() - 1);
+    for &arg in &args[1..] {
+        iters.push(crate::baseobjspace::iter(arg)?);
     }
-    let n = results.len();
-    let list = pyre_object::w_list_new(results);
-    Ok(pyre_object::w_seq_iter_new(list, n))
+    let w_iterators = pyre_object::w_list_new(iters);
+    Ok(pyre_object::mapobject::w_map_new(func, w_iterators, strict))
 }
 
-/// `zip(*iterables)` — PyPy: functional.py W_Zip
+/// `zip(*iterables, strict=False)` — `functional.py:1101-1105 W_Zip___new__`.
+/// A lazy iterator: each `next()` pulls one item per iterable into a tuple,
+/// stopping at the shortest (an empty `zip()` stops immediately); `strict`
+/// raises `ValueError` on a length mismatch.
 fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `pypy/module/__builtin__/functional.py:411-414 W_Zip.descr_new`
-    // accepts `strict` as a keyword.  Pyre's flat builtin ABI surfaces
-    // kwargs as a trailing `__pyre_kw__` dict; strip it before the
-    // positional walk and look up `strict` from it.
+    // Pyre's flat builtin ABI surfaces kwargs as a trailing dict; strip it
+    // before the positional walk and look up `strict` from it.
     let (args, kwargs) = split_builtin_kwargs(args);
     kwarg_reject_unknown(kwargs, &["strict"], "zip")?;
     let strict = kwarg_get(kwargs, "strict")
         .map(|v| crate::baseobjspace::is_true(v))
         .transpose()?
         .unwrap_or(false);
-    if args.is_empty() {
-        return Ok(pyre_object::w_seq_iter_new(
-            pyre_object::w_list_new(vec![]),
-            0,
-        ));
-    }
-    // Collect all iterables into lists, zip them
-    let mut iters: Vec<Vec<PyObjectRef>> = Vec::new();
+    // `functional.py:835-836 build_iterators_from_args` — `iter()` each input.
+    let mut iters = Vec::with_capacity(args.len());
     for &arg in args {
-        let mut items = Vec::new();
-        unsafe {
-            if pyre_object::is_list(arg) {
-                let n = pyre_object::w_list_len(arg);
-                for i in 0..n {
-                    if let Some(v) = pyre_object::w_list_getitem(arg, i as i64) {
-                        items.push(v);
-                    }
-                }
-            } else if pyre_object::is_tuple(arg) {
-                let n = pyre_object::w_tuple_len(arg);
-                for i in 0..n {
-                    if let Some(v) = pyre_object::w_tuple_getitem(arg, i as i64) {
-                        items.push(v);
-                    }
-                }
-            } else {
-                // Use iter/next protocol
-                let it = crate::baseobjspace::iter(arg)?;
-                loop {
-                    match crate::baseobjspace::next(it) {
-                        Ok(v) => items.push(v),
-                        Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
-                        Err(e) => return Err(e),
-                    }
-                }
-            }
-        }
-        iters.push(items);
+        iters.push(crate::baseobjspace::iter(arg)?);
     }
-    let min_len = iters.iter().map(|v| v.len()).min().unwrap_or(0);
-    // `functional.py:411-435 W_Zip.descr_new` — strict mode raises
-    // ValueError when iterables have different lengths.  Detect by
-    // checking max == min; report which argument was longer/shorter
-    // per CPython's `zip()` message format.
-    if strict {
-        let max_len = iters.iter().map(|v| v.len()).max().unwrap_or(0);
-        if max_len != min_len {
-            // CPython's `zip()` reports the first SHORT argument (the
-            // one with `len < max_len`) as "shorter than argument N"
-            // where N is some earlier (longer) argument.  Find the
-            // first short index — that's the one being reported.
-            let short = iters.iter().position(|v| v.len() < max_len).unwrap_or(0);
-            // Pick any longer argument as the reference point; CPython
-            // names the first one (typically argument 1).
-            let long = iters.iter().position(|v| v.len() == max_len).unwrap_or(0);
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::ValueError,
-                format!(
-                    "zip() argument {} is shorter than argument {}",
-                    short + 1,
-                    long + 1
-                ),
-            ));
-        }
-    }
-    let mut result = Vec::with_capacity(min_len);
-    for i in 0..min_len {
-        let tuple_items: Vec<_> = iters.iter().map(|v| v[i]).collect();
-        result.push(pyre_object::w_tuple_new(tuple_items));
-    }
-    let list = pyre_object::w_list_new(result);
-    Ok(pyre_object::w_seq_iter_new(list, min_len))
+    let w_iterators = pyre_object::w_list_new(iters);
+    Ok(pyre_object::zipobject::w_zip_new(w_iterators, strict))
 }
 
 /// `pypy/module/__builtin__/functional.py:253-272 W_Enumerate.descr_new`
@@ -5527,34 +5478,26 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     }
     let obj = args[0];
     unsafe {
-        // List: reverse a copy
-        if pyre_object::is_list(obj) {
-            let n = pyre_object::w_list_len(obj);
-            let mut items = Vec::with_capacity(n);
-            for i in (0..n as i64).rev() {
-                if let Some(v) = pyre_object::w_list_getitem(obj, i) {
-                    items.push(v);
-                }
+        // EXACT builtin list / tuple → a lazy `W_ReversedIterator` over the
+        // sequence (`functional.py:354-359 __init__`): `remaining = len - 1` and
+        // `descr_next` walks `getitem(seq, remaining)` downward.  A subclass
+        // shares the builtin `ob_type` but has its own `w_class`, so it falls
+        // through to the `__reversed__` MRO lookup below — CPython honors a
+        // subclass override (a non-overriding subclass inherits the builtin
+        // `list.__reversed__`, which is the same lazy iterator).
+        if pyre_object::is_exact_builtin_instance(obj) {
+            if pyre_object::is_list(obj) {
+                let n = pyre_object::w_list_len(obj) as i64;
+                return Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1));
             }
-            return Ok(pyre_object::w_seq_iter_new(
-                pyre_object::w_list_new(items),
-                n,
-            ));
-        }
-        // Tuple: reverse
-        if pyre_object::is_tuple(obj) {
-            let n = pyre_object::w_tuple_len(obj);
-            let mut items = Vec::with_capacity(n);
-            for i in (0..n as i64).rev() {
-                if let Some(v) = pyre_object::w_tuple_getitem(obj, i) {
-                    items.push(v);
-                }
+            if pyre_object::is_tuple(obj) {
+                let n = pyre_object::w_tuple_len(obj) as i64;
+                return Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1));
             }
-            let t = pyre_object::w_tuple_new(items);
-            return Ok(pyre_object::w_seq_iter_new(t, n));
         }
         // range: rangeobject.py W_RangeObject.descr_reversed — reflect
-        // the span and hand back a fresh reverse-walking iterator.
+        // the span and hand back a fresh reverse-walking iterator. (range is
+        // not subclassable, so no override can apply.)
         if pyre_object::is_w_range(obj) {
             return Ok(pyre_object::w_range_reversed(obj));
         }
@@ -5583,32 +5526,31 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             let last = current + (count - 1) * step;
             return Ok(pyre_object::w_range_iter_new(last, current - step, -step));
         }
-        // Instance __reversed__
-        if pyre_object::is_instance(obj) {
-            let w_type = pyre_object::w_instance_get_type(obj);
-            if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__reversed__") {
-                return Ok(crate::call_function(method, &[obj]));
-            }
+    }
+    // `__reversed__` resolved through the type MRO (`functional.py:362-366`) —
+    // honors a subclass override and the inherited builtin `list.__reversed__`,
+    // and any user object defining `__reversed__`.
+    if let Some(tp) = crate::typedef::r#type(obj) {
+        if let Some(method) = unsafe { crate::baseobjspace::lookup_in_type(tp, "__reversed__") } {
+            return Ok(crate::call_function(method, &[obj]));
         }
     }
-    // functional.py:351 — without __reversed__, require sequence protocol
-    // (__getitem__ + __len__). Non-sequences raise TypeError.
+    // functional.py:351 — without `__reversed__`, require the sequence
+    // protocol. `PySequence_Check` first (an object with `__getitem__`): a
+    // non-sequence is "not reversible", while a sequence missing `__len__`
+    // raises the regular "has no len()" from `len`.
     if let Some(tp) = crate::typedef::r#type(obj) {
         let has_getitem =
             unsafe { crate::baseobjspace::lookup_in_type(tp, "__getitem__") }.is_some();
-        let has_len = unsafe { crate::baseobjspace::lookup_in_type(tp, "__len__") }.is_some();
-        if has_getitem && has_len {
-            let items = collect_iterable(obj)?;
-            let mut rev = items;
-            rev.reverse();
-            let n = rev.len();
-            return Ok(pyre_object::w_seq_iter_new(pyre_object::w_list_new(rev), n));
+        if has_getitem {
+            // `functional.py:354-359` — reverse lazily through `W_ReversedIterator`.
+            let n = crate::baseobjspace::len_w(obj)?;
+            return Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1));
         }
     }
-    let type_name = unsafe { (*(*obj).ob_type).name };
     Err(crate::PyError::type_error(format!(
         "'{}' object is not reversible",
-        type_name
+        crate::baseobjspace::object_functionstr_type_name(obj)
     )))
 }
 

@@ -682,6 +682,22 @@ pub fn init_typeobjects() {
             new_typeobject_with_base("enumerate", |_| {}, object_type) as usize,
         );
         reg.insert(
+            &pyre_object::reversedobject::REVERSED_TYPE as *const PyType as usize,
+            new_typeobject_with_base("reversed", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::filterobject::FILTER_TYPE as *const PyType as usize,
+            new_typeobject_with_base("filter", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::mapobject::MAP_TYPE as *const PyType as usize,
+            new_typeobject_with_base("map", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::zipobject::ZIP_TYPE as *const PyType as usize,
+            new_typeobject_with_base("zip", |_| {}, object_type) as usize,
+        );
+        reg.insert(
             &pyre_object::dictviewobject::DICT_KEYITERATOR_TYPE as *const PyType as usize,
             new_typeobject_with_base("dict_keyiterator", |_| {}, object_type) as usize,
         );
@@ -1825,20 +1841,12 @@ fn init_list_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__reversed__",
             |args| {
-                // `listobject.py:737 descr_reversed` — reverse iterator over
-                // the list (same representation as `reversed(list)`).
+                // `listobject.py:737 descr_reversed` — a lazy reverse iterator
+                // over the list, the same `W_ReversedIterator` representation as
+                // `reversed(list)` (walks `getitem(seq, remaining)` downward).
                 let obj = args[0];
-                let n = unsafe { pyre_object::w_list_len(obj) };
-                let mut items = Vec::with_capacity(n);
-                for i in (0..n as i64).rev() {
-                    if let Some(v) = unsafe { pyre_object::w_list_getitem(obj, i) } {
-                        items.push(v);
-                    }
-                }
-                Ok(pyre_object::w_seq_iter_new(
-                    pyre_object::w_list_new(items),
-                    n,
-                ))
+                let n = unsafe { pyre_object::w_list_len(obj) } as i64;
+                Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1))
             },
             1,
         ),
@@ -2714,7 +2722,20 @@ fn init_dict_type(ns: &mut DictStorage) {
                 if args.len() < 2 {
                     return Ok(pyre_object::w_bool_from(false));
                 }
-                crate::baseobjspace::compare(args[0], args[1], crate::baseobjspace::CompareOp::Eq)
+                // A dict subclass is instance-represented (the mapping lives in
+                // the `__dict_data__` backing), so `compare` would not see it as
+                // a dict and would re-dispatch to this `__eq__`, recursing.
+                // Resolve each operand to its backing dict first; exact dicts
+                // and non-dict operands are left unchanged for `compare`.
+                let resolve = |o: PyObjectRef| {
+                    let backing = crate::type_methods::resolve_dict_backing(o);
+                    if backing.is_null() { o } else { backing }
+                };
+                crate::baseobjspace::compare(
+                    resolve(args[0]),
+                    resolve(args[1]),
+                    crate::baseobjspace::CompareOp::Eq,
+                )
             },
             2,
         ),
@@ -10328,6 +10349,14 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
     // `bytes.decode(encoding='utf-8', errors='strict')` — both parameters
     // are positional-or-keyword, so accept them from either side.
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::kwarg_reject_unknown(kwargs, &["encoding", "errors"], "decode")?;
+    // `encoding` is positional-or-keyword at position 1; giving it both ways is
+    // a TypeError (the rarer 3-positional `errors` over-count is not modelled).
+    if pos.len() > 1 && crate::builtins::kwarg_get(kwargs, "encoding").is_some() {
+        return Err(crate::PyError::type_error(
+            "argument for decode() given by name ('encoding') and position (1)",
+        ));
+    }
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
     let w_encoding = pos
         .get(1)
@@ -11078,6 +11107,15 @@ fn init_setlike_common(ns: &mut DictStorage) {
                 }
                 Ok(pyre_object::w_bool_from(true))
             },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__reduce__",
+        make_builtin_function_with_arity(
+            "__reduce__",
+            |args| crate::reduce_protocol::set_reduce(args[0]),
             1,
         ),
     );

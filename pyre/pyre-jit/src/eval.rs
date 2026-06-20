@@ -1739,6 +1739,52 @@ thread_local! {
             <pyre_interpreter::module::__pypy__::W_PickleBuffer
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
+        // PicklerMemoProxy / UnpicklerMemoProxy — typed payloads via
+        // `#[pyre_class]` in AUTO-ID mode; each holds one traced `PyObjectRef`
+        // back-reference to its owning pickler/unpickler. Tail of the tid chain.
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_interpreter::module::_pickle::W_PicklerMemoProxy
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_interpreter::module::_pickle::W_UnpicklerMemoProxy
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
+        // W_ReversedIterator (`reversed`) — typed payload via `#[pyre_class]`
+        // in AUTO-ID mode; its `w_sequence` field is a traced edge the
+        // collector must walk. Tail of the tid chain.
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_object::reversedobject::W_ReversedIterator
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
+        // W_Filter (`filter`) — AUTO-ID; its `w_predicate` / `w_iterable`
+        // fields are traced edges the collector must walk.
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_object::filterobject::W_Filter
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
+        // W_Map (`map`) — AUTO-ID; `w_fun` / `w_iterators` are traced edges.
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_object::mapobject::W_Map
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
+        // W_Zip (`zip`) — AUTO-ID; `w_iterators` is a traced edge.
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_object::zipobject::W_Zip
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
         // rclass.py:340-346 — assign subclassrange_{min,max} to each
         // vtable entry. freeze_types() runs assign_inheritance_ids
         // (normalizecalls.py:373-389), then we write the computed ranges

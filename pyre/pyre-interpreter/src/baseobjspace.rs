@@ -1580,9 +1580,9 @@ fn seq_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// `list_iterator.__setstate__(index)` — clamp the cursor into
 /// `[0, length]` (`iterobject.py descr_setstate`).
 fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
+    let mut index = int_w(args[1])?;
     unsafe {
         let length = pyre_object::w_seq_iter_length(args[0]);
-        let mut index = w_int_get_value(args[1]);
         if index < 0 {
             index = 0;
         } else if index > length {
@@ -1717,6 +1717,240 @@ fn enumerate_reduce_method(args: &[PyObjectRef]) -> PyResult {
         let state = w_tuple_new(vec![w_iter, index]);
         Ok(w_tuple_new(vec![builtin_callable("enumerate"), state]))
     }
+}
+
+/// `reversed.__reduce__()` — `functional.py:407-417
+/// W_ReversedIterator.descr___reduce__`: `(reversed, (sequence,),
+/// remaining)` while live; `(reversed, ((),))` once exhausted (the slot
+/// is cleared to `PY_NULL`).  The reconstructor is the `reversed`
+/// builtin so `pickle` recreates the iterator via `reversed(sequence)`.
+fn reversed_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let seq = pyre_object::reversedobject::w_reversed_get_sequence(args[0]);
+        if !seq.is_null() {
+            let remaining = pyre_object::reversedobject::w_reversed_get_remaining(args[0]);
+            let state = w_tuple_new(vec![seq]);
+            Ok(w_tuple_new(vec![
+                builtin_callable("reversed"),
+                state,
+                w_int_new(remaining),
+            ]))
+        } else {
+            let state = w_tuple_new(vec![w_tuple_new(vec![])]);
+            Ok(w_tuple_new(vec![builtin_callable("reversed"), state]))
+        }
+    }
+}
+
+/// `reversed.__setstate__(index)` — `functional.py:419-429
+/// descr___setstate__`: set `remaining` then clamp into `[-1, n-1]`
+/// (`n == len(sequence)`, or 0 once exhausted).
+fn reversed_setstate_method(args: &[PyObjectRef]) -> PyResult {
+    let mut remaining = int_w(args[1])?;
+    unsafe {
+        let seq = pyre_object::reversedobject::w_reversed_get_sequence(args[0]);
+        let n = if !seq.is_null() { len_w(seq)? } else { 0 };
+        if remaining < -1 {
+            remaining = -1;
+        } else if remaining > n - 1 {
+            remaining = n - 1;
+        }
+        pyre_object::reversedobject::w_reversed_set_remaining(args[0], remaining);
+    }
+    Ok(w_none())
+}
+
+/// `reversed.__length_hint__()` — `functional.py:374-383
+/// descr_length_hint`: elements not yet produced, `0` once exhausted.
+fn reversed_length_hint_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let remaining = pyre_object::reversedobject::w_reversed_get_remaining(args[0]);
+        let mut res = 0i64;
+        if remaining >= 0 {
+            let seq = pyre_object::reversedobject::w_reversed_get_sequence(args[0]);
+            let total = if !seq.is_null() { len_w(seq)? } else { 0 };
+            let rem_length = remaining + 1;
+            if rem_length <= total {
+                res = rem_length;
+            }
+        }
+        Ok(w_int_new(res))
+    }
+}
+
+/// `filter.__reduce__()` — `functional.py:944-949 W_Filter.descr_reduce`:
+/// `(filter, (predicate, iterable))`, where `predicate` is `None` when the
+/// stored predicate is `PY_NULL`.  Pickle recreates the iterator via
+/// `filter(predicate, iterable)`; the captured iterator carries its
+/// position.
+fn filter_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let w_predicate = pyre_object::filterobject::w_filter_get_predicate(args[0]);
+        let w_predicate = if w_predicate.is_null() {
+            w_none()
+        } else {
+            w_predicate
+        };
+        let w_iterable = pyre_object::filterobject::w_filter_get_iterable(args[0]);
+        let state = w_tuple_new(vec![w_predicate, w_iterable]);
+        Ok(w_tuple_new(vec![builtin_callable("filter"), state]))
+    }
+}
+
+/// `functional.py:1065-1067 _raise_strict_error` — the strict zip/map
+/// length-mismatch `ValueError`.  `index` is the 0-based position whose
+/// argument is short/long; the message numbers are 1-based.
+fn strict_zip_error(func_name: &str, index: usize, adjective: &str) -> PyError {
+    let plural = if index == 1 { " " } else { "s 1-" };
+    PyError::new(
+        PyErrorKind::ValueError,
+        format!(
+            "{}() argument {} is {} than argument{}{}",
+            func_name,
+            index + 1,
+            adjective,
+            plural,
+            index
+        ),
+    )
+}
+
+/// Pull one item from each iterator in the `list` `w_iterators`, returning
+/// them.  `Ok(None)` is a normal stop (the shortest is exhausted, non-strict).
+/// In `strict` mode a length mismatch raises `ValueError` naming `func_name`
+/// ("zip" / "map").  Shared by `map` and `zip`
+/// (`functional.py:1022-1079 W_Zip.next_w`).
+///
+/// # Safety
+/// `w_iterators` must be a valid `list` of iterator objects.
+unsafe fn pull_iterator_tuple(
+    w_iterators: PyObjectRef,
+    strict: bool,
+    func_name: &str,
+) -> Result<Option<Vec<PyObjectRef>>, PyError> {
+    let n = pyre_object::w_list_len(w_iterators) as usize;
+    if n == 0 {
+        return Ok(None);
+    }
+    // Each pulled value must survive the `next()` calls on the later iterators:
+    // those allocate and can relocate the young objects already pulled, leaving
+    // a stale pointer in a plain `Vec`. Pin each value into the shadow stack as
+    // it is produced, then re-read the set at its (possibly relocated) address
+    // before returning.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    for i in 0..n {
+        let it = pyre_object::w_list_getitem(w_iterators, i as i64).unwrap();
+        match next(it) {
+            Ok(v) => pyre_object::gc_roots::pin_root(v),
+            Err(e) if e.kind == PyErrorKind::StopIteration => {
+                if !strict {
+                    return Ok(None);
+                }
+                // A StopIteration in strict mode is a length mismatch.
+                // `i` iterators yielded before this one ran dry.
+                if i > 0 {
+                    return Err(strict_zip_error(func_name, i, "shorter"));
+                }
+                if n == 1 {
+                    // A single iterable can never mismatch.
+                    return Ok(None);
+                }
+                if n == 2 {
+                    // `functional.py:1047-1054` — the first ran dry; if the
+                    // second still yields it is the longer one.
+                    let it1 = pyre_object::w_list_getitem(w_iterators, 1).unwrap();
+                    return match next(it1) {
+                        Ok(_) => Err(strict_zip_error(func_name, 1, "longer")),
+                        Err(e2) if e2.kind == PyErrorKind::StopIteration => Ok(None),
+                        Err(e2) => Err(e2),
+                    };
+                }
+                // `functional.py:1069-1079 _validate_strict` — the first ran
+                // dry; any later iterator that still yields is the longer one.
+                // Start at 1: iterator 0 is the one already known exhausted, so
+                // re-`next`ing it is a wasted (and on a side-effectful iterator,
+                // observable) call.
+                for j in 1..n {
+                    let itj = pyre_object::w_list_getitem(w_iterators, j as i64).unwrap();
+                    match next(itj) {
+                        Ok(_) => return Err(strict_zip_error(func_name, j, "longer")),
+                        Err(e2) if e2.kind == PyErrorKind::StopIteration => {}
+                        Err(e2) => return Err(e2),
+                    }
+                }
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let items: Vec<PyObjectRef> = (0..n)
+        .map(|k| pyre_object::gc_roots::shadow_stack_get(base + k))
+        .collect();
+    Ok(Some(items))
+}
+
+/// `map.__reduce__()` — `functional.py:869-873 W_Map.descr_reduce`:
+/// `(map, (func, *iterators))`, with a trailing `True` when `strict`
+/// (CPython 3.14).  The captured iterators carry their positions.
+fn map_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let w_fun = pyre_object::mapobject::w_map_get_fun(args[0]);
+        let w_iterators = pyre_object::mapobject::w_map_get_iterators(args[0]);
+        let n = pyre_object::w_list_len(w_iterators);
+        let mut state_items = Vec::with_capacity(n as usize + 1);
+        state_items.push(w_fun);
+        for i in 0..n {
+            state_items.push(pyre_object::w_list_getitem(w_iterators, i as i64).unwrap());
+        }
+        let state = w_tuple_new(state_items);
+        let map_fn = builtin_callable("map");
+        if pyre_object::mapobject::w_map_get_strict(args[0]) {
+            Ok(w_tuple_new(vec![map_fn, state, w_bool_from(true)]))
+        } else {
+            Ok(w_tuple_new(vec![map_fn, state]))
+        }
+    }
+}
+
+/// `map.__setstate__(strict)` — CPython 3.14: set the `strict` flag from the
+/// unpickled state.
+fn map_setstate_method(args: &[PyObjectRef]) -> PyResult {
+    let strict = is_true(args[1])?;
+    unsafe {
+        pyre_object::mapobject::w_map_set_strict(args[0], strict);
+    }
+    Ok(w_none())
+}
+
+/// `zip.__reduce__()` — `functional.py:1081-1087 W_Zip.descr_reduce`:
+/// `(zip, (*iterators))`, with a trailing `True` when `strict`.
+fn zip_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let w_iterators = pyre_object::zipobject::w_zip_get_iterators(args[0]);
+        let n = pyre_object::w_list_len(w_iterators);
+        let mut state_items = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            state_items.push(pyre_object::w_list_getitem(w_iterators, i as i64).unwrap());
+        }
+        let state = w_tuple_new(state_items);
+        let zip_fn = builtin_callable("zip");
+        if pyre_object::zipobject::w_zip_get_strict(args[0]) {
+            Ok(w_tuple_new(vec![zip_fn, state, w_bool_from(true)]))
+        } else {
+            Ok(w_tuple_new(vec![zip_fn, state]))
+        }
+    }
+}
+
+/// `zip.__setstate__(strict)` — `functional.py:1089-1091
+/// W_Zip.descr_setstate`: `self.strict = bool(state)`.
+fn zip_setstate_method(args: &[PyObjectRef]) -> PyResult {
+    let strict = is_true(args[1])?;
+    unsafe {
+        pyre_object::zipobject::w_zip_set_strict(args[0], strict);
+    }
+    Ok(w_none())
 }
 
 unsafe fn getitem_range_iter(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
@@ -2033,6 +2267,27 @@ pub fn findattr(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     }
 }
 
+/// Like [`findattr`] but propagates a non-`AttributeError`/`NameError` error
+/// (e.g. a descriptor or `__getattr__` raising) instead of panicking. `Ok(None)`
+/// means the attribute is absent.
+pub fn findattr_result(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyError> {
+    if unsafe { is_none(obj) } {
+        return Ok(None);
+    }
+    match getattr_str(obj, name) {
+        Ok(value) => Ok(Some(value)),
+        Err(err) => {
+            if err.kind == crate::PyErrorKind::AttributeError
+                || err.kind == crate::PyErrorKind::NameError
+            {
+                Ok(None)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
 /// Check whether `exc_type` matches `check_class`, including tuple/list class inputs.
 pub fn exception_match(exc_type: PyObjectRef, check_class: PyObjectRef) -> bool {
     let (exc_type, check_class) = (exc_type, check_class);
@@ -2181,7 +2436,7 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "object of type '{}' has no len()",
-            (*(*obj).ob_type).name,
+            object_functionstr_type_name(obj),
         )))
     }
 }
@@ -2707,6 +2962,10 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             || pyre_object::is_long_range_iter(obj)
             || pyre_object::dictviewobject::is_dict_view_iterator(obj)
             || pyre_object::enumerateobject::is_enumerate(obj)
+            || pyre_object::reversedobject::is_reversed(obj)
+            || pyre_object::filterobject::is_filter(obj)
+            || pyre_object::mapobject::is_map(obj)
+            || pyre_object::zipobject::is_zip(obj)
             || pyre_object::callableiteratorobject::is_callable_iterator(obj)
         {
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str)> = match name {
@@ -2759,6 +3018,30 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             } else if pyre_object::enumerateobject::is_enumerate(obj) {
                 match name {
                     "__reduce__" => Some((enumerate_reduce_method, "__reduce__", 1)),
+                    _ => None,
+                }
+            } else if pyre_object::reversedobject::is_reversed(obj) {
+                match name {
+                    "__reduce__" => Some((reversed_reduce_method, "__reduce__", 1)),
+                    "__setstate__" => Some((reversed_setstate_method, "__setstate__", 2)),
+                    "__length_hint__" => Some((reversed_length_hint_method, "__length_hint__", 1)),
+                    _ => None,
+                }
+            } else if pyre_object::filterobject::is_filter(obj) {
+                match name {
+                    "__reduce__" => Some((filter_reduce_method, "__reduce__", 1)),
+                    _ => None,
+                }
+            } else if pyre_object::mapobject::is_map(obj) {
+                match name {
+                    "__reduce__" => Some((map_reduce_method, "__reduce__", 1)),
+                    "__setstate__" => Some((map_setstate_method, "__setstate__", 2)),
+                    _ => None,
+                }
+            } else if pyre_object::zipobject::is_zip(obj) {
+                match name {
+                    "__reduce__" => Some((zip_reduce_method, "__reduce__", 1)),
+                    "__setstate__" => Some((zip_setstate_method, "__setstate__", 2)),
                     _ => None,
                 }
             } else {
@@ -8332,6 +8615,21 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if pyre_object::enumerateobject::is_enumerate(obj) {
             return Ok(obj);
         }
+        // `pypy/module/__builtin__/functional.py:371-372
+        // W_ReversedIterator.descr___iter__` — `return self`.
+        if pyre_object::reversedobject::is_reversed(obj) {
+            return Ok(obj);
+        }
+        // `pypy/module/__builtin__/functional.py:927-928 W_Filter.iter_w` —
+        // `return self`.
+        if pyre_object::filterobject::is_filter(obj) {
+            return Ok(obj);
+        }
+        // `functional.py:846-847 W_Map.iter_w` / `:1019-1020 W_Zip.iter_w` —
+        // `return self`.
+        if pyre_object::mapobject::is_map(obj) || pyre_object::zipobject::is_zip(obj) {
+            return Ok(obj);
+        }
         // `pypy/module/_sre/interp_sre.py:915 W_SRE_Scanner.iter_w` —
         // `return self` (the finditer/scanner iterator).
         if pyre_object::sreobject::is_sre_scanner(obj) {
@@ -8618,6 +8916,78 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 }
             }
         }
+        // `pypy/module/__builtin__/functional.py:930-942 W_Filter.next_w`
+        // (reverse=False): pull from the iterator until the predicate (or
+        // truthiness, when None) passes.
+        //
+        //     def next_w(self):
+        //         w_obj = self.space.next(self.w_iterable)  # may raise w_StopIteration
+        //         if self.w_predicate is None:
+        //             pred = self.space.is_true(w_obj)
+        //         else:
+        //             w_pred = self.space.call_function(self.w_predicate, w_obj)
+        //             pred = self.space.is_true(w_pred)
+        //         if pred ^ self.reverse:
+        //             return w_obj
+        if pyre_object::filterobject::is_filter(obj) {
+            // `next`, the predicate, and `is_true`/`__bool__` all run Python and
+            // can move the filter and the yielded item; pin the filter and re-read
+            // its fields after each call, and pin the item across the predicate.
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            loop {
+                let w_iterable = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                    as *const pyre_object::filterobject::W_Filter))
+                    .w_iterable;
+                let w_obj = next(w_iterable)?;
+                let _r = pyre_object::gc_roots::push_roots();
+                pyre_object::gc_roots::pin_root(w_obj);
+                let w_obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let w_predicate = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                    as *const pyre_object::filterobject::W_Filter))
+                    .w_predicate;
+                let pred = if w_predicate.is_null() {
+                    is_true(pyre_object::gc_roots::shadow_stack_get(w_obj_slot))?
+                } else {
+                    let w_pred = crate::call::call_function_impl_result(
+                        w_predicate,
+                        &[pyre_object::gc_roots::shadow_stack_get(w_obj_slot)],
+                    )?;
+                    is_true(w_pred)?
+                };
+                if pred {
+                    return Ok(pyre_object::gc_roots::shadow_stack_get(w_obj_slot));
+                }
+            }
+        }
+        // `functional.py:849-863 W_Map.next_w` — pull one item from each
+        // sub-iterator, then `call(w_fun, *items)`; stop at the shortest
+        // (strict raises on mismatch).
+        if pyre_object::mapobject::is_map(obj) {
+            use pyre_object::mapobject as mo;
+            let w_iterators = mo::w_map_get_iterators(obj);
+            let strict = mo::w_map_get_strict(obj);
+            return match pull_iterator_tuple(w_iterators, strict, "map")? {
+                Some(items) => {
+                    let w_fun = mo::w_map_get_fun(obj);
+                    crate::call::call_function_impl_result(w_fun, &items)
+                }
+                None => Err(PyError::stop_iteration()),
+            };
+        }
+        // `functional.py:1022-1057 W_Zip.next_w` — pull one item from each
+        // sub-iterator into a tuple; stop at the shortest (strict raises on
+        // mismatch).
+        if pyre_object::zipobject::is_zip(obj) {
+            use pyre_object::zipobject as zo;
+            let w_iterators = zo::w_zip_get_iterators(obj);
+            let strict = zo::w_zip_get_strict(obj);
+            return match pull_iterator_tuple(w_iterators, strict, "zip")? {
+                Some(items) => Ok(pyre_object::w_tuple_new(items)),
+                None => Err(PyError::stop_iteration()),
+            };
+        }
         // itertools.pairwise — interp_itertools.py W_Pairwise.next_w
         //
         //     def next_w(self):
@@ -8836,6 +9206,44 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 w_item = next(w_iter_or_list)?;
             }
             return Ok(pyre_object::w_tuple_new(vec![w_index, w_item]));
+        }
+        // `pypy/module/__builtin__/functional.py:385-405
+        // W_ReversedIterator.descr_next` — `getitem(sequence, remaining)`
+        // then decrement; IndexError / StopIteration ends the walk and
+        // clears the slot.
+        if pyre_object::reversedobject::is_reversed(obj) {
+            use pyre_object::reversedobject as ro;
+            let remaining = ro::w_reversed_get_remaining(obj);
+            if remaining >= 0 {
+                // `getitem` runs `__getitem__` (Python) and can move the reversed
+                // iterator; pin it and write its state through the re-read pointer.
+                let _roots = pyre_object::gc_roots::push_roots();
+                pyre_object::gc_roots::pin_root(obj);
+                let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let seq = ro::w_reversed_get_sequence(obj);
+                match getitem(seq, w_int_new(remaining)) {
+                    Ok(w_item) => {
+                        ro::w_reversed_set_remaining(
+                            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                            remaining - 1,
+                        );
+                        return Ok(w_item);
+                    }
+                    Err(e) => {
+                        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                        ro::w_reversed_set_remaining(obj, -1);
+                        ro::w_reversed_set_sequence(obj, pyre_object::PY_NULL);
+                        if e.kind == PyErrorKind::IndexError || e.kind == PyErrorKind::StopIteration
+                        {
+                            return Err(PyError::stop_iteration());
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            ro::w_reversed_set_remaining(obj, -1);
+            ro::w_reversed_set_sequence(obj, pyre_object::PY_NULL);
+            return Err(PyError::stop_iteration());
         }
         // `pypy/module/_sre/interp_sre.py:918 W_SRE_Scanner.next_w` —
         // search from the current position, yielding the match object.

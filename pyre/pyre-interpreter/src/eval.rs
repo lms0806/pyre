@@ -1708,6 +1708,10 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::itertoolsmodule::is_pairwise(iter)
                 || pyre_object::dictviewobject::is_dict_view_iterator(iter)
                 || pyre_object::enumerateobject::is_enumerate(iter)
+                || pyre_object::reversedobject::is_reversed(iter)
+                || pyre_object::filterobject::is_filter(iter)
+                || pyre_object::mapobject::is_map(iter)
+                || pyre_object::zipobject::is_zip(iter)
                 || pyre_object::callableiteratorobject::is_callable_iterator(iter)
                 || pyre_object::sreobject::is_sre_scanner(iter)
             {
@@ -1874,6 +1878,10 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::itertoolsmodule::is_filterfalse(iter)
                 || pyre_object::itertoolsmodule::is_pairwise(iter)
                 || pyre_object::enumerateobject::is_enumerate(iter)
+                || pyre_object::reversedobject::is_reversed(iter)
+                || pyre_object::filterobject::is_filter(iter)
+                || pyre_object::mapobject::is_map(iter)
+                || pyre_object::zipobject::is_zip(iter)
                 || pyre_object::callableiteratorobject::is_callable_iterator(iter)
                 || pyre_object::dictviewobject::is_dict_view_iterator(iter)
                 || pyre_object::sreobject::is_sre_scanner(iter)
@@ -1925,6 +1933,10 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::itertoolsmodule::is_filterfalse(iter)
                 || pyre_object::itertoolsmodule::is_pairwise(iter)
                 || pyre_object::enumerateobject::is_enumerate(iter)
+                || pyre_object::reversedobject::is_reversed(iter)
+                || pyre_object::filterobject::is_filter(iter)
+                || pyre_object::mapobject::is_map(iter)
+                || pyre_object::zipobject::is_zip(iter)
                 || pyre_object::callableiteratorobject::is_callable_iterator(iter)
                 || pyre_object::dictviewobject::is_dict_view_iterator(iter)
                 || pyre_object::sreobject::is_sre_scanner(iter)
@@ -2302,11 +2314,11 @@ impl OpcodeStepExecutor for PyFrame {
         use crate::bytecode::CommonConstant;
         let val = match cc {
             CommonConstant::AssertionError => {
-                crate::make_builtin_function("AssertionError", |_args| {
-                    Err(crate::PyError::new(
-                        crate::PyErrorKind::AssertionError,
-                        "assertion error".to_string(),
-                    ))
+                // `LOAD_ASSERTION_ERROR` pushes the `AssertionError` class
+                // itself, so `assert x` raises `AssertionError()` and
+                // `assert x, msg` raises `AssertionError(msg)`.
+                crate::builtins::lookup_exc_class("AssertionError").unwrap_or_else(|| {
+                    crate::typedef::gettypeobject(&pyre_object::excobject::EXC_ASSERTION_ERROR_TYPE)
                 })
             }
             CommonConstant::NotImplementedError => {
