@@ -4203,6 +4203,7 @@ impl MIFrame {
             lead.push(majit_metainterp::recorder::SnapshotFrame {
                 jitcode_index: parent_jitcode_index,
                 pc: parent_pc as u32,
+                jitcode_pc: majit_ir::resumedata::NO_JITCODE_PC,
                 boxes: Self::fail_args_to_snapshot_boxes_typed(&parent_active, parent_types, ctx),
             });
         }
@@ -4241,6 +4242,7 @@ impl MIFrame {
         let top_frame = majit_metainterp::recorder::SnapshotFrame {
             jitcode_index: top_jitcode_index,
             pc: top_pc as u32,
+            jitcode_pc: majit_ir::resumedata::NO_JITCODE_PC,
             boxes: Self::fail_args_to_snapshot_boxes_typed(
                 top_active_boxes,
                 top_snapshot_types,
@@ -4346,6 +4348,7 @@ impl MIFrame {
         let helper_frame = majit_metainterp::recorder::SnapshotFrame {
             jitcode_index: helper_jitcode_index,
             pc: helper_pc as u32,
+            jitcode_pc: majit_ir::resumedata::NO_JITCODE_PC,
             boxes: Self::fail_args_to_snapshot_boxes_typed(boxes, &helper_types, ctx),
         };
 
@@ -4379,6 +4382,7 @@ impl MIFrame {
         let self_frame = majit_metainterp::recorder::SnapshotFrame {
             jitcode_index: self_jitcode_index,
             pc: self.fallthrough_pc as u32,
+            jitcode_pc: majit_ir::resumedata::NO_JITCODE_PC,
             boxes: Self::fail_args_to_snapshot_boxes_typed(&self_active, self_types, ctx),
         };
 
@@ -9746,6 +9750,12 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::EndFor
             | Instruction::UnaryNot
             | Instruction::UnaryInvert
+            // UnaryNegative walks the same MayForce residual-call arm as
+            // UnaryInvert/UnaryNot: pop 1, `residual_call_r_r(unary_negative_fn)`
+            // (`emit_frontend_neg` → `lower_unary_negative_hlop_to_insn`,
+            // a user `__neg__` may run Python), push 1 (net 0).  No oparg
+            // payload, so the #405 arm-seeding hazard does not apply.
+            | Instruction::UnaryNegative
             // ToBool handled by the dispatch_via_walker_for_opcode entry hook:
             // delegates to the stack-neutral no-op `to_bool` (truthiness is
             // re-evaluated by the following branch / UnaryNot guard, so the
@@ -10057,6 +10067,7 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         }
         Instruction::UnaryNot
         | Instruction::UnaryInvert
+        | Instruction::UnaryNegative
         | Instruction::GetIter
         | Instruction::MatchMapping
         | Instruction::MatchSequence

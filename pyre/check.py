@@ -56,6 +56,12 @@ def _detect_pyre_stdlib():
 
 PYRE_STDLIB = _detect_pyre_stdlib()
 
+# Opt-out (`--no-fbw-inline-multiframe`): export PYRE_FBW_INLINE_MULTIFRAME=0 into
+# pyre child runs to exercise the #68 multi-frame inline rollback escape hatch.
+# The path is on by default, so the default run already parity-checks it; this
+# opt-out validates the flag-off fallback.
+FBW_INLINE_MULTIFRAME_OFF = False
+
 BENCH_DIR = "pyre/bench"
 SYNTHETIC_BENCH_DIR = "pyre/bench/synth"
 SNAP_DIR = "pyre/check.snap"
@@ -222,6 +228,8 @@ def pyre_env():
     # in the environment wins.
     if PYRE_STDLIB and "PYRE_STDLIB" not in env:
         env["PYRE_STDLIB"] = PYRE_STDLIB
+    if FBW_INLINE_MULTIFRAME_OFF:
+        env["PYRE_FBW_INLINE_MULTIFRAME"] = "0"
     return env
 
 
@@ -879,6 +887,13 @@ def parse_args():
         default=20.0,
         help="per-script timeout in seconds for synthetic benchmarks",
     )
+    parser.add_argument(
+        "--no-fbw-inline-multiframe",
+        action="store_true",
+        help="run pyre with PYRE_FBW_INLINE_MULTIFRAME=0 (#68 forward-branch "
+        "multi-frame inline is on by default; this exercises the rollback "
+        "escape hatch)",
+    )
     parser.add_argument("pyre_path", nargs="?", default="")
     args = parser.parse_args()
 
@@ -899,6 +914,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.no_fbw_inline_multiframe:
+        global FBW_INLINE_MULTIFRAME_OFF
+        FBW_INLINE_MULTIFRAME_OFF = True
     chk = Check(args)
 
     backends = [args.backend] if args.backend else ["dynasm", "cranelift"]
