@@ -27,30 +27,110 @@ pub struct GcConfig {
     pub card_page_indices: u32,
 }
 
-fn read_size_from_env(varname: &str) -> Option<usize> {
-    // rpython/memory/gc/env.py:17-40 `_read_float_and_factor_from_env`
-    // accepts plain numbers plus K/M/G suffixes, optionally followed by B.
+/// env.py:17-36 `_read_float_and_factor_from_env`. Parse `varname` as a float
+/// with an optional `k`/`m`/`g` size suffix (optionally followed by `b`/`B`),
+/// returning `(value, factor)`. `None` mirrors PyPy's `(0.0, 0)` absent /
+/// unparseable result, which callers treat as "unset".
+fn read_float_and_factor_from_env(varname: &str) -> Option<(f64, f64)> {
     let raw = std::env::var(varname).ok()?;
     let mut value = raw.trim();
     if value.is_empty() {
         return None;
     }
+    // env.py:20-21 — a trailing b/B is dropped before the k/m/g check.
     if value.len() > 1 && matches!(value.as_bytes().last(), Some(b'b' | b'B')) {
         value = &value[..value.len() - 1];
     }
     if value.is_empty() {
         return None;
     }
+    // env.py:22-31 — a k/m/g suffix sets the factor; otherwise factor 1.
     let (number, factor) = match value.as_bytes().last().copied() {
         Some(b'k') | Some(b'K') => (&value[..value.len() - 1], 1024.0),
         Some(b'm') | Some(b'M') => (&value[..value.len() - 1], 1024.0 * 1024.0),
         Some(b'g') | Some(b'G') => (&value[..value.len() - 1], 1024.0 * 1024.0 * 1024.0),
-        Some(_) => (value, 1.0),
-        None => return None,
+        _ => (value, 1.0),
     };
     let parsed = number.parse::<f64>().ok()?;
-    let bytes = parsed * factor;
+    Some((parsed, factor))
+}
+
+/// env.py:38-44 `read_from_env` / `read_uint_from_env`: `value * factor` as an
+/// integer byte count. `None` (unset / unparseable / non-positive) lets callers
+/// fall back to the default, mirroring PyPy's `if x > 0` guards. PyPy's
+/// `read_uint_from_env` r_uint-wraps a negative product to a huge positive; pyre
+/// treats non-positive as unset, differing only on nonsensical negative input.
+fn read_uint_from_env(varname: &str) -> Option<usize> {
+    let (value, factor) = read_float_and_factor_from_env(varname)?;
+    let bytes = value * factor;
     (bytes > 0.0).then_some(bytes as usize)
+}
+
+/// env.py:46-50 `read_float_from_env`: the plain float, but only when no size
+/// factor was given (`factor != 1` → unset). Callers apply their own `> 1.0`
+/// threshold gate.
+fn read_float_from_env(varname: &str) -> Option<f64> {
+    let (value, factor) = read_float_and_factor_from_env(varname)?;
+    if factor != 1.0 {
+        return None;
+    }
+    Some(value)
+}
+
+/// env.py:387-411 `get_darwin_sysctl_signed`: read a signed integer sysctl by
+/// name; 0 on any error.
+#[cfg(target_os = "macos")]
+fn get_darwin_sysctl_signed(name: &[u8]) -> i64 {
+    let mut val: i64 = 0;
+    let mut len = std::mem::size_of::<i64>();
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr() as *const libc::c_char,
+            &mut val as *mut i64 as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 && len == std::mem::size_of::<i64>() {
+        val
+    } else {
+        0
+    }
+}
+
+/// env.py:413-433 `get_L2cache_darwin`. Returns the L2+L3 cache size in
+/// bytes via `sysctl`, or -1 when it cannot be determined.
+#[cfg(target_os = "macos")]
+fn get_l2cache() -> i64 {
+    let mangled = get_darwin_sysctl_signed(b"hw.l2cachesize\0")
+        + get_darwin_sysctl_signed(b"hw.l3cachesize\0");
+    if mangled > 0 { mangled } else { -1 }
+}
+
+/// env.py:437-438 `get_L2cache = globals().get('get_L2cache_' + sys.platform,
+/// lambda: -1)`. Non-macOS probes are not yet ported, so -1 (the 4MB
+/// unknown-cache fallback applies).
+#[cfg(not(target_os = "macos"))]
+fn get_l2cache() -> i64 {
+    -1
+}
+
+/// env.py:443-450 `best_nursery_size_for_L2cache`. About half the L2 cache,
+/// but only when it exceeds 8MB (so an L3-inclusive value does not size the
+/// nursery off L3); otherwise the 4MB unknown-cache fallback
+/// (`NURSERY_SIZE_UNKNOWN_CACHE`, env.py:440 = `DEFAULT_NURSERY_SIZE`).
+fn best_nursery_size_for_l2cache(l2cache: i64) -> usize {
+    if l2cache > 8 * 1024 * 1024 {
+        (l2cache / 2) as usize
+    } else {
+        DEFAULT_NURSERY_SIZE
+    }
+}
+
+/// env.py:452-456 `estimate_best_nursery_size`.
+fn estimate_best_nursery_size() -> usize {
+    best_nursery_size_for_l2cache(get_l2cache())
 }
 
 fn default_nursery_size() -> usize {
@@ -58,10 +138,39 @@ fn default_nursery_size() -> usize {
     //   newsize = env.read_from_env('PYPY_GC_NURSERY')
     //   if newsize <= 0: newsize = env.estimate_best_nursery_size()
     //   if newsize <= 0: newsize = defaultsize
-    //
-    // Pyre does not yet port the platform-specific cache estimator, so use
-    // env.py:441's 4MB unknown-cache fallback.
-    read_size_from_env("PYPY_GC_NURSERY").unwrap_or(DEFAULT_NURSERY_SIZE)
+    // estimate_best_nursery_size never returns <= 0 (its floor is the 4MB
+    // unknown-cache fallback), so the final `defaultsize` arm is unreachable.
+    read_uint_from_env("PYPY_GC_NURSERY").unwrap_or_else(estimate_best_nursery_size)
+}
+
+/// env.py:67 `addressable_size = float(2**63)` for a 64-bit host: the most
+/// memory the process could address, used as the fallback / upper clamp when
+/// the real total-memory probe is unavailable or larger.
+const ADDRESSABLE_SIZE: f64 = 9_223_372_036_854_775_808.0; // 2**63
+
+/// env.py:100-110 `get_total_memory_darwin`. Clamp the probed total memory:
+/// fall back to the addressable size when the probe failed (`<= 0`) and cap it
+/// at the addressable size otherwise.
+fn get_total_memory_darwin(result: i64) -> f64 {
+    if result <= 0 {
+        ADDRESSABLE_SIZE
+    } else {
+        (result as f64).min(ADDRESSABLE_SIZE)
+    }
+}
+
+/// env.py:117-127 `get_total_memory`. Total physical memory in bytes.
+/// macOS reads `hw.memsize` via `sysctl`; other platforms return the
+/// addressable size (env.py:126-127 "XXX implement me for other platforms";
+/// the Linux `/proc/meminfo` probe, env.py:70-98, is not yet ported).
+#[cfg(target_os = "macos")]
+fn get_total_memory() -> f64 {
+    get_total_memory_darwin(get_darwin_sysctl_signed(b"hw.memsize\0"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn get_total_memory() -> f64 {
+    ADDRESSABLE_SIZE
 }
 
 impl Default for GcConfig {
@@ -149,6 +258,13 @@ struct IncrementalMarkState {
     /// Mirrors incminimark's `gc_increment_step`, which defaults to
     /// `nursery_size * 2`.
     mark_budget_per_step: usize,
+    /// Reusable scratch buffer for `mark_object`: the child refs of the
+    /// object currently being traced. Reused (cleared, capacity retained)
+    /// across calls so marking does not heap-allocate a fresh `Vec` per
+    /// object. RPython's `_collect_obj` visitor pushes straight onto the gray
+    /// stack; pyre collects into this buffer first to release the immutable
+    /// `self.types` borrow before mutating `self.incr_state.gray_stack`.
+    mark_scratch: Vec<GcRef>,
 }
 
 impl IncrementalMarkState {
@@ -158,14 +274,10 @@ impl IncrementalMarkState {
             marking_in_progress: false,
             objects_marked: 0,
             mark_budget_per_step: (nursery_size.saturating_mul(2)).max(1),
+            mark_scratch: Vec::new(),
         }
     }
 }
-
-/// Default ratio of old-gen growth that triggers an incremental cycle.
-/// When old-gen bytes exceed `last_major_bytes * MAJOR_COLLECT_RATIO`,
-/// a new incremental cycle starts.
-const MAJOR_COLLECT_RATIO: f64 = 1.82;
 
 /// The MiniMark generational GC.
 #[allow(non_snake_case)] // _T_IS_RPYTHON_INSTANCE_BYTE keeps the RPython spelling
@@ -210,9 +322,35 @@ pub struct MiniMarkGC {
     pub major_collections: usize,
     /// State for incremental major collection.
     incr_state: IncrementalMarkState,
-    /// Old-gen bytes at the end of the last completed major collection.
-    /// Used to decide when to start the next incremental cycle.
-    last_major_bytes: usize,
+    /// incminimark.py:304 `self.major_collection_threshold`. After a major
+    /// collection, the next one is triggered once the total old-gen size
+    /// grows to this many times the surviving size (TRANSLATION_PARAMS
+    /// default 1.82; `PYPY_GC_MAJOR_COLLECT` override).
+    major_collection_threshold: f64,
+    /// incminimark.py:305 `self.growth_rate_max`. Caps how fast the
+    /// next-major threshold may grow from one collection to the next
+    /// (TRANSLATION_PARAMS default 1.4; `PYPY_GC_GROWTH` override).
+    growth_rate_max: f64,
+    /// incminimark.py:307,488,562 `self.min_heap_size`. Floor below which the
+    /// next-major threshold is never set: `max(PYPY_GC_MIN or nursery*8,
+    /// nursery*major_collection_threshold)`. This floor is what stops
+    /// allocation-heavy, tiny-live-set workloads (e.g. recursive fib) from
+    /// thrashing major cycles off a near-zero surviving baseline.
+    min_heap_size: f64,
+    /// incminimark.py:308 `self.max_heap_size` (`PYPY_GC_MAX`; 0.0 = unbounded).
+    max_heap_size: f64,
+    /// incminimark.py:310,498 `self.max_delta` (`PYPY_GC_MAX_DELTA`, else
+    /// `0.125 * get_total_memory()`). Caps the absolute next-major threshold
+    /// growth per cycle.
+    max_delta: f64,
+    /// incminimark.py:568 `self.next_major_collection_initial`. The
+    /// pre-reservation threshold; `set_major_threshold_from` grows the next
+    /// threshold relative to this value, bounded by `growth_rate_max`.
+    next_major_collection_initial: f64,
+    /// incminimark.py:569 `self.next_major_collection_threshold`. A new
+    /// incremental major cycle starts once `get_total_memory_used()` reaches
+    /// this value (`threshold_reached`).
+    next_major_collection_threshold: f64,
     /// Bytes promoted to old gen since the current incremental cycle started.
     ///
     /// Mirrors incminimark's `size_objects_made_old`.
@@ -275,6 +413,32 @@ impl MiniMarkGC {
     /// Create a new GC with custom configuration.
     pub fn with_config(config: GcConfig) -> Self {
         let nursery_size = config.nursery_size;
+
+        // incminimark.py:261,268,475-481 — major_collection_threshold /
+        // growth_rate_max from TRANSLATION_PARAMS, overridable by env.
+        let major_collection_threshold = read_float_from_env("PYPY_GC_MAJOR_COLLECT")
+            .filter(|v| *v > 1.0)
+            .unwrap_or(1.82);
+        let growth_rate_max = read_float_from_env("PYPY_GC_GROWTH")
+            .filter(|v| *v > 1.0)
+            .unwrap_or(1.4);
+        // incminimark.py:483-488 — min_heap_size: PYPY_GC_MIN, else nursery*8.
+        let mut min_heap_size = read_uint_from_env("PYPY_GC_MIN")
+            .map(|v| v as f64)
+            .unwrap_or(nursery_size as f64 * 8.0);
+        // incminimark.py:490-492 — max_heap_size: PYPY_GC_MAX, else 0 (unbounded).
+        let max_heap_size = read_uint_from_env("PYPY_GC_MAX")
+            .map(|v| v as f64)
+            .unwrap_or(0.0);
+        // incminimark.py:494-498 — max_delta: PYPY_GC_MAX_DELTA, else
+        // 0.125 * env.get_total_memory().
+        let max_delta = read_uint_from_env("PYPY_GC_MAX_DELTA")
+            .map(|v| v as f64)
+            .unwrap_or_else(|| 0.125 * get_total_memory());
+        // incminimark.py:562-563 — allocate_nursery floors min_heap_size by
+        // nursery_size * major_collection_threshold.
+        min_heap_size = min_heap_size.max(nursery_size as f64 * major_collection_threshold);
+
         let mut gc = MiniMarkGC {
             nursery: Nursery::new(config.nursery_size),
             oldgen: OldGen::new(),
@@ -288,7 +452,15 @@ impl MiniMarkGC {
             minor_collections: 0,
             major_collections: 0,
             incr_state: IncrementalMarkState::new(nursery_size),
-            last_major_bytes: 0,
+            major_collection_threshold,
+            growth_rate_max,
+            min_heap_size,
+            max_heap_size,
+            max_delta,
+            // incminimark.py:568-569 — both initialized to min_heap_size,
+            // then refined by set_major_threshold_from(0.0) below.
+            next_major_collection_initial: min_heap_size,
+            next_major_collection_threshold: min_heap_size,
             bytes_made_old_since_cycle: 0,
             threshold_bytes_made_old: 0,
             pinned_objects: VecSet::new(),
@@ -312,6 +484,8 @@ impl MiniMarkGC {
                 gc.card_page_shift += 1;
             }
         }
+        // incminimark.py:570 — allocate_nursery finalizes the first threshold.
+        gc.set_major_threshold_from(0.0, 0.0);
         gc._setup_guard_is_object();
         gc
     }
@@ -1106,15 +1280,47 @@ impl MiniMarkGC {
 
     // ── Incremental marking ──
 
-    /// Check whether old-gen growth warrants starting a new incremental
-    /// major collection cycle.
-    fn should_start_major_cycle(&self) -> bool {
-        if self.last_major_bytes == 0 {
-            // Never done a major collection. Use a minimum threshold so we
-            // don't start an incremental cycle with a nearly empty old gen.
-            return self.oldgen.total_bytes() > self.config.nursery_size;
+    /// incminimark.py:1264-1268 `get_total_memory_used`. Total memory the GC
+    /// is responsible for, NOT counting the nursery: old-gen objects plus
+    /// raw-malloced large objects. pyre's `oldgen.total_bytes()` already
+    /// aggregates promoted objects and large/raw objects allocated straight
+    /// into the old generation.
+    fn get_total_memory_used(&self) -> usize {
+        self.oldgen.total_bytes()
+    }
+
+    /// incminimark.py:1288-1290 `threshold_reached`. True once the old-gen
+    /// total has caught up to within `extra` of the next-major threshold,
+    /// i.e. it is time to make incremental major-collection progress.
+    fn threshold_reached(&self, extra: usize) -> bool {
+        (self.next_major_collection_threshold - self.get_total_memory_used() as f64) < extra as f64
+    }
+
+    /// incminimark.py:575-594 `set_major_threshold_from`. Set the next-major
+    /// threshold, capping growth at `next_major_collection_initial *
+    /// growth_rate_max`, flooring at `min_heap_size`, and bounding by
+    /// `max_heap_size`. Returns whether the result was bounded by the heap max.
+    fn set_major_threshold_from(&mut self, mut threshold: f64, reserving_size: f64) -> bool {
+        let threshold_max = self.next_major_collection_initial * self.growth_rate_max;
+        if threshold > threshold_max {
+            threshold = threshold_max;
         }
-        self.oldgen.total_bytes() as f64 > self.last_major_bytes as f64 * MAJOR_COLLECT_RATIO
+        //
+        threshold += reserving_size;
+        if threshold < self.min_heap_size {
+            threshold = self.min_heap_size;
+        }
+        //
+        let bounded = if self.max_heap_size > 0.0 && threshold > self.max_heap_size {
+            threshold = self.max_heap_size;
+            true
+        } else {
+            false
+        };
+        //
+        self.next_major_collection_initial = threshold;
+        self.next_major_collection_threshold = threshold;
+        bounded
     }
 
     /// Begin a new incremental marking cycle.
@@ -1194,7 +1400,7 @@ impl MiniMarkGC {
     /// minors may need multiple consecutive steps so old-gen growth does not
     /// outrun marking.
     fn run_major_progress_after_minor(&mut self) {
-        if !self.incr_state.marking_in_progress && !self.should_start_major_cycle() {
+        if !self.incr_state.marking_in_progress && !self.threshold_reached(0) {
             return;
         }
 
@@ -1259,55 +1465,66 @@ impl MiniMarkGC {
     /// Mark a single object: trace its GC pointer fields and push
     /// unmarked children onto the gray stack.
     fn mark_object(&mut self, obj_addr: usize) {
+        // Collect the object's child refs into the reused scratch buffer
+        // while `type_info` borrows `self.types`, then release that borrow
+        // before greying them (which mutates `self.incr_state.gray_stack`).
+        let mut scratch = std::mem::take(&mut self.incr_state.mark_scratch);
+        scratch.clear();
+
         let type_id = unsafe { (*header_of(obj_addr)).type_id() };
         let type_info = self.types.get(type_id);
 
         // custom_trace_hook parity for major GC marking.
         if let Some(trace_fn) = type_info.custom_trace {
-            let mut refs: Vec<GcRef> = Vec::new();
             unsafe {
                 trace_fn(obj_addr, &mut |slot_ptr: *mut GcRef| {
                     let field_ref = *slot_ptr;
                     if !field_ref.is_null() {
-                        refs.push(field_ref);
+                        scratch.push(field_ref);
                     }
                 });
             }
-            for field_ref in refs {
-                if self.is_managed_heap_object(field_ref.0) {
-                    let hdr = unsafe { header_of(field_ref.0) };
-                    if unsafe { !(*hdr).has_flag(flags::VISITED) } {
-                        unsafe { (*hdr).set_flag(flags::VISITED) };
-                        self.incr_state.gray_stack.push(field_ref.0);
+        } else {
+            // Trace fixed-part fields. The `is_managed_heap_object` guard
+            // (applied below) mirrors the `custom_trace` path and
+            // `seed_major_root`: a `Ptr(GcStruct)` field can transiently
+            // point at memory outside the GC-managed heap during the L1/L2
+            // stepping-stone state (e.g. `W_TupleObject.wrappeditems` →
+            // `std::alloc`'d ItemsBlock). In that window calling `header_of`
+            // on the field would dereference memory before the std::alloc'd
+            // block. Upstream RPython `_collect_obj`
+            // (incminimark.py:2739-2752) does not need this guard because
+            // RPython's type system guarantees every `Ptr(GcStruct)` is
+            // GC-managed; it converges away once every gc_ptr_offsets target
+            // is a real GC allocation.
+            for &offset in &type_info.gc_ptr_offsets {
+                let field_ref = unsafe { *((obj_addr + offset) as *const GcRef) };
+                if !field_ref.is_null() {
+                    scratch.push(field_ref);
+                }
+            }
+
+            // Trace variable-part items. Same `is_managed_heap_object`
+            // guard as the fixed-part loop — `items_have_gc_ptrs` blocks
+            // (e.g. `ItemsBlock` once it migrates to GC varsize) may
+            // transiently coexist with std::alloc'd siblings during the
+            // L1/L2 stepping-stone window.
+            if type_info.items_have_gc_ptrs && type_info.item_size > 0 {
+                let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
+                let items_start = obj_addr + type_info.size;
+                let item_size = type_info.item_size;
+                for i in 0..length {
+                    let field_ref = unsafe { *((items_start + i * item_size) as *const GcRef) };
+                    if !field_ref.is_null() {
+                        scratch.push(field_ref);
                     }
                 }
             }
-            return;
         }
 
-        let gc_ptr_offsets = type_info.gc_ptr_offsets.clone();
-        let items_have_gc_ptrs = type_info.items_have_gc_ptrs;
-        let item_size = type_info.item_size;
-        let length_offset = type_info.length_offset;
-        let base_size = type_info.size;
-
-        // Trace fixed-part fields. The `is_managed_heap_object` guard
-        // mirrors the `custom_trace` path above and `seed_major_root`
-        // (line 814): a `Ptr(GcStruct)` field can transiently point at
-        // memory outside the GC-managed heap during the L1/L2 stepping-
-        // stone state (e.g. `W_TupleObject.wrappeditems` →
-        // `std::alloc`'d ItemsBlock). In that
-        // window calling `header_of` on the field would dereference
-        // memory before the std::alloc'd block. Upstream RPython
-        // `_collect_obj` (incminimark.py:2739-2752) does not need this
-        // guard because RPython's type system guarantees every
-        // `Ptr(GcStruct)` is GC-managed. TODO:
-        // matches `mark_object`'s own custom_trace-path guard and
-        // converges away once every gc_ptr_offsets target is a real
-        // GC allocation.
-        for &offset in &gc_ptr_offsets {
-            let field_ref = unsafe { *((obj_addr + offset) as *const GcRef) };
-            if !field_ref.is_null() && self.is_managed_heap_object(field_ref.0) {
+        // `type_info` borrow ends here; now grey the collected children.
+        for &field_ref in &scratch {
+            if self.is_managed_heap_object(field_ref.0) {
                 let hdr = unsafe { header_of(field_ref.0) };
                 if unsafe { !(*hdr).has_flag(flags::VISITED) } {
                     unsafe { (*hdr).set_flag(flags::VISITED) };
@@ -1316,25 +1533,8 @@ impl MiniMarkGC {
             }
         }
 
-        // Trace variable-part items. Same `is_managed_heap_object`
-        // guard as the fixed-part loop — `items_have_gc_ptrs` blocks
-        // (e.g. `ItemsBlock` once it migrates to GC varsize) may
-        // transiently coexist with std::alloc'd siblings during the
-        // L1/L2 stepping-stone window.
-        if items_have_gc_ptrs && item_size > 0 {
-            let length = unsafe { *((obj_addr + length_offset) as *const usize) };
-            let items_start = obj_addr + base_size;
-            for i in 0..length {
-                let field_ref = unsafe { *((items_start + i * item_size) as *const GcRef) };
-                if !field_ref.is_null() && self.is_managed_heap_object(field_ref.0) {
-                    let hdr = unsafe { header_of(field_ref.0) };
-                    if unsafe { !(*hdr).has_flag(flags::VISITED) } {
-                        unsafe { (*hdr).set_flag(flags::VISITED) };
-                        self.incr_state.gray_stack.push(field_ref.0);
-                    }
-                }
-            }
-        }
+        // Return the buffer (with its capacity) for the next object.
+        self.incr_state.mark_scratch = scratch;
     }
 
     /// Complete the sweep phase after incremental marking finishes.
@@ -1349,7 +1549,23 @@ impl MiniMarkGC {
             self.invalidate_old_weakrefs();
         }
         self.oldgen.sweep();
-        self.last_major_bytes = self.oldgen.total_bytes();
+        // incminimark.py:2566-2577 — set the threshold for the next major
+        // collection to `major_collection_threshold` times the surviving
+        // size, but no more than `max_delta` above it, floored at
+        // `min_heap_size` by set_major_threshold_from. (pyre has no
+        // `kept_alive_by_finalizer` accounting, so `total_memory_used` is the
+        // post-sweep old-gen size directly.)
+        let total_memory_used = self.get_total_memory_used() as f64;
+        // The `bounded` result is intentionally dropped: incminimark.py:2603-2615
+        // raises MemoryError when `bounded and threshold_reached(reserving_size)`,
+        // but pyre has no GC out-of-memory path, so only the threshold-capping
+        // side effect of `set_major_threshold_from` is used (the PYPY_GC_MAX OOM
+        // policy is unported).
+        let _bounded = self.set_major_threshold_from(
+            (total_memory_used * self.major_collection_threshold)
+                .min(total_memory_used + self.max_delta),
+            0.0,
+        );
         self.bytes_made_old_since_cycle = 0;
         self.threshold_bytes_made_old = 0;
     }
@@ -1758,7 +1974,7 @@ impl MiniMarkGC {
     /// If a cycle is already in progress, one bounded marking step is
     /// performed. Returns true if any GC work was done.
     pub fn gc_step(&mut self) -> bool {
-        if self.should_start_major_cycle() && !self.incr_state.marking_in_progress {
+        if self.threshold_reached(0) && !self.incr_state.marking_in_progress {
             self.start_incremental_cycle();
             let done = self.incremental_mark_step();
             if done {
@@ -4437,6 +4653,26 @@ mod tests {
     }
 
     #[test]
+    fn test_estimate_best_nursery_size() {
+        // env.py:443-456 — half the L2 cache when it exceeds 8MB, else the
+        // 4MB unknown-cache fallback. Either way it must never return a size
+        // below the fallback, so the major-collection floor (nursery*8) is
+        // always well-defined.
+        let est = estimate_best_nursery_size();
+        assert!(est >= DEFAULT_NURSERY_SIZE, "estimate {est} below fallback");
+        // best_nursery_size_for_l2cache mirrors env.py's strict `> 8MB` test.
+        assert_eq!(best_nursery_size_for_l2cache(-1), DEFAULT_NURSERY_SIZE);
+        assert_eq!(
+            best_nursery_size_for_l2cache(8 * 1024 * 1024),
+            DEFAULT_NURSERY_SIZE
+        );
+        assert_eq!(
+            best_nursery_size_for_l2cache(32 * 1024 * 1024),
+            16 * 1024 * 1024
+        );
+    }
+
+    #[test]
     fn test_can_optimize_cond_call_via_trait() {
         let gc = test_gc(4096);
         let alloc: &dyn GcAllocator = &gc;
@@ -4458,7 +4694,7 @@ mod tests {
         let mut gc = test_gc(256);
         gc.register_type(TypeInfo::simple(16));
 
-        // Force a minor collection to set last_major_bytes baseline.
+        // Force a full collection to establish the next-major threshold baseline.
         let obj = gc.alloc_with_type(0, 16);
         let mut root = obj;
         unsafe {
@@ -4511,8 +4747,13 @@ mod tests {
         // Promote everything to old gen.
         gc.collect_nursery();
 
-        // Add more old-gen objects to trigger the ratio threshold.
-        for _ in 0..200 {
+        // Add enough old-gen objects to cross the next-major threshold. The
+        // threshold is floored at `min_heap_size = nursery_size * 8` = 32KB
+        // for this 4096-byte nursery (incminimark.py:488,562), so the old gen
+        // must exceed 32KB before `gc_step` will start a cycle — a few hundred
+        // small objects is intentionally not enough under the parity-correct
+        // floor.
+        for _ in 0..4000 {
             gc.alloc_in_oldgen(tid, GcHeader::SIZE + 16);
         }
 
