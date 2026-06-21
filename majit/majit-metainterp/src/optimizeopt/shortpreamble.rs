@@ -437,6 +437,7 @@ impl PreambleOp {
             preamble_op: std::rc::Rc::new(preamble_op),
             invented_name: self.invented_name,
             same_as_source: self.same_as_source.clone(),
+            label_arg_idx: self.label_arg_idx,
         })
     }
 }
@@ -542,6 +543,17 @@ impl PotentialShortOp {
                         // freshly invented name.
                         alt.res = ctx.materialize_box_at(alias);
                         alt.invented_name = true;
+                        // shortpreamble.py:330 `lst[i].short_op.res = new_name`:
+                        // the alias result is now the freshly invented SameAs box,
+                        // not a label arg. `label_arg_idx` was set by
+                        // `lookup_label_arg` from the ORIGINAL result position, so it
+                        // must be cleared to stay consistent with the updated `res`
+                        // (upstream keys slot identity off `short_op.res`, which the
+                        // line above just rebound). Otherwise the import slot-lookup
+                        // (unroll.rs:4171) would map this invented alias onto the
+                        // loop-carried `short_args[slot]` instead of minting a fresh
+                        // result, collapsing the extra `same_as` identity.
+                        alt.label_arg_idx = None;
                         // shortpreamble.py:328 `ResOperation(opnum, [shortop.res])`
                         // — the alias source is the Box itself; resolve to
                         // the canonical (possibly producer-bound) box.
@@ -583,9 +595,15 @@ impl ShortBoxes {
 
     /// shortpreamble.py:259 `self.potential_ops[box]` — resolve a label
     /// arg to its slot by the ORIGINAL box opref (not the renamed
-    /// `short_inputargs` box, which is a distinct identity).
+    /// `short_inputargs` box, which is a distinct identity). `potential_ops`
+    /// is box-keyed, so a box duplicated across `label_args + virtuals` (a
+    /// virtual field coinciding with a label arg) OVERWRITES to the LAST
+    /// occurrence's `ShortInputArg`; `rposition` mirrors that overwrite,
+    /// returning the live slot — consistent with `add_short_input_arg`
+    /// stamping `label_arg_idx = live_slot` (the last slot). For a
+    /// duplicate-free box `rposition == position`.
     pub fn lookup_label_arg(&self, opref: OpRef) -> Option<usize> {
-        self.label_args.iter().position(|&a| a == opref)
+        self.label_args.iter().rposition(|&a| a == opref)
     }
 
     /// RPython parity: check if opref is reachable in the short preamble.
@@ -669,16 +687,22 @@ impl ShortBoxes {
                  (shortpreamble.py:255-259)"
             );
         }
-        // shortpreamble.py:256 `box = label_args[i]` — record the original.
+        // shortpreamble.py:258 `self.short_inputargs.append(renamed)`: one
+        // renamed box per call, in caller order. The production caller
+        // (optimizer.rs preview loop) iterates `label_args + virtuals`
+        // (unroll.py:479) in order, appending one renamed box per slot, so
+        // this call's slot is `short_inputargs.len()`, captured before the
+        // push below.
+        let live_slot = self.short_inputargs.len();
+        // shortpreamble.py:256 `box = label_args[i]` — register the original
+        // so `is_reachable` / `produce_arg` membership resolve it.
         // `with_label_args` pre-seeds `label_args`; the standalone
-        // `create_short_boxes` path (empty `label_args`) appends here.
-        let label_arg_idx = match self.lookup_label_arg(arg) {
-            Some(idx) => idx,
-            None => {
-                self.label_args.push(arg);
-                self.label_args.len() - 1
-            }
-        };
+        // `create_short_boxes` path (empty `label_args`) appends here. A box
+        // duplicated across `label_args + virtuals` (a virtual field that
+        // coincides with a label arg) is registered once.
+        if self.lookup_label_arg(arg).is_none() {
+            self.label_args.push(arg);
+        }
         // shortpreamble.py:257 `renamed = OpHelpers.inputarg_from_tp(box.type)`
         // — a FRESH InputArg distinct from the original `box`. Its position
         // comes from the op-position counter so it is unique and accounted
@@ -688,15 +712,18 @@ impl ShortBoxes {
             arg_type,
             ctx.alloc_op_position_typed(arg_type).raw(),
         );
-        // `short_inputargs[i]` pairs with `label_args[i]`; callers feed args
-        // in label-arg order (production: optimizer.rs preview loop), so an
-        // append lands at the matching slot.
-        debug_assert_eq!(
-            label_arg_idx,
-            self.short_inputargs.len(),
-            "add_short_input_arg must be called in label_args order so \
-             short_inputargs[i] pairs with label_args[i]"
-        );
+        // shortpreamble.py:259 `self.potential_ops[box] = ShortInputArg(...)`
+        // is a plain dict assignment, so for a box duplicated across the
+        // combined list it OVERWRITES: the LAST slot's `ShortInputArg`
+        // survives and `produce_arg` returns `short_inputargs[LAST]`, leaving
+        // the FIRST slot's renamed box a dead Label arg — never produced,
+        // never given info (shortpreamble.py:414-417 sets info only on
+        // produced boxes). pyre mirrors that by stamping `label_arg_idx =
+        // live_slot` (this call's slot) on the `potential_ops` entry below;
+        // the later duplicate call overwrites with its later slot, so
+        // `produce_arg` returns the same LAST-slot renamed box. In the
+        // duplicate-free case `live_slot == lookup_label_arg(arg)`, so the
+        // rename is unchanged.
         self.short_inputargs.push(renamed);
         // shortpreamble.py:257 `ShortInputArg(box, renamed)` — `res` is the
         // original `box`; the SAME_AS replay arg is that box. Exported
@@ -718,11 +745,26 @@ impl ShortBoxes {
                 res: arg_box,
                 op: std::rc::Rc::new(same_as),
                 kind: PreambleOpKind::InputArg,
-                label_arg_idx: Some(label_arg_idx),
+                label_arg_idx: Some(live_slot),
                 invented_name: false,
                 same_as_source: None,
             }),
         );
+    }
+
+    /// shortpreamble.py:285/294 `return ...preamble_op`: for a ShortInputArg
+    /// the produced `preamble_op` IS the renamed inputarg box
+    /// (shortpreamble.py:257 `ShortInputArg(box, renamed)`). pyre stores the
+    /// renamed boxes in `short_inputargs`, paired with each label/virtual slot
+    /// by `label_arg_idx` (`lookup_label_arg`), so produce_arg returns that
+    /// renamed box — embedding the rename into the exported short op args at
+    /// export time, the same substitution the import rename pass performed
+    /// (`produced_short_boxes_from_exported_boxes`, `short_inputargs[position
+    /// of arg in label_args]`).
+    fn renamed_short_inputarg(&self, label_arg_idx: Option<usize>) -> BoxRef {
+        let idx = label_arg_idx
+            .expect("InputArg short box missing label_arg_idx (set by add_short_input_arg)");
+        self.short_inputargs[idx].clone()
     }
 
     fn produce_arg(
@@ -741,14 +783,15 @@ impl ShortBoxes {
                 // dependency's replay op object itself, so preamble-op
                 // args carry the dep replay handle.
                 //
-                // ShortInputArg: upstream `preamble_op` IS the inputarg
-                // box (shortpreamble.py:255-259), not an op. pyre models
-                // the replay as a SAME_AS op squatting the inputarg
-                // position; binding to that op retags the position into
-                // the op namespace (from_bound_op derives the OpRef from
-                // the box kind), so return the carried res box instead.
+                // ShortInputArg: upstream `preamble_op` IS the renamed
+                // inputarg box (shortpreamble.py:257 `ShortInputArg(box,
+                // renamed)`), so produce_arg returns the renamed
+                // short_inputargs box for this slot — the export-time
+                // rename. (`existing.res` is the ORIGINAL box, kept only
+                // as the info-lookup key, shortpreamble.py:417.)
                 if existing.kind == PreambleOpKind::InputArg {
-                    return Some(existing.res.clone());
+                    let label_arg_idx = existing.label_arg_idx;
+                    return Some(self.renamed_short_inputarg(label_arg_idx));
                 }
                 return Some(BoxRef::from_bound_op(&existing.preamble_op));
             }
@@ -772,23 +815,19 @@ impl ShortBoxes {
             .any(|(k, _)| k.to_opref() == opref)
         {
             // shortpreamble.py:291-294 `r = self.add_op_to_short(...);
-            // return r.preamble_op`. ShortInputArg: res box, see the
-            // produced arm above.
-            return self.materialize_one(ctx, opref).map(|produced| {
-                if produced.kind == PreambleOpKind::InputArg {
-                    produced.res.clone()
-                } else {
-                    BoxRef::from_bound_op(&produced.preamble_op)
-                }
-            });
+            // return r.preamble_op`. ShortInputArg: renamed short_inputargs
+            // box, see the produced arm above.
+            let produced = self.materialize_one(ctx, opref)?;
+            if produced.kind == PreambleOpKind::InputArg {
+                return Some(self.renamed_short_inputarg(produced.label_arg_idx));
+            }
+            return Some(BoxRef::from_bound_op(&produced.preamble_op));
         }
-        // Label args are always available as inputs (RPython: isinstance(op, InputArgIntOp)).
-        // Return the ORIGINAL label-arg box; exported entries carry original
-        // positions and are renamed to the matching short_inputargs slot at
-        // import. Match by the original opref, not the (distinct) renamed box.
-        if self.label_args.iter().any(|&a| a == opref) {
-            return Some(ctx.materialize_box_at(opref));
-        }
+        // shortpreamble.py:295-296 `else: return None`. Every label arg is
+        // registered as a ShortInputArg in `potential_ops`
+        // (`add_short_input_arg`, create_short_boxes:255-259), so a label arg
+        // is reached through the produced/potential arms above; an opref that
+        // is none of those is not produce-able.
         None
     }
 
@@ -935,6 +974,7 @@ impl ShortBoxes {
                 kind: PreambleOpKind::Heap,
                 invented_name: false,
                 same_as_source: None,
+                label_arg_idx: None,
             });
         }
         short_boxes
@@ -1240,6 +1280,13 @@ pub struct ProducedShortOp {
     /// Original result this invented name aliases.
     /// MIGRATION (#9): carried as a [`BoxRef`]; see [`PreambleOp::same_as_source`].
     pub same_as_source: Option<crate::r#box::BoxRef>,
+    /// Slot of this short box's result within the original
+    /// `label_args + virtuals`, i.e. `lookup_label_arg(canonical_result)`
+    /// carried over from [`PreambleOp::label_arg_idx`] across the export
+    /// boundary. `None` for a result that is not a label/virtual slot. Lets
+    /// the importer resolve the body-visible result slot directly instead of
+    /// matching the result against a parallel originals array.
+    pub label_arg_idx: Option<usize>,
 }
 
 /// Phase B B.1: helper used by `ProducedShortOp::produce_op` to seed a
@@ -3150,62 +3197,35 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
 }
 
 /// `unroll.py:497 ExportedState.short_boxes` shape: per-OpRef
-/// `ProducedShortOp` records derived from `ctx.exported_short_boxes`,
-/// with label-arg references in each preamble op renamed to the
-/// matching short-inputarg slot
-/// (`shortpreamble.py:269-270 ShortBoxes.create_short_boxes`).
+/// `ProducedShortOp` records derived from `ctx.exported_short_boxes`.
+///
+/// The label-arg → short-inputarg rename happens at EXPORT time inside
+/// `produce_arg` (shortpreamble.py:285/294): every short op the import
+/// path emits (Pure / Heap / LoopInvariant) already carries the renamed
+/// `short_inputargs` box in its args. The only exported entries that still
+/// reference an original label box are the `ShortInputArg` `SameAs*`
+/// stand-ins, and those are never emitted (`produce_op` returns None for
+/// `InputArg`, shortpreamble.py:233-234) nor read by any import consumer:
+/// `result_map` and the `produce_op` loop skip `InputArg`, the builder
+/// init skips entries with no `result_map` slot, and `use_box_recursive`'s
+/// arg recursion is rename-invariant for the `SameAs` self-reference. So
+/// no import-time arg rewrite is needed — the produced view is a plain
+/// filter + transform of `exported_short_boxes`.
 ///
 /// OVF guards are filtered out: the guard entry depends on the
 /// preceding `Int*Ovf` op and is re-emitted by the builder through
 /// `append_to_short`'s `is_ovf` branch, so the standalone guard must
 /// not appear in the produced map.
-///
-/// Phase B prep: extracted from
-/// `build_short_preamble_from_exported_boxes` so that future B1 wiring
-/// can store the same shape on `ExportedState.produced_short_boxes`
-/// (audit memo `box_identity_phase_b_surface_audit_2026_05_02.md`
-/// option (b)) without duplicating the rename logic.
 pub fn produced_short_boxes_from_exported_boxes(
-    label_args: &[OpRef],
-    short_inputargs: &[BoxRef],
     exported_short_boxes: &[PreambleOp],
 ) -> Vec<(OpRef, ProducedShortOp)> {
-    // optimizer.py:651-652 setarg(renamed_inputargs[i]) — the renamed
-    // operand IS the stored short-inputarg box object, not a fresh
-    // equal-positioned mint.
-    let inputarg_rename = |arg: OpRef| -> Option<&BoxRef> {
-        label_args
-            .iter()
-            .position(|&a| a == arg)
-            .and_then(|i| short_inputargs.get(i))
-    };
     exported_short_boxes
         .iter()
         .filter(|entry| !entry.op.opcode.is_guard_overflow())
         .map(|entry| {
-            let mut preamble_op = (*entry.op).clone();
-            // optimizer.py:651-652 setarg loop parity.
-            for i in 0..preamble_op.num_args() {
-                if let Some(renamed) = inputarg_rename(preamble_op.arg(i).to_opref()) {
-                    preamble_op.setarg(i, renamed.clone());
-                }
-            }
-            if let Some(fail_args) = preamble_op.fail_args_mut() {
-                for arg in fail_args {
-                    if let Some(renamed) = inputarg_rename(arg.to_opref()) {
-                        // Measured dead (PYRE_REMAP_PROBE 2026-06-11: 0 fires
-                        // across check.py corpus + lib tests) — exported short
-                        // boxes carry pure ops/guards without fail_args
-                        // referencing label args. Rewrite kept as a release
-                        // safety net.
-                        debug_assert!(
-                            false,
-                            "imported short-box fail_arg hit inputarg rename: {arg:?}"
-                        );
-                        *arg = majit_ir::operand::Operand::from_boxref(renamed);
-                    }
-                }
-            }
+            // Fresh clone per entry so the builder's on-object forwarded
+            // marker (`ShortPreambleBuilder::new`) mutates an isolated Rc.
+            let preamble_op = (*entry.op).clone();
             (
                 preamble_op.pos.get(),
                 ProducedShortOp {
@@ -3217,6 +3237,7 @@ pub fn produced_short_boxes_from_exported_boxes(
                     preamble_op: std::rc::Rc::new(preamble_op),
                     invented_name: entry.invented_name,
                     same_as_source: entry.same_as_source.clone(),
+                    label_arg_idx: entry.label_arg_idx,
                 },
             )
         })
@@ -3273,8 +3294,7 @@ pub fn build_short_preamble_from_exported_boxes(
     short_inputargs: &[BoxRef],
     exported_short_boxes: &[PreambleOp],
 ) -> ShortPreamble {
-    let produced =
-        produced_short_boxes_from_exported_boxes(label_args, short_inputargs, exported_short_boxes);
+    let produced = produced_short_boxes_from_exported_boxes(exported_short_boxes);
     build_short_preamble_from_produced_boxes(label_args, short_inputargs, &produced)
 }
 
@@ -3572,14 +3592,19 @@ mod tests {
 
     #[test]
     fn test_build_short_preamble_from_exported_boxes_uses_exported_order() {
+        // shortpreamble.py:285/294: the label-arg → short-inputarg rename
+        // happens at EXPORT time (produce_arg), so the exported short ops
+        // already carry the renamed `short_inputargs` boxes (10/11) in place
+        // of the original label args (0/1). The op-result positions (7/8) are
+        // not inputargs and are unchanged.
         let exported = vec![
             PreambleOp {
                 op: {
                     let mut op = Op::new(
                         OpCode::IntAdd,
                         &[
-                            BoxRef::from_opref(OpRef::int_op(0)),
-                            BoxRef::from_opref(OpRef::int_op(1)),
+                            BoxRef::from_opref(OpRef::int_op(10)),
+                            BoxRef::from_opref(OpRef::int_op(11)),
                         ],
                     );
                     op.pos.set(OpRef::int_op(7));
@@ -3597,7 +3622,7 @@ mod tests {
                         OpCode::IntSub,
                         &[
                             BoxRef::from_opref(OpRef::int_op(7)),
-                            BoxRef::from_opref(OpRef::int_op(1)),
+                            BoxRef::from_opref(OpRef::int_op(11)),
                         ],
                     );
                     op.pos.set(OpRef::int_op(8));
@@ -3697,6 +3722,7 @@ mod tests {
                     },
                     invented_name: false,
                     same_as_source: None,
+                    label_arg_idx: None,
                 },
             ),
             (
@@ -3711,6 +3737,7 @@ mod tests {
                     },
                     invented_name: false,
                     same_as_source: None,
+                    label_arg_idx: None,
                 },
             ),
         ];
@@ -3782,10 +3809,15 @@ mod tests {
 
     #[test]
     fn test_short_boxes() {
+        let mut __ctx = crate::optimizeopt::OptContext::new(256);
         let mut sb =
             ShortBoxes::with_label_args(&[OpRef::int_op(10), OpRef::int_op(11), OpRef::int_op(12)]);
         assert_eq!(sb.num_label_args, 3);
-        let mut __ctx = crate::optimizeopt::OptContext::new(0);
+        // Production seeds a renamed ShortInputArg for every label arg
+        // (optimizer.rs preview loop); the pure/heap deps resolve through them.
+        for arg in [OpRef::int_op(10), OpRef::int_op(11), OpRef::int_op(12)] {
+            sb.add_short_input_arg(&mut __ctx, arg, majit_ir::Type::Int);
+        }
         let mut pure = Op::new(
             OpCode::IntAdd,
             &[
@@ -3803,13 +3835,19 @@ mod tests {
         heap.pos.set(OpRef::int_op(21));
         sb.add_heap_op(&mut __ctx, heap);
         let produced = sb.produced_ops(&mut __ctx);
-        assert_eq!(produced.len(), 2);
+        // 3 ShortInputArgs (one per label arg) + the pure and heap ops.
+        let non_input: Vec<_> = produced
+            .iter()
+            .filter(|(_, p)| p.kind != PreambleOpKind::InputArg)
+            .collect();
+        assert_eq!(non_input.len(), 2);
     }
 
     #[test]
     fn test_short_boxes_reject_unknown_nonconstant_dependency() {
+        let mut __ctx = crate::optimizeopt::OptContext::new(256);
         let mut sb = ShortBoxes::with_label_args(&[OpRef::int_op(10)]);
-        let mut __ctx = crate::optimizeopt::OptContext::new(0);
+        sb.add_short_input_arg(&mut __ctx, OpRef::int_op(10), majit_ir::Type::Int);
         let mut pure = Op::new(
             OpCode::IntAdd,
             &[
@@ -3831,9 +3869,10 @@ mod tests {
 
     #[test]
     fn test_short_boxes_accept_known_constant_dependency() {
+        let mut __ctx = crate::optimizeopt::OptContext::new(256);
         let mut sb = ShortBoxes::with_label_args(&[OpRef::int_op(10)]);
+        sb.add_short_input_arg(&mut __ctx, OpRef::int_op(10), majit_ir::Type::Int);
         sb.note_known_constant(OpRef::int_op(999));
-        let mut __ctx = crate::optimizeopt::OptContext::new(0);
         let mut pure = Op::new(
             OpCode::IntAdd,
             &[
@@ -3845,11 +3884,19 @@ mod tests {
         sb.add_pure_op(&mut __ctx, pure);
 
         let produced = sb.produced_ops(&mut __ctx);
-        assert_eq!(produced.len(), 1);
+        let renamed10 = sb.create_short_inputargs(&[OpRef::int_op(10)])[0].to_opref();
+        // 1 ShortInputArg (label arg 10) + the accepted pure op.
+        let non_input: Vec<_> = produced
+            .iter()
+            .filter(|(_, p)| p.kind != PreambleOpKind::InputArg)
+            .collect();
+        assert_eq!(non_input.len(), 1);
         let pure = produced
             .iter()
             .find(|(result, _)| *result == OpRef::int_op(20))
             .expect("missing produced pure op");
+        // The label-arg dep is renamed to its short_inputargs box; the known
+        // constant 999 passes through unchanged.
         assert_eq!(
             pure.1
                 .preamble_op
@@ -3857,15 +3904,19 @@ mod tests {
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
-            vec![OpRef::int_op(10), OpRef::int_op(999)]
+            vec![renamed10, OpRef::int_op(999)]
         );
     }
 
     #[test]
     fn test_short_boxes_compound_prefers_non_heap_and_emits_invented_alias() {
-        let mut sb =
-            ShortBoxes::with_label_args(&[OpRef::int_op(10), OpRef::int_op(30), OpRef::int_op(31)]);
-        let mut __ctx = crate::optimizeopt::OptContext::new(0);
+        let mut __ctx = crate::optimizeopt::OptContext::new(256);
+        // Only the op DEPENDENCIES (30, 31) are label args; the compound result
+        // (pos 10) is an op result, not a label arg.
+        let mut sb = ShortBoxes::with_label_args(&[OpRef::int_op(30), OpRef::int_op(31)]);
+        for arg in [OpRef::int_op(30), OpRef::int_op(31)] {
+            sb.add_short_input_arg(&mut __ctx, arg, majit_ir::Type::Int);
+        }
 
         let mut heap = Op::with_descr(
             OpCode::GetfieldGcI,
@@ -3873,7 +3924,7 @@ mod tests {
             majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, majit_ir::ArrayFlag::Signed),
         );
         heap.pos.set(OpRef::int_op(10));
-        sb.add_potential_op(&mut __ctx, Some(0), heap, PreambleOpKind::Heap);
+        sb.add_potential_op(&mut __ctx, None, heap, PreambleOpKind::Heap);
 
         let mut pure = Op::new(
             OpCode::IntAdd,
@@ -3883,21 +3934,26 @@ mod tests {
             ],
         );
         pure.pos.set(OpRef::int_op(10));
-        sb.add_potential_op(&mut __ctx, Some(0), pure, PreambleOpKind::Pure);
+        sb.add_potential_op(&mut __ctx, None, pure, PreambleOpKind::Pure);
 
         let produced = sb.produced_ops(&mut __ctx);
-        assert_eq!(produced.len(), 2);
+        // 2 ShortInputArgs (30, 31) + the compound@10 (Pure chosen + Heap alias).
+        let non_input_count = produced
+            .iter()
+            .filter(|(_, p)| p.kind != PreambleOpKind::InputArg)
+            .count();
+        assert_eq!(non_input_count, 2);
 
         let chosen = produced
             .iter()
-            .find(|(result, _)| *result == OpRef::int_op(10))
+            .find(|(result, p)| *result == OpRef::int_op(10) && p.kind != PreambleOpKind::InputArg)
             .unwrap();
         assert_eq!(chosen.1.kind, PreambleOpKind::Pure);
         assert!(!chosen.1.invented_name);
 
         let alias = produced
             .iter()
-            .find(|(result, _)| *result != OpRef::int_op(10))
+            .find(|(result, p)| *result != OpRef::int_op(10) && p.kind != PreambleOpKind::InputArg)
             .unwrap();
         assert_eq!(alias.1.kind, PreambleOpKind::Heap);
         assert!(alias.1.invented_name);
@@ -3909,9 +3965,13 @@ mod tests {
 
     #[test]
     fn test_short_boxes_nested_compound_emits_multiple_invented_aliases() {
-        let mut sb =
-            ShortBoxes::with_label_args(&[OpRef::int_op(20), OpRef::int_op(30), OpRef::int_op(31)]);
-        let mut __ctx = crate::optimizeopt::OptContext::new(0);
+        let mut __ctx = crate::optimizeopt::OptContext::new(256);
+        // Only the op DEPENDENCIES (30, 31) are label args; the compound result
+        // (pos 20) is an op result, not a label arg.
+        let mut sb = ShortBoxes::with_label_args(&[OpRef::int_op(30), OpRef::int_op(31)]);
+        for arg in [OpRef::int_op(30), OpRef::int_op(31)] {
+            sb.add_short_input_arg(&mut __ctx, arg, majit_ir::Type::Int);
+        }
 
         let mut heap = Op::with_descr(
             OpCode::GetfieldGcI,
@@ -3919,11 +3979,11 @@ mod tests {
             majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, majit_ir::ArrayFlag::Signed),
         );
         heap.pos.set(OpRef::int_op(20));
-        sb.add_potential_op(&mut __ctx, Some(0), heap, PreambleOpKind::Heap);
+        sb.add_potential_op(&mut __ctx, None, heap, PreambleOpKind::Heap);
 
         let mut loopinv = Op::new(OpCode::CallI, &[BoxRef::from_opref(OpRef::int_op(30))]);
         loopinv.pos.set(OpRef::int_op(20));
-        sb.add_potential_op(&mut __ctx, Some(0), loopinv, PreambleOpKind::LoopInvariant);
+        sb.add_potential_op(&mut __ctx, None, loopinv, PreambleOpKind::LoopInvariant);
 
         let mut pure = Op::new(
             OpCode::IntAdd,
@@ -3933,21 +3993,28 @@ mod tests {
             ],
         );
         pure.pos.set(OpRef::int_op(20));
-        sb.add_potential_op(&mut __ctx, Some(0), pure, PreambleOpKind::Pure);
+        sb.add_potential_op(&mut __ctx, None, pure, PreambleOpKind::Pure);
 
         let produced = sb.produced_ops(&mut __ctx);
-        assert_eq!(produced.len(), 3);
+        // 2 ShortInputArgs (30, 31) + the compound@20 (Pure chosen + 2 aliases).
+        let non_input_count = produced
+            .iter()
+            .filter(|(_, p)| p.kind != PreambleOpKind::InputArg)
+            .count();
+        assert_eq!(non_input_count, 3);
 
         let chosen = produced
             .iter()
-            .find(|(result, _)| *result == OpRef::int_op(20))
+            .find(|(result, p)| *result == OpRef::int_op(20) && p.kind != PreambleOpKind::InputArg)
             .unwrap();
         assert_eq!(chosen.1.kind, PreambleOpKind::Pure);
         assert!(!chosen.1.invented_name);
 
         let aliases: Vec<_> = produced
             .iter()
-            .filter(|(result, _)| *result != OpRef::int_op(20))
+            .filter(|(result, p)| {
+                *result != OpRef::int_op(20) && p.kind != PreambleOpKind::InputArg
+            })
             .collect();
         assert_eq!(aliases.len(), 2);
         assert!(aliases.iter().all(|(_, produced)| produced.invented_name));
@@ -3960,7 +4027,10 @@ mod tests {
     fn test_rpython_create_short_boxes_prefers_short_inputarg_over_heap_result() {
         let mut ctx = crate::optimizeopt::OptContext::new(256);
         let mut sb = ShortBoxes::with_label_args(&[OpRef::int_op(10), OpRef::int_op(30)]);
+        // pos 10 is both a label arg and a heap result (the case under test);
+        // seed both label args (the heap dep 30 must be a ShortInputArg too).
         sb.add_short_input_arg(&mut ctx, OpRef::int_op(10), majit_ir::Type::Int);
+        sb.add_short_input_arg(&mut ctx, OpRef::int_op(30), majit_ir::Type::Int);
 
         let mut heap = Op::with_descr(
             OpCode::GetfieldGcI,
@@ -3971,8 +4041,9 @@ mod tests {
         sb.add_heap_op(&mut ctx, heap);
 
         let produced = sb.produced_ops(&mut ctx);
-        assert_eq!(produced.len(), 2);
 
+        // The compound at pos 10 prefers the ShortInputArg; the Heap becomes an
+        // invented alias. (Label arg 30 is also produced as a ShortInputArg.)
         let chosen = produced
             .iter()
             .find(|(result, _)| *result == OpRef::int_op(10))
@@ -3982,14 +4053,75 @@ mod tests {
 
         let alias = produced
             .iter()
-            .find(|(result, _)| *result != OpRef::int_op(10))
+            .find(|(_, p)| p.kind == PreambleOpKind::Heap)
             .unwrap();
-        assert_eq!(alias.1.kind, PreambleOpKind::Heap);
         assert!(alias.1.invented_name);
         assert_eq!(
             alias.1.same_as_source.as_ref().map(|b| b.to_opref()),
             Some(OpRef::int_op(10))
         );
+    }
+
+    #[test]
+    fn test_compound_pure_loser_to_short_inputarg_clears_label_arg_idx() {
+        // shortpreamble.py:326-333 — when a Pure alternative loses the compound
+        // tie to the ShortInputArg, its result is rebound to a fresh SameAs box
+        // (`lst[i].short_op.res = new_name`), so the invented alias is no longer
+        // a label arg. pyre's `label_arg_idx` (the position proxy for "res is
+        // label arg N") must be cleared in lockstep; otherwise the import
+        // slot-lookup at unroll.rs (the path-2 Pure|LoopInvariant arm) would map
+        // the invented alias onto the loop-carried `short_args[slot]`, collapsing
+        // the distinct same_as identity into a wrong-result miscompile. (The
+        // sibling Heap-loser test above does NOT exercise this: path-2 ignores
+        // label_arg_idx for the Heap kind.)
+        let mut ctx = crate::optimizeopt::OptContext::new(256);
+        let mut sb =
+            ShortBoxes::with_label_args(&[OpRef::int_op(10), OpRef::int_op(30), OpRef::int_op(31)]);
+        // pos 10 is both a label arg (slot 0) and a pure result (the case under
+        // test); seed all three label args (the pure deps 30/31 are
+        // ShortInputargs too).
+        sb.add_short_input_arg(&mut ctx, OpRef::int_op(10), majit_ir::Type::Int);
+        sb.add_short_input_arg(&mut ctx, OpRef::int_op(30), majit_ir::Type::Int);
+        sb.add_short_input_arg(&mut ctx, OpRef::int_op(31), majit_ir::Type::Int);
+
+        // A pure op whose result coincides with label arg 10, depending on the
+        // other two label args (avoids a self-referential in-production cycle).
+        let mut pure = Op::new(
+            OpCode::IntAdd,
+            &[
+                BoxRef::from_opref(OpRef::int_op(30)),
+                BoxRef::from_opref(OpRef::int_op(31)),
+            ],
+        );
+        pure.pos.set(OpRef::int_op(10));
+        sb.add_pure_op(&mut ctx, pure);
+
+        let produced = sb.produced_ops(&mut ctx);
+
+        // The compound at pos 10 prefers the ShortInputArg; the Pure becomes an
+        // invented alias.
+        let chosen = produced
+            .iter()
+            .find(|(result, _)| *result == OpRef::int_op(10))
+            .unwrap();
+        assert_eq!(chosen.1.kind, PreambleOpKind::InputArg);
+        assert!(!chosen.1.invented_name);
+        // The winning ShortInputArg keeps its label slot (box 10 = slot 0).
+        assert_eq!(chosen.1.label_arg_idx, Some(0));
+
+        let alias = produced
+            .iter()
+            .find(|(_, p)| p.kind == PreambleOpKind::Pure)
+            .unwrap();
+        assert!(alias.1.invented_name);
+        assert_eq!(
+            alias.1.same_as_source.as_ref().map(|b| b.to_opref()),
+            Some(OpRef::int_op(10))
+        );
+        // THE REGRESSION LOCK: the invented alias must NOT carry the original
+        // label slot. Before the fix this was Some(0) and the import collapsed
+        // the alias onto the loop-carried input.
+        assert_eq!(alias.1.label_arg_idx, None);
     }
 
     #[test]
@@ -4026,10 +4158,65 @@ mod tests {
     }
 
     #[test]
+    fn test_duplicate_slot_keeps_last_renamed_inputarg() {
+        // shortpreamble.py:255-259 — when a box appears at TWO slots of the
+        // combined `label_args + virtuals` (a virtual field coinciding with a
+        // label arg; empirically RefOp(50)/RefOp(174) in synth/tuple_unpacking),
+        // the `potential_ops[box] = ShortInputArg(box, renamed)` dict assignment
+        // OVERWRITES, so the LAST slot's renamed inputarg is the live one and
+        // `produce_arg` returns `short_inputargs[LAST]`; the FIRST slot's renamed
+        // box is the dead Label arg. pyre stamps `label_arg_idx = live_slot` (the
+        // current call's slot) so the later (overwriting) call records the LAST
+        // slot, matching upstream. Before the fix `lookup_label_arg`'s
+        // first-occurrence made produce_arg return short_inputargs[FIRST].
+        let mut ctx = crate::optimizeopt::OptContext::new(256);
+        // The SAME box at both slots: the production caller (optimizer.rs preview
+        // loop) iterates label_args+virtuals, so a coinciding box reaches
+        // add_short_input_arg once per slot.
+        let label_args = [OpRef::ref_op(50), OpRef::ref_op(50)];
+        let mut sb = ShortBoxes::with_label_args(&label_args);
+        sb.add_short_input_arg(&mut ctx, OpRef::ref_op(50), majit_ir::Type::Ref);
+        sb.add_short_input_arg(&mut ctx, OpRef::ref_op(50), majit_ir::Type::Ref);
+
+        // Two FRESH distinct renamed boxes, one per slot (shortpreamble.py:258).
+        let si = sb.create_short_inputargs(&label_args);
+        assert_eq!(si.len(), 2);
+        assert_ne!(si[0].to_opref(), si[1].to_opref());
+
+        // The duplicate collapses to ONE produced InputArg entry, keyed at the
+        // LAST slot (label_arg_idx == Some(1)), not the first (Some(0)).
+        let produced = sb.produced_ops(&mut ctx);
+        let inputarg_entries: Vec<_> = produced
+            .iter()
+            .filter(|(r, p)| *r == OpRef::ref_op(50) && p.kind == PreambleOpKind::InputArg)
+            .collect();
+        assert_eq!(inputarg_entries.len(), 1);
+        // THE REGRESSION LOCK: the overwriting (later) call must record the LAST
+        // slot, matching upstream's dict-overwrite. Some(0) before the fix.
+        assert_eq!(inputarg_entries[0].1.label_arg_idx, Some(1));
+
+        // produce_arg returns the LAST slot's renamed box.
+        let produced_arg = sb.produce_arg(&mut ctx, OpRef::ref_op(50)).unwrap();
+        assert_eq!(produced_arg.to_opref(), si[1].to_opref());
+        assert_ne!(produced_arg.to_opref(), si[0].to_opref());
+
+        // `lookup_label_arg` mirrors `potential_ops[box]`'s last-wins overwrite,
+        // resolving the duplicated box to the LAST/live slot. This keeps the
+        // non-InputArg export lookup (optimizer.rs `lookup_label_arg(
+        // canonical_result)`) consistent with the InputArg entry's `live_slot`
+        // above. `rposition`; was `Some(0)` (first) before the fix.
+        assert_eq!(sb.lookup_label_arg(OpRef::ref_op(50)), Some(1));
+    }
+
+    #[test]
     fn test_rpython_short_preamble_builder_add_op_to_short_builds_label_short_and_jump() {
-        let mut sb =
-            ShortBoxes::with_label_args(&[OpRef::int_op(10), OpRef::int_op(30), OpRef::int_op(31)]);
-        let mut __ctx = crate::optimizeopt::OptContext::new(0);
+        let mut __ctx = crate::optimizeopt::OptContext::new(256);
+        // The ovf result (pos 10) is an op result; its deps (30, 31) are the
+        // label args and become renamed ShortInputargs that the Label carries.
+        let mut sb = ShortBoxes::with_label_args(&[OpRef::int_op(30), OpRef::int_op(31)]);
+        for arg in [OpRef::int_op(30), OpRef::int_op(31)] {
+            sb.add_short_input_arg(&mut __ctx, arg, majit_ir::Type::Int);
+        }
 
         let mut ovf = Op::new(
             OpCode::IntAddOvf,
@@ -4039,9 +4226,11 @@ mod tests {
             ],
         );
         ovf.pos.set(OpRef::int_op(10));
-        sb.add_potential_op(&mut __ctx, Some(0), ovf, PreambleOpKind::Pure);
+        sb.add_potential_op(&mut __ctx, None, ovf, PreambleOpKind::Pure);
 
         let produced = sb.produced_ops(&mut __ctx);
+        let short_inputargs = sb.create_short_inputargs(&[OpRef::int_op(30), OpRef::int_op(31)]);
+        let label_arg_oprefs: Vec<OpRef> = short_inputargs.iter().map(|b| b.to_opref()).collect();
         // #146/S8: the builder map keys by the entry res Box; re-key the
         // produced_ops list (keyed by `preamble_op.pos`) to res for new() and
         // look up by the res box of the int_op(10) entry.
@@ -4056,11 +4245,7 @@ mod tests {
             .1
             .res
             .clone();
-        let mut builder = ShortPreambleBuilder::new(
-            &[OpRef::int_op(10)],
-            &entries,
-            &[BoxRef::from_opref(OpRef::int_op(10))],
-        );
+        let mut builder = ShortPreambleBuilder::new(&label_arg_oprefs, &entries, &short_inputargs);
         let used = builder.add_op_to_short(&res10).unwrap();
         assert!(builder.add_preamble_op(&res10));
         assert_eq!(used.opcode, OpCode::IntAddOvf);
@@ -4084,9 +4269,13 @@ mod tests {
 
     #[test]
     fn test_rpython_short_preamble_builder_tracks_extra_same_as() {
-        let mut sb =
-            ShortBoxes::with_label_args(&[OpRef::int_op(20), OpRef::int_op(30), OpRef::int_op(31)]);
-        let mut __ctx = crate::optimizeopt::OptContext::new(0);
+        let mut __ctx = crate::optimizeopt::OptContext::new(256);
+        // The compound result (pos 20) is an op result; its deps (30, 31) are
+        // the label args / renamed ShortInputargs.
+        let mut sb = ShortBoxes::with_label_args(&[OpRef::int_op(30), OpRef::int_op(31)]);
+        for arg in [OpRef::int_op(30), OpRef::int_op(31)] {
+            sb.add_short_input_arg(&mut __ctx, arg, majit_ir::Type::Int);
+        }
 
         let mut heap = Op::with_descr(
             OpCode::GetfieldGcI,
@@ -4094,7 +4283,7 @@ mod tests {
             majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, majit_ir::ArrayFlag::Signed),
         );
         heap.pos.set(OpRef::int_op(20));
-        sb.add_potential_op(&mut __ctx, Some(0), heap, PreambleOpKind::Heap);
+        sb.add_potential_op(&mut __ctx, None, heap, PreambleOpKind::Heap);
 
         let mut pure = Op::new(
             OpCode::IntAdd,
@@ -4104,7 +4293,7 @@ mod tests {
             ],
         );
         pure.pos.set(OpRef::int_op(20));
-        sb.add_potential_op(&mut __ctx, Some(0), pure, PreambleOpKind::Pure);
+        sb.add_potential_op(&mut __ctx, None, pure, PreambleOpKind::Pure);
 
         let produced = sb.produced_ops(&mut __ctx);
         let (alias_result, alias_res) = produced
