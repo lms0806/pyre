@@ -37,14 +37,7 @@ import codecs
 import _compat_pickle
 try:
     from __pypy__.builders import BytesBuilder
-    from __pypy__ import identity_dict
 except ImportError:
-    class identity_dict(dict):
-        def __getitem__(self, key): return super().__getitem__(id(key))
-        def __setitem__(self, key, val): super().__setitem__(id(key), val)
-        def __contains__(self, key): return super().__contains__(id(key))
-        def get(self, key, default=None):
-            return super().get(id(key), default)
     class BytesBuilder():
         def __init__(self):
             self.builder = io.BytesIO()
@@ -475,7 +468,11 @@ class _Pickler:
         except AttributeError:
             raise TypeError("file must have a 'write' attribute")
         self.framer = _Framer(self._file_write)
-        self.memo = identity_dict()
+        # The memo is keyed by id(obj) (not the object itself) for two reasons:
+        # it lets unhashable objects be memoized, and it keeps the memo layout
+        # compatible with CPython, which third-party code such as dill relies on
+        # (dill reads self.memo[id(obj)]).
+        self.memo = {}
         self.proto = int(protocol)
         self.bin = protocol >= 1
         self.fast = 0
@@ -529,10 +526,10 @@ class _Pickler:
         # growable) array, indexed by memo key.
         if self.fast:
             return
-        assert obj not in self.memo
+        assert id(obj) not in self.memo
         idx = len(self.memo)
         self.write(self.put(idx))
-        self.memo[obj] = idx, obj
+        self.memo[id(obj)] = idx, obj
 
     # Return a PUT (BINPUT, LONG_BINPUT) opcode string, with argument i.
     def put(self, idx):
@@ -566,7 +563,7 @@ class _Pickler:
             return
 
         # Check the memo
-        x = self.memo.get(obj)
+        x = self.memo.get(id(obj))
         if x is not None:
             self.write(self.get(x[0]))
             return
@@ -720,8 +717,8 @@ class _Pickler:
             # If the object is already in the memo, this means it is
             # recursive. In this case, throw away everything we put on the
             # stack, and fetch the object back from the memo.
-            if obj in self.memo:
-                write(POP + self.get(self.memo[obj][0]))
+            if id(obj) in self.memo:
+                write(POP + self.get(self.memo[id(obj)][0]))
             else:
                 self.memoize(obj)
 
@@ -910,8 +907,8 @@ class _Pickler:
             for element in obj:
                 save(element)
             # Subtle.  Same as in the big comment below.
-            if obj in memo:
-                get = self.get(memo[obj][0])
+            if id(obj) in memo:
+                get = self.get(memo[id(obj)][0])
                 self.write(POP * n + get)
             else:
                 self.write(_tuplesize2code[n])
@@ -925,7 +922,7 @@ class _Pickler:
         for element in obj:
             save(element)
 
-        if obj in memo:
+        if id(obj) in memo:
             # Subtle.  d was not in memo when we entered save_tuple(), so
             # the process of saving the tuple's elements must have saved
             # the tuple itself:  the tuple is recursive.  The proper action
@@ -933,7 +930,7 @@ class _Pickler:
             # simply GET the tuple (it's already constructed).  This check
             # could have been done in the "for element" loop instead, but
             # recursive tuples are a rare thing.
-            get = self.get(memo[obj][0])
+            get = self.get(memo[id(obj)][0])
             if self.bin:
                 write(POP_MARK + get)
             else:   # proto 0 -- POP_MARK not available
@@ -1066,11 +1063,11 @@ class _Pickler:
         for item in obj:
             save(item)
 
-        if obj in self.memo:
+        if id(obj) in self.memo:
             # If the object is already in the memo, this means it is
             # recursive. In this case, throw away everything we put on the
             # stack, and fetch the object back from the memo.
-            write(POP_MARK + self.get(self.memo[obj][0]))
+            write(POP_MARK + self.get(self.memo[id(obj)][0]))
             return
 
         write(FROZENSET)
