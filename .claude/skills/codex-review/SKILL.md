@@ -32,12 +32,12 @@ so Codex sees the diff and the `rpython/`/`pypy/` trees:
 PROMPT="$(cat .github/codex-review-prompt.md)"
 codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.5 \
   -C "$(git rev-parse --show-toplevel)" \
-  --output-last-message /tmp/codex-review-report.md \
+  --output-last-message .claude/codex-review-report.md \
   "$PROMPT" </dev/null
 ```
 
 `--output-last-message` writes just the final four-section report to the file
-(stdout still streams Codex's progress). Read `/tmp/codex-review-report.md` for
+(stdout still streams Codex's progress). Read `.claude/codex-review-report.md` for
 the report to parse.
 
 Notes:
@@ -126,7 +126,7 @@ Close with a short summary:
   deferred, 4: 2 deferred`).
 - What was changed in-session and the verification result.
 - The follow-up tasks that were filed (ids/titles).
-- The raw report path (`/tmp/codex-review-report.md`) for reference.
+- The raw report path (`.claude/codex-review-report.md`) for reference.
 
 ## Relationship to CI
 
