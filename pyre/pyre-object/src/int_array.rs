@@ -69,6 +69,31 @@ impl IntArray {
         self.capacity().saturating_sub(self.len)
     }
 
+    /// Allocated capacity (block header). The no-resize append fast path
+    /// guards `len < heap_capacity()` before writing past the live length,
+    /// mirroring `_ll_list_resize_ge`'s `len(items) >= length + 1` check
+    /// (rlist.py:285).
+    #[inline]
+    pub fn heap_capacity(&self) -> usize {
+        self.heap_cap
+    }
+
+    /// Store the live length without touching the block. The caller must
+    /// guarantee `new_len <= heap_capacity()` (the no-resize precondition);
+    /// mirrors `_ll_list_resize_ge`'s `l.length = newsize` (rlist.py:293).
+    /// Enforced here because this is safe/public: a `len` past the allocated
+    /// capacity would make `as_slice`/`as_mut_slice` build out-of-bounds
+    /// slices (UB).
+    #[inline]
+    pub fn set_len(&mut self, new_len: usize) {
+        assert!(
+            new_len <= self.heap_cap,
+            "IntArray::set_len precondition violated: new_len ({new_len}) > heap_cap ({})",
+            self.heap_cap
+        );
+        self.len = new_len;
+    }
+
     /// Integer list storage is always a separate block (no inline buffer).
     #[inline]
     pub fn is_inline(&self) -> bool {

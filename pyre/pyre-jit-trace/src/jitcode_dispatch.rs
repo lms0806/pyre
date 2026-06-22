@@ -234,6 +234,33 @@ pub struct SubJitCodeBody {
 /// tests pass synthetic closures over a local fixture map).
 pub type SubJitCodeLookup = dyn Fn(usize) -> Option<SubJitCodeBody>;
 
+/// Build a [`SubJitCodeBody`] view over the build-time `ALL_JITCODES[idx]`
+/// entry (`crate::jitcode_runtime::all_jitcodes`). Returns `None` for an
+/// out-of-range index.
+///
+/// The all-jitcodes table is `Box::leak`'d at load
+/// (`jitcode_runtime::load_all_jitcodes`), so the borrowed `code` /
+/// `constants_*` slices are `'static` as [`SubJitCodeBody`] requires.
+///
+/// This is the production sub-jitcode lookup shape — the shadow walker,
+/// the per-opcode arm entry, and trace-time list-helper specializations
+/// that descend into a charon body (e.g. `w_list_append`) all resolve a
+/// callee body through it. RPython parity: a `BhDescr::JitCode {
+/// jitcode_index }` operand resolves to `ALL_JITCODES[jitcode_index]`.
+pub fn sub_jitcode_body_by_index(idx: usize) -> Option<SubJitCodeBody> {
+    crate::jitcode_runtime::all_jitcodes()
+        .get(idx)
+        .map(|jc| SubJitCodeBody {
+            code: jc.code.as_slice(),
+            num_regs_r: jc.num_regs_r(),
+            num_regs_i: jc.num_regs_i(),
+            num_regs_f: jc.num_regs_f(),
+            constants_i: jc.constants_i.as_slice(),
+            constants_r: jc.constants_r.as_slice(),
+            constants_f: jc.constants_f.as_slice(),
+        })
+}
+
 /// State the walker reads from / writes to while stepping. RPython
 /// equivalent: `MetaInterp` itself — the trace recorder, the symbolic
 /// register banks (`registers_i`, `registers_r`, `registers_f`), and
@@ -5907,6 +5934,19 @@ thread_local! {
     static FBW_STORE_JOURNAL: std::cell::RefCell<Vec<[pyre_object::PyObjectRef; 3]>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
+    /// Undo log for the walked region's eagerly executed list APPENDS:
+    /// `(list, length_before_append)` pairs pushed by the `list.append`
+    /// specialization before it grows the list.  Same rationale as
+    /// [`FBW_STORE_JOURNAL`] — the append is admitted only when
+    /// `w_list_can_append_without_realloc` holds, so the undo is a pure
+    /// length rewind (`w_list_int_set_len`, no reallocation, no boxing) and
+    /// the backing array still has the slot.  A committing walk drops the
+    /// log; a non-commit walk rewinds each list's length in reverse push
+    /// order so the legacy replay re-appends against the pre-walk heap.
+    /// Entries' list refs are GC roots via [`fbw_store_journal_root_walker`].
+    static FBW_APPEND_JOURNAL: std::cell::RefCell<Vec<(pyre_object::PyObjectRef, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+
     /// Set when the walk records a side effect that was neither executed
     /// at walk time nor undo-logged: a void residual call recorded
     /// symbolically (the `try_execute_residual_call_via_executor` void
@@ -5920,6 +5960,7 @@ thread_local! {
 /// begins (mirrors [`bool_box_truth_reset`]).
 pub(crate) fn fbw_store_journal_reset() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
+    FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_UNJOURNALED_EFFECT.with(|c| c.set(false));
 }
 
@@ -5933,9 +5974,21 @@ pub(crate) fn fbw_store_journal_push(
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().push([list, key, displaced]));
 }
 
-/// Commit-path epilogue: the walk's eager stores stand; drop the undo log.
+/// Record the live length a walked eager list append grew past, for the
+/// length rewind when the walk does not commit its end state.  `list` must
+/// be an Integer-strategy list whose backing array had spare capacity (the
+/// append's gate), so the rewind is allocation-free.
+// Consumed by the #171 P3 `list.append` specialization arm
+// (`try_walker_specialize_list_append`).
+pub(crate) fn fbw_append_journal_push(list: pyre_object::PyObjectRef, length_before: usize) {
+    FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().push((list, length_before)));
+}
+
+/// Commit-path epilogue: the walk's eager stores and appends stand; drop
+/// the undo logs.
 pub(crate) fn fbw_store_journal_commit() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
+    FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
 }
 
 /// Non-commit epilogue: restore each displaced element in reverse push
@@ -5943,6 +5996,11 @@ pub(crate) fn fbw_store_journal_commit() {
 /// `w_list_setitem` allocates nothing on the restore (the displaced value
 /// is already boxed and strategy-matching), so entries cannot move
 /// mid-rollback.
+///
+/// Stores are restored BEFORE appends are rewound: a store's key was
+/// in-bounds at store time and stays in-bounds at the walk's final
+/// (max) length, so every restore lands while the list is still grown;
+/// shrinking first could push a restore index past the length and drop it.
 pub(crate) fn fbw_store_journal_rollback() {
     FBW_STORE_JOURNAL.with(|j| {
         let mut entries = j.borrow_mut();
@@ -5960,6 +6018,14 @@ pub(crate) fn fbw_store_journal_rollback() {
                     eprintln!("[fbw-store-journal] rollback failed (index out of bounds)");
                 }
             }
+        }
+    });
+    // Rewind each eager append's length in reverse push order
+    // (`w_list_int_set_len`, allocation-free).
+    FBW_APPEND_JOURNAL.with(|j| {
+        let mut entries = j.borrow_mut();
+        while let Some((list, length_before)) = entries.pop() {
+            unsafe { pyre_object::listobject::w_list_int_set_len(list, length_before) };
         }
     });
 }
@@ -5980,10 +6046,10 @@ pub(crate) fn fbw_has_unjournaled_effect() -> bool {
     FBW_UNJOURNALED_EFFECT.with(|c| c.get())
 }
 
-/// `framework.py root_walker.walk_roots` parity for the store journal:
-/// the triples hold nursery-resident refs across the rest of the walk
-/// (residual calls allocate, and a minor collection moves nursery
-/// objects), so every slot is forwarded as a root.  Registered once via
+/// `framework.py root_walker.walk_roots` parity for the store and append
+/// journals: the entries hold nursery-resident refs across the rest of the
+/// walk (residual calls allocate, and a minor collection moves nursery
+/// objects), so every ref slot is forwarded as a root.  Registered once via
 /// `majit_gc::shadow_stack::register_extra_root_walker` at JIT init.
 pub fn fbw_store_journal_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     FBW_STORE_JOURNAL.with(|j| {
@@ -5994,6 +6060,13 @@ pub fn fbw_store_journal_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRe
                 // the Vec storage alive for the visit.
                 visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
             }
+        }
+    });
+    FBW_APPEND_JOURNAL.with(|j| {
+        for (list, _len) in j.borrow_mut().iter_mut() {
+            // SAFETY: as above — only the `PyObjectRef` slot is a root; the
+            // `usize` length is a plain scalar.
+            visitor(unsafe { &mut *(list as *mut pyre_object::PyObjectRef).cast() });
         }
     });
 }
@@ -8935,6 +9008,46 @@ fn dispatch_residual_call_iRd_kind(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // #171 P3: specialize `lst.append(x)` so its array ops reach the trace,
+    // replacing the opaque `bh_call_fn` residual (walker-native fold; see
+    // `try_walker_specialize_list_append`).  The call arrives as `CallFn` with
+    // `dst_bank == 'r'` (the None result is a Ref, not void) and
+    // `r_args = [bound-method, PY_NULL, value]`.  Default ON
+    // (`PYRE_171_INLINE_LIST=0` opts out); falls through to the
+    // residual for any non-matching shape (SAFE).  The eager append rides
+    // `FBW_APPEND_JOURNAL`, whose commit/rollback epilogues run on FBW walk
+    // ends (same lifecycle as the STORE_SUBSCR store journal).
+    //
+    // Restrict to the top full-body frame: inside an inlined callee sub-walk
+    // (`INLINE_SUBWALK_CAPTURE_BOUNDARY`) the fold's gating guards collapse
+    // their resume to the caller's CALL boundary (`entry_py_pc` /
+    // `outer_active_boxes`), which re-executes the whole caller iteration on a
+    // guard failure — doubling any caller side effect sequenced before the
+    // inlined call (e.g. a `STORE_ATTR` ahead of an inlined `push(lst, x)`).
+    // An inlined append falls back to the generic residual, which resumes
+    // *past* the call (after_residual_call) and so re-runs nothing extra.
+    //
+    // Also restrict to loop traces (`header_pc != 0`): in a function-entry
+    // trace (a no-loop helper compiled from entry, e.g. `def push(a, v):
+    // a.append(v)` called in a hot loop) the spare-capacity guard's
+    // blackhole resume reconstructs the re-executed append's receiver from a
+    // wrong box and re-runs `LOAD_METHOD` on a garbage pointer — the
+    // function-entry exit-layout numbering does not preserve the receiver
+    // local across the fold's mid-statement guards.  Loop traces resume
+    // through the loop-header pc_map coordinate and reconstruct it correctly
+    // (a no-loop helper's append falls back to the generic residual).
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get())
+        && ctx.trace_ctx.header_pc != 0
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && pyre_171_inline_list_enabled()
+        && try_walker_specialize_list_append(ctx, code, op, &r_args, dst)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // pyjitpl.py:2063 forces-branch sub-case: when the descr's
     // `call_release_gil_target` is a non-NULL `(realfuncaddr, saveerr)`
     // pair, route through `direct_call_release_gil` which records
@@ -10557,6 +10670,270 @@ fn try_walker_specialize_subscr(
     Ok(Some(()))
 }
 
+/// Env gate for the #171 P3 `list.append` int-storage fold.  Default ON;
+/// `PYRE_171_INLINE_LIST=0` opts out.  The fold is restricted to loop traces
+/// at the top full-body frame (see the dispatch-site gate): inline sub-walks
+/// and function-entry traces decline to the generic residual, so the only
+/// live path is the validated loop-trace append.
+fn pyre_171_inline_list_enabled() -> bool {
+    std::env::var("PYRE_171_INLINE_LIST").as_deref() != Ok("0")
+}
+
+/// #171 P3: specialize `lst.append(x)` so its array ops (getfield length /
+/// capacity guard / setarrayitem / setfield length+1) reach the trace,
+/// replacing the opaque `bh_call_fn` residual that hides them.  Emits the IR
+/// walker-native — the `generated_list_append_by_strategy` int-storage fold
+/// (codegen.rs), hand-rolled against the walker register banks.
+///
+/// (Descending the canonical `w_list_append` body — the single-source
+/// alternative — is blocked: that body's prologue residuals call low-level
+/// strategy/storage helpers whose addresses are absent from
+/// `jit_trace_fnaddrs()`, so they stay symbolic `stable_symbolic_fnaddr`
+/// hashes and the executor declines them at the `>>47` guard, leaving the
+/// strategy switch non-concrete.  Registering + GC-safety-proving those
+/// helpers is a separate infra epic.)
+///
+/// Shape (confirmed empirically + cross-verified): the walker sees the call
+/// as `pyre_helper == CallFn`, `dst_bank == 'r'`, `r_args = [bound-method,
+/// PY_NULL, value]` (arity 3 — `bh_call_fn(callable, null_or_self, arg0)`).
+/// The Python result is `None` (a Ref, not void), so a None const is written
+/// to `dst` for the trailing `POP_TOP` to discard.
+///
+/// Gates to the Integer-storage / plain-`W_IntObject` / spare-capacity path
+/// (the no-realloc fast path).  Like [`try_walker_specialize_store_subscr`],
+/// the fold records the append IR but does NOT mutate the concrete list; this
+/// applies the append itself and journals the length rewind
+/// (`fbw_append_journal_push`) so a non-commit walk's legacy replay re-appends
+/// against the pre-walk heap.  Any non-matching shape declines (`Ok(None)`)
+/// BEFORE emitting IR, leaving the generic residual fallback intact (SAFE).
+fn try_walker_specialize_list_append(
+    ctx: &mut WalkContext<'_, '_>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 3 {
+        return Ok(None);
+    }
+    // r_args = [callable(bound method), null_or_self(PY_NULL), value].
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (ConcreteValue::Ref(callable), ConcreteValue::Ref(null_or_self), ConcreteValue::Ref(value)) =
+        (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    else {
+        return Ok(None);
+    };
+    // Plain bound-call shape only: callable + value present, null_or_self the
+    // PY_NULL sentinel.  A non-null `null_or_self` is a receiver
+    // `bh_call_fn_impl` prepends as arg0 — not the `lst.append(x)` shape.
+    if callable.is_null() || !null_or_self.is_null() || value.is_null() {
+        return Ok(None);
+    }
+
+    // Recognize the bound builtin `list.append` + Integer-storage list +
+    // plain-int value + spare capacity.  Mirrors the trait recognition
+    // (`trace_opcode.rs` is_method / canonical_list_method("append")).
+    let (inner_func, inner_self, len_before, is_inline, elem) = unsafe {
+        if !pyre_object::methodobject::is_method(callable) {
+            return Ok(None);
+        }
+        let inner_func = pyre_object::methodobject::w_method_get_func(callable);
+        let inner_self = pyre_object::methodobject::w_method_get_self(callable);
+        if inner_func.is_null() || inner_self.is_null() {
+            return Ok(None);
+        }
+        // Canonical-identity check: a list subclass overriding `append`, or a
+        // same-named method on another type, declines (its func differs).
+        let list_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE);
+        if pyre_interpreter::lookup_in_type(list_type, "append") != Some(inner_func) {
+            return Ok(None);
+        }
+        // Int storage + plain `W_IntObject` value + spare capacity.  `is_plain_int1`
+        // also admits a fits-int `W_LongObject`, but the fold unboxes through a
+        // plain `INT_TYPE` guard, so exclude `long` here (the `unbox_long` arm is
+        // a follow-up); a long value falls to the generic residual.
+        if !pyre_object::pyobject::is_list(inner_self)
+            || !pyre_object::w_list_uses_int_storage(inner_self)
+            || !pyre_object::is_plain_int1(value)
+            || pyre_object::pyobject::is_long(value)
+            || !pyre_object::w_list_can_append_without_realloc(inner_self)
+        {
+            return Ok(None);
+        }
+        (
+            inner_func,
+            inner_self,
+            pyre_object::w_list_len(inner_self),
+            pyre_object::w_list_is_inline_storage(inner_self),
+            pyre_object::w_int_get_value(value),
+        )
+    };
+
+    // --- commit to the specialization: emit IR (no further declines) ---
+    let callable_op = r_args[0];
+    let value_op = r_args[2];
+
+    // Pin the callable: guard_class METHOD, then guard_value on the stable
+    // `w_function` slot.  The bound method is freshly allocated each
+    // iteration but its function pointer is stable, so the receiver alone
+    // cannot tie the trace to `list.append` — guard the function.
+    let method_type_addr = &pyre_object::methodobject::METHOD_TYPE as *const _ as i64;
+    if !callable_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(callable_op) {
+        let type_const = ctx.trace_ctx.const_int(method_type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[callable_op, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(callable_op, method_type_addr);
+
+    let func_ref = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        callable_op,
+        crate::descr::method_w_function_descr(),
+    );
+    let func_const = ctx.trace_ctx.const_ref(inner_func as i64);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[func_ref, func_const], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(func_ref, func_const);
+
+    // Recover the receiver list OpRef from the method object for the fold.
+    let self_ref = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        callable_op,
+        crate::descr::method_w_self_descr(),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        self_ref,
+        majit_ir::Value::Ref(majit_ir::GcRef(inner_self as usize)),
+    );
+
+    // --- emit the int-storage append fold (walker-native) ---
+    // Mirrors `generated_list_append_by_strategy` (strategy_id=1), hand-rolled
+    // against the walker register banks with the real `op.pc` resume
+    // coordinate.  (The `WalkerFrameOps` trait impl captures snapshots at pc
+    // 0 — valid only for the per-opcode arm path, not this full-body walk —
+    // and `generated_list_append_by_strategy` is `MIFrame`-bound, so neither
+    // is reusable here.)  No charon-body descent: that body's prologue
+    // residuals call low-level strategy/storage helpers whose addresses are
+    // absent from `jit_trace_fnaddrs()`, so they stay symbolic and the
+    // executor declines them — the trace leg uses this fold; the
+    // runtime/blackhole leg still runs the canonical `w_list_append` body.
+
+    // guard_class LIST (skip when the class is already known / operand const).
+    let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
+    if !self_ref.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(self_ref) {
+        let type_const = ctx.trace_ctx.const_int(list_type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[self_ref, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(self_ref, list_type_addr);
+
+    // guard_value(strategy == Integer): getfield strategy + GuardValue.
+    let strategy = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        self_ref,
+        crate::descr::list_strategy_descr(),
+    );
+    let sid_const = ctx.trace_ctx.const_int(1);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[strategy, sid_const], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(strategy, sid_const);
+
+    // length read (int_items.len), stamped to the concrete pre-append length
+    // so the `IntLt` capacity guard and `IntAdd` length update fold.
+    let len = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        self_ref,
+        crate::descr::list_int_items_len_descr(),
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(len, majit_ir::Value::Int(len_before as i64));
+
+    // Spare-capacity guard (`_ll_list_resize_ge` fast case, rlist.py:285):
+    // append inlines only while `len < capacity`.  On guard failure the
+    // resume at `op.pc` re-executes the method CALL — the real, resizing
+    // append performed generically.
+    let heap_cap = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        self_ref,
+        crate::descr::list_int_items_heap_cap_descr(),
+    );
+    let capacity = if is_inline {
+        // Inline arrays encode capacity as `heap_cap == 0`; guard that shape,
+        // then use the compile-time inline-capacity constant.
+        let zero_const = ctx.trace_ctx.const_int(0);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[heap_cap, zero_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(heap_cap, zero_const);
+        ctx.trace_ctx
+            .const_int(pyre_object::INT_ARRAY_INLINE_CAP as i64)
+    } else {
+        // Heap storage: `heap_cap > 0` is the backing-array capacity.
+        let zero = ctx.trace_ctx.const_int(0);
+        let heap_storage = ctx.trace_ctx.record_op(OpCode::IntGt, &[heap_cap, zero]);
+        ctx.trace_ctx
+            .set_opref_concrete(heap_storage, majit_ir::Value::Int(1));
+        walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[heap_storage])?;
+        heap_cap
+    };
+    let has_room = ctx.trace_ctx.record_op(OpCode::IntLt, &[len, capacity]);
+    ctx.trace_ctx
+        .set_opref_concrete(has_room, majit_ir::Value::Int(1));
+    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[has_room])?;
+
+    // Write the value: `items_ptr[len] = unbox(value)`, then `len += 1`.
+    let items_ptr = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        self_ref,
+        crate::descr::list_int_items_ptr_descr(),
+    );
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let raw = walker_unbox_int(ctx, op.pc, value_op, int_type_addr)?;
+    ctx.trace_ctx
+        .set_opref_concrete(raw, majit_ir::Value::Int(elem));
+    crate::state::trace_raw_int_array_setitem_value(ctx.trace_ctx, items_ptr, len, raw);
+
+    let one = ctx.trace_ctx.const_int(1);
+    let new_len = ctx.trace_ctx.record_op(OpCode::IntAdd, &[len, one]);
+    ctx.trace_ctx
+        .set_opref_concrete(new_len, majit_ir::Value::Int(len_before as i64 + 1));
+    let len_descr = crate::descr::list_int_items_len_descr();
+    let len_descr_idx = len_descr.index();
+    ctx.trace_ctx
+        .record_op_with_descr(OpCode::SetfieldGc, &[self_ref, new_len], len_descr);
+    ctx.trace_ctx
+        .heapcache_setfield_cached(self_ref, len_descr_idx, new_len);
+
+    // Tracing is execution (pyjitpl.py:2095): apply the append to the
+    // concrete list now (the fold recorded the IR but did not mutate) and
+    // journal the length rewind for a non-commit walk.  The int-spare append
+    // allocates nothing (no realloc by the gate, raw int store), so no GC can
+    // move the operands between recognition and here — `inner_self` / `value`
+    // stay valid, no shadow re-read needed.
+    fbw_append_journal_push(inner_self, len_before);
+    unsafe { pyre_object::w_list_append(inner_self, value) };
+
+    // The Python result is None (a Ref); write it to the 'r' dst so the
+    // trailing POP_TOP has a slot to discard.
+    let none_ref = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', none_ref)?;
+    Ok(Some(()))
+}
+
 /// #62: walker-native speculative specialization for the `STORE_SUBSCR`
 /// helper residual_call (oopspec `StoreSubscr`, void result).  Ports
 /// `generated_store_subscr_value` → `generated_list_setitem_by_strategy`
@@ -11531,6 +11908,110 @@ fn allocate_callee_register_banks(
     (regs_r, regs_i, regs_f, concrete_r, concrete_i)
 }
 
+/// Seed a callee jitcode's register banks with positional args and walk
+/// its body, returning the callee's terminal [`DispatchOutcome`]
+/// (`SubReturn` / `SubRaise` / `Terminate` / `SwitchToBlackhole`).
+///
+/// Shared descent core of the `inline_call_*` handlers
+/// ([`dispatch_inline_call_dr_kind`], `_dir`, `_dirf`) — they read the
+/// callee index + arglists from the caller bytecode, then delegate the
+/// bank allocation, arity check, arg seeding, sub-`WalkContext`
+/// construction, and `walk()` to here. A trace-time specialization can
+/// also call this directly to synthesize a descent into a charon helper
+/// body (e.g. `w_list_append`), passing args it already holds rather
+/// than reading them from bytecode.
+///
+/// `pc` is the caller-site pc, used only for arity-mismatch error
+/// reporting. An empty arg slice for an unused bank passes its arity
+/// check trivially. The callee runs with `is_top_level == false` and
+/// inherits the caller's descr pool + sub-jitcode lookup (RPython
+/// `pyjitpl.py:230-260 setup_call(argboxes_i, argboxes_r, argboxes_f)`).
+/// Only Ref-bank concrete shadows are seeded — matching the
+/// `inline_call_*` handlers, which thread `ref_arg_concretes` but no
+/// Int/Float concrete shadows across the frame boundary.
+fn run_sub_jitcode_walk(
+    ctx: &mut WalkContext<'_, '_>,
+    pc: usize,
+    sub_body: &SubJitCodeBody,
+    int_args: &[OpRef],
+    ref_args: &[OpRef],
+    ref_arg_concretes: &[ConcreteValue],
+    float_args: &[OpRef],
+) -> Result<DispatchOutcome, DispatchError> {
+    let (
+        mut callee_regs_r,
+        mut callee_regs_i,
+        mut callee_regs_f,
+        mut callee_concrete_r,
+        mut callee_concrete_i,
+    ) = allocate_callee_register_banks(sub_body, ctx.trace_ctx);
+
+    if int_args.len() > sub_body.num_regs_i {
+        return Err(DispatchError::InlineCallIntArityMismatch {
+            pc,
+            provided: int_args.len(),
+            callee_num_regs_i: sub_body.num_regs_i,
+        });
+    }
+    if ref_args.len() > sub_body.num_regs_r {
+        return Err(DispatchError::InlineCallArityMismatch {
+            pc,
+            provided: ref_args.len(),
+            callee_num_regs_r: sub_body.num_regs_r,
+        });
+    }
+    if float_args.len() > sub_body.num_regs_f {
+        return Err(DispatchError::InlineCallFloatArityMismatch {
+            pc,
+            provided: float_args.len(),
+            callee_num_regs_f: sub_body.num_regs_f,
+        });
+    }
+    for (i, arg) in int_args.iter().enumerate() {
+        callee_regs_i[i] = *arg;
+    }
+    for (i, arg) in ref_args.iter().enumerate() {
+        callee_regs_r[i] = *arg;
+    }
+    for (i, arg) in float_args.iter().enumerate() {
+        callee_regs_f[i] = *arg;
+    }
+    for (i, concrete) in ref_arg_concretes.iter().enumerate() {
+        callee_concrete_r[i] = *concrete;
+    }
+
+    let (callee_outcome, _callee_end_pc) = {
+        let mut sub_wc = WalkContext {
+            registers_r: &mut callee_regs_r,
+            registers_i: &mut callee_regs_i,
+            registers_f: &mut callee_regs_f,
+            concrete_registers_r: &mut callee_concrete_r,
+            concrete_registers_i: &mut callee_concrete_i,
+            descr_refs: ctx.descr_refs,
+            raw_descrs: ctx.raw_descrs,
+            is_authoritative_executor: ctx.is_authoritative_executor,
+            is_full_body_walk: ctx.is_full_body_walk,
+            trace_ctx: ctx.trace_ctx,
+            done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
+            done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
+            done_with_this_frame_descr_float: ctx.done_with_this_frame_descr_float.clone(),
+            done_with_this_frame_descr_void: ctx.done_with_this_frame_descr_void.clone(),
+            exit_frame_with_exception_descr_ref: ctx.exit_frame_with_exception_descr_ref.clone(),
+            is_top_level: false,
+            sub_jitcode_lookup: ctx.sub_jitcode_lookup,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+            entry_py_pc: ctx.entry_py_pc,
+            outer_jitcode_index: ctx.outer_jitcode_index,
+            outer_active_boxes: ctx.outer_active_boxes.clone(),
+            store_subscr_fn_addr: ctx.store_subscr_fn_addr,
+            pending_guard_snapshot_error: None,
+        };
+        walk(sub_body.code, 0, &mut sub_wc)?
+    };
+    Ok(callee_outcome)
+}
+
 /// Operand layout `dR>X`:
 ///   2B descr index + 1B varlen + N×1B Ref args + 1B `>X` dst.
 ///
@@ -11573,57 +12054,8 @@ fn dispatch_inline_call_dr_kind(
     let (args, arg_width) = read_ref_var_list(code, op, 2, ctx)?;
     let arg_concretes = read_ref_var_list_concrete(code, op, 2, ctx);
 
-    let (
-        mut callee_regs_r,
-        mut callee_regs_i,
-        mut callee_regs_f,
-        mut callee_concrete_r,
-        mut callee_concrete_i,
-    ) = allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
-
-    if args.len() > sub_body.num_regs_r {
-        return Err(DispatchError::InlineCallArityMismatch {
-            pc: op.pc,
-            provided: args.len(),
-            callee_num_regs_r: sub_body.num_regs_r,
-        });
-    }
-    for (i, arg) in args.iter().enumerate() {
-        callee_regs_r[i] = *arg;
-    }
-    for (i, concrete) in arg_concretes.iter().enumerate() {
-        callee_concrete_r[i] = *concrete;
-    }
-
-    let (callee_outcome, _callee_end_pc) = {
-        let mut sub_wc = WalkContext {
-            registers_r: &mut callee_regs_r,
-            registers_i: &mut callee_regs_i,
-            registers_f: &mut callee_regs_f,
-            concrete_registers_r: &mut callee_concrete_r,
-            concrete_registers_i: &mut callee_concrete_i,
-            descr_refs: ctx.descr_refs,
-            raw_descrs: ctx.raw_descrs,
-            is_authoritative_executor: ctx.is_authoritative_executor,
-            is_full_body_walk: ctx.is_full_body_walk,
-            trace_ctx: ctx.trace_ctx,
-            done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
-            done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
-            done_with_this_frame_descr_float: ctx.done_with_this_frame_descr_float.clone(),
-            done_with_this_frame_descr_void: ctx.done_with_this_frame_descr_void.clone(),
-            exit_frame_with_exception_descr_ref: ctx.exit_frame_with_exception_descr_ref.clone(),
-            is_top_level: false,
-            sub_jitcode_lookup: ctx.sub_jitcode_lookup,
-            last_exc_value: None,
-            last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: ctx.entry_py_pc,
-            outer_jitcode_index: ctx.outer_jitcode_index,
-            outer_active_boxes: ctx.outer_active_boxes.clone(),
-            store_subscr_fn_addr: ctx.store_subscr_fn_addr,
-            pending_guard_snapshot_error: None,
-        };
-        walk(sub_body.code, 0, &mut sub_wc)?
-    };
+    let callee_outcome =
+        run_sub_jitcode_walk(ctx, op.pc, &sub_body, &[], &args, &arg_concretes, &[])?;
 
     match callee_outcome {
         DispatchOutcome::SubReturn {
@@ -11761,67 +12193,15 @@ fn dispatch_inline_call_dir_kind(
     let (ref_args, ref_width) = read_ref_var_list(code, op, 2 + int_width, ctx)?;
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
 
-    let (
-        mut callee_regs_r,
-        mut callee_regs_i,
-        mut callee_regs_f,
-        mut callee_concrete_r,
-        mut callee_concrete_i,
-    ) = allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
-
-    if int_args.len() > sub_body.num_regs_i {
-        return Err(DispatchError::InlineCallIntArityMismatch {
-            pc: op.pc,
-            provided: int_args.len(),
-            callee_num_regs_i: sub_body.num_regs_i,
-        });
-    }
-    if ref_args.len() > sub_body.num_regs_r {
-        return Err(DispatchError::InlineCallArityMismatch {
-            pc: op.pc,
-            provided: ref_args.len(),
-            callee_num_regs_r: sub_body.num_regs_r,
-        });
-    }
-    for (i, arg) in int_args.iter().enumerate() {
-        callee_regs_i[i] = *arg;
-    }
-    for (i, arg) in ref_args.iter().enumerate() {
-        callee_regs_r[i] = *arg;
-    }
-    for (i, concrete) in ref_arg_concretes.iter().enumerate() {
-        callee_concrete_r[i] = *concrete;
-    }
-
-    let (callee_outcome, _callee_end_pc) = {
-        let mut sub_wc = WalkContext {
-            registers_r: &mut callee_regs_r,
-            registers_i: &mut callee_regs_i,
-            registers_f: &mut callee_regs_f,
-            concrete_registers_r: &mut callee_concrete_r,
-            concrete_registers_i: &mut callee_concrete_i,
-            descr_refs: ctx.descr_refs,
-            raw_descrs: ctx.raw_descrs,
-            is_authoritative_executor: ctx.is_authoritative_executor,
-            is_full_body_walk: ctx.is_full_body_walk,
-            trace_ctx: ctx.trace_ctx,
-            done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
-            done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
-            done_with_this_frame_descr_float: ctx.done_with_this_frame_descr_float.clone(),
-            done_with_this_frame_descr_void: ctx.done_with_this_frame_descr_void.clone(),
-            exit_frame_with_exception_descr_ref: ctx.exit_frame_with_exception_descr_ref.clone(),
-            is_top_level: false,
-            sub_jitcode_lookup: ctx.sub_jitcode_lookup,
-            last_exc_value: None,
-            last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: ctx.entry_py_pc,
-            outer_jitcode_index: ctx.outer_jitcode_index,
-            outer_active_boxes: ctx.outer_active_boxes.clone(),
-            store_subscr_fn_addr: ctx.store_subscr_fn_addr,
-            pending_guard_snapshot_error: None,
-        };
-        walk(sub_body.code, 0, &mut sub_wc)?
-    };
+    let callee_outcome = run_sub_jitcode_walk(
+        ctx,
+        op.pc,
+        &sub_body,
+        &int_args,
+        &ref_args,
+        &ref_arg_concretes,
+        &[],
+    )?;
 
     match callee_outcome {
         DispatchOutcome::SubReturn {
@@ -11944,77 +12324,15 @@ fn dispatch_inline_call_dirf_kind(
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
     let (float_args, float_width) = read_float_var_list(code, op, 2 + int_width + ref_width, ctx)?;
 
-    let (
-        mut callee_regs_r,
-        mut callee_regs_i,
-        mut callee_regs_f,
-        mut callee_concrete_r,
-        mut callee_concrete_i,
-    ) = allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
-
-    if int_args.len() > sub_body.num_regs_i {
-        return Err(DispatchError::InlineCallIntArityMismatch {
-            pc: op.pc,
-            provided: int_args.len(),
-            callee_num_regs_i: sub_body.num_regs_i,
-        });
-    }
-    if ref_args.len() > sub_body.num_regs_r {
-        return Err(DispatchError::InlineCallArityMismatch {
-            pc: op.pc,
-            provided: ref_args.len(),
-            callee_num_regs_r: sub_body.num_regs_r,
-        });
-    }
-    if float_args.len() > sub_body.num_regs_f {
-        return Err(DispatchError::InlineCallFloatArityMismatch {
-            pc: op.pc,
-            provided: float_args.len(),
-            callee_num_regs_f: sub_body.num_regs_f,
-        });
-    }
-    for (i, arg) in int_args.iter().enumerate() {
-        callee_regs_i[i] = *arg;
-    }
-    for (i, arg) in ref_args.iter().enumerate() {
-        callee_regs_r[i] = *arg;
-    }
-    for (i, arg) in float_args.iter().enumerate() {
-        callee_regs_f[i] = *arg;
-    }
-    for (i, concrete) in ref_arg_concretes.iter().enumerate() {
-        callee_concrete_r[i] = *concrete;
-    }
-
-    let (callee_outcome, _callee_end_pc) = {
-        let mut sub_wc = WalkContext {
-            registers_r: &mut callee_regs_r,
-            registers_i: &mut callee_regs_i,
-            registers_f: &mut callee_regs_f,
-            concrete_registers_r: &mut callee_concrete_r,
-            concrete_registers_i: &mut callee_concrete_i,
-            descr_refs: ctx.descr_refs,
-            raw_descrs: ctx.raw_descrs,
-            is_authoritative_executor: ctx.is_authoritative_executor,
-            is_full_body_walk: ctx.is_full_body_walk,
-            trace_ctx: ctx.trace_ctx,
-            done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
-            done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
-            done_with_this_frame_descr_float: ctx.done_with_this_frame_descr_float.clone(),
-            done_with_this_frame_descr_void: ctx.done_with_this_frame_descr_void.clone(),
-            exit_frame_with_exception_descr_ref: ctx.exit_frame_with_exception_descr_ref.clone(),
-            is_top_level: false,
-            sub_jitcode_lookup: ctx.sub_jitcode_lookup,
-            last_exc_value: None,
-            last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: ctx.entry_py_pc,
-            outer_jitcode_index: ctx.outer_jitcode_index,
-            outer_active_boxes: ctx.outer_active_boxes.clone(),
-            store_subscr_fn_addr: ctx.store_subscr_fn_addr,
-            pending_guard_snapshot_error: None,
-        };
-        walk(sub_body.code, 0, &mut sub_wc)?
-    };
+    let callee_outcome = run_sub_jitcode_walk(
+        ctx,
+        op.pc,
+        &sub_body,
+        &int_args,
+        &ref_args,
+        &ref_arg_concretes,
+        &float_args,
+    )?;
 
     match callee_outcome {
         DispatchOutcome::SubReturn {
@@ -14387,21 +14705,90 @@ mod tests {
     /// `crate::jitcode_runtime::all_jitcodes()`. Used by the end-to-end
     /// arm acceptance tests (`walk_return_value_arm_*`,
     /// `walk_pop_top_arm_*`) so the walker can recurse into real
-    /// callee bodies. The runtime's `all_jitcodes()` is a
-    /// `LazyLock<Vec<Arc<JitCode>>>` — every `.code` slice it surfaces
-    /// is `'static`-rooted, satisfying `SubJitCodeBody`'s body
-    /// constraint.
+    /// callee bodies. Delegates to the production
+    /// [`super::sub_jitcode_body_by_index`].
     fn production_sub_jitcodes(idx: usize) -> Option<SubJitCodeBody> {
-        let all = crate::jitcode_runtime::all_jitcodes();
-        all.get(idx).map(|jc| SubJitCodeBody {
-            code: jc.code.as_slice(),
-            num_regs_r: jc.num_regs_r(),
-            num_regs_i: jc.num_regs_i(),
-            num_regs_f: jc.num_regs_f(),
-            constants_i: jc.constants_i.as_slice(),
-            constants_r: jc.constants_r.as_slice(),
-            constants_f: jc.constants_f.as_slice(),
-        })
+        super::sub_jitcode_body_by_index(idx)
+    }
+
+    #[test]
+    fn sub_jitcode_body_by_index_builds_w_list_append() {
+        // The shared by-index `SubJitCodeBody` builder must resolve a
+        // build-time charon body (`w_list_append`) to a well-formed body —
+        // non-empty bytecode and >= 2 ref registers for the (list, value)
+        // params (calldescr arg_classes 'rr').  (Foundation for the deferred
+        // Route C single-source descent; the shipping `lst.append` arm folds
+        // walker-native instead — see `try_walker_specialize_list_append`.)
+        let idx = crate::jitcode_runtime::list_append_jitcode()
+            .expect("w_list_append must be present in ALL_JITCODES")
+            .index();
+        let body = super::sub_jitcode_body_by_index(idx)
+            .expect("by-index builder must resolve w_list_append");
+        assert!(
+            !body.code.is_empty(),
+            "w_list_append body must carry assembled bytecode"
+        );
+        assert!(
+            body.num_regs_r >= 2,
+            "w_list_append takes (list, value) => >= 2 ref registers, got {}",
+            body.num_regs_r
+        );
+        // Out-of-range index resolves to None (RPython: ALL_JITCODES miss).
+        assert!(super::sub_jitcode_body_by_index(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn append_journal_rollback_rewinds_length() {
+        // #171 P3 journal infra: a walked eager `list.append` grows the
+        // concrete list at trace time (the fold records the array-op IR but
+        // does not mutate), so a NON-commit walk must rewind the length,
+        // exactly like the STORE_SUBSCR store journal restores its displaced
+        // element.  Spare-capacity gating (`w_list_can_append_without_realloc`)
+        // makes the rewind a pure length set with no reallocation to undo.
+        use pyre_object::listobject::{w_list_can_append_without_realloc, w_list_len};
+        use pyre_object::{w_int_new, w_list_append};
+
+        super::fbw_store_journal_reset();
+
+        let list =
+            pyre_object::listobject::w_list_new(vec![w_int_new(10), w_int_new(20), w_int_new(30)]);
+        // A first append forces the backing array to grow with a growth
+        // factor, leaving spare capacity so the *next* append is in-place
+        // (the only shape the arm specializes).
+        unsafe { w_list_append(list, w_int_new(40)) };
+        let len_before = unsafe { w_list_len(list) };
+        assert_eq!(len_before, 4);
+        assert!(
+            unsafe { w_list_can_append_without_realloc(list) },
+            "post-grow list must have spare capacity for the in-place append"
+        );
+
+        // Rollback path: journal push + eager append (production order, see
+        // try_walker_specialize_list_append), then a non-commit exit rewinds
+        // the length.
+        super::fbw_append_journal_push(list, len_before);
+        unsafe { w_list_append(list, w_int_new(50)) };
+        assert_eq!(unsafe { w_list_len(list) }, 5);
+        super::fbw_store_journal_rollback();
+        assert_eq!(
+            unsafe { w_list_len(list) },
+            len_before,
+            "non-commit walk must rewind the eager append's length"
+        );
+
+        // Commit path: the eager append stands; the log is dropped.
+        super::fbw_append_journal_push(list, len_before);
+        unsafe { w_list_append(list, w_int_new(60)) };
+        super::fbw_store_journal_commit();
+        assert_eq!(
+            unsafe { w_list_len(list) },
+            len_before + 1,
+            "committed walk keeps the eager append"
+        );
+        // A subsequent rollback with the log already committed-empty is a
+        // no-op (does not shrink further).
+        super::fbw_store_journal_rollback();
+        assert_eq!(unsafe { w_list_len(list) }, len_before + 1);
     }
 
     /// Tests use the production `PyreJitCodeDescr` adapter

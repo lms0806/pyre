@@ -488,6 +488,53 @@ fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> 
     raw as PyObjectRef
 }
 
+// Integer-strategy low-level access primitives, mirroring the rlist.py
+// oopspec leaves the JIT codewriter substitutes for clean array operations.
+// The runtime bodies below are the fallback when the call is not looked into;
+// the codewriter recognises the `#[oopspec("list.int_*")]` tag and emits
+// `GetfieldGcR(int_items.block) → GetarrayitemGcI` / `SetarrayitemGcI` /
+// `GetfieldGcI(int_items.len)` instead (see int_array.rs). The `_fast`
+// accessors take a non-negative, in-bounds `index`; the caller normalises
+// negative indices and checks the bound, as `ll_getitem`/`ll_setitem` wrap
+// `ll_getitem_fast`/`ll_setitem_fast` in rlist.py.
+
+/// `ll_length` for the Integer strategy (rlist.py:367 `'list.len(l)'`).
+#[majit_macros::oopspec("list.int_len(l)")]
+pub fn ll_list_int_length(l: &W_ListObject) -> usize {
+    l.int_items.len()
+}
+
+/// `ll_getitem_fast` for the Integer strategy (rlist.py:375
+/// `'list.getitem(l, index)'`): raw unboxed read at a known-in-bounds index.
+#[majit_macros::oopspec("list.int_getitem(l, index)")]
+pub fn ll_list_int_getitem_fast(l: &W_ListObject, index: usize) -> i64 {
+    l.int_items.as_slice()[index]
+}
+
+/// `ll_setitem_fast` for the Integer strategy (rlist.py:380
+/// `'list.setitem(l, index, item)'`): raw unboxed write at a known-in-bounds
+/// index.
+#[majit_macros::oopspec("list.int_setitem(l, index, item)")]
+pub fn ll_list_int_setitem_fast(l: &mut W_ListObject, index: usize, item: i64) {
+    l.int_items.as_mut_slice()[index] = item;
+}
+
+/// Allocated capacity for the Integer strategy. `ll_append`'s resize-ge
+/// fast case (rlist.py:285) inlines the append only while
+/// `len(items) >= length + 1`, i.e. spare capacity exists.
+#[majit_macros::oopspec("list.int_capacity(l)")]
+pub fn ll_list_int_capacity(l: &W_ListObject) -> usize {
+    l.int_items.heap_capacity()
+}
+
+/// Store the Integer-strategy live length (`_ll_list_resize_ge`'s
+/// `l.length = newsize`, rlist.py:293). The caller has already ensured
+/// the block has room, so this only bumps the length field.
+#[majit_macros::oopspec("list.int_set_len(l, n)")]
+pub fn ll_list_int_set_len(l: &mut W_ListObject, n: usize) {
+    l.int_items.set_len(n);
+}
+
 /// Get the item at the given index from a list.
 ///
 /// Supports negative indexing. Returns None if out of bounds.
@@ -509,13 +556,12 @@ pub unsafe fn w_list_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef
             Some(items[idx as usize])
         }
         ListStrategy::Integer => {
-            let items = list.int_items.as_slice();
-            let len = items.len() as i64;
+            let len = ll_list_int_length(list) as i64;
             let idx = if index < 0 { index + len } else { index };
             if idx < 0 || idx >= len {
                 return None;
             }
-            Some(w_int_new(items[idx as usize]))
+            Some(w_int_new(ll_list_int_getitem_fast(list, idx as usize)))
         }
         ListStrategy::Float => {
             let items = list.float_items.as_slice();
@@ -552,14 +598,14 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
             true
         }
         ListStrategy::Integer => {
-            let len = list.int_items.len() as i64;
+            let len = ll_list_int_length(list) as i64;
             let idx = if index < 0 { index + len } else { index };
             if idx < 0 || idx >= len {
                 return false;
             }
             // AbstractUnwrappedStrategy.setitem (listobject.py:1737): plain_int_w (unwrap)
             if is_plain_int1(value) {
-                list.int_items[idx as usize] = plain_int_w(value);
+                ll_list_int_setitem_fast(list, idx as usize, plain_int_w(value));
                 true
             } else {
                 switch_to_object_strategy(list);
@@ -605,7 +651,19 @@ pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
         }
         ListStrategy::Integer => {
             if is_plain_int1(value) {
-                list.int_items.push(plain_int_w(value));
+                // ll_append (rtyper/rlist.py:588): length = ll_length();
+                // _ll_resize_ge(length+1); ll_setitem_fast(length, item).
+                // The resize-ge fast case (rlist.py:285) inlines only while
+                // there is spare capacity; bump the length and store in
+                // place. Otherwise fall back to the resizing push.
+                let item = plain_int_w(value);
+                let length = ll_list_int_length(list);
+                if length < ll_list_int_capacity(list) {
+                    ll_list_int_set_len(list, length + 1);
+                    ll_list_int_setitem_fast(list, length, item);
+                } else {
+                    list.int_items.push(item);
+                }
             } else {
                 switch_to_object_strategy(list);
                 list.object_push(value);
@@ -624,6 +682,26 @@ pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
     }
 }
 
+/// Set the live length of an Integer-strategy list without reallocating
+/// or boxing — the undo of a spare-capacity append (`_ll_list_resize_ge`'s
+/// `l.length = newsize` run in reverse).  The backing array already has
+/// room (the append that this reverses was admitted by
+/// [`w_list_can_append_without_realloc`]), so this only rewinds the length
+/// field.
+///
+/// # Safety
+/// `obj` must point to a valid Integer-strategy `W_ListObject` whose
+/// backing array has capacity for at least `n` elements.
+pub unsafe fn w_list_int_set_len(obj: PyObjectRef, n: usize) {
+    let list = &mut *(obj as *mut W_ListObject);
+    debug_assert_eq!(
+        list.strategy,
+        ListStrategy::Integer,
+        "w_list_int_set_len on non-Integer strategy"
+    );
+    ll_list_int_set_len(list, n);
+}
+
 /// Get the length of a list.
 ///
 /// # Safety
@@ -634,7 +712,7 @@ pub unsafe fn w_list_len(obj: PyObjectRef) -> usize {
         // listobject.py:1131 EmptyListStrategy.length returns 0.
         ListStrategy::Empty => 0,
         ListStrategy::Object => list.length,
-        ListStrategy::Integer => list.int_items.len(),
+        ListStrategy::Integer => ll_list_int_length(list),
         ListStrategy::Float => list.float_items.len(),
     }
 }
@@ -1227,6 +1305,41 @@ mod tests {
             let item = w_list_getitem(list, -1).unwrap();
             assert_eq!(crate::intobject::w_int_get_value(item), 3);
         }
+    }
+
+    #[test]
+    fn integer_strategy_oopspec_leaves_roundtrip() {
+        let items = vec![w_int_new(10), w_int_new(20), w_int_new(30)];
+        let list = w_list_new(items);
+        unsafe {
+            let l = &mut *(list as *mut W_ListObject);
+            assert_eq!(l.strategy, ListStrategy::Integer);
+            assert_eq!(ll_list_int_length(l), 3);
+            assert_eq!(ll_list_int_getitem_fast(l, 0), 10);
+            assert_eq!(ll_list_int_getitem_fast(l, 2), 30);
+            ll_list_int_setitem_fast(l, 1, 99);
+            assert_eq!(ll_list_int_getitem_fast(l, 1), 99);
+            // The write is observable through the public accessor.
+            let item = w_list_getitem(list, 1).unwrap();
+            assert_eq!(crate::intobject::w_int_get_value(item), 99);
+        }
+    }
+
+    #[test]
+    fn integer_strategy_oopspec_tags_present() {
+        // The `#[oopspec(...)]` attribute emits the spec string for the
+        // codewriter's `_handle_list_call` to decode (rlib/jit.py:250 parity).
+        assert_eq!(oopspec_ll_list_int_length, "list.int_len(l)");
+        assert_eq!(
+            oopspec_ll_list_int_getitem_fast,
+            "list.int_getitem(l, index)"
+        );
+        assert_eq!(
+            oopspec_ll_list_int_setitem_fast,
+            "list.int_setitem(l, index, item)"
+        );
+        assert_eq!(oopspec_ll_list_int_capacity, "list.int_capacity(l)");
+        assert_eq!(oopspec_ll_list_int_set_len, "list.int_set_len(l, n)");
     }
 
     #[test]
