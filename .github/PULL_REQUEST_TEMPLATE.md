@@ -23,7 +23,8 @@ Note: Do not run the review in the same session that generated the code.
 
 If you are using Claude, a quick local review is `/parity to upstream/main`.
 
-The currently recommended prompt for gpt-5.5 is:
+The currently recommended prompt for gpt-5.5 will be run automatically when this is ready for review.
+The prompt is:
 
 ----
 Assess by static analysis whether our changes in git diff main are equivalent
@@ -45,12 +46,8 @@ language differences between RPython and Rust. Mark those separately under
 “Structural adaptations.”
 -->
 
-### Prompt & Model
-
-Model: <!-- e.g. gpt-5.5 opus-4.7  -->
-
-Prompt: <!-- Paste the original prompt, regardless of language. -->
-
-### Answer
-
-<!-- If the answer is not in English, attach an English copy as well. -->
+- [ ] I fully resolved all reasonable code review comments from Codex and CodeRabbit.
+  - [ ] Auto-review section 1 is clear. This check is mandatory.
+  - [ ] Auto-review section 2 is clear. If this is not checked, please add a comment explaining why.
+- [ ] I did not use AI to write the code of this patch.
+  - If this is not checked, commits must include `Assisted-by`
