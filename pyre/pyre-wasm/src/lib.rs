@@ -11,16 +11,200 @@ compile_error!("feature `wasmi` requires target_arch = \"wasm32\"");
 #[cfg(feature = "web")]
 use wasm_bindgen::prelude::*;
 
+// Native-host (`wasmi`) builds target wasm32-unknown-unknown, which has no OS
+// entropy. To avoid the wasm-bindgen-based `wasm_js` backend (whose imports a
+// non-JS embedder cannot satisfy), getrandom is wired to its `custom` backend
+// via `--cfg getrandom_backend="custom"`, which calls this hook. pyre seeds only
+// non-cryptographic uses (string hash key, the `random` module) from it, and the
+// values never affect check.py's oracle comparison, so a deterministic
+// SplitMix64 stream is sufficient.
+#[cfg(all(target_arch = "wasm32", feature = "wasmi"))]
+mod custom_getrandom {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static STATE: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+
+    #[unsafe(no_mangle)]
+    unsafe extern "Rust" fn __getrandom_v03_custom(
+        dest: *mut u8,
+        len: usize,
+    ) -> Result<(), getrandom::Error> {
+        let mut i = 0;
+        while i < len {
+            let mut z = STATE
+                .fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed)
+                .wrapping_add(0x9e37_79b9_7f4a_7c15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^= z >> 31;
+            let bytes = z.to_le_bytes();
+            let n = core::cmp::min(8, len - i);
+            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), dest.add(i), n) };
+            i += n;
+        }
+        Ok(())
+    }
+}
+
 use pyre_interpreter::*;
 
 use std::cell::RefCell;
 use std::sync::Once;
+
+// Residual-call host trampoline for the native-host (`wasmi`) build.
+//
+// wasm32 `call_indirect` type-checks every call, so the in-module metainterp
+// cannot transmute a raw funcptr to a statically-guessed `extern "C" fn` and
+// call it — a residual target whose real signature is not the uniform
+// `(i64…) -> i64` traps. The compiled trace already round-trips such calls
+// through the host (`env.jit_call`); this routes the recording / blackhole
+// path through the symmetric `pyre_jit.jit_call_host` import, which reflects
+// the callee's wasm signature and coerces each positional argument.
+#[cfg(all(target_arch = "wasm32", feature = "wasmi"))]
+mod residual_host {
+    use core::cell::UnsafeCell;
+
+    // Call-area layout shared with `majit-backend-wasm` codegen and the host
+    // runner's `jit_call_trampoline`; offsets are relative to the frame-pointer
+    // base passed to the import.
+    const CALL_RESULT_OFS: usize = 2000;
+    const CALL_FUNC_OFS: usize = 2008;
+    const CALL_NARGS_OFS: usize = 2016;
+    const CALL_ARGS_OFS: usize = 2024;
+    const MAX_ARGS: usize = 16;
+    const SCRATCH_LEN: usize = CALL_ARGS_OFS + MAX_ARGS * 8;
+
+    #[link(wasm_import_module = "pyre_jit")]
+    unsafe extern "C" {
+        fn jit_call_host(frame_ptr: u32);
+    }
+
+    // A wasm32 module instance is single-threaded, so a shared scratch buffer
+    // needs no synchronization. Residual calls nest synchronously: each level
+    // writes its arguments, the host reads them before invoking the callee, and
+    // each level reads its result immediately after the host returns — so an
+    // inner call that reuses the buffer cannot clobber an outer call's
+    // already-consumed arguments or not-yet-written result.
+    struct Scratch(UnsafeCell<[u8; SCRATCH_LEN]>);
+    unsafe impl Sync for Scratch {}
+    static SCRATCH: Scratch = Scratch(UnsafeCell::new([0u8; SCRATCH_LEN]));
+
+    fn residual_host_call(func_ptr: usize, args: &[i64]) -> i64 {
+        assert!(
+            args.len() <= MAX_ARGS,
+            "residual_host_call: arity {} exceeds {MAX_ARGS}",
+            args.len()
+        );
+        let base = SCRATCH.0.get() as *mut u8;
+        unsafe {
+            (base.add(CALL_FUNC_OFS) as *mut i64).write_unaligned(func_ptr as i64);
+            (base.add(CALL_NARGS_OFS) as *mut i64).write_unaligned(args.len() as i64);
+            for (i, &a) in args.iter().enumerate() {
+                (base.add(CALL_ARGS_OFS + i * 8) as *mut i64).write_unaligned(a);
+            }
+            jit_call_host(base as u32);
+            (base.add(CALL_RESULT_OFS) as *const i64).read_unaligned()
+        }
+    }
+
+    /// Install the trampoline on the current thread. Idempotent.
+    pub fn install() {
+        majit_backend::call_stub::set_residual_host_call(Some(residual_host_call));
+    }
+}
+
+// Host-filesystem source provider for the native-host (`wasmi`) build.
+//
+// wasm32 has no filesystem, but the wasmtime runner does, so module source is
+// read through `pyre_host.*` host imports the runner satisfies. The runner
+// reports the real stdlib root (the `$PYRE_STDLIB` directory `pyre/check.py`
+// forwards); seeding it on `sys.path` lets the SAME import machinery that runs
+// on native resolve `import re` against genuine host paths. The browser/web
+// build has no such host, so it embeds the stdlib instead (`wasm_vfs`).
+#[cfg(all(target_arch = "wasm32", feature = "wasmi"))]
+mod host_fs_provider {
+    use pyre_interpreter::importing::SourceProvider;
+    use std::path::Path;
+
+    #[link(wasm_import_module = "pyre_host")]
+    unsafe extern "C" {
+        /// Write the real stdlib root path into `[buf, buf+cap)`; return its
+        /// byte length (without writing if it exceeds `cap`), or -1 if unset.
+        fn host_stdlib_root(buf_ptr: *mut u8, buf_cap: u32) -> i64;
+        /// 1 if `[path, path+len)` names a directory, else 0.
+        fn host_is_dir(path_ptr: *const u8, path_len: u32) -> u32;
+        /// Byte length of the regular file at `path`, or -1 if not a file.
+        fn host_file_size(path_ptr: *const u8, path_len: u32) -> i64;
+        /// Read the file at `path` into `[buf, buf+cap)`; return bytes written
+        /// (clamped to `cap`), or -1 on error.
+        fn host_read(path_ptr: *const u8, path_len: u32, buf_ptr: *mut u8, buf_cap: u32) -> i64;
+    }
+
+    struct HostFsProvider;
+
+    impl SourceProvider for HostFsProvider {
+        fn is_file(&self, path: &Path) -> bool {
+            let p = path.to_string_lossy();
+            unsafe { host_file_size(p.as_ptr(), p.len() as u32) >= 0 }
+        }
+        fn is_dir(&self, path: &Path) -> bool {
+            let p = path.to_string_lossy();
+            unsafe { host_is_dir(p.as_ptr(), p.len() as u32) != 0 }
+        }
+        fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+            let p = path.to_string_lossy();
+            let size = unsafe { host_file_size(p.as_ptr(), p.len() as u32) };
+            if size < 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("{}", path.display()),
+                ));
+            }
+            let mut buf = vec![0u8; size as usize];
+            let n = unsafe {
+                host_read(
+                    p.as_ptr(),
+                    p.len() as u32,
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                )
+            };
+            if n < 0 {
+                return Err(std::io::Error::other(format!(
+                    "host_read failed: {}",
+                    path.display()
+                )));
+            }
+            buf.truncate(n as usize);
+            String::from_utf8(buf)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        }
+    }
+
+    /// Query the host for the stdlib root, seed it on `sys.path`, and install
+    /// the host-FS source provider.  Called once before the first import.
+    pub fn install() {
+        let mut buf = vec![0u8; 4096];
+        let n = unsafe { host_stdlib_root(buf.as_mut_ptr(), buf.len() as u32) };
+        if n > 0 && (n as usize) <= buf.len() {
+            if let Ok(root) = std::str::from_utf8(&buf[..n as usize]) {
+                pyre_interpreter::importing::add_sys_path(Path::new(root));
+            }
+        }
+        pyre_interpreter::importing::install_source_provider(std::rc::Rc::new(HostFsProvider));
+    }
+}
 
 static PANIC_HOOK: Once = Once::new();
 
 fn install_panic_hook() {
     PANIC_HOOK.call_once(|| {
         std::panic::set_hook(Box::new(|info| {
+            // The module is built with the default `panic=abort`, so a panic
+            // ends the run. Record the formatted message in linear memory
+            // before the abort; the runner's `recover_panic_messages` scans for
+            // it (the browser glue surfaces it the same way) so the real cause
+            // is visible rather than a bare trap.
             let msg = format!("[pyre panic] {info}");
             OUTPUT_BUF.with(|buf| buf.borrow_mut().push_str(&msg));
         }));
@@ -43,7 +227,17 @@ fn install_wasm_print_hook() {
 /// (C-ABI) entry points below.
 fn run_python_impl(source: &str) -> String {
     install_panic_hook();
+    #[cfg(all(target_arch = "wasm32", feature = "wasmi"))]
+    residual_host::install();
     pyre_interpreter::importing::install_builtin_modules();
+    // Give the import machinery a source of module bytes. The browser has no
+    // filesystem, so the web build serves the embedded stdlib closure from an
+    // in-memory VFS; the native-host (`wasmi`) build reads the host filesystem
+    // through `pyre_host.*` imports the runner satisfies.
+    #[cfg(feature = "web")]
+    pyre_interpreter::importing::mount_embedded_stdlib(std::path::Path::new("/lib-python/3"));
+    #[cfg(all(target_arch = "wasm32", feature = "wasmi"))]
+    host_fs_provider::install();
     install_wasm_print_hook();
     OUTPUT_BUF.with(|buf| buf.borrow_mut().clear());
 
@@ -53,11 +247,35 @@ fn run_python_impl(source: &str) -> String {
     };
 
     let execution_context = std::rc::Rc::new(PyExecutionContext::default());
+    // Seed the TLS execution-context slot (pyrex real_main does the same at
+    // boot). `getexecutioncontext().gettopframe()` must be live so a residual
+    // `bh_call_fn_impl` from a blackhole resume — e.g. a `print(...)` after a
+    // JIT-compiled loop — can resolve its parent frame instead of tripping the
+    // fail-fast topframe assert.
+    pyre_interpreter::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&execution_context));
+    // Register the __build_class__ callback and seed its exec-context slot
+    // (pyrex setup_exec_context does the same). Without this, a `class Sub(...,
+    // kw=...)` body cannot resolve the live frame in call_init_subclass_on_bases
+    // and __init_subclass__ keyword arguments are rejected.
+    pyre_interpreter::call::register_build_class();
+    pyre_interpreter::call::set_build_class_exec_ctx(std::rc::Rc::as_ptr(&execution_context));
     let mut frame =
         match pyre_interpreter::pyframe::PyFrame::new_with_context(code, execution_context) {
             Ok(frame) => frame,
             Err(e) => return format!("Error: {e}"),
         };
+
+    // Register the `__main__` module in sys.modules (pyrex real_main does the
+    // same), reusing the canonical globals dict so `__main__.__dict__`,
+    // `globals()`, and `function.__globals__` share one identity. Without this,
+    // `sys.modules['__main__']` / `import __main__` raise KeyError.
+    let canonical = frame.get_w_globals_obj();
+    let main_module = pyre_object::moduleobject::w_module_new_aliasing_dict(
+        "__main__",
+        unsafe { pyre_object::w_dict_get_dict_storage_proxy(canonical) },
+        canonical,
+    );
+    pyre_interpreter::importing::set_sys_module("__main__", main_module);
 
     // catch_unwind to capture panics from JIT as error messages
     let eval_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -154,14 +372,23 @@ mod host_abi {
     /// the host must free with `pyre_dealloc`.
     #[unsafe(no_mangle)]
     pub extern "C" fn pyre_run_python(ptr: *const u8, len: usize) -> u64 {
-        let source = if ptr.is_null() {
-            String::new()
+        let result = if ptr.is_null() || len == 0 {
+            run_python_impl("")
         } else {
-            let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-            String::from_utf8_lossy(bytes).into_owned()
+            // Reject a (ptr, len) that escapes linear memory before forming a
+            // slice; the embedder supplies these raw, so an out-of-range pair
+            // would otherwise be undefined behaviour.
+            let mem_bytes = core::arch::wasm32::memory_size(0).saturating_mul(65536);
+            match (ptr as usize).checked_add(len) {
+                Some(end) if end <= mem_bytes => {
+                    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+                    run_python_impl(&String::from_utf8_lossy(bytes))
+                }
+                _ => "Error: input buffer out of wasm memory bounds".to_string(),
+            }
         };
 
-        let out = run_python_impl(&source).into_bytes();
+        let out = result.into_bytes();
         let out_len = out.len();
         let out_ptr = pyre_alloc(out_len);
         if out_len != 0 {

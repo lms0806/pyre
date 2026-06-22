@@ -40,7 +40,10 @@ pub fn jit_exc_raise(value: i64) {
     let exc_type = if value == 0 {
         0
     } else {
-        unsafe { *(value as *const i64) }
+        // `typeptr` is a machine pointer (32-bit on wasm32); read it at
+        // pointer width and zero-extend, so the high bits stay clear and
+        // `GuardException`'s type comparison matches the baked class pointer.
+        unsafe { *(value as *const usize) as i64 }
     };
     JIT_EXC_VALUE.store(value, Ordering::Relaxed);
     JIT_EXC_TYPE.store(exc_type, Ordering::Relaxed);
@@ -52,6 +55,12 @@ pub fn jit_exc_take() -> i64 {
     let value = JIT_EXC_VALUE.swap(0, Ordering::Relaxed);
     JIT_EXC_TYPE.store(0, Ordering::Relaxed);
     value
+}
+
+/// Clear both exception slots without reading the value.
+pub fn jit_exc_clear() {
+    JIT_EXC_VALUE.store(0, Ordering::Relaxed);
+    JIT_EXC_TYPE.store(0, Ordering::Relaxed);
 }
 
 /// Address of `JIT_EXC_VALUE`, embedded as an immediate in JIT-emitted wasm
@@ -133,6 +142,53 @@ fn wasm_alloc_oldgen_typed(type_id: u32, size: usize) -> GcRef {
             Some(gc) => gc.alloc_oldgen_typed(type_id, size),
             None => GcRef(0),
         }
+    })
+}
+
+/// JIT-trace allocation trampoline target for `New` / `NewWithVtable`.
+///
+/// A compiled trace cannot allocate directly (the GC lives behind the
+/// `WASM_ACTIVE_GC` thread-local), so the `New` codegen routes through the
+/// host `jit_call` trampoline, which resolves this function via the module's
+/// `__indirect_function_table` (its address is taken in `compile_loop`, so it
+/// lands in the table) and invokes it with `(type_id, size)`. Returns the new
+/// object pointer, or 0 when no GC is installed. The `ob_type` field for
+/// `NewWithVtable` is written inline by codegen at `vtable_offset`.
+pub extern "C" fn wasm_jit_alloc(type_id: i64, size: i64) -> i64 {
+    wasm_alloc_nursery_typed(type_id as u32, size as usize).0 as i64
+}
+
+/// JIT-trace variable-size allocation trampoline target for `NewArray` /
+/// `NewArrayClear`. Allocates `length` items and writes the length field at
+/// `len_offset`, mirroring [`WasmBackend::bh_new_array`].
+pub extern "C" fn wasm_jit_alloc_array(
+    type_id: i64,
+    base_size: i64,
+    item_size: i64,
+    length: i64,
+    len_offset: i64,
+) -> i64 {
+    let Ok(length) = usize::try_from(length) else {
+        return 0;
+    };
+    WASM_ACTIVE_GC.with(|cell| match cell.borrow_mut().as_deref_mut() {
+        Some(gc) => {
+            let obj = gc.alloc_varsize_typed(
+                type_id as u32,
+                base_size as usize,
+                item_size as usize,
+                length,
+            );
+            if obj.is_null() {
+                0
+            } else {
+                unsafe {
+                    *((obj.0 as *mut u8).add(len_offset as usize) as *mut usize) = length;
+                }
+                obj.0 as i64
+            }
+        }
+        None => 0,
     })
 }
 
@@ -385,6 +441,53 @@ impl WasmBackend {
 
 unsafe impl Send for WasmBackend {}
 
+/// Report why a trace cannot be compiled by the wasm backend, or `None` if it
+/// can. Declined traces fall back to the interpreter (correct, unaccelerated)
+/// instead of producing an invalid trace module.
+fn wasm_unsupported_trace_reason(ops: &[Op]) -> Option<String> {
+    let mut has_label = false;
+    let mut has_jump = false;
+    let mut has_new = false;
+    let mut has_call = false;
+    for op in ops {
+        if op.opcode.is_call_assembler() {
+            // CALL_ASSEMBLER enters another trace's compiled token; the wasm
+            // backend has no inter-module trace chaining (#62).
+            return Some(format!(
+                "wasm backend: {:?} (loop-callee inline)",
+                op.opcode
+            ));
+        }
+        match op.opcode {
+            majit_ir::OpCode::Label => has_label = true,
+            majit_ir::OpCode::Jump => has_jump = true,
+            majit_ir::OpCode::New
+            | majit_ir::OpCode::NewWithVtable
+            | majit_ir::OpCode::NewArray
+            | majit_ir::OpCode::NewArrayClear => has_new = true,
+            opcode if opcode.is_call() => has_call = true,
+            _ => {}
+        }
+    }
+    // A JUMP with no LABEL targets an external loop; codegen's `br` would have
+    // no enclosing loop block, yielding invalid wasm.
+    if has_jump && !has_label {
+        return Some("wasm backend: JUMP to external loop (no local LABEL)".into());
+    }
+    // A loop that BOTH allocates and makes residual calls every iteration grows
+    // the heap without bound (the wasm backend has no GC malloc-nursery rewrite,
+    // so wasm_jit_alloc never collects) while the host-trampoline calls keep it
+    // running long enough to exhaust memory. Decline so the interpreter (with
+    // its GC) runs the loop. An all-inline allocating loop (no residual call)
+    // stays compiled: it is fast and its bounded run does not exhaust memory.
+    if has_label && has_new && has_call {
+        return Some(
+            "wasm backend: allocation + residual call in loop trace (no GC nursery)".into(),
+        );
+    }
+    None
+}
+
 impl majit_backend::Backend for WasmBackend {
     fn cpu_tracker(&self) -> &std::sync::Arc<majit_backend::CpuTotalTracker> {
         &self.cpu_tracker
@@ -392,6 +495,81 @@ impl majit_backend::Backend for WasmBackend {
 
     fn backend_name(&self) -> &'static str {
         "wasm"
+    }
+
+    // ── Blackhole allocation (llmodel.py:775-790) ──
+    //
+    // The blackhole interpreter materializes virtuals (e.g. a virtualized
+    // `W_IntObject` loop variable forced at loop exit) through these. Without
+    // a real implementation `bhimpl_new*` returns 0 and the resumed frame
+    // carries null operands. Mirrors `CraneliftBackend`'s overrides but routes
+    // through the wasm thread-local GC; allocation inputs carry no unrooted GC
+    // refs, so no collection-suppression beyond the no-collect fixed-size path
+    // is required.
+
+    /// llmodel.py:775 bh_new(sizedescr).
+    fn bh_new(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
+        let size = sizedescr.as_size();
+        // TODO: get_type_id() returns the u64 path_hash cache key; the GC tid
+        // is its low 32 bits until gc_cache routing resolves the real tid.
+        let type_id = sizedescr.get_type_id() as u32;
+        WASM_ACTIVE_GC.with(|cell| match cell.borrow_mut().as_deref_mut() {
+            Some(gc) => gc.alloc_nursery_no_collect_typed(type_id, size).0 as i64,
+            None => 0,
+        })
+    }
+
+    /// llmodel.py:778-782 bh_new_with_vtable(sizedescr): allocate, then write
+    /// the type pointer at `vtable_offset`.
+    fn bh_new_with_vtable(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
+        let size = sizedescr.as_size();
+        let vtable = sizedescr.get_vtable();
+        let type_id = sizedescr.get_type_id() as u32;
+        let ptr = WASM_ACTIVE_GC.with(|cell| match cell.borrow_mut().as_deref_mut() {
+            Some(gc) => gc.alloc_nursery_no_collect_typed(type_id, size).0 as i64,
+            None => 0,
+        });
+        if ptr != 0 && vtable != 0 {
+            if let Some(vt_off) = self.vtable_offset {
+                unsafe {
+                    *((ptr as *mut u8).add(vt_off) as *mut usize) = vtable;
+                }
+            }
+        }
+        ptr
+    }
+
+    /// llmodel.py:788 bh_new_array(length, arraydescr).
+    fn bh_new_array(&self, length: i64, arraydescr: &majit_translate::jitcode::BhDescr) -> i64 {
+        let length = usize::try_from(length).expect("bh_new_array length must be non-negative");
+        let (base_size, itemsize, _sign) = arraydescr.unpack_arraydescr_size();
+        let len_offset = arraydescr
+            .array_len_offset()
+            .expect("bh_new_array requires ArrayDescr.lendescr");
+        let type_id = arraydescr.get_type_id() as u32;
+        WASM_ACTIVE_GC.with(|cell| match cell.borrow_mut().as_deref_mut() {
+            Some(gc) => {
+                let obj = gc.alloc_varsize_typed(type_id, base_size, itemsize, length);
+                if obj.is_null() {
+                    0
+                } else {
+                    unsafe {
+                        *((obj.0 as *mut u8).add(len_offset) as *mut usize) = length;
+                    }
+                    obj.0 as i64
+                }
+            }
+            None => 0,
+        })
+    }
+
+    /// llmodel.py:790 bh_new_array_clear = bh_new_array (allocator zeroes).
+    fn bh_new_array_clear(
+        &self,
+        length: i64,
+        arraydescr: &majit_translate::jitcode::BhDescr,
+    ) -> i64 {
+        self.bh_new_array(length, arraydescr)
     }
 
     fn compile_loop(
@@ -408,12 +586,32 @@ impl majit_backend::Backend for WasmBackend {
         }
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let ops: &[Op] = &ops_owned;
+
+        // Decline traces the wasm backend cannot compile correctly, so the
+        // metainterp falls back to the interpreter (correct, if unaccelerated)
+        // rather than installing a structurally-invalid trace module:
+        //   * CALL_ASSEMBLER inlines a loop-bearing callee by jumping into
+        //     another trace's compiled token. The wasm backend has no
+        //     inter-module trace chaining (each trace is its own module), so it
+        //     cannot execute the target — declining is the #62 loop-callee gap.
+        //   * A JUMP with no LABEL targets an external loop; codegen would emit
+        //     a `br 0` with no enclosing block, producing invalid wasm
+        //     ("expected i32 but nothing on stack").
+        if let Some(reason) = wasm_unsupported_trace_reason(ops) {
+            return Err(BackendError::Unsupported(reason));
+        }
+
         self.collect_constants_from_ops(ops);
         let trace_id = self.trace_counter;
         self.trace_counter += 1;
 
         let typeid_table = self.collect_classptr_typeid_table(ops);
         let guard_gc_type_info = self.collect_guard_gc_type_info(ops);
+        // Allocation helpers reached from a compiled trace through the host
+        // `jit_call` trampoline. `fn as usize` is the `__indirect_function_table`
+        // index on wasm32; taking it here keeps the function in the table.
+        let alloc_fn_ptr = wasm_jit_alloc as *const () as usize as i64;
+        let alloc_array_fn_ptr = wasm_jit_alloc_array as *const () as usize as i64;
         let (wasm_bytes, guard_exits) = codegen::build_wasm_module(
             inputargs,
             ops,
@@ -421,6 +619,8 @@ impl majit_backend::Backend for WasmBackend {
             self.vtable_offset,
             &typeid_table,
             &guard_gc_type_info,
+            alloc_fn_ptr,
+            alloc_array_fn_ptr,
         )?;
 
         // Build fail descriptors
@@ -529,6 +729,13 @@ impl majit_backend::Backend for WasmBackend {
         }
         #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
         {
+            // The pending-exception cell is global, unlike the native
+            // per-jitframe `jf_guard_exc`. A residual raise on a blackhole
+            // resume path (publish_residual_call_exception) writes it outside
+            // any trace and nothing clears it, so clear it before running this
+            // trace; otherwise jit_exc_take below would surface a stale
+            // exception from a previous frame's resume as this trace's.
+            jit_exc_clear();
             glue::execute(compiled.func_handle, _frame_ptr);
 
             // A GuardNoException / GuardException exit leaves the pending

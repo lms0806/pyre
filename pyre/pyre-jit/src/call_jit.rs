@@ -459,14 +459,26 @@ extern "C" fn jit_call_user_function_from_frame(
             // machinery sees it, bypassing try/except.
             let exc_obj = err.exc_object;
             if exc_obj != pyre_object::PY_NULL {
-                #[cfg(feature = "cranelift")]
-                majit_backend_cranelift::jit_exc_raise(exc_obj as i64);
-                #[cfg(feature = "dynasm")]
-                majit_backend_dynasm::jit_exc_raise(exc_obj as i64);
+                store_jit_exception(exc_obj as i64);
             }
             0 // garbage — GUARD_NO_EXCEPTION will fire
         }
     }
+}
+
+/// llmodel.py:194-199 _store_exception: publish a materialised exception
+/// object into the active backend's `_store_exception` cells so the
+/// GuardNoException after the call detects it. One arm per backend; the wasm
+/// backend keeps the pending exception in shared linear memory.
+pub(crate) fn store_jit_exception(value: i64) {
+    #[cfg(feature = "cranelift")]
+    majit_backend_cranelift::jit_exc_raise(value);
+    #[cfg(feature = "dynasm")]
+    majit_backend_dynasm::jit_exc_raise(value);
+    #[cfg(target_arch = "wasm32")]
+    majit_backend_wasm::jit_exc_raise(value);
+    #[cfg(not(any(feature = "cranelift", feature = "dynasm", target_arch = "wasm32")))]
+    let _ = value;
 }
 
 /// Backend bridge for pyre-interpreter's residual-call helpers, which
@@ -474,10 +486,7 @@ extern "C" fn jit_call_user_function_from_frame(
 /// exception object into the active backend's _store_exception cells so
 /// the GuardNoException after the call detects it.
 extern "C" fn jit_exc_raise_shim(value: i64) {
-    #[cfg(feature = "cranelift")]
-    majit_backend_cranelift::jit_exc_raise(value);
-    #[cfg(feature = "dynasm")]
-    majit_backend_dynasm::jit_exc_raise(value);
+    store_jit_exception(value);
 }
 
 /// Publish a raise from a may-force residual helper to BOTH executors.
@@ -492,10 +501,7 @@ extern "C" fn jit_exc_raise_shim(value: i64) {
 /// helper's NULL result flows to the consumer — keep both states in sync.
 fn publish_residual_call_exception(exc_obj: i64) {
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj));
-    #[cfg(feature = "cranelift")]
-    majit_backend_cranelift::jit_exc_raise(exc_obj);
-    #[cfg(feature = "dynasm")]
-    majit_backend_dynasm::jit_exc_raise(exc_obj);
+    store_jit_exception(exc_obj);
 }
 
 /// Drain the backend `_store_exception` cells (`jit_exc_clear`) without
@@ -519,6 +525,8 @@ pub(crate) fn drain_backend_jit_exc() {
     majit_backend_cranelift::jit_exc_clear();
     #[cfg(feature = "dynasm")]
     majit_backend_dynasm::jit_exc_clear();
+    #[cfg(target_arch = "wasm32")]
+    majit_backend_wasm::jit_exc_clear();
 }
 
 #[majit_macros::jit_may_force]
@@ -1957,10 +1965,7 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
                 // below (line 2120-2122) and with `lib.rs::jit_exc_raise`
                 // — every backend's blackhole resume publishes the
                 // pending exception, not just cranelift.
-                #[cfg(feature = "cranelift")]
-                majit_backend_cranelift::jit_exc_raise(exc_obj as i64);
-                #[cfg(feature = "dynasm")]
-                majit_backend_dynasm::jit_exc_raise(exc_obj as i64);
+                store_jit_exception(exc_obj as i64);
             }
             Some(0) // garbage return — GUARD_NO_EXCEPTION will fire
         }
@@ -2014,10 +2019,7 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
                     if exc_obj != pyre_object::PY_NULL {
                         majit_metainterp::blackhole::BH_LAST_EXC_VALUE
                             .with(|c| c.set(exc_obj as i64));
-                        #[cfg(feature = "cranelift")]
-                        majit_backend_cranelift::jit_exc_raise(exc_obj as i64);
-                        #[cfg(feature = "dynasm")]
-                        majit_backend_dynasm::jit_exc_raise(exc_obj as i64);
+                        store_jit_exception(exc_obj as i64);
                     }
                     Some(0)
                 }
@@ -2080,6 +2082,9 @@ fn bridge_source_identity_from_descr(
 /// On failure (trace abort, start failure), returns false so the caller
 /// falls through to resume_in_blackhole (RPython pyjitpl.py:2906-2907
 /// SwitchToBlackhole → run_blackhole_interp_to_cancel_tracing).
+// On wasm the early unconditional decline makes the native bridge body
+// unreachable; the suppression is intentional and wasm-only.
+#[cfg_attr(target_arch = "wasm32", allow(unreachable_code))]
 pub fn trace_and_compile_from_bridge(
     // pyjitpl.py:2890 `handle_guard_failure(self, resumedescr, deadframe)`
     // threads `resumedescr` (the descr) as the canonical identity source
@@ -2118,6 +2123,31 @@ pub fn trace_and_compile_from_bridge(
         // the caller into `resume_in_blackhole` (pyjitpl.py:711).
         return false;
     };
+
+    // The wasm backend declines every compile_bridge (no inter-module trace
+    // chaining, #62), so a bridge attempt always falls back to a blackhole
+    // resume. Running the bridge tracer walk first executes the resumed region
+    // — any post-loop tail or exception handler — concretely, and the declined
+    // backend then drops the caller into resume_in_blackhole, which re-executes
+    // the same region: a side-effecting tail fires twice (and the wasted walk
+    // every iteration of a hot guard makes the loop time out). Skip the walk
+    // and resume in the blackhole exactly once. resume_in_blackhole_from_exit_
+    // layout decodes its own position from the exit layout, so no frame PC
+    // setup is owed here. Native compiles or cleanly aborts bridges, so this
+    // routing is wasm-only.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (
+            frame,
+            raw_values,
+            exit_layout,
+            guard_exc,
+            green_key,
+            trace_id,
+            fail_index,
+        );
+        return false;
+    }
 
     let info = {
         let (_, info) = crate::eval::driver_pair();
