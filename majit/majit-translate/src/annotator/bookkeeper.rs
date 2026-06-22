@@ -648,7 +648,12 @@ impl Bookkeeper {
             };
             variants
                 .iter()
-                .filter(|(root, _)| root.contains("::"))
+                // A `::`-qualified template root (`module::Enum`) or a
+                // per-instantiation root (`Result<Tuple>`, #100) — both
+                // name a real enum base.  The bare leaf duplicate
+                // (`Enum`) is the other key the registration publishes,
+                // skipped here so the subtree numbers once.
+                .filter(|(root, _)| root.contains("::") || root.contains('<'))
                 .filter_map(|(root, by_discr)| {
                     let leaf = root.rsplit("::").next().unwrap_or(root);
                     reg.is_enum_base(leaf).then(|| {
@@ -1834,10 +1839,21 @@ impl Bookkeeper {
         receiver: &Rc<crate::flowspace::model::Variable>,
     ) -> Option<super::model::KnownTypeData> {
         let by_discr = {
+            // The discriminant→variant table is keyed by the bare
+            // charon-template root (one template per generic ADT), so a
+            // per-instantiation receiver name (`Result<bool>`) must drop
+            // its `<…>` suffix to resolve.  Bare names pass through
+            // unchanged.
+            let lookup_root = majit_ir::descr::strip_instantiation_suffix(enum_root);
             let guard = self.pyre_enum_variant_by_discriminant.borrow();
             let map = guard.as_ref()?;
-            map.get(enum_root)
-                .or_else(|| enum_root.rsplit("::").next().and_then(|leaf| map.get(leaf)))
+            map.get(lookup_root)
+                .or_else(|| {
+                    lookup_root
+                        .rsplit("::")
+                        .next()
+                        .and_then(|leaf| map.get(leaf))
+                })
                 .cloned()?
         };
         let mut ktd = super::model::KnownTypeData::new();
@@ -2106,13 +2122,14 @@ impl Bookkeeper {
             "f32" => return SomeValue::SingleFloat(super::model::SomeSingleFloat::new()),
             "f64" => return SomeValue::Float(super::model::SomeFloat::new()),
             "bool" => return super::model::s_bool(),
-            // Rust strings are UTF-8 text; literals lower through
-            // `__str_const` into `UniStr` constants (UnicodeString
-            // annotation, `UnicodeRepr::convert_const`), so the field
-            // projection must be the unicode string type or attr-cell
-            // unions degrade to the byte `StringRepr` ("not a str:
-            // UniStr(..)" at convert_const).
-            "String" | "str" => return super::model::s_unicode0(),
+            // Rust `String`/`str` fields are byte string values: string
+            // literals lower through `__str_const` into
+            // `ConstValue::ByteStr` constants (stamped `Ptr(STR)`, the
+            // rtyper's byte `StringRepr`), so the field projection must
+            // meet the same `SomeString` — projecting `s_unicode0` here
+            // raised `str ∪ unicode` where a literal merged into a
+            // String-typed attr cell.
+            "String" | "str" => return super::model::s_str0(),
             "char" => return SomeValue::Char(super::model::SomeChar::new(false)),
             "()" => return super::model::s_none(),
             _ => {}

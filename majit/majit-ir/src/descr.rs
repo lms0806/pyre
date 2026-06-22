@@ -422,6 +422,16 @@ pub fn register_struct_origins(origins: std::collections::HashMap<String, String
 /// `use foo::bar::Baz` path expansion that yields `foo::bar::Baz`
 /// in the AST).
 pub fn canonical_struct_name(name: &str) -> String {
+    // A per-instantiation name carries a `<…>` argument suffix
+    // (`Result<Tuple>`).  Canonicalize the bare base and reattach the
+    // suffix verbatim so a leaf (`Result<Tuple>`) and a qualified
+    // (`core::result::Result<Tuple>`) spelling normalise to one key,
+    // exactly as their bare bases reconcile — the base never contains a
+    // `<`, so the recursion bottoms out in the ungeneric path below.
+    if let Some(lt) = name.find('<') {
+        let (base, suffix) = name.split_at(lt);
+        return format!("{}{}", canonical_struct_name(base), suffix);
+    }
     if name.contains("::") {
         return name.to_string();
     }
@@ -431,6 +441,63 @@ pub fn canonical_struct_name(name: &str) -> String {
             format!("{}::{}", module_path, name)
         }
         _ => name.to_string(),
+    }
+}
+
+/// Drop a trailing generic-argument suffix (`Foo<bar>` → `Foo`,
+/// `m::Foo<a, b>` → `m::Foo`), returning the ungeneric root.
+/// Truncates at the first `<`, so a nested argument's own `::` / `<`
+/// never leaks into the root; a name with no `<` is returned unchanged.
+///
+/// A per-instantiation enum receiver is spelled `Result<bool>`, but the
+/// discriminant→variant table is keyed by the bare template root
+/// `Result` (one template per generic ADT).  The narrowing resolver
+/// strips the suffix for that table lookup while the variant `ClassDef`
+/// key keeps it.
+pub fn strip_instantiation_suffix(name: &str) -> &str {
+    match name.find('<') {
+        Some(i) => &name[..i],
+        None => name,
+    }
+}
+
+/// Remove the first balanced generic-argument group from a (possibly
+/// variant-qualified) name, preserving any trailing path segment:
+/// `Result<Tuple>::Ok` → `Result::Ok`, `Result<Tuple>` → `Result`,
+/// `m::Result<core::option::Option<i32>>::Ok` → `m::Result::Ok`.  A name
+/// with no `<` is borrowed unchanged (no allocation).
+///
+/// Unlike [`strip_instantiation_suffix`] (which truncates at the first
+/// `<`), this keeps the `::variant` tail a per-instantiation enum variant
+/// key carries, so a `Result<Tuple>::Ok` field lookup resolves through the
+/// bare `Result::Ok` rows the template registered.
+pub fn strip_generic_args(name: &str) -> std::borrow::Cow<'_, str> {
+    let Some(start) = name.find('<') else {
+        return std::borrow::Cow::Borrowed(name);
+    };
+    let mut depth = 0usize;
+    let mut end = None;
+    for (i, b) in name.bytes().enumerate().skip(start) {
+        match b {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    match end {
+        Some(e) => {
+            let mut out = String::with_capacity(name.len() - (e + 1 - start));
+            out.push_str(&name[..start]);
+            out.push_str(&name[e + 1..]);
+            std::borrow::Cow::Owned(out)
+        }
+        None => std::borrow::Cow::Borrowed(name),
     }
 }
 
@@ -4815,6 +4882,64 @@ impl FailDescr for SimpleFailDescr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_instantiation_suffix_drops_generic_args() {
+        // `<…>` is truncated at the first `<`, keeping any module
+        // qualifier and dropping a nested argument's own `::` / `<`.
+        assert_eq!(strip_instantiation_suffix("Result<bool>"), "Result");
+        assert_eq!(
+            strip_instantiation_suffix("m::Result<bool, E>"),
+            "m::Result"
+        );
+        assert_eq!(
+            strip_instantiation_suffix("Result<core::option::Option<i32>>"),
+            "Result"
+        );
+        // No `<` → unchanged (the behaviour every existing bare-keyed
+        // caller relies on).
+        assert_eq!(strip_instantiation_suffix("Color"), "Color");
+        assert_eq!(strip_instantiation_suffix("module::Color"), "module::Color");
+    }
+
+    #[test]
+    fn strip_generic_args_keeps_variant_tail() {
+        // The balanced `<…>` group is removed, the trailing `::variant`
+        // segment kept — the spelling a per-instantiation variant key
+        // (`Result<Tuple>::Ok`) must resolve under the bare template rows.
+        assert_eq!(strip_generic_args("Result<Tuple>::Ok"), "Result::Ok");
+        assert_eq!(strip_generic_args("Result<Tuple>"), "Result");
+        assert_eq!(
+            strip_generic_args("m::Result<core::option::Option<i32>>::Ok"),
+            "m::Result::Ok"
+        );
+        // No `<` → borrowed unchanged.
+        assert_eq!(strip_generic_args("Result::Ok"), "Result::Ok");
+        assert!(matches!(
+            strip_generic_args("Result::Ok"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn canonical_struct_name_reattaches_generic_suffix() {
+        // A leaf with no origin-registry entry reattaches its suffix
+        // verbatim (the recursion bottoms out in the ungeneric path).
+        // `Tuple` has no `::`, so the leaf stays bare and the `<…>` is
+        // preserved exactly — the constructor and the prologue pre-mint
+        // pass the identical string and resolve one classdef.
+        assert_eq!(canonical_struct_name("Result<Tuple>"), "Result<Tuple>");
+        // Already-qualified base passes through verbatim under the suffix.
+        assert_eq!(
+            canonical_struct_name("core::result::Result<Tuple>"),
+            "core::result::Result<Tuple>"
+        );
+        // Idempotent.
+        assert_eq!(
+            canonical_struct_name(&canonical_struct_name("Result<Tuple>")),
+            canonical_struct_name("Result<Tuple>")
+        );
+    }
 
     // ── FFI call surface parity tests (rpython/jit/metainterp/test/test_fficall.py) ──
 
