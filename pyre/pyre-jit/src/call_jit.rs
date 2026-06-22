@@ -3821,6 +3821,42 @@ pub extern "C" fn bh_import_name_fn(
     }
 }
 
+/// IMPORT_FROM residual (`import_from` HLOp → `residual_call_ir_r`).
+/// Resolves the attribute name from the jitcode's own code object via
+/// `name_idx` (same `co_names` invariant as `bh_load_attr_fn`) and runs
+/// `importing::import_from(module, name, ec)` — first the module's
+/// namespace dict, then a submodule-import fallback (which may run a
+/// module's top-level Python → `MayForce`) — with the TLS-pinned
+/// execution context.  `module` is the peeked TOS (IMPORT_FROM does not
+/// pop it).  On error the exception is published through
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the call
+/// returns 0.
+pub extern "C" fn bh_import_from_fn(module: i64, w_code_ptr: i64, name_idx: i64) -> i64 {
+    let w_code = w_code_ptr as pyre_object::PyObjectRef;
+    let code = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject)
+    };
+    let idx = name_idx as usize;
+    debug_assert!(
+        idx < code.names.len(),
+        "bh_import_from_fn name_idx {idx} out of range ({} names) — codegen invariant",
+        code.names.len()
+    );
+    if idx >= code.names.len() {
+        return 0;
+    }
+    let name = code.names[idx].as_ref();
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    match pyre_interpreter::importing::import_from(module as pyre_object::PyObjectRef, name, ec) {
+        Ok(attr) => attr as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            publish_residual_call_exception(exc_obj as i64);
+            0
+        }
+    }
+}
+
 /// LOAD_SUPER_ATTR residual (`load_super_attr` HLOp → `residual_call_ir_r`).
 /// Resolves the attribute name from the jitcode's code object via `name_idx`
 /// (same `co_names` invariant as `bh_load_attr_fn`), builds the `super(cls,
@@ -3905,6 +3941,28 @@ pub extern "C" fn bh_binary_slice_fn(obj: i64, start: i64, stop: i64) -> i64 {
             0
         }
     }
+}
+
+/// STORE_SLICE residual (`store_slice` HLOp → `residual_call_r_v`).
+/// Runs `obj[start:stop] = value` through the shared
+/// `runtime_ops::store_slice_values` (the same code the interpreter's
+/// `store_slice` runs — builds a `slice(start, stop, None)` and dispatches
+/// `setitem`).  A user `__setitem__` or slice-bound `__index__` may run
+/// Python and force virtualizables (`MayForce`).  Void result, so always
+/// returns 0; on error the exception is published through
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException`, matching
+/// `bh_delete_subscr_fn`.
+pub extern "C" fn bh_store_slice_fn(obj: i64, start: i64, stop: i64, value: i64) -> i64 {
+    if let Err(err) = pyre_interpreter::runtime_ops::store_slice_values(
+        obj as pyre_object::PyObjectRef,
+        start as pyre_object::PyObjectRef,
+        stop as pyre_object::PyObjectRef,
+        value as pyre_object::PyObjectRef,
+    ) {
+        let exc_obj = err.to_exc_object();
+        publish_residual_call_exception(exc_obj as i64);
+    }
+    0
 }
 
 /// DELETE_SUBSCR residual (`delete_subscr` HLOp → `residual_call_r_v`).
@@ -4036,6 +4094,36 @@ pub extern "C" fn bh_store_name_fn(frame_ptr: i64, w_name: i64, value: i64) -> i
     let name =
         unsafe { pyre_object::strobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
     match frame.store_name_value(name, 0, value as pyre_object::PyObjectRef) {
+        Ok(()) => 1,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            0
+        }
+    }
+}
+
+/// `STORE_GLOBAL` residual for the standalone (blackhole / deopt)
+/// per-CodeObject jitcode.  `pyopcode.py:567 STORE_GLOBAL` writes the
+/// value directly into `w_globals`, bypassing `w_locals`.  Delegates to
+/// the interpreter trait impl (`eval.rs store_global_value`), which
+/// routes through `w_dict_setitem_str` on the eagerly-resolved
+/// `w_globals_obj` (or the back-mirror dict storage when null).  Same
+/// blackhole-only execution contract and `w_name` ABI as
+/// `bh_store_name_fn`.  `STORE_GLOBAL` carries no nameindex-keyed cache,
+/// so the trait's `nameindex` argument is passed as 0.  Returns 1 on
+/// success; on error it sets `BH_LAST_EXC_VALUE` and returns 0.
+pub extern "C" fn bh_store_global_fn(frame_ptr: i64, w_name: i64, value: i64) -> i64 {
+    use pyre_interpreter::pyopcode::NamespaceOpcodeHandler;
+    assert!(
+        frame_ptr != 0,
+        "bh_store_global_fn requires a non-null PyFrame; every STORE_GLOBAL emit \
+         site must thread portal_frame_reg as the leading ref operand"
+    );
+    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    let name =
+        unsafe { pyre_object::strobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
+    match frame.store_global_value(name, 0, value as pyre_object::PyObjectRef) {
         Ok(()) => 1,
         Err(err) => {
             let exc_obj = err.to_exc_object();
@@ -4641,8 +4729,7 @@ pub extern "C" fn bh_unpack_sequence_fn(count: i64, seq: i64) -> i64 {
     match pyre_interpreter::runtime_ops::unpack_sequence_exact(seq, count as usize) {
         Ok(items) => pyre_interpreter::runtime_ops::build_tuple_from_refs(&items) as i64,
         Err(err) => {
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE
-                .with(|c| c.set(err.to_exc_object() as i64));
+            publish_residual_call_exception(err.to_exc_object() as i64);
             0
         }
     }
@@ -4657,6 +4744,23 @@ pub extern "C" fn bh_unpack_item_fn(index: i64, seq: i64) -> i64 {
         Err(err) => {
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE
                 .with(|c| c.set(err.to_exc_object() as i64));
+            0
+        }
+    }
+}
+
+/// UNPACK_EX: split `seq` for `a, *b, c = seq` into `before` head items, a
+/// starred middle list, and `after` tail items, returning the
+/// `before + 1 + after` slots in TOS order as a tuple (raising ValueError on
+/// too few values, or any iteration error from a non-sequence source). The
+/// portal reads each slot back out with `bh_unpack_item_fn`, mirroring
+/// `bh_unpack_sequence_fn`.
+pub extern "C" fn bh_unpack_ex_fn(before: i64, after: i64, seq: i64) -> i64 {
+    let seq = seq as pyre_object::PyObjectRef;
+    match pyre_interpreter::runtime_ops::unpack_ex_slots(before as usize, after as usize, seq) {
+        Ok(slots) => pyre_interpreter::runtime_ops::build_tuple_from_refs(&slots) as i64,
+        Err(err) => {
+            publish_residual_call_exception(err.to_exc_object() as i64);
             0
         }
     }

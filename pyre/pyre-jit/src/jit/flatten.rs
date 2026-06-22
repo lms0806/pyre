@@ -3179,6 +3179,12 @@ pub struct LoweringContext {
     /// w_name, value]`, void result) via
     /// [`lower_store_name_hlop_to_insn`].
     pub store_name_fn_idx: u16,
+    /// `store_global_fn` descrs-pool index.  STORE_GLOBAL family (single
+    /// HLOp opname `store_global`, the `pyopcode.py:567` frame-receiver
+    /// shape) lowers to `residual_call_r_v` (three Ref inputs `[frame,
+    /// w_name, value]`, void result) via
+    /// [`lower_store_global_hlop_to_insn`].
+    pub store_global_fn_idx: u16,
     /// `bind(assembler, cpu.newtuple_from_array_fn as *const (),
     /// CallFlavor::Plain)` descrs-pool index for the production
     /// source.  BUILD_TUPLE records the rtyped `pyopcode.py:995-998`
@@ -3337,6 +3343,15 @@ pub struct LoweringContext {
     /// `bh_import_name_fn` runs `__import__` (module top-level Python may
     /// run → `MayForce`).
     pub import_name_fn_idx: u16,
+    /// `import_from_fn` descrs-pool index.  IMPORT_FROM records the
+    /// `import_from(module, code, name_idx)` HLOp (code = the jitcode's own
+    /// W_CodeObject as a `Signed(ptr) + Kind::Ref` constant, name_idx =
+    /// `co_names` index) lowered to `residual_call_ir_r(ConstInt(fn_idx),
+    /// ListI([name_idx]), ListR([module, code]), Descr) → reg` via
+    /// [`lower_import_from_hlop_to_insn`]; `bh_import_from_fn` runs
+    /// `importing::import_from` (submodule import may run module top-level
+    /// Python → `MayForce`).
+    pub import_from_fn_idx: u16,
     /// `load_super_attr_fn` descrs-pool index.  LOAD_SUPER_ATTR records the
     /// `load_super_attr(self, cls, code, name_idx)` HLOp lowered to
     /// `residual_call_ir_r(ConstInt(fn_idx), ListI([name_idx]), ListR([self,
@@ -3411,6 +3426,13 @@ pub struct LoweringContext {
     /// DELETE_SUBSCR shape); `bh_list_extend_fn` extends the list in place
     /// from an arbitrary iterable (user `__iter__`/`__next__` → `MayForce`).
     pub list_extend_fn_idx: u16,
+    /// `store_slice_fn` descrs-pool index.  STORE_SLICE records the
+    /// `store_slice(obj, start, stop, value)` HLOp lowered to
+    /// `residual_call_r_v(ConstInt(fn_idx), ListR([obj, start, stop, value]),
+    /// Descr)` (void result) via [`lower_store_slice_hlop_to_insn`] (the
+    /// four-Ref STORE_SUBSCR shape); `bh_store_slice_fn` builds a `slice` and
+    /// runs `setitem` (user `__setitem__`/`__index__` → `MayForce`).
+    pub store_slice_fn_idx: u16,
 }
 
 /// Map a BINARY_OP HLOp opname (`add`/.../`xor`/`getitem` plus the
@@ -3991,6 +4013,45 @@ where
     let value_operand = flatten_arg_with_lowering(&op.args[2], get_register, lower_constant);
     Some(build_residual_call_r_v_insn_from_operands(
         ctx.store_name_fn_idx,
+        vec![frame_operand, name_operand, value_operand],
+        CallFlavor::Plain,
+        majit_ir::PyreHelperKind::None,
+    ))
+}
+
+/// Lower a `STORE_GLOBAL` pre-rtype HLOp `store_global(frame, w_name,
+/// value)` → void (the `pyopcode.py:567 STORE_GLOBAL` frame-receiver
+/// shape recorded by `emit_frontend_store_global`) to the post-rtype
+/// `residual_call_r_v(ConstInt(store_global_fn_idx), ListR([frame,
+/// w_name, value]), Descr)` Insn — the same void 3-Ref shape as
+/// `lower_store_name_hlop_to_insn`.  `bh_store_global_fn(frame: Ref,
+/// w_name: Ref, value: Ref)` delegates to the interpreter
+/// `store_global_value`.  `CallFlavor::Plain` like
+/// [`lower_store_name_hlop_to_insn`].
+pub fn lower_store_global_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "store_global" {
+        return None;
+    }
+    if op.args.len() != 3 {
+        return None;
+    }
+    if op.result.is_some() {
+        return None;
+    }
+    let frame_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
+    let name_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
+    let value_operand = flatten_arg_with_lowering(&op.args[2], get_register, lower_constant);
+    Some(build_residual_call_r_v_insn_from_operands(
+        ctx.store_global_fn_idx,
         vec![frame_operand, name_operand, value_operand],
         CallFlavor::Plain,
         majit_ir::PyreHelperKind::None,
@@ -4688,6 +4749,47 @@ where
     ))
 }
 
+/// Lower the STORE_SLICE pyre HLOp `store_slice(obj, start, stop, value)` →
+/// void to `residual_call_r_v(ConstInt(store_slice_fn_idx), ListR([obj,
+/// start, stop, value]), Descr)` — the four-Ref void sibling of
+/// [`lower_setitem_hlop_to_insn`].  `bh_store_slice_fn(obj, start, stop,
+/// value)` builds a `slice(start, stop, None)` and runs `setitem` through the
+/// shared `runtime_ops::store_slice_values` (a user `__setitem__` or slice
+/// `__index__` may run Python → `MayForce`).
+///
+/// Returns `None` for non-`store_slice` opnames so the caller can fall
+/// through to other lowering arms.
+pub fn lower_store_slice_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "store_slice" {
+        return None;
+    }
+    if op.args.len() != 4 {
+        return None;
+    }
+    if op.result.is_some() {
+        return None;
+    }
+    let obj_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
+    let start_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
+    let stop_operand = flatten_arg_with_lowering(&op.args[2], get_register, lower_constant);
+    let value_operand = flatten_arg_with_lowering(&op.args[3], get_register, lower_constant);
+    Some(build_residual_call_r_v_insn_from_operands(
+        ctx.store_slice_fn_idx,
+        vec![obj_operand, start_operand, stop_operand, value_operand],
+        CallFlavor::MayForce,
+        majit_ir::PyreHelperKind::None,
+    ))
+}
+
 /// Single-op lowering pass that dispatches the four retired pre-rtype
 /// HLOp families (BINARY_OP / COMPARE_OP / BOOL / SETITEM) through
 /// the matching `lower_*_hlop_to_insn` helper, falling through to the
@@ -4768,6 +4870,9 @@ where
     if let Some(insn) = lower_store_name_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_store_global_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     if let Some(insn) = lower_tuple_build_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
@@ -4784,6 +4889,9 @@ where
         return Some(insn);
     }
     if let Some(insn) = lower_binary_slice_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_store_slice_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
     if let Some(insn) = lower_delsubscr_hlop_to_insn(op, ctx, get_register, lower_constant) {
@@ -4805,6 +4913,9 @@ where
         return Some(insn);
     }
     if let Some(insn) = lower_import_name_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_import_from_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
     if let Some(insn) = lower_load_super_attr_hlop_to_insn(op, ctx, get_register, lower_constant) {
@@ -5478,6 +5589,57 @@ where
                 Kind::Ref,
                 vec![fromlist, level, code, frame],
             )),
+            descr_operand,
+        ],
+        dst_reg,
+    ))
+}
+
+/// Lower the IMPORT_FROM pyre HLOp `import_from(module, code, name_idx)` →
+/// `result: Ref` to `residual_call_ir_r(ConstInt(import_from_fn_idx),
+/// ListI([name_idx]), ListR([module, code]), Descr) → reg` — the same
+/// two-Ref shape as [`lower_getattr_hlop_to_insn`].  `bh_import_from_fn`
+/// resolves `getattr(module, name)` with a submodule-import fallback that may
+/// run module top-level Python → `MayForce`.  `module` is the peeked TOS
+/// (IMPORT_FROM does not pop it).
+///
+/// Returns `None` for non-`import_from` opnames so the caller can fall
+/// through to other lowering arms.
+pub fn lower_import_from_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "import_from" || op.args.len() != 3 {
+        return None;
+    }
+    let module = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let code = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
+    let name_idx = const_int_for_value_arg(&op.args[2])?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
+        result_kind: Some(Kind::Ref),
+    }));
+    Some(Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(ctx.import_from_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(
+                Kind::Int,
+                vec![Operand::ConstInt(name_idx)],
+            )),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![module, code])),
             descr_operand,
         ],
         dst_reg,
@@ -7031,6 +7193,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -7047,6 +7210,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -7057,6 +7221,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
         let mut on = SSARepr::new("setattr_on");
         let mut on_regallocs = make_regallocs();
@@ -7188,6 +7353,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -7204,6 +7370,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -7214,6 +7381,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
 
         let mut ssarepr = SSARepr::new("retired_families");
@@ -7332,6 +7500,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -7348,6 +7517,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -7358,6 +7528,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
 
         let mut ssarepr = SSARepr::new("trailing_live");
@@ -7439,6 +7610,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -7455,6 +7627,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -7465,6 +7638,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
 
         let mut ssarepr = SSARepr::new("multi_block_lowering");
@@ -7590,6 +7764,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -7606,6 +7781,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -7616,6 +7792,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
 
         let mut ssarepr = SSARepr::new("pyre_walker_2exit");
@@ -7786,6 +7963,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -7802,6 +7980,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -7812,6 +7991,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         });
 
         let mut regallocs = perform_register_allocation_all_kinds(&graph);
@@ -8031,6 +8211,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -8047,6 +8228,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8057,6 +8239,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8142,6 +8325,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -8158,6 +8342,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8168,6 +8353,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8197,6 +8383,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -8213,6 +8400,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8223,6 +8411,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
 
         let hlop = SpaceOperation::new("sub", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
@@ -8329,6 +8518,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -8345,6 +8535,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8355,6 +8546,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8419,6 +8611,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -8435,6 +8628,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8445,6 +8639,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8480,6 +8675,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -8496,6 +8692,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8506,6 +8703,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8533,6 +8731,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -8549,6 +8748,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8559,6 +8759,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
         let hlop = SpaceOperation::new("eq", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -8593,6 +8794,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -8609,6 +8811,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8619,6 +8822,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8680,6 +8884,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -8696,6 +8901,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8706,6 +8912,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8730,6 +8937,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -8746,6 +8954,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8756,6 +8965,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
         let hlop = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -8794,6 +9004,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -8810,6 +9021,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8820,6 +9032,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8862,6 +9075,69 @@ mod tests {
     }
 
     #[test]
+    fn lower_store_slice_hlop_emits_residual_call_r_v() {
+        // Lowering a `store_slice(obj, start, stop, value)` HLOp (no result —
+        // `emit_frontend_store_slice` records the SpaceOperation with `result
+        // = None`) must produce a `residual_call_r_v` with args
+        // `[ConstInt(store_slice_fn_idx), ListR([obj, start, stop, value]),
+        // Descr]` and **no** result Register — the four-Ref void sibling of
+        // the SETITEM shape.
+        let obj = Variable::new(VariableId(0), Kind::Ref);
+        let start = Variable::new(VariableId(1), Kind::Ref);
+        let stop = Variable::new(VariableId(2), Kind::Ref);
+        let value = Variable::new(VariableId(3), Kind::Ref);
+        let op = SpaceOperation::new(
+            "store_slice",
+            vec![obj.into(), start.into(), stop.into(), value.into()],
+            None,
+            11,
+        );
+        let (ctx, _code_const, _name_idx_const) = load_attr_lowering_fixture();
+        let mut get_register = identity_register_mapper();
+        let mut lower_constant = test_constant_lowering();
+
+        let insn =
+            lower_store_slice_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
+                .expect("STORE_SLICE HLOp must lower");
+
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_r_v");
+                assert!(result.is_none(), "void Insn must have no result");
+                assert_eq!(args.len(), 3);
+                match &args[0] {
+                    Operand::ConstInt(v) => assert_eq!(*v, 116),
+                    other => panic!("expected ConstInt(116), got {other:?}"),
+                }
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert_eq!(list.content.len(), 4);
+                    }
+                    other => panic!("expected ListOfKind(Ref, 4), got {other:?}"),
+                }
+                match &args[2] {
+                    Operand::Descr(rc) => match &**rc {
+                        DescrOperand::CallDescrStub(stub) => {
+                            assert_eq!(
+                                stub.arg_kinds,
+                                vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Ref]
+                            );
+                        }
+                        other => panic!("expected CallDescrStub, got {other:?}"),
+                    },
+                    other => panic!("expected Operand::Descr, got {other:?}"),
+                }
+            }
+            other => panic!("expected Insn::Op, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn lower_setitem_hlop_returns_none_for_non_family() {
         let v = Variable::new(VariableId(0), Kind::Ref);
         // Wrong opname.
@@ -8874,6 +9150,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -8890,6 +9167,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8900,6 +9178,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8939,6 +9218,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -8955,6 +9235,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8965,6 +9246,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
         let hlop = SpaceOperation::new(
             "setitem",
@@ -9019,6 +9301,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -9035,6 +9318,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -9045,6 +9329,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -9075,6 +9360,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -9091,6 +9377,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -9101,6 +9388,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -9131,6 +9419,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -9147,6 +9436,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -9157,6 +9447,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -9192,6 +9483,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -9208,6 +9500,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -9218,6 +9511,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -9267,6 +9561,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -9283,6 +9578,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -9293,6 +9589,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -10441,6 +10738,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 15],
@@ -10457,6 +10755,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -10467,6 +10766,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, Some(cpu));
         ssarepr
@@ -10738,6 +11038,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
+            store_global_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs,
@@ -10754,6 +11055,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -10764,6 +11066,7 @@ mod tests {
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
+            store_slice_fn_idx: 0,
         };
         let null_or_self_var = Variable::new(VariableId(10), Kind::Ref);
         let op = super::super::flow::SpaceOperation::new(
@@ -10927,6 +11230,7 @@ mod tests {
             load_method_self_fn_idx: 92,
             load_name_fn_idx: 93,
             store_name_fn_idx: 94,
+            store_global_fn_idx: 0,
             store_attr_fn_idx: 95,
             build_map_from_array_fn_idx: 96,
             binary_slice_fn_idx: 97,
@@ -10938,6 +11242,7 @@ mod tests {
             format_with_spec_fn_idx: 102,
             convert_value_fn_idx: 104,
             import_name_fn_idx: 105,
+            import_from_fn_idx: 117,
             load_super_attr_fn_idx: 106,
             super_attr_unwrap_fn_idx: 107,
             load_deref_value_fn_idx: 108,
@@ -10948,6 +11253,7 @@ mod tests {
             list_extend_fn_idx: 113,
             store_deref_value_fn_idx: 114,
             make_cell_fn_idx: 115,
+            store_slice_fn_idx: 116,
         };
         let code_const = Constant::new(
             super::super::flow::ConstantValue::Signed(0x2000),
@@ -12199,6 +12505,91 @@ mod tests {
                                 panic!(
                                     "ListR must be [fromlist, level, code, frame], got {other:?}"
                                 )
+                            }
+                        }
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_import_from_hlop_emits_import_from_fn_residual() {
+        // `import_from(module, code, name_idx)` →
+        // `residual_call_ir_r(ConstInt(import_from_fn_idx), ListI([name_idx]),
+        // ListR([module, code]), Descr) → reg` (MayForce — a submodule-import
+        // fallback may run a module's top-level Python).  Two Ref operands —
+        // the peeked TOS module and the jitcode's own code object — plus one
+        // Int; the same two-Ref shape as `getattr`.
+        let module_var = Variable::new(VariableId(8), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, code_const, name_idx_const) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "import_from",
+            vec![module_var.into(), code_const.into(), name_idx_const.into()],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_import_from_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("3-arg import_from lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_ir_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(117)),
+                    "import_from_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Int);
+                        assert!(
+                            matches!(&list.content[..], [Operand::ConstInt(5)]),
+                            "ListI = [name_idx], got {:?}",
+                            list.content
+                        );
+                    }
+                    other => panic!("expected ListI, got {other:?}"),
+                }
+                match &args[2] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        match &list.content[..] {
+                            [Operand::Register(md), Operand::ConstRef(0x2000)] => {
+                                assert_eq!(md.index, 101, "leading Ref operand must be module");
+                            }
+                            other => {
+                                panic!("ListR must be [module, code], got {other:?}")
                             }
                         }
                     }

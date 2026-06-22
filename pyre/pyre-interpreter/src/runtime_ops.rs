@@ -1089,22 +1089,97 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
         return (0..count).map(|idx| sequence_getitem(seq, idx)).collect();
     }
     // Fallback: iteration protocol (handles type objects with metaclass __iter__, etc.)
-    // PyPy: ObjSpace.unpackiterable
-    let iter = crate::baseobjspace::iter(seq)?;
+    // baseobjspace.py:1031 _unpackiterable_known_length_jitlook.  pyopcode.py:872
+    // UNPACK_SEQUENCE wraps the whole `fixedview_unroll` (iter + known-length
+    // loop) in a TypeError → "cannot unpack non-iterable %T object" remap.
+    let non_iterable = || {
+        PyError::type_error(format!("cannot unpack non-iterable {} object", unsafe {
+            (*(*seq).ob_type).name
+        }))
+    };
+    let iter = match crate::baseobjspace::iter(seq) {
+        Ok(it) => it,
+        Err(e) if e.kind == PyErrorKind::TypeError => return Err(non_iterable()),
+        Err(e) => return Err(e),
+    };
     let mut items = Vec::with_capacity(count);
-    for _ in 0..count {
+    loop {
         match crate::baseobjspace::next(iter) {
-            Ok(val) => items.push(val),
-            Err(e) if e.kind == PyErrorKind::StopIteration => {
-                return Err(PyError::value_error(format!(
-                    "not enough values to unpack (expected {count}, got {})",
-                    items.len()
-                )));
+            Ok(val) => {
+                if items.len() == count {
+                    return Err(PyError::value_error(format!(
+                        "too many values to unpack (expected {count})"
+                    )));
+                }
+                items.push(val);
             }
+            Err(e) if e.kind == PyErrorKind::StopIteration => break,
+            Err(e) if e.kind == PyErrorKind::TypeError => return Err(non_iterable()),
             Err(e) => return Err(e),
         }
     }
+    if items.len() < count {
+        return Err(PyError::value_error(format!(
+            "not enough values to unpack (expected {count}, got {})",
+            items.len()
+        )));
+    }
     Ok(items)
+}
+
+/// UNPACK_EX — split `value` for `a, *b, c = value` into `before` head
+/// items, a starred middle list, and `after` tail items, returning the
+/// `before + 1 + after` slots in TOS order ([head items], middle list,
+/// [tail items]).  Shared by the interpreter's `unpack_ex` handler and the
+/// JIT residual `bh_unpack_ex_fn`; the portal reads each slot back out with
+/// `bh_unpack_item_fn`, exactly as `unpack_sequence_exact`.  Raises
+/// ValueError when fewer than `before + after` values are available.
+pub fn unpack_ex_slots(
+    before: usize,
+    after: usize,
+    value: PyObjectRef,
+) -> Result<Vec<PyObjectRef>, PyError> {
+    let elements: Vec<PyObjectRef> = unsafe {
+        if is_tuple(value) {
+            pyre_object::w_tuple_items_copy_as_vec(value)
+        } else if is_list(value) {
+            pyre_object::w_list_items_copy_as_vec(value)
+        } else {
+            // pyopcode.py:884 UNPACK_EX wraps `fixedview` in a
+            // TypeError → "cannot unpack non-iterable %T object" remap.
+            // `collect_iterable` is the `fixedview` analog (iter + next
+            // loop), so any TypeError it raises is remapped here.
+            match crate::builtins::collect_iterable(value) {
+                Ok(items) => items,
+                Err(e) if e.kind == PyErrorKind::TypeError => {
+                    return Err(PyError::type_error(format!(
+                        "cannot unpack non-iterable {} object",
+                        (*(*value).ob_type).name
+                    )));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    };
+    let min_expected = before + after;
+    if elements.len() < min_expected {
+        return Err(PyError::value_error(format!(
+            "not enough values to unpack (expected at least {}, got {})",
+            min_expected,
+            elements.len()
+        )));
+    }
+    let middle_len = elements.len() - min_expected;
+    let mut slots = Vec::with_capacity(before + 1 + after);
+    for &item in elements.iter().take(before) {
+        slots.push(item);
+    }
+    let middle: Vec<PyObjectRef> = elements[before..before + middle_len].to_vec();
+    slots.push(w_list_new(middle));
+    for i in 0..after {
+        slots.push(elements[before + middle_len + i]);
+    }
+    Ok(slots)
 }
 
 pub fn ensure_range_iter(iter: PyObjectRef) -> Result<(), PyError> {

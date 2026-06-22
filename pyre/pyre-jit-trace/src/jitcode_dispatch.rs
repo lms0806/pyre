@@ -1014,21 +1014,28 @@ pub enum DispatchError {
     /// mismatch.
     SubWalkClosedLoop { pc: usize },
     /// A `goto_if_not` branch guard resumes at a target that still carries
-    /// a live operand-stack temp (resume-target stack depth > 0). This is
-    /// the short-circuit shape — `x and y`, `x or y`, the conditional
-    /// expression `a if c else b`, and chained comparison `a < b < c` —
-    /// where CPython keeps the tested value on the value stack across the
-    /// branch (`COPY` / `TO_BOOL` / `POP_JUMP_IF_*`). The full-body walk's
-    /// single-frame guard snapshot rebuilds locals + the post-opcode
-    /// operand stack from the live register banks, but the kept temp at a
-    /// branch *target* (a control-flow merge the trace did not take) is
-    /// not represented in the not-taken arm's liveness, so the deopt
-    /// re-entry restores a wrong value into a loop-carried slot (task
-    /// #124/#281 per-PC resume-value precision). Plain `while` / `if`
-    /// branches resume at depth 0 and are unaffected. The walker surfaces
-    /// a typed abort so the driver maps it to `TraceAction::Abort` →
-    /// interpreter fallback (correct, untraced) instead of compiling a
-    /// trace whose guard-failure path corrupts the frame.
+    /// two or more live operand-stack temps (resume-target stack depth > 1)
+    /// and the not-taken edge's kept-value recovery is incomplete.
+    /// This is the multi-kept-temp short-circuit shape — `(x and y) or z`,
+    /// chained comparison `a < b < c` — where CPython keeps more than one
+    /// tested value on the value stack across the branch (`COPY` / `TO_BOOL`
+    /// / `POP_JUMP_IF_*`). The full-body walk's single-frame guard snapshot
+    /// rebuilds locals + the post-opcode operand stack from the live register
+    /// banks; a single depth-1 kept temp is recovered positionally
+    /// (`kept_stack_subst` in `collect_outer_active_boxes`).  Depth > 1 is
+    /// supported only when the not-taken edge's decoded `ref_copy` moves
+    /// (`#420`) cover every distinct kept resume color AND each move's source
+    /// resolves to a live register value; that resolved set then drives the
+    /// snapshot encoder.  This abort fires only when that recovery is
+    /// incomplete — a kept slot the edge does not rename ("live-across"), a
+    /// cyclic `*_push`/`*_pop` move, a truncated/under-sized color map, or a
+    /// source that resolves to `OpRef::NONE` — i.e. when the deopt re-entry
+    /// would otherwise restore a wrong value into a loop-carried slot
+    /// (task #124/#281 per-PC resume-value precision).  Plain `while` / `if`
+    /// branches resume at depth 0 and are unaffected.  The walker surfaces a
+    /// typed abort so the driver maps it to `TraceAction::Abort` →
+    /// interpreter fallback (correct, untraced) instead of compiling a trace
+    /// whose guard-failure path corrupts the frame.
     BranchGuardKeptStackUnsupported { pc: usize },
     /// A callee compiled as its own Finish portal (reached via
     /// `call_user_function_with_eval`) accessed its frame through a
@@ -4525,6 +4532,21 @@ fn try_execute_residual_call_via_executor(
     if (func_ptr as u64) >> 47 != 0 {
         return Ok(None);
     }
+    // A residual whose funcptr is a `PyFrame` operand-stack accessor
+    // (`pop`/`push`/`peek`/`peek_at`) reads or mutates the live frame's
+    // operand stack.  During a walk that stack is empty — the walk holds
+    // operand values symbolically in its register banks, not on the real
+    // frame (the portal lowers stack ops to vable array writes; these
+    // accessors appear only inside inlined callee sub-jitcode bodies such as
+    // `pop_value`).  Executing one here underflows `PyFrame::pop`'s
+    // `valuestackdepth > stack_base()` assertion against the paused outer
+    // frame.  Record it symbolically instead, mirroring the tracer's
+    // never-mutate-the-traced-frame discipline; it runs at runtime against a
+    // frame whose operand stack the compiled trace's preceding pushes have
+    // populated.
+    if pyre_interpreter::is_pyframe_operand_stack_accessor(func_ptr as usize) {
+        return Ok(None);
+    }
     if allboxes.len() - 1 > majit_translate::jit_codewriter::insns::MAX_HOST_CALL_ARITY {
         return Ok(None);
     }
@@ -5194,8 +5216,8 @@ fn collect_outer_active_boxes(
         }
         active.push(v);
     }
-    // #124 kept-stack recovery (gated by `guard_py_pc`, set only on the
-    // `PYRE_RELAX_124` branch-guard path).  A branch guard's not-taken arm
+    // #124 kept-stack recovery (gated by `guard_py_pc`, set on the
+    // branch-guard snapshot path).  A branch guard's not-taken arm
     // resumes at a merge point whose live Ref colors are filled by the
     // not-taken edge's register move — colors the walk has NOT written at
     // the guard point, because that move executes only when the branch is
@@ -5305,8 +5327,20 @@ fn collect_outer_active_boxes(
         }
         _ => std::collections::HashMap::new(),
     };
+    // #420: exact not-taken edge-move recovery, keyed by resume-merge color.
+    // Takes precedence over the positional `kept_stack_subst` heuristic — the
+    // guard trampoline's `ref_copy(dst <- src)` gave this kept slot's live
+    // guard-pc source value directly, exact for any kept-stack depth.
+    let kept_recovered: std::collections::HashMap<u32, OpRef> = BRANCH_GUARD_KEPT_RECOVERED
+        .with(|c| c.borrow().iter().map(|&(dst, v)| (dst as u32, v)).collect());
     for &idx in &banks.ref_ {
         let color = idx as usize;
+        if let Some(&rv) = kept_recovered.get(&idx) {
+            // Edge-move-resolved kept operand; overrides the unwritten
+            // merge-color read for this not-taken-arm operand-stack slot.
+            active.push(rv);
+            continue;
+        }
         if let Some(&subst) = kept_stack_subst.get(&idx) {
             // The guard-pc kept value overrides the (unwritten) merge-color
             // read for this not-taken-arm operand-stack slot.
@@ -5496,7 +5530,7 @@ thread_local! {
 
     /// Set (to the branch guard's own jitcode `op.pc`) only for the
     /// duration of the `walker_capture_snapshot_for_last_guard` call a
-    /// kept-stack branch guard makes under `PYRE_RELAX_124` (#124).  The
+    /// kept-stack branch guard makes (#124).  The
     /// snapshot helper is invoked with the *resume* coordinate
     /// (`other_target`, the not-taken arm), so the guard's own coordinate
     /// is otherwise unavailable to the encoder.  `collect_outer_active_
@@ -5508,6 +5542,19 @@ thread_local! {
     /// edge move reads from.  Null outside the gated kept-stack path.
     static BRANCH_GUARD_JITCODE_PC: std::cell::Cell<usize> =
         const { std::cell::Cell::new(usize::MAX) };
+
+    /// `#420` not-taken edge-move recovery: the decoded `ref_copy`
+    /// parallel-move list of a kept-stack branch guard's trampoline, as
+    /// `(resume-merge color, guard-state kept value)` pairs.  The branch
+    /// handler reads each `ref_copy(dst <- src)` of the not-taken edge and
+    /// stores `(dst, registers_r[src])` here; `collect_outer_active_boxes`
+    /// and the `stack_sync` vable overlay read it so every kept operand-
+    /// stack slot resumes with the exact value the edge move would produce,
+    /// instead of the stale merge-color read.  This replaces the positional
+    /// depth-1 heuristic with the exact, depth-independent edge resolution.
+    /// Empty outside the gated kept-stack path (cleared after each capture).
+    static BRANCH_GUARD_KEPT_RECOVERED: std::cell::RefCell<Vec<(u16, OpRef)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// RAII guard: mark the current scope as an inline sub-walk (see
@@ -6159,6 +6206,57 @@ fn resolve_branch_target_through_trampoline(code: &[u8], target: usize) -> usize
     resume
 }
 
+/// Decode a not-taken branch trampoline's `ref_copy` parallel-move
+/// sequence into `(dst, src)` Ref-color pairs (`#420`).  The trampoline
+/// (`live; (ref_copy|int_copy|float_copy)*; [goto]; live; <op>`,
+/// `flatten.rs:2145 insert_renamings`) resolves the not-taken edge's Phi:
+/// each `ref_copy(dst <- src)` moves the kept value's guard-pc Ref color
+/// `src` into the merge block's inputarg color `dst`.  The walk does NOT
+/// execute these moves — they fire only when the branch is taken at
+/// runtime — so the merge color `dst` reads stale at the guard point; the
+/// live kept value sits at `src`, which the walk register file still
+/// holds.  Returning the `(dst, src)` list lets the snapshot / vable
+/// recovery read `registers_r[src]` for each kept slot, exact for any
+/// kept-stack depth (the positional depth-1 heuristic generalized).
+///
+/// Returns `None` on a `*_push` / `*_pop` step — a cyclic parallel move
+/// whose value transits a blackhole stack the walk has no register for;
+/// the caller keeps the conservative kept-stack decline.  Each `ref_copy`
+/// is `[opcode, src, dst]` (`ref_copy/r>r`: `registers_r[dst] =
+/// registers_r[src]`).
+fn decode_branch_trampoline_ref_moves(code: &[u8], tramp_start: usize) -> Option<Vec<(u16, u16)>> {
+    let mut pc = tramp_start;
+    let mut moves: Vec<(u16, u16)> = Vec::new();
+    for _ in 0..64 {
+        let op = decode_op_at(code, pc)?;
+        match op.opname {
+            "live" => pc = op.next_pc,
+            "ref_copy" => {
+                let src = *code.get(op.pc + 1)? as u16;
+                let dst = *code.get(op.pc + 2)? as u16;
+                moves.push((dst, src));
+                pc = op.next_pc;
+            }
+            // Non-Ref-bank moves (int / float locals) never feed an
+            // operand-stack slot (the operand stack is always boxed Ref);
+            // step over them.
+            "int_copy" | "float_copy" => pc = op.next_pc,
+            "goto" => pc = read_label(code, &op, 0),
+            // Cyclic parallel move: the value transits a transient stack,
+            // not a register the walk can read.  Decline (conservative).
+            "ref_push" | "ref_pop" | "int_push" | "int_pop" | "float_push" | "float_pop" => {
+                return None;
+            }
+            // First real destination op terminates the move list.
+            _ => return Some(moves),
+        }
+    }
+    // Cap exhausted without reaching the first real destination op: the
+    // move list is truncated, not complete — decline (conservative)
+    // rather than present an incomplete recovery as the full edge.
+    None
+}
+
 /// Full-body-walk operand-stack depth at a branch guard's resume target.
 ///
 /// `target` is a jitcode pc — the `goto_if_not` `other_target` (the
@@ -6201,6 +6299,50 @@ fn branch_resume_target_stack_depth(target: usize) -> Option<u16> {
             .depth_at_py_pc()
             .get(py)
             .copied()
+    }
+}
+
+/// The resume-merge Ref colors of a branch guard's kept operand-stack
+/// slots (`#420`): `stack_slot_color_map[0 .. depth_at_py_pc[resume]]`,
+/// the colors `collect_outer_active_boxes` / `stack_sync` look the kept
+/// values up by.  Used to decide whether the not-taken edge's decoded
+/// `ref_copy` moves cover *every* kept slot — only then is the depth > 1
+/// recovery complete and the guard safe to compile.  A slot the edge does
+/// not rename is "live-across"; its value sits at the possibly-collapsed
+/// `stack_slot_color_map[s]` color, unproven for depth > 1, so an
+/// uncovered slot keeps the conservative decline.  Same `FULL_BODY_SNAPSHOT_SYM`
+/// contract as `branch_resume_target_stack_depth`.
+fn branch_resume_stack_colors(target: usize) -> Option<Vec<u16>> {
+    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    if full_body_sym.is_null() {
+        return None;
+    }
+    let sym = unsafe { &*full_body_sym };
+    if sym.jitcode.is_null() {
+        return None;
+    }
+    unsafe {
+        let jc = &*sym.jitcode;
+        if jc.payload.code_ptr.is_null() {
+            return None;
+        }
+        let code = &*jc.payload.code_ptr;
+        let py = python_pc_for_jitcode_pc(&jc.payload.metadata, target) as usize;
+        let py = skip_python_trivia_forward(code, py);
+        let depth = crate::liveness::liveness_for(jc.payload.code_ptr)
+            .depth_at_py_pc()
+            .get(py)
+            .copied()? as usize;
+        let scm = &jc.payload.metadata.stack_slot_color_map;
+        // Defensive: a map shorter than the resume depth (only possible if
+        // stack_slot_color_map were under-sized below co_stacksize, the
+        // regression pyjitcode.rs warns about) must DECLINE, not silently
+        // truncate the kept-slot color list — a truncated list would let
+        // recovery_complete pass without checking every kept slot.
+        if depth > scm.len() {
+            return None;
+        }
+        Some((0..depth).map(|s| scm[s]).collect())
     }
 }
 
@@ -6552,10 +6694,27 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 };
                 let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
                 let nlocals = sym.nlocals;
+                // #420: a kept slot whose merge color the not-taken edge fills
+                // reads stale in `registers_r` at the guard; the branch handler
+                // decoded the edge's `ref_copy` moves into `(merge color ->
+                // live guard value)`.  Prefer that recovered value so the vable
+                // shadow (the authoritative deopt restore) carries the exact
+                // kept operand, not the stale merge-color read.
+                let recovered: Vec<(u16, OpRef)> =
+                    BRANCH_GUARD_KEPT_RECOVERED.with(|c| c.borrow().clone());
                 (0..depth.min(stack_color_map.len()))
                     .filter_map(|s| {
-                        let color = stack_color_map[s] as usize;
-                        let v = ctx.registers_r.get(color).copied().unwrap_or(OpRef::NONE);
+                        let color = stack_color_map[s];
+                        let v = recovered
+                            .iter()
+                            .find(|&&(dst, _)| dst == color)
+                            .map(|&(_, v)| v)
+                            .unwrap_or_else(|| {
+                                ctx.registers_r
+                                    .get(color as usize)
+                                    .copied()
+                                    .unwrap_or(OpRef::NONE)
+                            });
                         if v != OpRef::NONE && !opref_is_null_const_ptr(v) {
                             Some((nvs + nlocals + s, v))
                         } else {
@@ -12126,36 +12285,88 @@ fn handle(
                 if switchcase != 0 { target } else { op.next_pc },
             );
             if !valuebox.is_constant() {
-                // #124/#281: a branch guard whose resume target still holds
-                // a live operand-stack temp (short-circuit `and`/`or`, the
-                // conditional expression, chained comparison) cannot be
-                // resumed precisely by the single-frame snapshot — the kept
-                // value lives on the not-taken arm the snapshot does not
-                // model, so a guard-failure deopt restores a wrong value
-                // into a loop-carried slot.  Abort the walk → interpreter
-                // fallback (correct, untraced) rather than compile a trace
-                // that corrupts the frame on every odd-path iteration.
-                // Plain `while` / `if` branches resume at depth 0 and pass.
-                //
-                // Only a kept-stack (depth > 0) resume target is the #124
-                // case; a plain `while` / `if` resumes at depth 0 and the
-                // single-frame snapshot models it exactly.
-                let kept_stack =
-                    branch_resume_target_stack_depth(other_target).is_some_and(|d| d > 0);
-                // #124 Approach B (M4): the kept-stack guard resumes precisely
-                // at its own JitCode pc through the M3 carrier
-                // (`BRANCH_GUARD_JITCODE_PC` → rd_numb → `setposition`), so the
-                // gate opens and the guard compiles instead of declining to the
-                // interpreter.  M3 is on by default, so production takes this
-                // path.  `PYRE_RELAX_124` is the standalone opener exercising
-                // the kept-stack recovery path without the M3 decode.  Only when
-                // M3 is force-disabled (`PYRE_M3_JITCODE_PC=0`) AND `PYRE_RELAX_124`
-                // is unset does the conservative decline apply (a guard-failure
-                // deopt at depth > 0 would otherwise restore a wrong value into a
-                // loop-carried slot via the lossy `py_pc → pc_map` translation).
-                let kept_stack_resume_enabled = crate::pyjitcode::m3_jitcode_pc_enabled()
-                    || std::env::var_os("PYRE_RELAX_124").is_some();
-                if kept_stack && !kept_stack_resume_enabled {
+                // #124/#281: a branch guard whose resume target still holds a
+                // live operand-stack temp (short-circuit `and`/`or`, the
+                // conditional expression, chained comparison) keeps that temp
+                // on the not-taken arm the single-frame snapshot does not model
+                // by itself.  The kept temp(s) are recovered from the not-taken
+                // edge's `ref_copy` parallel-move trampoline (decoded below),
+                // exact for any kept-stack depth.  Plain `while` / `if`
+                // branches resume at depth 0 and carry no kept temp.
+                let resume_depth = branch_resume_target_stack_depth(other_target);
+                let kept_stack = resume_depth.is_some_and(|d| d > 0);
+                let depth_gt_1 = resume_depth.is_some_and(|d| d > 1);
+                let relax_124 = std::env::var_os("PYRE_RELAX_124").is_some();
+                // A kept-stack guard's not-taken arm keeps one or more
+                // operand-stack temps live across the guard.  The not-taken
+                // edge resolves the merge through inline `ref_copy(dst <- src)`
+                // moves (`flatten.rs:2145 insert_renamings`): the live kept
+                // value sits at the guard-pc color `src`, which the walk has
+                // written, while the resume merge color `dst` is unwritten at
+                // the guard point.  Decode that trampoline into `(dst, src)`
+                // pairs (`#420`); the snapshot / vable recovery then reads
+                // `registers_r[src]` for each kept slot — exact for any kept-
+                // stack depth, superseding the positional depth-1 heuristic.
+                let raw_branch_target = if switchcase != 0 { target } else { op.next_pc };
+                let kept_recovered = if kept_stack {
+                    decode_branch_trampoline_ref_moves(code, raw_branch_target)
+                } else {
+                    Some(Vec::new())
+                };
+                if std::env::var_os("PYRE_DIAG124C").is_some() && kept_stack {
+                    eprintln!(
+                        "[edge124] pc={} depth={resume_depth:?} raw_target={raw_branch_target} \
+                         moves(dst<-src)={kept_recovered:?}",
+                        op.pc,
+                    );
+                }
+                // Resolve each `(dst, src)` move to `(dst, live guard value)`
+                // against the guard-state register file NOW — before gating.
+                // A move whose `src` is out of range or holds `OpRef::NONE`
+                // recovers no live kept value, so it must not count toward
+                // coverage; basing `recovery_complete` on the raw `dst` set
+                // would let such a move pass the gate and then silently drop
+                // at the snapshot step, leaving a kept slot unrecovered (a
+                // depth > 1 miscompile).  A const-source `ref_copy` patches
+                // `src` into the constants window of `registers_r`, so this
+                // one read covers register and const sources alike.  The same
+                // resolved set both gates and feeds the snapshot encoder
+                // (single source of truth); `record_guard` below records into
+                // the trace history only and does not mutate `registers_r`,
+                // so reading it here is identical to reading it post-guard.
+                let resolved_recovered: Option<Vec<(u16, OpRef)>> =
+                    kept_recovered.as_ref().map(|mv| {
+                        mv.iter()
+                            .filter_map(|&(dst, src)| {
+                                let v = ctx.registers_r.get(src as usize).copied()?;
+                                (v != OpRef::NONE).then_some((dst, v))
+                            })
+                            .collect()
+                    });
+                // Recover depth > 1 only when the decoded edge moves cover
+                // EVERY kept resume stack slot.  A slot the not-taken edge
+                // does not rename ("live-across") would fall through to the
+                // possibly-collapsed `stack_slot_color_map[s]` read — the
+                // original depth > 1 decline reason — so an uncovered slot,
+                // a cyclic `*_push`/`*_pop` (decodes to `None`), or unknown
+                // liveness keeps the conservative decline.  Depth-1 is handled
+                // by the positional heuristic below and is not gated here.
+                // `PYRE_RELAX_124` forces depth > 1 through for diagnosis.
+                let recovery_complete = match (
+                    resolved_recovered.as_ref(),
+                    branch_resume_stack_colors(other_target),
+                ) {
+                    (Some(moves), Some(cols)) => {
+                        // Every kept slot's resume color must be DISTINCT — a
+                        // collapsed `stack_slot_color_map` aliasing two slots
+                        // onto one color would feed both the same recovered
+                        // value — AND covered by an explicit edge move.
+                        let distinct = cols.iter().enumerate().all(|(i, c)| !cols[..i].contains(c));
+                        distinct && cols.iter().all(|c| moves.iter().any(|&(dst, _)| dst == *c))
+                    }
+                    _ => false,
+                };
+                if depth_gt_1 && !recovery_complete && !relax_124 {
                     return Err(DispatchError::BranchGuardKeptStackUnsupported { pc: op.pc });
                 }
                 ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);
@@ -12170,9 +12381,16 @@ fn handle(
                 // `goto_if_not`) and desync the decoded box layout.
                 if kept_stack {
                     BRANCH_GUARD_JITCODE_PC.with(|c| c.set(op.pc));
+                    // Feed the snapshot encoder the SAME resolved set the gate
+                    // checked (resolved above, before `record_guard`): each
+                    // `(dst, live guard value)`, sources already filtered to
+                    // live in-range values.
+                    BRANCH_GUARD_KEPT_RECOVERED
+                        .with(|c| *c.borrow_mut() = resolved_recovered.unwrap_or_default());
                 }
                 let capture = walker_capture_snapshot_for_last_guard(ctx, other_target);
                 BRANCH_GUARD_JITCODE_PC.with(|c| c.set(usize::MAX));
+                BRANCH_GUARD_KEPT_RECOVERED.with(|c| c.borrow_mut().clear());
                 capture?;
             }
             let next_pc = if switchcase != 0 { op.next_pc } else { target };

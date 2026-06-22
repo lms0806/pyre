@@ -102,6 +102,9 @@ pub struct Cpu {
     pub store_attr_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// BINARY_SLICE residual — `(obj, start, stop) → obj[start:stop]`.
     pub binary_slice_fn: extern "C" fn(i64, i64, i64) -> i64,
+    /// STORE_SLICE residual — `(obj, start, stop, value) → void`
+    /// (`obj[start:stop] = value`).
+    pub store_slice_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// DELETE_SUBSCR residual — `(obj, index) → void` (`del obj[index]`).
     pub delete_subscr_fn: extern "C" fn(i64, i64) -> i64,
     /// LIST_EXTEND residual — `(list, iterable) → void` (`list.extend(iterable)`,
@@ -126,6 +129,12 @@ pub struct Cpu {
     /// the threaded `frame`, and imports through the TLS-pinned execution
     /// context (may run module top-level Python → fallible).
     pub import_name_fn: extern "C" fn(i64, i64, i64, i64, i64) -> i64,
+    /// `bh_import_from_fn(module, code, name_idx)` — IMPORT_FROM residual;
+    /// resolves the attribute name from the code object and runs
+    /// `importing::import_from` on the peeked module (namespace lookup, then a
+    /// submodule-import fallback that may run module top-level Python →
+    /// fallible) through the TLS-pinned execution context.
+    pub import_from_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bh_load_super_attr_fn(self, cls, code, name_idx)` — LOAD_SUPER_ATTR
     /// `getattr(super(cls, self), name)` residual (descriptor `__get__` may
     /// run Python → fallible).
@@ -181,6 +190,11 @@ pub struct Cpu {
     /// with `w_name` an interned str constant.  Blackhole/deopt lowering
     /// of `STORE_NAME` (`pyopcode.py:855`).
     pub store_name_fn: extern "C" fn(i64, i64, i64) -> i64,
+    /// `bhimpl_store_global` — `(frame: Ref, w_name: Ref, value: Ref) →
+    /// Void` with `w_name` an interned str constant.  Blackhole/deopt
+    /// lowering of `STORE_GLOBAL` (`pyopcode.py:567`); writes directly
+    /// into `w_globals`, bypassing `w_locals`.
+    pub store_global_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `newtuple(list_w)` (`objspace.py:332`) — (ref array) → new tuple.
     /// The array is the forced `popvalues` list; length travels inside
     /// the array, so any arity fits.
@@ -203,6 +217,10 @@ pub struct Cpu {
     pub unpack_sequence_fn: extern "C" fn(i64, i64) -> i64,
     /// Read item `index` out of the validated unpack tuple — (index, seq) → item.
     pub unpack_item_fn: extern "C" fn(i64, i64) -> i64,
+    /// UNPACK_EX residual — `(before, after, seq) → tuple` of the
+    /// `before + 1 + after` slots (head items, starred list, tail items)
+    /// in TOS order; read back with `unpack_item_fn`.
+    pub unpack_ex_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bhimpl_build_slice` — (argc, start, stop, step) → new slice.
     pub build_slice_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// `RAISE_VARARGS` normalization helper used before `raise/r`.
@@ -300,6 +318,7 @@ impl Cpu {
             load_method_self_fn: crate::call_jit::bh_load_method_self_fn,
             store_attr_fn: crate::call_jit::bh_store_attr_fn,
             binary_slice_fn: crate::call_jit::bh_binary_slice_fn,
+            store_slice_fn: crate::call_jit::bh_store_slice_fn,
             delete_subscr_fn: crate::call_jit::bh_delete_subscr_fn,
             delete_attr_fn: crate::call_jit::bh_delete_attr_fn,
             list_extend_fn: crate::call_jit::bh_list_extend_fn,
@@ -307,6 +326,7 @@ impl Cpu {
             format_with_spec_fn: crate::call_jit::bh_format_with_spec_fn,
             convert_value_fn: crate::call_jit::bh_convert_value_fn,
             import_name_fn: crate::call_jit::bh_import_name_fn,
+            import_from_fn: crate::call_jit::bh_import_from_fn,
             load_super_attr_fn: crate::call_jit::bh_load_super_attr_fn,
             super_attr_unwrap_fn: crate::call_jit::bh_super_attr_unwrap_fn,
             load_deref_value_fn: crate::call_jit::bh_load_deref_value_fn,
@@ -325,6 +345,7 @@ impl Cpu {
             getattr_fn: crate::call_jit::bh_getattr_fn,
             load_name_fn: crate::call_jit::bh_load_name_fn,
             store_name_fn: crate::call_jit::bh_store_name_fn,
+            store_global_fn: crate::call_jit::bh_store_global_fn,
             newtuple_from_array_fn: crate::call_jit::bh_newtuple_from_array,
             build_map_from_array_fn: crate::call_jit::bh_build_map_from_array,
             build_set_from_array_fn: crate::call_jit::bh_build_set_from_array,
@@ -332,6 +353,7 @@ impl Cpu {
             newlist_from_array_fn: crate::call_jit::bh_newlist_from_array,
             unpack_sequence_fn: crate::call_jit::bh_unpack_sequence_fn,
             unpack_item_fn: crate::call_jit::bh_unpack_item_fn,
+            unpack_ex_fn: crate::call_jit::bh_unpack_ex_fn,
             build_slice_fn: crate::call_jit::bh_build_slice_fn,
             normalize_raise_varargs_fn: crate::call_jit::bh_normalize_raise_varargs_with_frame,
             get_current_exception_fn: crate::call_jit::bh_get_current_exception,

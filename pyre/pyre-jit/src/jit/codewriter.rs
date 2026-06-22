@@ -2648,6 +2648,29 @@ fn emit_frontend_setitem(
     );
 }
 
+fn emit_frontend_store_slice(
+    _graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    obj: super::flow::FlowValue,
+    start: super::flow::FlowValue,
+    stop: super::flow::FlowValue,
+    value: super::flow::FlowValue,
+    offset: i64,
+) {
+    // pyopcode.py STORE_SLICE -> builds `slice(start, stop, None)` and runs
+    // `obj[slice] = value`.  pyre's interpreter routes this through
+    // `runtime_ops::store_slice_values`; the residual records the same shape
+    // as `setitem` (void, no result slot) so `flatten_space_operation`'s
+    // `result == None` branch lowers it to `residual_call_r_v`.
+    record_graph_op(
+        block,
+        "store_slice",
+        vec![obj.into(), start.into(), stop.into(), value.into()],
+        None,
+        offset,
+    );
+}
+
 fn emit_frontend_delsubscr(
     _graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -2857,6 +2880,28 @@ fn emit_frontend_store_name(
     record_graph_op(
         block,
         "store_name",
+        vec![frame.into(), name.into(), value.into()],
+        None,
+        offset,
+    );
+}
+
+fn emit_frontend_store_global(
+    _graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    frame: super::flow::FlowValue,
+    name: super::flow::FlowValue,
+    value: super::flow::FlowValue,
+    offset: i64,
+) {
+    // pyopcode.py:934 STORE_GLOBAL — writes the value directly into
+    // `w_globals`, bypassing `w_locals`.  Frame-receiver call shape like
+    // `emit_frontend_store_name`; lowers to `bh_store_global_fn(frame,
+    // w_name, value)` (`flatten::lower_store_global_hlop_to_insn`).  See
+    // `emit_frontend_setitem` for the void-result rationale.
+    record_graph_op(
+        block,
+        "store_global",
         vec![frame.into(), name.into(), value.into()],
         None,
         offset,
@@ -3085,6 +3130,24 @@ fn emit_frontend_import_name(
             frame.into(),
             name_idx.into(),
         ],
+        Kind::Ref,
+        offset,
+    )
+}
+
+fn emit_frontend_import_from(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    module: super::flow::FlowValue,
+    code: super::flow::FlowValue,
+    name_idx: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "import_from",
+        vec![module.into(), code.into(), name_idx.into()],
         Kind::Ref,
         offset,
     )
@@ -3489,10 +3552,12 @@ struct FnPtrIndices {
     getattr_fn: HelperHandle,
     load_name_fn: HelperHandle,
     store_name_fn: HelperHandle,
+    store_global_fn: HelperHandle,
     newtuple_from_array_fn: HelperHandle,
     newlist_from_array_fn: HelperHandle,
     unpack_sequence_fn: HelperHandle,
     unpack_item_fn: HelperHandle,
+    unpack_ex_fn: HelperHandle,
     build_slice_fn: HelperHandle,
     normalize_raise_varargs_fn: HelperHandle,
     call_fn_0: HelperHandle,
@@ -3524,6 +3589,7 @@ struct FnPtrIndices {
     build_string_from_array_fn: HelperHandle,
     convert_value_fn: HelperHandle,
     import_name_fn: HelperHandle,
+    import_from_fn: HelperHandle,
     load_super_attr_fn: HelperHandle,
     super_attr_unwrap_fn: HelperHandle,
     load_deref_value_fn: HelperHandle,
@@ -3534,6 +3600,7 @@ struct FnPtrIndices {
     unary_not_fn: HelperHandle,
     load_fast_check_fn: HelperHandle,
     list_extend_fn: HelperHandle,
+    store_slice_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3698,13 +3765,18 @@ fn register_helper_fn_pointers(
         cpu.newtuple_from_array_fn as *const (),
         CallFlavor::Plain,
     );
-    // `bh_unpack_sequence_fn` validates the length and allocates the item
-    // tuple (can raise ValueError/TypeError); `bh_unpack_item_fn` indexes
-    // that validated tuple. Both can raise → `CallFlavor::Plain`.
+    // `bh_unpack_sequence_fn` validates the exact length and allocates the
+    // item tuple.  For a non-list/tuple sequence it drives the iterator
+    // protocol (`runtime_ops::unpack_sequence_exact` → `baseobjspace::iter`/
+    // `next`), so a user `__iter__`/`__next__` can run Python and force the
+    // virtualizable → `CallFlavor::MayForce`, symmetric with `unpack_ex_fn`
+    // and the `virtualizable_analyzer.analyze(op)` row of `getcalldescr`
+    // (`call.py:288`).  `bh_unpack_item_fn` only indexes the materialised
+    // result tuple and stays `Plain`.
     let unpack_sequence_fn = bind(
         assembler,
         cpu.unpack_sequence_fn as *const (),
-        CallFlavor::Plain,
+        CallFlavor::MayForce,
     );
     let unpack_item_fn = bind(
         assembler,
@@ -3744,6 +3816,15 @@ fn register_helper_fn_pointers(
     // Bound after the existing fn_ptrs to preserve their indices.
     let load_name_fn = bind(assembler, cpu.load_name_fn as *const (), CallFlavor::Plain);
     let store_name_fn = bind(assembler, cpu.store_name_fn as *const (), CallFlavor::Plain);
+    // `bh_store_global_fn` delegates to the interpreter `store_global_value`
+    // (pyopcode.py:934 STORE_GLOBAL); same blackhole/deopt-only contract and
+    // `CallFlavor::Plain` classification as `store_name_fn`.  Bound adjacent
+    // to it to keep the namespace-store helpers contiguous.
+    let store_global_fn = bind(
+        assembler,
+        cpu.store_global_fn as *const (),
+        CallFlavor::Plain,
+    );
     // `bh_store_attr_fn` calls `baseobjspace::setattr_str`, which can run
     // user `__setattr__` (forces virtualizables) and raise → `MayForce`.
     // Symmetric to `load_attr_fn`; appended last to preserve fn_ptr indices.
@@ -3828,6 +3909,13 @@ fn register_helper_fn_pointers(
     let import_name_fn = bind(
         assembler,
         cpu.import_name_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // `bh_import_from_fn` runs `importing::import_from` (a submodule-import
+    // fallback may run module top-level Python) → `MayForce`.
+    let import_from_fn = bind(
+        assembler,
+        cpu.import_from_fn as *const (),
         CallFlavor::MayForce,
     );
     // `bh_load_super_attr_fn` runs `getattr` on the super proxy (descriptor
@@ -3928,6 +4016,31 @@ fn register_helper_fn_pointers(
     let call_fn_12 = bind(assembler, cpu.call_fn_12 as *const (), CallFlavor::MayForce);
     let call_fn_13 = bind(assembler, cpu.call_fn_13 as *const (), CallFlavor::MayForce);
     let call_fn_14 = bind(assembler, cpu.call_fn_14 as *const (), CallFlavor::MayForce);
+    // `bh_store_slice_fn` runs `obj[start:stop] = value` via
+    // `runtime_ops::store_slice_values` (a `slice` object through
+    // `baseobjspace::setitem`); a user `__setitem__` or slice-bound
+    // `__index__` can run Python and force virtualizables → `MayForce`.
+    // Appended last to preserve fn_ptr indices.
+    let store_slice_fn = bind(
+        assembler,
+        cpu.store_slice_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // `bh_unpack_ex_fn` validates `a, *b, c = seq` and allocates the slot
+    // tuple (head items, starred list, tail items).  For a non-list/tuple
+    // sequence it drives the iterator protocol
+    // (`runtime_ops::unpack_ex_slots` → `collect_iterable` →
+    // `baseobjspace::next`), so a user `__iter__`/`__next__` can run Python
+    // and force the virtualizable → `CallFlavor::MayForce`, symmetric with
+    // `store_slice_fn` and the `virtualizable_analyzer.analyze(op)` row of
+    // `getcalldescr` (`call.py:288`).  `bh_unpack_item_fn` (already bound)
+    // only indexes the materialised result tuple and stays `Plain`.  Appended
+    // last to preserve fn_ptr indices.
+    let unpack_ex_fn = bind(
+        assembler,
+        cpu.unpack_ex_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3940,6 +4053,7 @@ fn register_helper_fn_pointers(
         getattr_fn,
         load_name_fn,
         store_name_fn,
+        store_global_fn,
         newtuple_from_array_fn,
         newlist_from_array_fn,
         unpack_sequence_fn,
@@ -3975,6 +4089,7 @@ fn register_helper_fn_pointers(
         build_string_from_array_fn,
         convert_value_fn,
         import_name_fn,
+        import_from_fn,
         load_super_attr_fn,
         super_attr_unwrap_fn,
         load_deref_value_fn,
@@ -3985,6 +4100,8 @@ fn register_helper_fn_pointers(
         unary_not_fn,
         load_fast_check_fn,
         list_extend_fn,
+        store_slice_fn,
+        unpack_ex_fn,
     }
 }
 
@@ -4801,6 +4918,11 @@ impl CodeWriter {
                     idx: store_name_fn_idx,
                     flavor: _store_name_fn_flavor,
                 },
+            store_global_fn:
+                HelperHandle {
+                    idx: store_global_fn_idx,
+                    flavor: _store_global_fn_flavor,
+                },
             newtuple_from_array_fn:
                 HelperHandle {
                     idx: newtuple_from_array_fn_idx,
@@ -4976,6 +5098,11 @@ impl CodeWriter {
                     idx: import_name_fn_idx,
                     flavor: _import_name_fn_flavor,
                 },
+            import_from_fn:
+                HelperHandle {
+                    idx: import_from_fn_idx,
+                    flavor: _import_from_fn_flavor,
+                },
             load_super_attr_fn:
                 HelperHandle {
                     idx: load_super_attr_fn_idx,
@@ -5026,6 +5153,16 @@ impl CodeWriter {
                     idx: list_extend_fn_idx,
                     flavor: _list_extend_fn_flavor,
                 },
+            store_slice_fn:
+                HelperHandle {
+                    idx: store_slice_fn_idx,
+                    flavor: _store_slice_fn_flavor,
+                },
+            unpack_ex_fn:
+                HelperHandle {
+                    idx: unpack_ex_fn_idx,
+                    flavor: _unpack_ex_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -5069,6 +5206,7 @@ impl CodeWriter {
                 getattr_fn_idx,
                 load_name_fn_idx,
                 store_name_fn_idx,
+                store_global_fn_idx,
                 newtuple_from_array_fn_idx,
                 newlist_from_array_fn_idx,
                 // `[u16; 15]` indexed by nargs (0..=14).  `call_fn_idx`
@@ -5104,6 +5242,7 @@ impl CodeWriter {
                 build_string_from_array_fn_idx,
                 convert_value_fn_idx,
                 import_name_fn_idx,
+                import_from_fn_idx,
                 load_super_attr_fn_idx,
                 super_attr_unwrap_fn_idx,
                 load_deref_value_fn_idx,
@@ -5114,6 +5253,7 @@ impl CodeWriter {
                 unary_not_fn_idx,
                 load_fast_check_fn_idx,
                 list_extend_fn_idx,
+                store_slice_fn_idx,
             });
         }
 
@@ -8217,15 +8357,31 @@ impl CodeWriter {
                                 py_pc as i64,
                             );
                         }
-                        Instruction::StoreGlobal { .. } => {
-                            // flowcontext.py:884-890 STORE_GLOBAL is
-                            // unsupported; the stack effect still consumes one
-                            // value.  Unlike STORE_NAME it bypasses w_locals
-                            // (`pyopcode.py:940`), and no hot path needs it
-                            // yet — keep the abort until a helper lands.
-                            emit_abort_permanent!(py_pc);
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_vsd!(current_depth, py_pc);
+                        Instruction::StoreGlobal { namei } => {
+                            // pyopcode.py:934 STORE_GLOBAL — pops the value and
+                            // writes it directly into `w_globals` (bypassing
+                            // `w_locals`) via the `store_global` HLOp →
+                            // `bh_store_global_fn(frame, w_name, value)`
+                            // residual call.  Traced via the trait leg
+                            // (`store_global_value`); the residual runs only on
+                            // blackhole/deopt.  Same void 3-Ref shape as the
+                            // StoreName arm.
+                            let name_idx = namei.get(op_arg) as usize;
+                            let attr_name =
+                                super::flow::Constant::string(code.names[name_idx].as_str());
+                            let value_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &stored_value {
+                                pin!(Some(*v), value_reg);
+                            }
+                            emit_frontend_store_global(
+                                &mut graph,
+                                &current_block.block(),
+                                frame_var.into(),
+                                attr_name.into(),
+                                stored_value,
+                                py_pc as i64,
+                            );
                         }
                         Instruction::MakeFunction { .. } => {
                             // Pops code object (TOS), pushes function. Net: 0.
@@ -8388,9 +8544,14 @@ impl CodeWriter {
                             // so no manual scratch reservation is needed.
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let seq_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // A non-list/tuple sequence is iterated
+                            // (`unpack_sequence_exact` → `baseobjspace::iter`/`next`
+                            // → user `__iter__`/`__next__`), which can run Python and
+                            // force the virtualizable → `CallFlavor::MayForce` (emits
+                            // `GUARD_NOT_FORCED`).
                             let tuple_var = residual_call!(
                                 unpack_sequence_fn_idx,
-                                CallFlavor::Plain,
+                                CallFlavor::MayForce,
                                 majit_ir::PyreHelperKind::UnpackSequence,
                                 vec![super::flow::Constant::signed(n as i64).into()],
                                 vec![seq_value],
@@ -9049,18 +9210,78 @@ impl CodeWriter {
                         }
 
                         // ImportFrom: peek module, push attr. Net: +1.
-                        Instruction::ImportFrom { .. } => {
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                        Instruction::ImportFrom { namei } => {
+                            // pyopcode.py IMPORT_FROM — PEEK the module (TOS,
+                            // NOT popped) and push `getattr(module, name)` (with
+                            // a submodule-import fallback) via the `import_from`
+                            // HLOp → `residual_call_ir_r(import_from_fn,
+                            // ListI([name_idx]), ListR([module, code]))`.  Net
+                            // +1; the module stays on the stack.  Surrogate
+                            // operands mirror the LoadAttr / ImportName arms: the
+                            // jitcode's own W_CodeObject as a post-rtype
+                            // `Signed(ptr) + Kind::Ref` constant and the
+                            // `co_names` index the helper resolves the attribute
+                            // name with.  `bh_import_from_fn` runs the import
+                            // through the TLS execution context (MayForce).
+                            let name_idx = namei.get(op_arg) as usize;
+                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
+                            let name_idx_const: super::flow::FlowValue =
+                                super::flow::Constant::signed(name_idx as i64).into();
+                            let module_value = current_state
+                                .stack
+                                .last()
+                                .cloned()
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let result_value = emit_frontend_import_from(
+                                &mut graph,
+                                &current_block.block(),
+                                module_value,
+                                code_const,
+                                name_idx_const,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
-                        // StoreSlice: pops 4 (stop, start, obj, value). Net: -4.
+                        // StoreSlice: pops 4 (stop=TOS, start=TOS1,
+                        // container=TOS2, value=TOS3). Net: -4.
+                        // `obj[start:stop] = value` → `store_slice(container,
+                        // start, stop, value)` HLOp lowered to
+                        // `residual_call_r_v(store_slice_fn_idx, ListR[obj,
+                        // start, stop, value])`.  `bh_store_slice_fn` builds a
+                        // `slice` and runs `setitem` through the shared
+                        // `runtime_ops::store_slice_values`; a user
+                        // `__setitem__` or slice `__index__` may run Python →
+                        // MayForce.  Inputs are read by the backend ABI into
+                        // call regs before the call executes; no write-back
+                        // conflicts because ResKind::Void.
                         Instruction::StoreSlice => {
-                            for _ in 0..4 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            }
-                            emit_abort_permanent!(py_pc);
+                            current_depth -= 1;
+                            emit_vsd!(current_depth, py_pc);
+                            let stop_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            current_depth -= 1;
+                            emit_vsd!(current_depth, py_pc);
+                            let start_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            current_depth -= 1;
+                            emit_vsd!(current_depth, py_pc);
+                            let container_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            current_depth -= 1;
+                            emit_vsd!(current_depth, py_pc);
+                            let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            emit_frontend_store_slice(
+                                &mut graph,
+                                &current_block.block(),
+                                container_value,
+                                start_value,
+                                stop_value,
+                                stored_value,
+                                py_pc as i64,
+                            );
                         }
 
                         // FormatWithSpec: pops 2 (spec=TOS, value=TOS1), pushes 1
@@ -9162,12 +9383,59 @@ impl CodeWriter {
                             let args = counts.get(op_arg);
                             let before = args.before as usize;
                             let after = args.after as usize;
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            for _ in 0..before + 1 + after {
-                                push_fresh_ref(&mut current_state, &mut graph);
-                                current_depth += 1;
+                            let total = before + 1 + after;
+                            // Pop the sequence; `unpack_ex_fn(before, after, seq)`
+                            // splits it into the `before + 1 + after` slots
+                            // (head items, starred list, tail items) in TOS order
+                            // as a tuple — the UNPACK_SEQUENCE shape with a star
+                            // list slot. The result is a generic tuple (never a
+                            // SPECIALISED_TUPLE_II), so `unpack_item_fn(k, tuple)`
+                            // reads each slot through the opaque residual below.
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let seq_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // A non-list/tuple sequence is iterated
+                            // (`collect_iterable` → user `__iter__`/`__next__`),
+                            // which can run Python and force the virtualizable →
+                            // `CallFlavor::MayForce` (emits `GUARD_NOT_FORCED`).
+                            let tuple_var = residual_call!(
+                                unpack_ex_fn_idx,
+                                CallFlavor::MayForce,
+                                vec![
+                                    super::flow::Constant::signed(before as i64).into(),
+                                    super::flow::Constant::signed(after as i64).into(),
+                                ],
+                                vec![seq_value],
+                                vec![],
+                                vec![Kind::Int, Kind::Int, Kind::Ref],
+                                ResKind::Ref,
+                                py_pc as i64,
+                            );
+                            let tuple_value = tuple_var
+                                .map(super::flow::FlowValue::from)
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            // Push the slots in reverse so the stack top is
+                            // slot[0] (unpack_ex pushes head items last).
+                            for k in (0..total).rev() {
+                                let item_dst = stack_base + current_depth;
+                                let item_var = residual_call!(
+                                    unpack_item_fn_idx,
+                                    CallFlavor::Plain,
+                                    majit_ir::PyreHelperKind::UnpackItem,
+                                    vec![super::flow::Constant::signed(k as i64).into()],
+                                    vec![tuple_value.clone()],
+                                    vec![],
+                                    vec![Kind::Int, Kind::Ref],
+                                    ResKind::Ref,
+                                    py_pc as i64,
+                                );
+                                let item_value = item_var
+                                    .map(super::flow::FlowValue::from)
+                                    .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                                if let super::flow::FlowValue::Variable(v) = &item_value {
+                                    pin!(Some(*v), item_dst);
+                                }
+                                push_and_bump!(item_value, py_pc);
                             }
-                            emit_abort_permanent!(py_pc);
                         }
 
                         // BuildInterpolation: conditionally pops format_spec when (oparg & 1) != 0,
