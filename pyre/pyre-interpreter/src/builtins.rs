@@ -216,6 +216,13 @@ fn memoryview_ndim(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(w_int_new(1))
 }
 
+/// `memoryview.__repr__` — `memory_repr`: `<memory at 0x...>` keyed on the
+/// view's own address, not the default `<memoryview object at 0x...>`.
+fn memoryview_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    Ok(w_str_new(&format!("<memory at {mv:?}>")))
+}
+
 /// Unpack a memoryview-or-bytes-like operand to its element-value list,
 /// or `None` when it is neither (so `__eq__` can return NotImplemented).
 /// A memoryview unpacks per its own `itemsize` (so a cast view yields the
@@ -601,6 +608,11 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
                 ns,
                 "tobytes",
                 make_builtin_function_with_arity("tobytes", memoryview_tobytes, 1),
+            );
+            crate::dict_storage_store(
+                ns,
+                "__repr__",
+                make_builtin_function_with_arity("__repr__", memoryview_repr, 1),
             );
             crate::dict_storage_store(
                 ns,
@@ -5648,6 +5660,16 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
                 let n = pyre_object::w_tuple_len(obj) as i64;
                 return Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1));
             }
+            // bytes / bytearray expose the sequence protocol at the C level but
+            // not as `__getitem__` / `__len__` type slots, so they would miss
+            // the `PySequence_Check` path below. `getitem` indexes them
+            // (returning the int byte) for `W_ReversedIterator` to walk.
+            if pyre_object::bytesobject::is_bytes(obj)
+                || pyre_object::bytearrayobject::is_bytearray(obj)
+            {
+                let n = crate::baseobjspace::len_w(obj)?;
+                return Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1));
+            }
         }
         // range: rangeobject.py W_RangeObject.descr_reversed — reflect
         // the span and hand back a fresh reverse-walking iterator. (range is
@@ -5779,6 +5801,13 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     // `__lt__` raises, sort halts with that error.  Rust's
     // `sort_by` closure cannot return Result, so capture the first
     // error via a Cell and surface it after the sort completes.
+    // `listsort.py descr_sort` reverses before and after a stable
+    // ascending sort for `reverse=True`, so equal elements keep their
+    // original relative order (a stable descending sort). A single
+    // post-sort reverse would instead flip ties.
+    if reverse {
+        keyed.reverse();
+    }
     let sort_error: std::cell::Cell<Option<crate::PyError>> = std::cell::Cell::new(None);
     let sort_lt = |ka: PyObjectRef, kb: PyObjectRef| -> bool {
         if sort_error
@@ -5832,6 +5861,7 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     if let Some(err) = sort_error.take() {
         return Err(err);
     }
+    // Second half of the `reverse=True` double-reverse (see above).
     if reverse {
         keyed.reverse();
     }

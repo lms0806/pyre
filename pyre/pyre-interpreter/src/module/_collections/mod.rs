@@ -1,12 +1,14 @@
 //! _collections module — PyPy: `pypy/module/_collections/`.
 //!
 //! Provides the C-accelerated `deque` / `defaultdict` / `OrderedDict`
-//! type stubs.  Pyre backs each instance with an attribute-dict list
-//! (`__data__`) or dict (`__data__` + `default_factory`); semantically
-//! correct for `collections.py`'s `MutableSequence` /
-//! `MutableMapping.register(...)` consumers but not performant.  PyPy's
-//! `W_Deque` is a doubly-linked block list — porting that needs typed
-//! payload backing on top of `py_class!`.
+//! types.  `deque` is the interp-level `py_class!` stub below, backed by
+//! an attribute-dict list (`__data__`); semantically correct for
+//! `collections.py`'s `MutableSequence` consumers but not performant
+//! (PyPy's `W_Deque` is a doubly-linked block list — porting that needs
+//! typed payload backing on top of `py_class!`).  `defaultdict` is the
+//! app-level `dict` subclass in `app_defaultdict.py`, mirroring PyPy's
+//! `app_defaultdict.py` (neither runtime can subclass the app-level
+//! `dict` from interp-level).
 
 use pyre_object::*;
 
@@ -213,7 +215,10 @@ mod deque_class {
     }
 
     crate::py_class! {
-        "deque",
+        // Dotted name so the builtin `__module__` resolves to `collections`
+        // (the name dot-split fallback), matching CPython's
+        // `collections.deque`; `__name__` / `__qualname__` strip to `deque`.
+        "collections.deque",
         methods: {
             // `init(iterable=None, maxlen=None)` — remember maxlen, then
             // extend so the bound is enforced while filling.
@@ -398,6 +403,36 @@ mod deque_class {
                     _ => crate::call::call_function_impl_result(ty, &[list]),
                 }
             }
+            fn __reduce__(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+                // `_collectionsmodule.c deque_reduce` —
+                // `(type(self), args, state, iter(self))`.  `args` is
+                // `((), maxlen)` when the deque is bounded so the bound
+                // survives the round-trip, else `()`.  `state` is the generic
+                // instance state; the items ride the listitems iterator (the
+                // 4th element).
+                //
+                // The instance payload (`__data__`/`__maxlen__`/`__state__`)
+                // lives in the attribute side-dict (this type is hasdict so the
+                // attribute backing has somewhere to go), and a subclass keeps
+                // user attributes in that same dict with no separate `__dict__`
+                // descriptor exposed, so `object_getstate_default` reports
+                // `None` here and a deque subclass round-trips its type, items
+                // and bound but not extra instance attributes. Preserving those
+                // needs the typed-payload deque backing noted in the module
+                // header (the payload would then leave the attribute dict free
+                // to be a real instance `__dict__`).
+                let ty = unsafe { w_instance_get_type(self_obj) };
+                let w_maxlen = crate::baseobjspace::getattr_str(self_obj, "__maxlen__")
+                    .unwrap_or_else(|_| w_none());
+                let args = if w_maxlen.is_null() || unsafe { is_none(w_maxlen) } {
+                    w_tuple_new(vec![])
+                } else {
+                    w_tuple_new(vec![w_tuple_new(vec![]), w_maxlen])
+                };
+                let state = crate::reduce_protocol::object_getstate_default(self_obj)?;
+                let items = crate::baseobjspace::iter(w_list_new(snapshot(self_obj)))?;
+                Ok(w_tuple_new(vec![ty, args, state, items]))
+            }
             fn __len__(self_obj: PyObjectRef) -> i64 {
                 data(self_obj)
                     .map(|d| unsafe { w_list_len(d) } as i64)
@@ -485,7 +520,11 @@ mod deque_class {
                 let Some(_guard) = crate::display::ReprGuard::enter(self_obj) else {
                     return Ok("[...]".to_string());
                 };
-                let name = unsafe { w_type_get_name(w_instance_get_type(self_obj)) };
+                // The repr uses the short class name, so strip any dotted
+                // module prefix from the builtin tp_name (`collections.deque`
+                // → `deque`); a user subclass name has no dot.
+                let full = unsafe { w_type_get_name(w_instance_get_type(self_obj)) };
+                let name = full.rsplit('.').next().unwrap_or(full);
                 let listrepr = snapshot(self_obj)
                     .into_iter()
                     .map(|it| unsafe { crate::py_repr(it) })
@@ -507,62 +546,18 @@ mod deque_class {
     }
 }
 
-/// `pypy/module/_collections/interp_defaultdict.py` — `W_DefaultDict`
-/// stub backed by an inner dict at `self.__data__` plus
-/// `self.default_factory`.  A missing key invokes `default_factory` and
-/// stores the result (`W_DefaultDict.missing`); a missing key with no
-/// factory raises `KeyError(key)`.  Still a stub vs upstream: this type
-/// subclasses `object`, not `dict`, so `isinstance(d, dict)` is False, and
-/// `__missing__`/`__repr__`/`copy`/`__reduce__` are absent.
-mod defaultdict_class {
-    use super::*;
-
-    crate::py_class! {
-        "defaultdict",
-        methods: {
-            fn __init__(self_obj: PyObjectRef, factory: Option<PyObjectRef>) {
-                let _ = crate::baseobjspace::setattr_str(
-                    self_obj, "default_factory", factory.unwrap_or(w_none()));
-                let _ = crate::baseobjspace::setattr_str(self_obj, "__data__", w_dict_new());
-            }
-            fn __getitem__(self_obj: PyObjectRef, key: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-                // `interp_defaultdict.py W_DefaultDict.missing` — present key
-                // returns stored value; missing key + no factory raises
-                // KeyError(key); missing key + factory invokes the factory
-                // and stores the result.
-                let d = crate::baseobjspace::getattr_str(self_obj, "__data__")
-                    .map_err(|_| crate::PyError::key_error_with_key(key))?;
-                unsafe {
-                    if let Some(v) = w_dict_lookup(d, key) {
-                        return Ok(v);
-                    }
-                }
-                let factory = crate::baseobjspace::getattr_str(self_obj, "default_factory")
-                    .unwrap_or_else(|_| w_none());
-                if factory.is_null() || unsafe { is_none(factory) } {
-                    return Err(crate::PyError::key_error_with_key(key));
-                }
-                let value = crate::call::call_function_impl_result(factory, &[])?;
-                unsafe { w_dict_store(d, key, value) };
-                Ok(value)
-            }
-            fn __setitem__(self_obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
-                if let Ok(d) = crate::baseobjspace::getattr_str(self_obj, "__data__") {
-                    unsafe { w_dict_store(d, key, value) };
-                }
-            }
-        }
-    }
-}
-
 crate::py_module! {
     "_collections",
     interpleveldefs: {
         "deque"           => deque_class::type_object(),
         "_deque_iterator" => crate::typedef::w_object(),
-        "defaultdict"     => defaultdict_class::type_object(),
         // `OrderedDict` is a dict subclass; alias to the dict type
         // object so `isinstance(d, OrderedDict)` matches dict instances.
         "OrderedDict"     => crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE),
+    },
+    // `defaultdict` is an app-level `dict` subclass — see the module
+    // header and `app_defaultdict.py` (PyPy `app_defaultdict.defaultdict`).
+    appleveldefs: {
+        "app_defaultdict.py" => ["defaultdict"],
     },
 }
