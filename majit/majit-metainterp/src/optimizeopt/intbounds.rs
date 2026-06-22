@@ -3351,17 +3351,18 @@ impl Optimization for OptIntBounds {
         &self,
         args: &[OpRef],
         ctx: &OptContext,
-    ) -> crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IntBound> {
+    ) -> crate::optimizeopt::vec_assoc::VecAssoc<crate::r#box::BoxRef, IntBound> {
         let mut exported = crate::optimizeopt::vec_assoc::VecAssoc::new();
         for &arg in args {
-            // `&OptContext` here forbids the `materialize_box_at` fallback in
-            // `resolve_box`, so use the immutable forwarded-chain walk
-            // (`get_box_replacement(arg) ≡ get_box_replacement_box(arg)
-            // .to_opref()` with the unresolvable-arg fallthrough).
-            let resolved = ctx
-                .get_box_replacement_box(arg)
-                .map(|b| b.to_opref())
-                .unwrap_or(arg);
+            // An IntBound only lives on a value-bearing box; an unresolvable
+            // arg position carries none. Resolve the canonical box once and
+            // key the export by box identity (`Rc::ptr_eq`), matching RPython's
+            // `box._forwarded` IntBound storage. `&OptContext` here forbids the
+            // `materialize_box_at` fallback, so an unbound arg is simply skipped.
+            let Some(arg_box) = ctx.get_box_replacement_box(arg) else {
+                continue;
+            };
+            let resolved = arg_box.to_opref();
             // optimizer.py:118-119 `setintbound`: an IntBound is never stored
             // on a Const (history.py:220 a Const carries its value inline);
             // unroll.py:483 likewise skips Const args when exporting info, so
@@ -3374,14 +3375,11 @@ impl Optimization for OptIntBounds {
             if !matches!(ctx.opref_type(resolved), Some(majit_ir::Type::Int)) {
                 continue;
             }
-            if let Some(bound) = ctx
-                .get_box_replacement_box(arg)
-                .and_then(|b| ctx.peek_intbound_box(&b))
-            {
+            if let Some(bound) = ctx.peek_intbound_box(&arg_box) {
                 if bound.is_unbounded() {
                     continue;
                 }
-                exported.insert(resolved, bound);
+                exported.insert(arg_box, bound);
             }
         }
         exported
@@ -3496,16 +3494,19 @@ mod tests {
             // box.
             for i in 0..resolved_op.num_args() {
                 let a = resolved_op.arg(i);
-                let resolved = match ctx.resolve_box_box_opt(&a) {
-                    Some(b) => b,
-                    None => {
-                        let ar = a.to_opref();
-                        if ar.is_none() {
-                            a.clone()
-                        } else {
-                            ctx.materialize_box_at(ar).get_box_replacement(false)
-                        }
-                    }
+                let ar = a.to_opref();
+                let resolved = if ar.is_none() {
+                    a.clone()
+                } else {
+                    // Mint + register the canonical `_forwarded` host for this
+                    // position FIRST (whether the operand is a bound producer
+                    // box or a position-only ref), so the pass's later
+                    // `get_box_replacement` resolves to that bound terminal
+                    // rather than re-minting an unbound `from_opref` box. Then
+                    // resolve any forwarding box-native.
+                    let canonical = ctx.materialize_box_at(ar);
+                    ctx.resolve_box_box_opt(&canonical)
+                        .unwrap_or_else(|| canonical.get_box_replacement(false))
                 };
                 resolved_op.setarg(i, resolved);
             }
@@ -3566,9 +3567,37 @@ mod tests {
     }
 
     fn make_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
+        // oparser-faithful (rpython/jit/tool/oparser.py): each position-only
+        // ResOp arg is bound to a synthetic producer of the matching type so
+        // it sheds to `Operand::Op` (not the position-only `Operand::Box`);
+        // constant / input-arg / none refs shed to `Operand::Const` /
+        // `Operand::InputArg` / nothing via `from_opref` and never mint.
         let box_args: Vec<crate::r#box::BoxRef> = args
             .iter()
-            .map(|a| crate::r#box::BoxRef::from_opref(*a))
+            .map(|a| match *a {
+                OpRef::IntOp(n) => {
+                    crate::r#box::test_support::rooted_resop_box(majit_ir::Type::Int, n)
+                }
+                OpRef::FloatOp(n) => {
+                    crate::r#box::test_support::rooted_resop_box(majit_ir::Type::Float, n)
+                }
+                OpRef::RefOp(n) => {
+                    crate::r#box::test_support::rooted_resop_box(majit_ir::Type::Ref, n)
+                }
+                OpRef::VoidOp(n) => {
+                    crate::r#box::test_support::rooted_resop_box(majit_ir::Type::Void, n)
+                }
+                OpRef::InputArgInt(n) => {
+                    crate::r#box::test_support::rooted_inputarg_box(majit_ir::Type::Int, n)
+                }
+                OpRef::InputArgFloat(n) => {
+                    crate::r#box::test_support::rooted_inputarg_box(majit_ir::Type::Float, n)
+                }
+                OpRef::InputArgRef(n) => {
+                    crate::r#box::test_support::rooted_inputarg_box(majit_ir::Type::Ref, n)
+                }
+                other => crate::r#box::BoxRef::from_opref(other),
+            })
             .collect();
         let mut op = Op::new(opcode, &box_args);
         op.pos.set(OpRef::op_typed(pos, op.result_type()));
@@ -4099,9 +4128,13 @@ mod tests {
     /// autogenintrules.py rule and_x_x: int_and(a, a) => a.
     #[test]
     fn test_int_and_x_x() {
+        // `a` is an unproduced header input (oparser `[i0]`): model it as an
+        // InputArg so the production driver's dispatch-entry rebind resolves
+        // it through the OpRef store (no detached bound producer to strand the
+        // `_forwarded` chain). Both args share position 0 ⇒ `same_box` holds.
         let ops = vec![make_op(
             OpCode::IntAnd,
-            &[OpRef::int_op(0), OpRef::int_op(0)],
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
             1,
         )];
         let result = run_pass(&ops);
@@ -4165,9 +4198,11 @@ mod tests {
     /// autogenintrules.py rule or_x_x: int_or(a, a) => a.
     #[test]
     fn test_int_or_x_x() {
+        // `a` is an unproduced header input — model it as an InputArg (see
+        // `test_int_and_x_x`) so the production driver resolves it positionally.
         let ops = vec![make_op(
             OpCode::IntOr,
-            &[OpRef::int_op(0), OpRef::int_op(0)],
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
             1,
         )];
         let result = run_pass(&ops);
@@ -4672,12 +4707,20 @@ mod tests {
     fn test_guard_true_int_lt_enables_add_ovf_removal() {
         use crate::optimizeopt::optimizer::Optimizer;
 
+        // i0/i1 are unproduced header inputs (modelled as InputArgs so the
+        // production driver resolves them positionally); i2/i4 are produced by
+        // the trace; i200 is the const-seeded slot (`constants.insert(200, …)`)
+        // whose canonical host the const-seeding registers.
         let ops = vec![
-            make_op(OpCode::IntLt, &[OpRef::int_op(0), OpRef::int_op(1)], 2),
+            make_op(
+                OpCode::IntLt,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                2,
+            ),
             make_op(OpCode::GuardTrue, &[OpRef::int_op(2)], 3),
             make_op(
                 OpCode::IntAddOvf,
-                &[OpRef::int_op(0), OpRef::int_op(200)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(200)],
                 4,
             ),
             make_op(OpCode::GuardNoOverflow, &[], 5),

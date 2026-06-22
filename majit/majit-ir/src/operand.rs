@@ -254,12 +254,39 @@ impl Operand {
         if b.is_constant() {
             return Operand::Const(b.clone());
         }
-        // Only position-only boxes remain `Operand::Box`. The optimizer
-        // grind (#9-④) reduced production mints to the S9 cross-phase
-        // residual: export-boundary `get_box_replacement` fallbacks (which
-        // carry their own producerless tripwire) and unmapped Phase-1
-        // short-preamble jump args. Both are producer-less by construction
-        // in the current context.
+        // Only position-only boxes (no producer Rc) reach here.
+        //
+        // Drain status (#9 keystone): the gauge fires ZERO times across the
+        // full synth corpus (117 benches, measured). The two former live
+        // sources are bound at their origin: short-preamble `short_inputargs`
+        // now mint via `from_bound_inputarg` over a rooted `InputArg` Rc
+        // carried through the preview → export → import channel
+        // (`short_inputarg_refs`, resolving to `Operand::InputArg`), and
+        // `emit_constant_*` SAME_AS placeholders take the constant box as their
+        // source (resolving to `Operand::Const`). `MAJIT_DIAG_OPERAND_BOX=1`
+        // reports each mint's position-only `OpRef`; off by default, no
+        // behavior change in the gate. A new mint from the WIRED pipeline
+        // appearing here is a regression — bind it at its producer.
+        //
+        // The remaining minters are of two kinds, both gating variant deletion:
+        // (1) unit-test fixtures that build `from_opref` / `new_inputarg`
+        // position-only boxes directly (no producer graph); and (2) the ported
+        // SIMD vectorizer machinery — `Renamer::rename` (renamer.rs:51/64),
+        // `vector.rs` pack/unpack/copy, `GuardStrengthenOpt` (guard.rs), and the
+        // vectorizer-coupled unroll peel-remap — which set op args via
+        // `from_opref(renamed)` of a non-const ResOp/InputArg position. That
+        // machinery is NOT in the production pass pipeline
+        // (optimizer.rs `default_pipeline` wires no `OptVector`), so it
+        // never runs and the gauge stays zero — but it is reachable the moment
+        // the vectorizer is wired. Deleting the `Operand::Box` variant — and
+        // with it the `BoxRef` operand carrier — is therefore gated on BOTH
+        // migrating the fixtures to bound producers AND either binding those
+        // vectorizer minters or removing the unwired vectorizer; until then the
+        // fall-through stays a real fallback, NOT an `unreachable!` tripwire
+        // (which would become a latent panic once the vectorizer is enabled).
+        if std::env::var_os("MAJIT_DIAG_OPERAND_BOX").is_some() {
+            eprintln!("OPERAND_BOX_MINT {:?}", b.to_opref());
+        }
         Operand::Box(b.clone())
     }
 

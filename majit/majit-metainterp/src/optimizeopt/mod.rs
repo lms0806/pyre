@@ -555,16 +555,17 @@ fn raise_speculative_error(reason: &'static str) -> ! {
 pub struct OptContext {
     /// The output operation list being built.
     pub new_operations: Vec<majit_ir::OpRc>,
-    /// optimizer.py:246 `self._emittedoperations = {}` — result positions
-    /// of ops emitted by THIS optimizer run. `as_operation`
-    /// (optimizer.py:369-377) only treats a box as a producer when
-    /// `op in self._emittedoperations`, so pattern-matching rewrites
+    /// optimizer.py:246 `self._emittedoperations = {}` — the result boxes
+    /// of ops emitted by THIS optimizer run, keyed by box identity
+    /// (`Rc::ptr_eq`) to mirror the upstream dict keyed by the `op` object.
+    /// `as_operation` (optimizer.py:369-377) only treats a box as a producer
+    /// when `op in self._emittedoperations`, so pattern-matching rewrites
     /// (e.g. autogenintrules.py int_add chain reassociation) never reach
     /// across an optimization-run boundary into a previous phase's ops.
     /// A Phase-2 lookup that followed a label arg to its Phase-1 producer
     /// would re-express a per-iteration value in terms of the PREAMBLE's
     /// entry value, which the loop header does not carry per-iteration.
-    pub emitted_operations: majit_ir::vec_set::VecSet<OpRef>,
+    pub emitted_operations: majit_ir::vec_set::VecSet<crate::r#box::BoxRef>,
     /// Number of input arguments, used to offset emitted op positions
     /// so that variable indices don't collide with input arg indices.
     num_inputs: u32,
@@ -685,6 +686,15 @@ pub struct OptContext {
     /// the export-site `label_args + virtuals` recompute (measured
     /// identical across the corpus, 2026-06-11).
     pub exported_short_inputargs: Vec<crate::r#box::BoxRef>,
+    /// Rooted `InputArgRc` carriers for `exported_short_inputargs`, index-
+    /// aligned with that vector. Each renamed short-preamble input box
+    /// (`exported_short_inputargs[i]`) holds a WEAK handle to
+    /// `exported_short_inputarg_refs[i]`; keeping the strong Rc alive here
+    /// lets the box resolve to a real bound `InputArg` (so the operand binds
+    /// to `Operand::InputArg` instead of shedding to the position-only
+    /// `Operand::Box` catch-all). Carried alongside `exported_short_inputargs`
+    /// through the same export channel.
+    pub exported_short_inputarg_refs: Vec<majit_ir::InputArgRc>,
     /// optimizer.py: `can_replace_guards` — disable guard replacement during
     /// bridge compilation. Defaults to true for preamble.
     pub can_replace_guards: bool,
@@ -1604,6 +1614,7 @@ impl OptContext {
             active_short_preamble_producer: None,
             exported_short_boxes: Vec::new(),
             exported_short_inputargs: Vec::new(),
+            exported_short_inputarg_refs: Vec::new(),
 
             imported_virtuals: Vec::new(),
             imported_label_args: None,
@@ -2149,6 +2160,7 @@ impl OptContext {
             active_short_preamble_producer: None,
             exported_short_boxes: Vec::new(),
             exported_short_inputargs: Vec::new(),
+            exported_short_inputarg_refs: Vec::new(),
 
             imported_virtuals: Vec::new(),
             imported_label_args: None,
@@ -2263,9 +2275,14 @@ impl OptContext {
     /// the resulting OpRef.
     pub fn emit_constant_int(&mut self, value: i64) -> OpRef {
         let pos_ref = self.reserve_pos_typed(Type::Int);
+        // The SAME_AS source is the constant itself (`make_constant_box` below
+        // forwards the result to the same `Const`, so the op is a tautology
+        // `result = ConstInt(value)`). A constant operand binds directly; a
+        // position-only `from_opref(pos_ref)` self-reference would shed to the
+        // catch-all `Operand::Box` with no live producer (#9).
         let mut op = Op::new(
             OpCode::SameAsI,
-            &[crate::r#box::BoxRef::from_opref(pos_ref)],
+            &[crate::r#box::BoxRef::new_const(Value::Int(value))],
         );
         op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
@@ -2278,9 +2295,10 @@ impl OptContext {
     /// return the resulting OpRef.
     pub fn emit_constant_ref(&mut self, value: GcRef) -> OpRef {
         let pos_ref = self.reserve_pos_typed(Type::Ref);
+        // SAME_AS source is the constant ref itself; see `emit_constant_int`.
         let mut op = Op::new(
             OpCode::SameAsR,
-            &[crate::r#box::BoxRef::from_opref(pos_ref)],
+            &[crate::r#box::BoxRef::new_const(Value::Ref(value))],
         );
         op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
@@ -2293,9 +2311,10 @@ impl OptContext {
     /// the resulting OpRef.
     pub fn emit_constant_float(&mut self, value: f64) -> OpRef {
         let pos_ref = self.reserve_pos_typed(Type::Float);
+        // SAME_AS source is the constant float itself; see `emit_constant_int`.
         let mut op = Op::new(
             OpCode::SameAsF,
-            &[crate::r#box::BoxRef::from_opref(pos_ref)],
+            &[crate::r#box::BoxRef::new_const(Value::Float(value))],
         );
         op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
@@ -2752,7 +2771,8 @@ impl OptContext {
                 // clone path below records this too; `get_producing_op` only
                 // admits producers present here, so the reused op must be
                 // marked emitted or it stays invisible to producer matching.
-                self.emitted_operations.insert(op_pos);
+                self.emitted_operations
+                    .insert(crate::r#box::BoxRef::from_bound_op(&reused));
                 self.new_operations.push(reused);
                 return op_pos;
             }
@@ -2795,7 +2815,8 @@ impl OptContext {
             }
         }
         // optimizer.py:674 `self._emittedoperations[op] = None`.
-        self.emitted_operations.insert(op_pos);
+        self.emitted_operations
+            .insert(crate::r#box::BoxRef::from_bound_op(&op_rc));
         self.new_operations.push(op_rc);
         pos_ref
     }
@@ -5772,8 +5793,8 @@ impl OptContext {
         ) {
             (Some(ref a), Some(ref b)) => a.same_box(b),
             _ => {
-                let query = self.get_box_replacement(query).to_opref();
-                let stored = self.get_box_replacement(stored).to_opref();
+                let query = self.get_replacement_opref(query);
+                let stored = self.get_replacement_opref(stored);
                 if query == stored {
                     return true;
                 }
@@ -6459,7 +6480,13 @@ impl OptContext {
         // Walk the forwarding chain first (resoperation.py:58) so the
         // replacement box's producer is read.
         let producer = op.get_box_replacement(false).bound_op()?;
-        if !self.emitted_operations.contains(&producer.pos.get()) {
+        // optimizer.py:369-377 `op in self._emittedoperations` — keyed by the
+        // producer's box identity (`from_bound_op` memoizes one box per op Rc,
+        // so this is the same box recorded at emit).
+        if !self
+            .emitted_operations
+            .contains(&crate::r#box::BoxRef::from_bound_op(&producer))
+        {
             return None;
         }
         Some((*producer).clone())
@@ -8421,7 +8448,7 @@ pub trait Optimization {
         &self,
         _args: &[OpRef],
         _ctx: &OptContext,
-    ) -> crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IntBound> {
+    ) -> crate::optimizeopt::vec_assoc::VecAssoc<crate::r#box::BoxRef, IntBound> {
         crate::optimizeopt::vec_assoc::VecAssoc::new()
     }
 
@@ -9931,7 +9958,10 @@ mod ensure_ptr_info_arg0_tests {
         let descr: DescrRef = Arc::new(TestFieldDescr { index: 0, parent });
         let mut op = Op::with_descr(
             OpCode::GetfieldGcI,
-            &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+            &[crate::r#box::test_support::rooted_inputarg_box(
+                Type::Ref,
+                0,
+            )],
             descr,
         );
         op.pos.set(OpRef::int_op(1));
@@ -9946,7 +9976,10 @@ mod ensure_ptr_info_arg0_tests {
         });
         let mut op = Op::with_descr(
             OpCode::ArraylenGc,
-            &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+            &[crate::r#box::test_support::rooted_inputarg_box(
+                Type::Ref,
+                0,
+            )],
             descr,
         );
         op.pos.set(OpRef::int_op(1));
@@ -10014,7 +10047,10 @@ mod ensure_ptr_info_arg0_tests {
             });
             let mut op = Op::with_descr(
                 OpCode::Strlen,
-                &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+                &[crate::r#box::test_support::rooted_inputarg_box(
+                    Type::Ref,
+                    0,
+                )],
                 descr,
             );
             op.pos.set(OpRef::int_op(1));
@@ -10048,7 +10084,10 @@ mod ensure_ptr_info_arg0_tests {
             });
             let mut op = Op::with_descr(
                 OpCode::Strlen,
-                &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+                &[crate::r#box::test_support::rooted_inputarg_box(
+                    Type::Ref,
+                    0,
+                )],
                 descr,
             );
             op.pos.set(OpRef::int_op(1));
@@ -10370,8 +10409,8 @@ mod imported_short_preamble_fallback_tests {
         let mut replay_op = Op::new(
             OpCode::IntAdd,
             &[
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(7)),
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(8)),
+                crate::r#box::test_support::rooted_resop_box(majit_ir::Type::Int, 7),
+                crate::r#box::test_support::rooted_resop_box(majit_ir::Type::Int, 8),
             ],
         );
         replay_op.pos.set(OpRef::int_op(14));
