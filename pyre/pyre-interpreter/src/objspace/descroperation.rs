@@ -11,7 +11,7 @@ use malachite_bigint::BigInt;
 use num_integer::Integer;
 use num_traits::ToPrimitive;
 
-use pyre_object::strobject::is_str;
+use pyre_object::unicodeobject::is_str;
 use pyre_object::*;
 use rustpython_wtf8::Wtf8Buf;
 
@@ -2755,7 +2755,7 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Ne => la != lb,
             }));
         }
-        // dict equality — `pypy/objspace/std/dictobject.py
+        // dict equality — `pypy/objspace/std/dictmultiobject.py
         // W_DictMultiObject.descr_eq` is order-independent: same length
         // AND each key-value pair in `a` exists with equal value in `b`.
         // CPython only defines == / != for dicts (no ordering), so we
