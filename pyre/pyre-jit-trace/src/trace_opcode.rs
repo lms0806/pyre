@@ -446,26 +446,15 @@ fn emit_call_assembler_callee_frame(
             let nlocals = callee_code.varnames.len();
             let ncells = pyre_interpreter::ncells(callee_code);
             let max_stack = callee_code.max_stackdepth as usize;
-            // Resolve the canonical W_DictObject sibling so the inline
-            // new-PyFrame helper populates `PyFrame.w_globals_obj`, and
-            // recover the legacy raw storage from it via the proxy back-link
-            // for the `frame_stores_global` stamp.  The function's own raw
-            // slot is null (MAKE_FUNCTION captures the object only), so
-            // reading it here would mis-stamp `pycode.w_globals`.
+            // The callee's globals OBJECT (`function.w_func_globals_obj`)
+            // populates `PyFrame.w_globals` and feeds the
+            // `frame_stores_global` stamp.
             let callee_globals_obj =
                 unsafe { pyre_interpreter::function_get_globals_obj(concrete_callable) };
-            let callee_globals = if callee_globals_obj.is_null() {
-                std::ptr::null_mut()
-            } else {
-                unsafe {
-                    pyre_object::dictmultiobject::w_dict_get_dict_storage_proxy(callee_globals_obj)
-                        as *mut pyre_interpreter::DictStorage
-                }
-            };
             let stores_global = unsafe {
                 pyre_interpreter::w_code_frame_stores_global(
                     w_callee_code as PyObjectRef,
-                    callee_globals,
+                    callee_globals_obj,
                 )
             };
             if ncells == 0 && !stores_global {
@@ -4698,8 +4687,21 @@ impl MIFrame {
         let mut boxes = Vec::new();
         // opencoder.py:722: virtualizable_ptr FIRST.
         // The virtualizable frame pointer is always a GCREF.
+        //
+        // RPython parity: the vable identity is the virtualizable OWNER
+        // (portal) frame — `metainterp.virtualizable_boxes[-1]` — recorded once
+        // at toplevel, NOT the current frame. For an inlined callee `sym` (the
+        // separate-inline-frame path), `sym.frame` is the callee frame, whose
+        // heap `locals_cells_stack_w` length differs from the owner frame's;
+        // the static-field count and array length below are sourced from the
+        // owner (`ctx.virtualizable_*`), so using `sym.frame` here makes the
+        // decoder's `get_total_size(virtualizable)` read the callee's shorter
+        // array and trip `consume_vable_info` (vable_size-1 mismatch). Source
+        // the identity from the seeded owner; fall back to `sym.frame` only in
+        // the unseeded test path.
+        let identity_opref = ctx.virtualizable_owner_identity().unwrap_or(sym.frame);
         boxes.push(Self::opref_to_snapshot_tagged_for_slot(
-            sym.frame,
+            identity_opref,
             ctx,
             Some(majit_ir::Type::Ref),
         ));
@@ -7404,7 +7406,7 @@ impl MIFrame {
                     null, // debugdata = None
                     null, // lastblock = None
                     // pyframe.py:128 self.w_globals is the dict OBJECT; the
-                    // vable slot is PYFRAME_W_GLOBALS_OBJ_OFFSET, so seed the
+                    // vable slot is PYFRAME_W_GLOBALS_OFFSET, so seed the
                     // W_DictObject sibling, not the raw DictStorage*.
                     ctx.const_ref(callee_globals_obj as i64),
                 )
@@ -11593,7 +11595,7 @@ mod tests {
             .execute_frame(None, None)
             .expect("module body should execute");
         let exc_class = unsafe {
-            (*frame.fget_w_globals())
+            (*frame.fget_w_globals_storage())
                 .get("x")
                 .copied()
                 .expect("namespace should contain ValueError")

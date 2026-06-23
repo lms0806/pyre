@@ -40,8 +40,12 @@ pub struct W_CodeObject {
     pub ob_header: PyObject,
     /// Opaque pointer to a `CodeObject` (owned via Box::into_raw).
     pub code_ptr: *const (),
-    /// PyPy: `PyCode.w_globals`.
-    pub w_globals: *mut crate::DictStorage,
+    /// PyPy: `PyCode.w_globals` — the globals dict OBJECT (`W_DictMultiObject`,
+    /// `pycode.py:105 "w_globals?"`).  A `malloc_typed`-immortal wrapper, so
+    /// the pointer never moves.  Null until first stamped by
+    /// `frame_stores_global`.  The off-GC `DictStorage` storage is recovered
+    /// on demand via `w_globals_storage`.
+    pub w_globals: PyObjectRef,
     /// PyPy: `PyCode.hidden_applevel` (`pycode.py:111, 147`). Set by
     /// `pycompiler.compile(hidden_applevel=True)` for PyPy gateway/
     /// app_main bridge code.  Pyre has no such call site yet, so this
@@ -87,8 +91,6 @@ pub struct W_CodeObject {
 
 /// Field offset of `code_ptr` within `W_CodeObject`.
 pub const CODE_PTR_OFFSET: usize = std::mem::offset_of!(W_CodeObject, code_ptr);
-/// Field offset of `w_globals` within `W_CodeObject`.
-pub const CODE_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(W_CodeObject, w_globals);
 
 /// GC type id assigned to `W_CodeObject`.
 ///
@@ -223,7 +225,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
             w_class: pyre_object::pyobject::get_instantiate(&CODE_TYPE),
         },
         code_ptr,
-        w_globals: std::ptr::null_mut(),
+        w_globals: pyre_object::PY_NULL,
         hidden_applevel,
         fast_natural_arity,
         globals_caches,
@@ -331,18 +333,20 @@ pub unsafe fn w_code_hidden_applevel(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const W_CodeObject)).hidden_applevel }
 }
 
-/// PyPy: `PyCode.w_globals`.
+/// PyPy: `PyCode.w_globals` — the globals dict OBJECT. The JIT
+/// codewriter/bridge read this to fold globals lookups without an off-GC
+/// proxy.
 #[inline]
-pub unsafe fn w_code_get_w_globals(obj: PyObjectRef) -> *mut crate::DictStorage {
+pub unsafe fn w_code_get_w_globals(obj: PyObjectRef) -> PyObjectRef {
     if obj.is_null() {
-        return std::ptr::null_mut();
+        return pyre_object::PY_NULL;
     }
     unsafe { (*(obj as *const W_CodeObject)).w_globals }
 }
 
 /// PyPy: `PyCode.w_globals = w_globals`.
 #[inline]
-pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: *mut crate::DictStorage) {
+pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: PyObjectRef) {
     if obj.is_null() {
         return;
     }
@@ -353,10 +357,7 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: *mut crate::Dict
 
 /// PyPy: `PyCode.frame_stores_global(w_globals)`.
 #[inline]
-pub unsafe fn w_code_frame_stores_global(
-    obj: PyObjectRef,
-    w_globals: *mut crate::DictStorage,
-) -> bool {
+pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
     }
