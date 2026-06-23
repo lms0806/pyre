@@ -9,6 +9,7 @@ use majit_backend::{
 };
 use majit_backend_cranelift::{CraneliftBackend, force_token_to_dead_frame, jit_exc_raise};
 use majit_ir::box_ref::BoxRef;
+use majit_ir::operand::Operand;
 use majit_ir::{
     ArrayDescr, Descr, DescrRef, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value,
 };
@@ -71,6 +72,8 @@ fn full_mul_u64(a: u64, b: u64) -> (u64, u64) {
 fn make_descr(_index: u32) -> DescrRef {
     majit_backend::make_resume_guard_descr_typed(Vec::new())
 }
+
+use majit_ir::box_ref::bound_box_from_opref as rb;
 
 // ---------------------------------------------------------------------------
 // Test 1: Simple arithmetic (trace -> optimize -> compile -> execute)
@@ -2288,23 +2291,23 @@ fn test_call_assembler_callee_guard_failure_frame_stack() {
     let mut callee_ops = vec![
         Op::new(
             OpCode::Label,
-            &[BoxRef::from_opref(OpRef::input_arg_int(0))],
+            &[Operand::from_boxref(&rb(OpRef::input_arg_int(0)))],
         ),
         Op::new(
             OpCode::IntGt,
             &[
-                BoxRef::from_opref(OpRef::input_arg_int(0)),
-                BoxRef::from_opref(OpRef::const_int(10)),
+                Operand::from_boxref(&rb(OpRef::input_arg_int(0))),
+                Operand::from_boxref(&rb(OpRef::const_int(10))),
             ],
         ),
         Op::with_descr(
             OpCode::GuardTrue,
-            &[BoxRef::from_opref(OpRef::int_op(1))],
+            &[Operand::from_boxref(&rb(OpRef::int_op(1)))],
             make_descr(0),
         ),
         Op::with_descr(
             OpCode::Finish,
-            &[BoxRef::from_opref(OpRef::input_arg_int(0))],
+            &[Operand::from_boxref(&rb(OpRef::input_arg_int(0)))],
             make_descr(1),
         ),
     ];

@@ -16335,13 +16335,16 @@ mod tests {
     use majit_gc::trace::TypeInfo;
     use majit_ir::box_ref::BoxRef;
     use majit_ir::descr::{Descr, EffectInfo, ExtraEffect, SizeDescr};
+    use majit_ir::operand::Operand;
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> majit_ir::OpRc {
-        let bx: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+        let bx: Vec<Operand> = args.iter().map(|a| Operand::from_boxref(&rb(*a))).collect();
         let o = Op::new(opcode, &bx);
         o.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         std::rc::Rc::new(o)
     }
+
+    use majit_ir::box_ref::bound_box_from_opref as rb;
 
     /// llsupport/gc.py:563 GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr
@@ -16370,7 +16373,7 @@ mod tests {
         pos: u32,
         descr: majit_ir::DescrRef,
     ) -> majit_ir::OpRc {
-        let bx: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+        let bx: Vec<Operand> = args.iter().map(|a| Operand::from_boxref(&rb(*a))).collect();
         let o = Op::with_descr(opcode, &bx, descr);
         o.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         std::rc::Rc::new(o)
@@ -17256,8 +17259,8 @@ mod tests {
             OpRef::NONE.raw(),
         );
         guard.setfailargs(smallvec::smallvec![
-            BoxRef::from_opref(OpRef::input_arg_ref(1)),
-            BoxRef::from_opref(OpRef::input_arg_int(0)),
+            rb(OpRef::input_arg_ref(1)),
+            rb(OpRef::input_arg_int(0)),
         ]);
         let ops = vec![
             mk_op(
@@ -17463,9 +17466,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let root_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
@@ -17560,9 +17561,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let root_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
@@ -17631,9 +17630,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        bridge_guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
+        bridge_guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             bridge_guard,
@@ -17703,9 +17700,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        root_guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
+        root_guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let root_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             root_guard,
@@ -17771,9 +17766,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        bridge_guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
+        bridge_guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             bridge_guard,
@@ -18292,9 +18285,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 1);
-        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -18342,9 +18333,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 1);
-        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -18385,9 +18374,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
-        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -18438,9 +18425,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
-        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -18495,9 +18480,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 3);
-        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -18569,9 +18552,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
-        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -20547,8 +20528,8 @@ mod tests {
         );
         // Explicit fail_args: save both i0 and i1 plus the computed sum (i0+i1)
         guard_op.setfailargs(smallvec::smallvec![
-            BoxRef::from_opref(OpRef::input_arg_int(0)),
-            BoxRef::from_opref(OpRef::input_arg_int(1)),
+            rb(OpRef::input_arg_int(0)),
+            rb(OpRef::input_arg_int(1)),
         ]);
 
         let ops = vec![
@@ -20642,8 +20623,8 @@ mod tests {
             OpRef::NONE.raw(),
         );
         guard_op.setfailargs(smallvec::smallvec![
-            BoxRef::from_opref(OpRef::input_arg_float(1)),
-            BoxRef::from_opref(OpRef::input_arg_ref(2)),
+            rb(OpRef::input_arg_float(1)),
+            rb(OpRef::input_arg_ref(2)),
         ]);
         let ops = vec![
             mk_op(
@@ -20692,10 +20673,10 @@ mod tests {
             OpRef::NONE.raw(),
         );
         guard_op.setfailargs(smallvec::smallvec![
-            BoxRef::from_opref(OpRef::input_arg_int(0)),
-            BoxRef::from_opref(OpRef::input_arg_ref(1)),
-            BoxRef::from_opref(OpRef::input_arg_float(2)),
-            BoxRef::from_opref(OpRef::input_arg_ref(3)),
+            rb(OpRef::input_arg_int(0)),
+            rb(OpRef::input_arg_ref(1)),
+            rb(OpRef::input_arg_float(2)),
+            rb(OpRef::input_arg_ref(3)),
         ]);
         let ops = vec![
             mk_op(
@@ -20888,8 +20869,8 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.setfailargs(smallvec::smallvec![
-            BoxRef::from_opref(OpRef::input_arg_int(1)),
-            BoxRef::from_opref(OpRef::input_arg_int(0)),
+            rb(OpRef::input_arg_int(1)),
+            rb(OpRef::input_arg_int(0)),
         ]);
         let ops = vec![
             mk_op(
@@ -20964,8 +20945,8 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.setfailargs(smallvec::smallvec![
-            BoxRef::from_opref(OpRef::input_arg_int(1)),
-            BoxRef::from_opref(OpRef::input_arg_int(0)),
+            rb(OpRef::input_arg_int(1)),
+            rb(OpRef::input_arg_int(0)),
         ]);
         let ops = vec![
             mk_op(
@@ -21039,9 +21020,9 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.setfailargs(smallvec::smallvec![
-            BoxRef::from_opref(OpRef::input_arg_int(1)),
-            BoxRef::from_opref(OpRef::int_op(3)),
-            BoxRef::from_opref(OpRef::input_arg_int(0)),
+            rb(OpRef::input_arg_int(1)),
+            rb(OpRef::int_op(3)),
+            rb(OpRef::input_arg_int(0)),
         ]);
         let ops = vec![
             mk_op(
@@ -21098,9 +21079,9 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.setfailargs(smallvec::smallvec![
-            BoxRef::from_opref(OpRef::input_arg_int(1)),
-            BoxRef::from_opref(OpRef::int_op(3)),
-            BoxRef::from_opref(OpRef::input_arg_int(0)),
+            rb(OpRef::input_arg_int(1)),
+            rb(OpRef::int_op(3)),
+            rb(OpRef::input_arg_int(0)),
         ]);
         let ops = vec![
             mk_op(
@@ -21169,9 +21150,9 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.setfailargs(smallvec::smallvec![
-            BoxRef::from_opref(OpRef::input_arg_int(1)),
-            BoxRef::from_opref(OpRef::float_op(3)),
-            BoxRef::from_opref(OpRef::input_arg_int(0)),
+            rb(OpRef::input_arg_int(1)),
+            rb(OpRef::float_op(3)),
+            rb(OpRef::input_arg_int(0)),
         ]);
         let ops = vec![
             mk_op(
@@ -21611,9 +21592,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
-        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let root_ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
@@ -21687,9 +21666,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
-        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let root_ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
@@ -21767,9 +21744,9 @@ mod tests {
         ];
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(4)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![
-            BoxRef::from_opref(OpRef::input_arg_ref(0)),
-            BoxRef::from_opref(OpRef::input_arg_int(1)),
-            BoxRef::from_opref(OpRef::input_arg_ref(2)),
+            rb(OpRef::input_arg_ref(0)),
+            rb(OpRef::input_arg_int(1)),
+            rb(OpRef::input_arg_ref(2)),
         ]);
         let root_ops = vec![
             mk_op_with_descr(
@@ -21866,9 +21843,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
-        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let root_ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
@@ -21953,9 +21928,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
-        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let root_ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
@@ -22068,9 +22041,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
-        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let root_ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
@@ -22188,7 +22159,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
-        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(1))]);
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::int_op(1))]);
         let root_ops = vec![
             // Peeled preamble: runs once on the initial host entry, before the
             // first LABEL.  A loader re-entry must skip it.
@@ -22679,9 +22650,9 @@ mod tests {
         let inputargs = vec![];
         let mut guard = mk_op(OpCode::GuardNonnull, &[OpRef::ref_op(2)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![
-            BoxRef::from_opref(OpRef::ref_op(0)),
-            BoxRef::from_opref(OpRef::ref_op(1)),
-            BoxRef::from_opref(OpRef::ref_op(2))
+            rb(OpRef::ref_op(0)),
+            rb(OpRef::ref_op(1)),
+            rb(OpRef::ref_op(2))
         ]);
         let ops = vec![
             mk_op(OpCode::Label, &[], OpRef::NONE.raw()),
@@ -22856,7 +22827,7 @@ mod tests {
         // Ref-typed OpRef variant.
         let str0 = OpRef::ref_op(0);
         let op = |oc, args: &[OpRef]| {
-            let bx: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+            let bx: Vec<Operand> = args.iter().map(|a| Operand::from_boxref(&rb(*a))).collect();
             std::rc::Rc::new(Op::new(oc, &bx))
         };
         let ops = vec![
@@ -22908,7 +22879,7 @@ mod tests {
         let src = OpRef::ref_op(0);
         let dst = OpRef::ref_op(3);
         let op = |oc, args: &[OpRef]| {
-            let bx: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+            let bx: Vec<Operand> = args.iter().map(|a| Operand::from_boxref(&rb(*a))).collect();
             std::rc::Rc::new(Op::new(oc, &bx))
         };
         let ops = vec![
@@ -22962,7 +22933,7 @@ mod tests {
         // pointer use the Ref-typed OpRef variant.
         let buf = OpRef::ref_op(0);
         let op = |oc, args: &[OpRef]| {
-            let bx: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+            let bx: Vec<Operand> = args.iter().map(|a| Operand::from_boxref(&rb(*a))).collect();
             std::rc::Rc::new(Op::new(oc, &bx))
         };
         let ops = vec![
@@ -22996,7 +22967,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_ref(0)];
         let op = |oc, args: &[OpRef]| {
-            let bx: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+            let bx: Vec<Operand> = args.iter().map(|a| Operand::from_boxref(&rb(*a))).collect();
             std::rc::Rc::new(Op::new(oc, &bx))
         };
         let ops = vec![
@@ -23042,7 +23013,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_ref(0)];
         let op = |oc, args: &[OpRef]| {
-            let bx: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+            let bx: Vec<Operand> = args.iter().map(|a| Operand::from_boxref(&rb(*a))).collect();
             std::rc::Rc::new(Op::new(oc, &bx))
         };
         let ops = vec![
@@ -23304,8 +23275,8 @@ mod tests {
         let guard_op = Op::new(OpCode::GuardNotInvalidated, &[]);
         guard_op.pos.set(OpRef::int_op(OpRef::NONE.raw()));
         guard_op.setfailargs(smallvec::smallvec![
-            BoxRef::from_opref(OpRef::input_arg_int(0)),
-            BoxRef::from_opref(OpRef::input_arg_int(1)),
+            rb(OpRef::input_arg_int(0)),
+            rb(OpRef::input_arg_int(1)),
         ]);
 
         let ops = vec![
@@ -23355,7 +23326,7 @@ mod tests {
 
         let guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
         guard_inv.pos.set(OpRef::int_op(OpRef::NONE.raw()));
-        guard_inv.setfailargs(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(1))]);
+        guard_inv.setfailargs(smallvec::smallvec![rb(OpRef::int_op(1))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -23405,9 +23376,7 @@ mod tests {
 
         let guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
         guard_inv.pos.set(OpRef::int_op(OpRef::NONE.raw()));
-        guard_inv.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
+        guard_inv.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             std::rc::Rc::new(guard_inv),
@@ -23458,8 +23427,8 @@ mod tests {
             OpRef::NONE.raw(),
         );
         guard1.setfailargs(smallvec::smallvec![
-            BoxRef::from_opref(OpRef::input_arg_int(0)),
-            BoxRef::from_opref(OpRef::input_arg_int(1)),
+            rb(OpRef::input_arg_int(0)),
+            rb(OpRef::input_arg_int(1)),
         ]);
         let int_add = mk_op(
             OpCode::IntAdd,
@@ -23467,7 +23436,7 @@ mod tests {
             2,
         );
         let mut guard2 = mk_op(OpCode::GuardFalse, &[OpRef::int_op(2)], OpRef::NONE.raw());
-        guard2.setfailargs(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(2))]);
+        guard2.setfailargs(smallvec::smallvec![rb(OpRef::int_op(2))]);
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -23527,9 +23496,9 @@ mod tests {
             OpRef::NONE.raw(),
         );
         guard.setfailargs(smallvec::smallvec![
-            BoxRef::from_opref(OpRef::input_arg_int(0)),
-            BoxRef::from_opref(OpRef::input_arg_ref(1)),
-            BoxRef::from_opref(OpRef::input_arg_float(2)),
+            rb(OpRef::input_arg_int(0)),
+            rb(OpRef::input_arg_ref(1)),
+            rb(OpRef::input_arg_float(2)),
         ]);
         let ops = vec![
             mk_op(
@@ -23594,9 +23563,7 @@ mod tests {
             mk_op(OpCode::IntGt, &[OpRef::int_op(1), OpRef::int_op(101)], 2),
             {
                 let mut g = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
-                g.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-                    OpRef::input_arg_int(0)
-                )]);
+                g.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
                 g
             },
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),

@@ -30,6 +30,7 @@ pub(crate) use majit_backend_cranelift::CraneliftBackend as BackendImpl;
 pub(crate) use majit_backend_dynasm::runner::DynasmBackend as BackendImpl;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use majit_backend_wasm::WasmBackend as BackendImpl;
+use majit_ir::operand::Operand;
 
 #[cfg(not(any(feature = "cranelift", feature = "dynasm", target_arch = "wasm32")))]
 compile_error!("majit-metainterp requires a backend: enable feature \"cranelift\" or \"dynasm\"");
@@ -5219,7 +5220,7 @@ impl<M: Clone> MetaInterp<M> {
                 &trace
                     .inputargs
                     .iter()
-                    .map(BoxRef::from_bound_inputarg)
+                    .map(|ia| Operand::from_boxref(&BoxRef::from_bound_inputarg(ia)))
                     .collect::<Vec<_>>(),
             );
             label_op.pos.set(majit_ir::OpRef::NONE);
@@ -5366,7 +5367,7 @@ impl<M: Clone> MetaInterp<M> {
                     &trace
                         .inputargs
                         .iter()
-                        .map(BoxRef::from_bound_inputarg)
+                        .map(|ia| Operand::from_boxref(&BoxRef::from_bound_inputarg(ia)))
                         .collect::<Vec<_>>(),
                 );
                 label_op.pos.set(majit_ir::OpRef::NONE);
@@ -7189,11 +7190,16 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(jump_op) = compiled_ops.last().filter(|op| op.opcode == OpCode::Jump) {
             jump_op.setdescr(target_token.as_jump_target_descr());
         }
+        // Bind the label args to the TreeLoop's canonical `InputArgRc`
+        // producers (the same slot-for-slot mirror used by the retry-path
+        // Label synthesis above) instead of re-minting position-only boxes:
+        // `inputargs` are value clones of `trace.inputargs`.
         let mut label_op = majit_ir::Op::new(
             majit_ir::OpCode::Label,
-            &inputargs
+            &trace
+                .inputargs
                 .iter()
-                .map(|ia| BoxRef::from_opref(ia.opref()))
+                .map(|ia| Operand::from_boxref(&BoxRef::from_bound_inputarg(ia)))
                 .collect::<Vec<_>>(),
         );
         label_op.pos.set(majit_ir::OpRef::NONE);
@@ -16144,10 +16150,20 @@ mod metainterp_static_data_tests {
         let fnaddr = execute_varargs_int_helper as *const () as i64;
         let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
         let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
-        let argboxes = [
-            (JitArgKind::Int, OpRef::int_op(1), 4),
-            (JitArgKind::Int, OpRef::int_op(2), 6),
-        ];
+        // Bind the int operands to recorded inputarg producers so the
+        // recorded CALL_I op carries `Operand::InputArg`, not a
+        // position-only `Operand::Box`.
+        let a0 = meta
+            .trace_ctx()
+            .expect("active trace")
+            .recorder
+            .record_input_arg(majit_ir::Type::Int);
+        let a1 = meta
+            .trace_ctx()
+            .expect("active trace")
+            .recorder
+            .record_input_arg(majit_ir::Type::Int);
+        let argboxes = [(JitArgKind::Int, a0, 4), (JitArgKind::Int, a1, 6)];
 
         let result = meta.do_residual_call_full(
             funcbox,
@@ -16502,7 +16518,15 @@ mod metainterp_static_data_tests {
         );
         let fnaddr = cond_call_void_helper as *const () as i64;
         let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
-        let condbox = (JitArgKind::Int, OpRef::int_op(50), 1);
+        // Bind the cond operand to a recorded inputarg producer so the
+        // recorded COND_CALL_N op carries `Operand::InputArg`, not a
+        // position-only `Operand::Box`.
+        let cond_ref = meta
+            .trace_ctx()
+            .expect("active trace")
+            .recorder
+            .record_input_arg(majit_ir::Type::Int);
+        let condbox = (JitArgKind::Int, cond_ref, 1);
         let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
         let result = meta.do_conditional_call(
             condbox,
@@ -16555,8 +16579,17 @@ mod metainterp_static_data_tests {
             majit_ir::Type::Int,
             majit_ir::EffectInfo::default(),
         );
-        let condbox = (JitArgKind::Int, OpRef::int_op(50), 0);
-        let funcbox = (JitArgKind::Ref, OpRef::ref_op(0), fnaddr);
+        // Bind cond to a recorded Int inputarg producer and funcbox to the
+        // live Ref inputarg seeded by `live_values` (position 0) so the
+        // recorded COND_CALL_VALUE_I op carries `Operand::InputArg` for both
+        // operands, not a position-only `Operand::Box`.
+        let cond_ref = meta
+            .trace_ctx()
+            .expect("active trace")
+            .recorder
+            .record_input_arg(majit_ir::Type::Int);
+        let condbox = (JitArgKind::Int, cond_ref, 0);
+        let funcbox = (JitArgKind::Ref, OpRef::input_arg_ref(0), fnaddr);
         let result = meta.do_conditional_call(
             condbox,
             funcbox,
@@ -16651,11 +16684,20 @@ mod metainterp_static_data_tests {
         let fnaddr = execute_varargs_int_helper as *const () as i64;
         let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
         let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
-        let argboxes = [
-            funcbox,
-            (JitArgKind::Int, OpRef::int_op(1), 5),
-            (JitArgKind::Int, OpRef::int_op(2), 9),
-        ];
+        // Bind the int operands to recorded inputarg producers so the
+        // recorded CALL_I op carries `Operand::InputArg`, not a
+        // position-only `Operand::Box`.
+        let a0 = meta
+            .trace_ctx()
+            .expect("active trace")
+            .recorder
+            .record_input_arg(majit_ir::Type::Int);
+        let a1 = meta
+            .trace_ctx()
+            .expect("active trace")
+            .recorder
+            .record_input_arg(majit_ir::Type::Int);
+        let argboxes = [funcbox, (JitArgKind::Int, a0, 5), (JitArgKind::Int, a1, 9)];
         // Pre-set last_exc_value to verify clear_exception runs.
         meta.last_exc_value = 0xdead;
         let result = meta.miframe_execute_varargs(
@@ -16697,6 +16739,17 @@ mod metainterp_static_data_tests {
         let fnaddr = execute_varargs_int_helper as *const () as i64;
         let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
         let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
+        // Record producer ops at positions 1 and 2 (after one inputarg at
+        // position 0) so the int operands `OpRef::int_op(1)`/`int_op(2)`
+        // bind to those `Operand::Op` producers instead of minting a
+        // position-only `Operand::Box`. Their `to_opref()` still round-trips
+        // to `int_op(1)`/`int_op(2)`, preserving the arg-identity asserts.
+        {
+            let rec = &mut meta.trace_ctx().expect("active trace").recorder;
+            let i0 = rec.record_input_arg(majit_ir::Type::Int);
+            assert_eq!(rec.record_op(OpCode::IntAdd, &[i0, i0]), OpRef::int_op(1));
+            assert_eq!(rec.record_op(OpCode::IntAdd, &[i0, i0]), OpRef::int_op(2));
+        }
         let argboxes = [
             funcbox,
             (JitArgKind::Int, OpRef::int_op(1), 7),
@@ -17862,7 +17915,10 @@ mod tests {
     }
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
-        let args: Vec<BoxRef> = args.iter().map(|a| bound_box(*a)).collect();
+        let args: Vec<majit_ir::operand::Operand> = args
+            .iter()
+            .map(|a| majit_ir::operand::Operand::from_boxref(&bound_box(*a)))
+            .collect();
         let op = Op::new(opcode, &args);
         op.pos.set(if pos == OpRef::NONE.raw() {
             OpRef::NONE
@@ -17873,7 +17929,10 @@ mod tests {
     }
 
     fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: DescrRef) -> Op {
-        let args: Vec<BoxRef> = args.iter().map(|a| bound_box(*a)).collect();
+        let args: Vec<majit_ir::operand::Operand> = args
+            .iter()
+            .map(|a| majit_ir::operand::Operand::from_boxref(&bound_box(*a)))
+            .collect();
         let op = Op::with_descr(opcode, &args, descr);
         op.pos.set(if pos == OpRef::NONE.raw() {
             OpRef::NONE

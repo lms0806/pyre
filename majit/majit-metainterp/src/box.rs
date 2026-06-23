@@ -80,6 +80,26 @@ pub(crate) mod test_support {
         b
     }
 
+    /// Drop-in for `BoxRef::from_opref(root)` inside test `BoxEnv`
+    /// `get_box_replacement_boxref` impls: dispatch on the OpRef variant to a
+    /// bound ResOp / InputArg box (`None` / `Const` stay `from_opref`, which
+    /// `Operand` represents). Mirrors `majit_ir::box_ref::bound_box_from_opref`
+    /// using this module's thread-local producer pool, so the box sheds to a
+    /// bound `Operand::Op` / `Operand::InputArg` and never hits the
+    /// position-only `from_boxref` panic.
+    pub(crate) fn rooted_box_from_opref(a: OpRef) -> BoxRef {
+        if a.is_none() || a.is_constant() {
+            return BoxRef::from_opref(a);
+        }
+        let ty = a.ty().unwrap_or(Type::Void);
+        match a {
+            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+                rooted_inputarg_box(ty, a.raw())
+            }
+            _ => rooted_resop_box(ty, a.raw()),
+        }
+    }
+
     /// oparser-faithful trace builder for optimizer unit tests
     /// (`rpython/jit/tool/oparser.py`). Each producer op is registered as a
     /// live `OpRc` and each consumer arg references the producing op's bound
@@ -130,7 +150,11 @@ pub(crate) mod test_support {
         /// next sequential result position. Returns the producing op's bound
         /// result box for use as a later consumer arg.
         pub(crate) fn op(&mut self, opcode: OpCode, args: &[BoxRef]) -> BoxRef {
-            let op = std::rc::Rc::new(Op::new(opcode, args));
+            let op_args: Vec<majit_ir::operand::Operand> = args
+                .iter()
+                .map(majit_ir::operand::Operand::from_boxref)
+                .collect();
+            let op = std::rc::Rc::new(Op::new(opcode, &op_args));
             op.pos
                 .set(OpRef::op_typed(self.next_pos, opcode.result_type()));
             self.next_pos += 1;
@@ -146,7 +170,11 @@ pub(crate) mod test_support {
             args: &[BoxRef],
             descr: majit_ir::DescrRef,
         ) -> BoxRef {
-            let op = std::rc::Rc::new(Op::with_descr(opcode, args, descr));
+            let op_args: Vec<majit_ir::operand::Operand> = args
+                .iter()
+                .map(majit_ir::operand::Operand::from_boxref)
+                .collect();
+            let op = std::rc::Rc::new(Op::with_descr(opcode, &op_args, descr));
             op.pos
                 .set(OpRef::op_typed(self.next_pos, opcode.result_type()));
             self.next_pos += 1;

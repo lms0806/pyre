@@ -72,6 +72,26 @@ fn opref_to_box(r: OpRef) -> BoxRef {
     }
 }
 
+fn mk_op(opcode: OpCode, args: &[BoxRef]) -> Op {
+    Op::new(
+        opcode,
+        &args
+            .iter()
+            .map(|b| Operand::from_boxref(b))
+            .collect::<Vec<Operand>>(),
+    )
+}
+fn mk_op_descr(opcode: OpCode, args: &[BoxRef], descr: DescrRef) -> Op {
+    Op::with_descr(
+        opcode,
+        &args
+            .iter()
+            .map(|b| Operand::from_boxref(b))
+            .collect::<Vec<Operand>>(),
+        descr,
+    )
+}
+
 /// Alignment for nursery allocations (8 bytes).
 const NURSERY_ALIGN: usize = 8;
 
@@ -588,7 +608,7 @@ impl RewriteState {
             return load.clone();
         }
         let index_box = BoxRef::new_const(Value::Int(index as i64));
-        let load = self.emit(Op::new(OpCode::LoadFromGcTable, &[index_box]));
+        let load = self.emit(mk_op(OpCode::LoadFromGcTable, &[index_box]));
         self.gcrefs_recently_loaded.insert(index, load.clone());
         load
     }
@@ -614,7 +634,7 @@ impl RewriteState {
             if let Some(Value::Ref(gcref)) = op.arg(i).const_value() {
                 if !gcref.is_null() {
                     let load = self.remove_constptr(gcref);
-                    op.setarg(i, load);
+                    op.setarg(i, Operand::from_boxref(&load));
                 }
             }
         }
@@ -693,8 +713,8 @@ impl RewriteState {
     /// `is_subtraction` distinguishes INT_SUB (negate the constant
     /// before storing) from INT_ADD.  Mirrors rewrite.py:1015.
     fn record_int_add_or_sub(&mut self, op: &Op, is_subtraction: bool) {
-        let v_arg0 = op.arg(0);
-        let v_arg1 = op.arg(1);
+        let v_arg0 = op.arg(0).to_boxref();
+        let v_arg1 = op.arg(1).to_boxref();
         let (box_arg, mut constant) = if let Some(c) = self.resolve_constant(&v_arg1) {
             let signed = if is_subtraction { -c } else { c };
             (v_arg0, signed)
@@ -786,7 +806,10 @@ impl RewriteState {
         // optimizer.py:651-652 force_box loop parity:
         //   for i in range(op.numargs()): op.setarg(i, ...)
         for i in 0..rewritten.num_args() {
-            rewritten.setarg(i, self.resolve(rewritten.arg(i)));
+            rewritten.setarg(
+                i,
+                Operand::from_boxref(&self.resolve(rewritten.arg(i).to_boxref())),
+            );
         }
         if let Some(fail_args) = rewritten.fail_args_mut() {
             for arg in fail_args.iter_mut() {
@@ -897,10 +920,10 @@ impl RewriteState {
 
             let op = &self.out[pz.out_index];
             // resoperation.py:290 AbstractResOp.setarg parity.
-            op.setarg(1, scaled_start);
-            op.setarg(2, scaled_len);
-            op.setarg(3, one.clone());
-            op.setarg(4, one);
+            op.setarg(1, Operand::from_boxref(&scaled_start));
+            op.setarg(2, Operand::from_boxref(&scaled_len));
+            op.setarg(3, Operand::from_boxref(&one.clone()));
+            op.setarg(4, Operand::from_boxref(&one));
         }
 
         // rewrite.py:760-766 — NULL-pointer writes still pending for
@@ -915,13 +938,26 @@ impl RewriteState {
         // directly.
         let pending_zsf = std::mem::take(&mut self._delayed_zero_setfields);
         for (ptr, entries) in pending_zsf {
+            // The pending-zero base is the result of an earlier malloc/New
+            // already emitted into `self.out`; bind the GC_STORE base to that
+            // producer so the arg sheds to `Operand::Op` (RPython keeps the
+            // base Box object). `opref_to_box` only synthesises a
+            // position-only box for GC/backend reads that never reach
+            // `from_boxref`; used as an op arg it would be rejected, so resolve
+            // the producer here. `to_opref()` is unchanged either way.
+            let ptr_box = self
+                .out
+                .iter()
+                .find(|o| o.pos.get() == ptr)
+                .map(|o| BoxRef::from_bound_op(o))
+                .unwrap_or_else(|| opref_to_box(ptr));
             for ofs in entries.iter().copied() {
                 let ofs_ref = self.const_int(ofs);
                 let zero_ref = self.const_int(0);
                 let word_ref = self.const_int(8);
-                let store = Op::new(
+                let store = mk_op(
                     OpCode::GcStore,
-                    &[opref_to_box(ptr), ofs_ref, zero_ref, word_ref],
+                    &[ptr_box.clone(), ofs_ref, zero_ref, word_ref],
                 );
                 self.emit(store);
             }
@@ -973,7 +1009,7 @@ impl GcRewriterImpl {
         }
         // rewrite.py:445 `next_op.getarg(0) is not op` — in pyre OpRef
         // carries the same identity role as RPython's box object.
-        if box_to_opref(&next_op.arg(0)) != op.pos.get() {
+        if box_to_opref(&next_op.arg(0).to_boxref()) != op.pos.get() {
             return false;
         }
         self.remove_tested_failarg(next_op, i + 1, st);
@@ -1000,7 +1036,7 @@ impl GcRewriterImpl {
             Some(fa) if !fa.is_empty() => fa,
             _ => return,
         };
-        let target = box_to_opref(&op.arg(0));
+        let target = box_to_opref(&op.arg(0).to_boxref());
         // rewrite.py:456-459: guard's failargs contain the tested box?
         let Some(idx) = fail_args.iter().position(|a| box_to_opref(a) == target) else {
             return;
@@ -1008,7 +1044,7 @@ impl GcRewriterImpl {
         // rewrite.py:463 `value = int(opnum == rop.GUARD_FALSE)`
         let value: i64 = i64::from(op.opcode == OpCode::GuardFalse);
         let const_ref = st.const_int(value);
-        let same = Op::new(OpCode::SameAsI, &[const_ref]);
+        let same = mk_op(OpCode::SameAsI, &[const_ref]);
         let same_pos = st.emit_result(same, OpRef::NONE);
 
         // rewrite.py:466-469 — rewrite failargs + stash the copy-and-changed
@@ -1149,7 +1185,7 @@ impl GcRewriterImpl {
             .expect("handle_new_array descr must be ArrayDescr");
 
         let item_size = descr.item_size();
-        let v_length = st.resolve(op.arg(0)); // the length operand
+        let v_length = st.resolve(op.arg(0).to_boxref()); // the length operand
         let length_const = st.resolve_constant(&v_length);
 
         // rewrite.py:548-558 — total_size for the constant-size /
@@ -1365,7 +1401,7 @@ impl GcRewriterImpl {
         let c_zero = st.const_int(0);
         let c_scale_a = st.const_int(scale);
         let c_scale_b = st.const_int(scale);
-        let zero_op = Op::new(
+        let zero_op = mk_op(
             OpCode::ZeroArray,
             &[v_arr.clone(), c_zero, v_length_scaled, c_scale_a, c_scale_b],
         );
@@ -1426,7 +1462,7 @@ impl GcRewriterImpl {
         st.emitting_an_operation_that_can_collect();
         let kind_ref = st.const_int(kind);
         let itemsize_ref = st.const_int(ad.item_size() as i64);
-        let varsize_op = Op::new(
+        let varsize_op = mk_op(
             OpCode::CallMallocNurseryVarsize,
             &[kind_ref, itemsize_ref, v_length],
         );
@@ -1443,10 +1479,10 @@ impl GcRewriterImpl {
         st: &mut RewriteState,
     ) -> BoxRef {
         st.emitting_an_operation_that_can_collect();
-        let call_op = Op::new(OpCode::CallR, args);
+        let call_op = mk_op(OpCode::CallR, args);
         call_op.setdescr(calldescr);
         let result = st.emit_result(call_op, result_pos);
-        st.emit(Op::new(OpCode::CheckMemoryError, &[result.clone()]));
+        st.emit(mk_op(OpCode::CheckMemoryError, &[result.clone()]));
         result
     }
 
@@ -1657,10 +1693,10 @@ impl GcRewriterImpl {
         }
 
         // rewrite.py:1065-1068 — effective source / destination addresses.
-        let src_gcptr = st.resolve(op.arg(0));
-        let dst_gcptr = st.resolve(op.arg(1));
-        let src_index = st.resolve(op.arg(2));
-        let dst_index = st.resolve(op.arg(3));
+        let src_gcptr = st.resolve(op.arg(0).to_boxref());
+        let dst_gcptr = st.resolve(op.arg(1).to_boxref());
+        let src_index = st.resolve(op.arg(2).to_boxref());
+        let dst_index = st.resolve(op.arg(3).to_boxref());
 
         let i1 = self.emit_load_effective_address(src_gcptr, src_index, basesize, itemscale, st);
         let i2 = self.emit_load_effective_address(dst_gcptr, dst_index, basesize, itemscale, st);
@@ -1670,23 +1706,23 @@ impl GcRewriterImpl {
         //   UNICODE: arg = ConstInt(op.getarg(4).getint() << itemscale)
         //            or INT_LSHIFT(op.getarg(4), ConstInt(itemscale))
         let arg = if op.opcode == OpCode::Copystrcontent {
-            st.resolve(op.arg(4))
+            st.resolve(op.arg(4).to_boxref())
         } else {
-            let v_length = st.resolve(op.arg(4));
+            let v_length = st.resolve(op.arg(4).to_boxref());
             if let Some(c) = st.resolve_constant(&v_length) {
                 // rewrite.py:1073-1074 — constant-fold the shift.
                 st.const_int(c << itemscale)
             } else {
                 // rewrite.py:1075-1078 — emit INT_LSHIFT.
                 let shift_ref = st.const_int(itemscale);
-                let lshift = Op::new(OpCode::IntLshift, &[v_length, shift_ref]);
+                let lshift = mk_op(OpCode::IntLshift, &[v_length, shift_ref]);
                 st.emit_result(lshift, OpRef::NONE)
             }
         };
 
         // rewrite.py:1079-1080 — CALL_N(memcpy_fn, i2, i1, arg, descr=memcpy_descr).
         let memcpy_fn_const = st.const_int(memcpy_fn);
-        let call_op = Op::new(OpCode::CallN, &[memcpy_fn_const, i2, i1, arg]);
+        let call_op = mk_op(OpCode::CallN, &[memcpy_fn_const, i2, i1, arg]);
         call_op.setdescr(memcpy_descr);
         st.emit(call_op);
     }
@@ -1710,7 +1746,7 @@ impl GcRewriterImpl {
             // rewrite.py:1083-1088 — single LEA op.
             let base_ref = st.const_int(base);
             let shift_ref = st.const_int(itemscale);
-            let lea = Op::new(
+            let lea = mk_op(
                 OpCode::LoadEffectiveAddress,
                 &[v_gcptr, v_index, base_ref, shift_ref],
             );
@@ -1723,15 +1759,15 @@ impl GcRewriterImpl {
             //   i1  = INT_ADD(i1b, ConstInt(base))
             let scaled = if itemscale > 0 {
                 let shift_ref = st.const_int(itemscale);
-                let lshift = Op::new(OpCode::IntLshift, &[v_index, shift_ref]);
+                let lshift = mk_op(OpCode::IntLshift, &[v_index, shift_ref]);
                 st.emit_result(lshift, OpRef::NONE)
             } else {
                 v_index
             };
-            let add1 = Op::new(OpCode::IntAdd, &[v_gcptr, scaled]);
+            let add1 = mk_op(OpCode::IntAdd, &[v_gcptr, scaled]);
             let i1b = st.emit_result(add1, OpRef::NONE);
             let base_ref = st.const_int(base);
-            let add2 = Op::new(OpCode::IntAdd, &[i1b, base_ref]);
+            let add2 = mk_op(OpCode::IntAdd, &[i1b, base_ref]);
             st.emit_result(add2, OpRef::NONE)
         }
     }
@@ -1748,7 +1784,7 @@ impl GcRewriterImpl {
     /// the lowered GC_STORE (forwarded by `transform_to_gc_load`) lands
     /// after the WB.
     fn handle_write_barrier_setfield(&self, op: &Op, st: &mut RewriteState) {
-        let obj = st.resolve(op.arg(0));
+        let obj = st.resolve(op.arg(0).to_boxref());
         if st.wb_already_applied(&obj) {
             return;
         }
@@ -1766,7 +1802,7 @@ impl GcRewriterImpl {
             .getdescr()
             .and_then(|d| d.as_field_descr().map(|fd| fd.is_pointer_field()))
             .unwrap_or(false);
-        let val = st.resolve(op.arg(1));
+        let val = st.resolve(op.arg(1).to_boxref());
         let val_is_ref = if field_is_ptr {
             match st.result_type_of(&val) {
                 Some(tp) => tp == Type::Ref,
@@ -1787,7 +1823,7 @@ impl GcRewriterImpl {
 
     /// rewrite.py:948-953 `gen_write_barrier`.
     fn gen_write_barrier(&self, v_base: BoxRef, st: &mut RewriteState) {
-        let wb_op = Op::new(OpCode::CondCallGcWb, &[v_base.clone()]);
+        let wb_op = mk_op(OpCode::CondCallGcWb, &[v_base.clone()]);
         st.emit(wb_op);
         st.remember_wb(&v_base);
     }
@@ -1811,7 +1847,7 @@ impl GcRewriterImpl {
             return;
         };
         let offset = fd.offset() as i64;
-        let base = st.resolve(op.arg(0));
+        let base = st.resolve(op.arg(0).to_boxref());
         if let Some(entries) = st._delayed_zero_setfields.get_mut(&box_to_opref(&base)) {
             entries.remove(&offset);
         }
@@ -1830,8 +1866,8 @@ impl GcRewriterImpl {
     ///     self.remember_setarrayitem_occurred(array_box, index_box.getint())
     /// ```
     fn consider_setarrayitem_gc(&self, op: &Op, st: &mut RewriteState) {
-        let array_ref = st.resolve(op.arg(0));
-        let index_ref = op.arg(1);
+        let array_ref = st.resolve(op.arg(0).to_boxref());
+        let index_ref = op.arg(1).to_boxref();
         if st.resolve_constant(&array_ref).is_some() {
             return;
         }
@@ -1848,10 +1884,10 @@ impl GcRewriterImpl {
     /// and then `self.emit_op(op)` follows the forwarding. We do the
     /// equivalent in the caller by invoking handle_setarrayitem after WB.
     fn handle_write_barrier_setarrayitem(&self, op: &Op, st: &mut RewriteState) {
-        let val = st.resolve(op.arg(0));
+        let val = st.resolve(op.arg(0).to_boxref());
         // rewrite.py:938-942
         if !st.wb_already_applied(&val) {
-            let v = st.resolve(op.arg(2));
+            let v = st.resolve(op.arg(2).to_boxref());
             let val_is_ref = match st.result_type_of(&v) {
                 Some(tp) => tp == Type::Ref,
                 // None only for the OpRef::None / virtual marker (no type
@@ -1863,7 +1899,7 @@ impl GcRewriterImpl {
                     .unwrap_or(false),
             };
             if val_is_ref && !st.is_null_constant(&v) {
-                self.gen_write_barrier_array(val, st.resolve(op.arg(1)), st);
+                self.gen_write_barrier_array(val, st.resolve(op.arg(1).to_boxref()), st);
             }
         }
     }
@@ -1881,9 +1917,9 @@ impl GcRewriterImpl {
             .expect("SETARRAYITEM descr must be ArrayDescr");
         let itemsize = ad.item_size() as i64;
         let basesize = ad.base_size() as i64;
-        let ptr = st.resolve(op.arg(0));
-        let index = st.resolve(op.arg(1));
-        let value = st.resolve(op.arg(2));
+        let ptr = st.resolve(op.arg(0).to_boxref());
+        let index = st.resolve(op.arg(1).to_boxref());
+        let value = st.resolve(op.arg(2).to_boxref());
         self.emit_gc_store_or_indexed(
             Some(op),
             ptr,
@@ -1931,13 +1967,13 @@ impl GcRewriterImpl {
             None => {
                 let offset_ref = st.const_int(offset);
                 let itemsize_ref = st.const_int(itemsize);
-                Op::new(OpCode::GcStore, &[ptr, offset_ref, value, itemsize_ref])
+                mk_op(OpCode::GcStore, &[ptr, offset_ref, value, itemsize_ref])
             }
             Some(idx) => {
                 let factor_ref = st.const_int(factor);
                 let offset_ref = st.const_int(offset);
                 let itemsize_ref = st.const_int(itemsize);
-                Op::new(
+                mk_op(
                     OpCode::GcStoreIndexed,
                     &[ptr, idx, value, factor_ref, offset_ref, itemsize_ref],
                 )
@@ -2008,10 +2044,10 @@ impl GcRewriterImpl {
             let mul_op = if (factor & (factor - 1)) == 0 {
                 let shift = (factor as u64).trailing_zeros() as i64;
                 let shift_ref = st.const_int(shift);
-                Op::new(OpCode::IntLshift, &[index_box.clone(), shift_ref])
+                mk_op(OpCode::IntLshift, &[index_box.clone(), shift_ref])
             } else {
                 let factor_ref = st.const_int(factor);
-                Op::new(OpCode::IntMul, &[index_box.clone(), factor_ref])
+                mk_op(OpCode::IntMul, &[index_box.clone(), factor_ref])
             };
             return (1, offset, ScaledIndex::PreScale(mul_op));
         }
@@ -2031,8 +2067,8 @@ impl GcRewriterImpl {
         let itemsize = ad.item_size() as i64;
         let ofs = ad.base_size() as i64;
         let sign = ad.is_item_signed();
-        let ptr = st.resolve(op.arg(0));
-        let index = st.resolve(op.arg(1));
+        let ptr = st.resolve(op.arg(0).to_boxref());
+        let index = st.resolve(op.arg(1).to_boxref());
         self.emit_gc_load_or_indexed(op, ptr, index, itemsize, itemsize, ofs, sign, st);
     }
 
@@ -2079,13 +2115,13 @@ impl GcRewriterImpl {
             None => {
                 let offset_ref = st.const_int(offset);
                 let itemsize_ref = st.const_int(itemsize_enc);
-                Op::new(get_gc_load(optype), &[ptr, offset_ref, itemsize_ref])
+                mk_op(get_gc_load(optype), &[ptr, offset_ref, itemsize_ref])
             }
             Some(idx) => {
                 let factor_ref = st.const_int(factor);
                 let offset_ref = st.const_int(offset);
                 let itemsize_ref = st.const_int(itemsize_enc);
-                Op::new(
+                mk_op(
                     get_gc_load_indexed(optype),
                     &[ptr, idx, factor_ref, offset_ref, itemsize_ref],
                 )
@@ -2183,9 +2219,9 @@ impl GcRewriterImpl {
                 .expect("RAW_STORE descr must be ArrayDescr");
             let itemsize = ad.item_size() as i64;
             let ofs = ad.base_size() as i64;
-            let ptr = st.resolve(op.arg(0));
-            let index = st.resolve(op.arg(1));
-            let value = st.resolve(op.arg(2));
+            let ptr = st.resolve(op.arg(0).to_boxref());
+            let index = st.resolve(op.arg(1).to_boxref());
+            let value = st.resolve(op.arg(2).to_boxref());
             self.emit_gc_store_or_indexed(Some(op), ptr, index, value, itemsize, 1, ofs, st);
             return false;
         }
@@ -2198,8 +2234,8 @@ impl GcRewriterImpl {
             let itemsize = ad.item_size() as i64;
             let ofs = ad.base_size() as i64;
             let sign = ad.is_item_signed();
-            let ptr = st.resolve(op.arg(0));
-            let index = st.resolve(op.arg(1));
+            let ptr = st.resolve(op.arg(0).to_boxref());
+            let index = st.resolve(op.arg(1).to_boxref());
             self.emit_gc_load_or_indexed(op, ptr, index, itemsize, 1, ofs, sign, st);
             return false;
         }
@@ -2220,8 +2256,8 @@ impl GcRewriterImpl {
             let itemsize = ad.item_size() as i64;
             let fieldsize = fd.field_size() as i64;
             let sign = fd.is_field_signed();
-            let ptr = st.resolve(op.arg(0));
-            let index = st.resolve(op.arg(1));
+            let ptr = st.resolve(op.arg(0).to_boxref());
+            let index = st.resolve(op.arg(1).to_boxref());
             self.emit_gc_load_or_indexed(op, ptr, index, fieldsize, itemsize, ofs, sign, st);
             return false;
         }
@@ -2241,9 +2277,9 @@ impl GcRewriterImpl {
             let ofs = (ad.base_size() + fd.offset()) as i64;
             let itemsize = ad.item_size() as i64;
             let fieldsize = fd.field_size() as i64;
-            let ptr = st.resolve(op.arg(0));
-            let index = st.resolve(op.arg(1));
-            let value = st.resolve(op.arg(2));
+            let ptr = st.resolve(op.arg(0).to_boxref());
+            let index = st.resolve(op.arg(1).to_boxref());
+            let value = st.resolve(op.arg(2).to_boxref());
             self.emit_gc_store_or_indexed(
                 Some(op),
                 ptr,
@@ -2280,7 +2316,7 @@ impl GcRewriterImpl {
             let ofs = fd.offset() as i64;
             let itemsize = fd.field_size() as i64;
             let sign = fd.is_field_signed();
-            let ptr = st.resolve(op.arg(0));
+            let ptr = st.resolve(op.arg(0).to_boxref());
             let cint_zero = st.const_int(0);
             let is_gc = matches!(
                 opnum,
@@ -2306,8 +2342,8 @@ impl GcRewriterImpl {
                 .expect("SETFIELD descr must be FieldDescr");
             let ofs = fd.offset() as i64;
             let itemsize = fd.field_size() as i64;
-            let ptr = st.resolve(op.arg(0));
-            let value = st.resolve(op.arg(1));
+            let ptr = st.resolve(op.arg(0).to_boxref());
+            let value = st.resolve(op.arg(1).to_boxref());
             let cint_zero = st.const_int(0);
             self.emit_gc_store_or_indexed(Some(op), ptr, cint_zero, value, itemsize, 1, ofs, st);
             return false;
@@ -2324,7 +2360,7 @@ impl GcRewriterImpl {
                 .offset() as i64;
             // rewrite.py:272 WORD itemsize, unsigned.
             let word = std::mem::size_of::<usize>() as i64;
-            let ptr = st.resolve(op.arg(0));
+            let ptr = st.resolve(op.arg(0).to_boxref());
             let cint_zero = st.const_int(0);
             self.emit_gc_load_or_indexed(op, ptr, cint_zero, word, 1, ofs, NOT_SIGNED, st);
             return false;
@@ -2345,7 +2381,7 @@ impl GcRewriterImpl {
                 .len_descr()
                 .expect("STR/UNICODE ArrayDescr must carry lendescr");
             let ofs = ld.offset() as i64;
-            let ptr = st.resolve(op.arg(0));
+            let ptr = st.resolve(op.arg(0).to_boxref());
             let cint_zero = st.const_int(0);
             self.emit_gc_load_or_indexed(op, ptr, cint_zero, word, 1, ofs, NOT_SIGNED, st);
             return false;
@@ -2364,7 +2400,7 @@ impl GcRewriterImpl {
                 .expect("STRHASH/UNICODEHASH descr must be a FieldDescr");
             assert_eq!(fd.field_size() as i64, word, "rewrite.py:286/292 assert");
             let ofs = fd.offset() as i64;
-            let ptr = st.resolve(op.arg(0));
+            let ptr = st.resolve(op.arg(0).to_boxref());
             let cint_zero = st.const_int(0);
             self.emit_gc_load_or_indexed(op, ptr, cint_zero, word, 1, ofs, true, st);
             return false;
@@ -2375,8 +2411,8 @@ impl GcRewriterImpl {
         // asserted upstream at rewrite.py:298.
         if matches!(opnum, OpCode::Strgetitem) {
             let (itemsize, basesize) = strgetsetitem_token(op, /*is_str=*/ true);
-            let ptr = st.resolve(op.arg(0));
-            let index = st.resolve(op.arg(1));
+            let ptr = st.resolve(op.arg(0).to_boxref());
+            let index = st.resolve(op.arg(1).to_boxref());
             self.emit_gc_load_or_indexed(
                 op, ptr, index, itemsize, itemsize, basesize, NOT_SIGNED, st,
             );
@@ -2386,8 +2422,8 @@ impl GcRewriterImpl {
         // extra_item_after_alloc, so basesize is used as-is.
         if matches!(opnum, OpCode::Unicodegetitem) {
             let (itemsize, basesize) = strgetsetitem_token(op, /*is_str=*/ false);
-            let ptr = st.resolve(op.arg(0));
-            let index = st.resolve(op.arg(1));
+            let ptr = st.resolve(op.arg(0).to_boxref());
+            let index = st.resolve(op.arg(1).to_boxref());
             self.emit_gc_load_or_indexed(
                 op, ptr, index, itemsize, itemsize, basesize, NOT_SIGNED, st,
             );
@@ -2396,9 +2432,9 @@ impl GcRewriterImpl {
         // rewrite.py:307-313 STRSETITEM.
         if matches!(opnum, OpCode::Strsetitem) {
             let (itemsize, basesize) = strgetsetitem_token(op, /*is_str=*/ true);
-            let ptr = st.resolve(op.arg(0));
-            let index = st.resolve(op.arg(1));
-            let value = st.resolve(op.arg(2));
+            let ptr = st.resolve(op.arg(0).to_boxref());
+            let index = st.resolve(op.arg(1).to_boxref());
+            let value = st.resolve(op.arg(2).to_boxref());
             self.emit_gc_store_or_indexed(
                 Some(op),
                 ptr,
@@ -2414,9 +2450,9 @@ impl GcRewriterImpl {
         // rewrite.py:314-318 UNICODESETITEM.
         if matches!(opnum, OpCode::Unicodesetitem) {
             let (itemsize, basesize) = strgetsetitem_token(op, /*is_str=*/ false);
-            let ptr = st.resolve(op.arg(0));
-            let index = st.resolve(op.arg(1));
-            let value = st.resolve(op.arg(2));
+            let ptr = st.resolve(op.arg(0).to_boxref());
+            let index = st.resolve(op.arg(1).to_boxref());
+            let value = st.resolve(op.arg(2).to_boxref());
             self.emit_gc_store_or_indexed(
                 Some(op),
                 ptr,
@@ -2435,32 +2471,32 @@ impl GcRewriterImpl {
             OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF
         ) {
             let scale = st
-                .resolve_constant(&op.arg(2))
+                .resolve_constant(&op.arg(2).to_boxref())
                 .expect("GC_LOAD_INDEXED scale must be ConstInt");
             let offset = st
-                .resolve_constant(&op.arg(3))
+                .resolve_constant(&op.arg(3).to_boxref())
                 .expect("GC_LOAD_INDEXED offset must be ConstInt");
             let size = st
-                .resolve_constant(&op.arg(4))
+                .resolve_constant(&op.arg(4).to_boxref())
                 .expect("GC_LOAD_INDEXED size must be ConstInt");
-            let ptr = st.resolve(op.arg(0));
-            let index = st.resolve(op.arg(1));
+            let ptr = st.resolve(op.arg(0).to_boxref());
+            let index = st.resolve(op.arg(1).to_boxref());
             self.emit_gc_load_or_indexed(op, ptr, index, size.abs(), scale, offset, size < 0, st);
             return false;
         }
         if matches!(opnum, OpCode::GcStoreIndexed) {
             let scale = st
-                .resolve_constant(&op.arg(3))
+                .resolve_constant(&op.arg(3).to_boxref())
                 .expect("GC_STORE_INDEXED scale must be ConstInt");
             let offset = st
-                .resolve_constant(&op.arg(4))
+                .resolve_constant(&op.arg(4).to_boxref())
                 .expect("GC_STORE_INDEXED offset must be ConstInt");
             let size = st
-                .resolve_constant(&op.arg(5))
+                .resolve_constant(&op.arg(5).to_boxref())
                 .expect("GC_STORE_INDEXED size must be ConstInt");
-            let ptr = st.resolve(op.arg(0));
-            let index = st.resolve(op.arg(1));
-            let value = st.resolve(op.arg(2));
+            let ptr = st.resolve(op.arg(0).to_boxref());
+            let index = st.resolve(op.arg(1).to_boxref());
+            let value = st.resolve(op.arg(2).to_boxref());
             // rewrite.py:338: use abs(size) for safety even though store
             // size is expected to be positive.
             self.emit_gc_store_or_indexed(
@@ -2492,7 +2528,7 @@ impl GcRewriterImpl {
             let length = st.known_length(&v_base, LARGE);
             if length >= LARGE {
                 // Unknown or too big: produce COND_CALL_GC_WB_ARRAY.
-                let wb_op = Op::new(OpCode::CondCallGcWbArray, &[v_base, v_index]);
+                let wb_op = mk_op(OpCode::CondCallGcWbArray, &[v_base, v_index]);
                 st.emit(wb_op);
                 // rewrite.py:970: a WB_ARRAY is not enough to prevent
                 // any future write barriers, so don't remember_wb!
@@ -2500,7 +2536,7 @@ impl GcRewriterImpl {
             }
         }
         // Fall-back: produce a regular write_barrier.
-        let wb_op = Op::new(OpCode::CondCallGcWb, &[v_base.clone()]);
+        let wb_op = mk_op(OpCode::CondCallGcWb, &[v_base.clone()]);
         st.emit(wb_op);
         st.remember_wb(&v_base);
     }
@@ -2539,12 +2575,12 @@ impl GcRewriterImpl {
             let new_total = st.pending_malloc_total + size;
             if self.can_use_nursery(new_total) {
                 let new_total_ref = st.const_int(new_total as i64);
-                st.out[prev_idx].setarg(0, new_total_ref);
+                st.out[prev_idx].setarg(0, Operand::from_boxref(&new_total_ref));
                 st.pending_malloc_total = new_total;
 
                 // rewrite.py:896: NURSERY_PTR_INCREMENT(last, ConstInt(previous_size))
                 let prev_size_ref = st.const_int(st.previous_size as i64);
-                let incr_op = Op::new(
+                let incr_op = mk_op(
                     OpCode::NurseryPtrIncrement,
                     &[st.last_malloced_ref.clone(), prev_size_ref],
                 );
@@ -2559,7 +2595,7 @@ impl GcRewriterImpl {
         // rewrite.py:903: CALL_MALLOC_NURSERY(ConstInt(size))
         st.emitting_an_operation_that_can_collect();
         let size_ref = st.const_int(size as i64);
-        let op = Op::new(OpCode::CallMallocNursery, &[size_ref]);
+        let op = mk_op(OpCode::CallMallocNursery, &[size_ref]);
         let r = st.emit_result(op, result_pos);
         st.pending_malloc_idx = Some(st.out.len() - 1);
         st.pending_malloc_total = size;
@@ -2613,7 +2649,7 @@ impl GcRewriterImpl {
         let ofs = st.const_int(-(crate::header::GcHeader::SIZE as i64) + tid_fd.offset() as i64);
         let tid_val = st.const_int(tid as i64);
         let size = st.const_int(tid_fd.field_size() as i64);
-        let store = Op::new(OpCode::GcStore, &[obj, ofs, tid_val, size]);
+        let store = mk_op(OpCode::GcStore, &[obj, ofs, tid_val, size]);
         st.emit(store);
     }
 
@@ -2709,13 +2745,13 @@ impl GcRewriterImpl {
         // sign_size) where (ofs, sign_size, sign) = unpack_fielddescr(
         // descrs.jfi_frame_size).
         let jfi_frame_size_ofs = st.const_int(std::mem::size_of::<isize>() as i64);
-        let size = st.emit(Op::new(
+        let size = st.emit(mk_op(
             OpCode::GcLoadI,
             &[llfi.clone(), jfi_frame_size_ofs, signed_size.clone()],
         ));
         // rewrite.py:634 — gen_malloc_nursery_varsize_frame(size)
         st.emitting_an_operation_that_can_collect();
-        let malloc_op = Op::new(OpCode::CallMallocNurseryVarsizeFrame, &[size]);
+        let malloc_op = mk_op(OpCode::CallMallocNurseryVarsizeFrame, &[size]);
         let frame = st.emit_result(malloc_op, OpRef::NONE);
         st.remember_wb(&frame);
 
@@ -2746,7 +2782,7 @@ impl GcRewriterImpl {
         // Both read/write lltype.Signed values (jfi_frame_depth and the
         // jf_frame length field).
         let jfi_frame_depth_ofs = st.const_int(0);
-        let length = st.emit(Op::new(
+        let length = st.emit(mk_op(
             OpCode::GcLoadI,
             &[llfi.clone(), jfi_frame_depth_ofs, signed_size],
         ));
@@ -2791,7 +2827,7 @@ impl GcRewriterImpl {
             //                      offset = basesize + array_offset.
             let offset = descrs.jf_frame_baseitemofs as i32 + index_list[i];
             let ofs_ref = st.const_int(offset as i64);
-            st.emit(Op::new(
+            st.emit(mk_op(
                 OpCode::GcStore,
                 &[frame.clone(), ofs_ref, arg.clone(), itemsize_ref],
             ));
@@ -2805,7 +2841,7 @@ impl GcRewriterImpl {
         } else {
             vec![frame]
         };
-        let call_asm = Op::new(op.opcode, &new_args);
+        let call_asm = mk_op(op.opcode, &new_args);
         if let Some(d) = op.getdescr() {
             call_asm.setdescr(d);
         }
@@ -3005,10 +3041,13 @@ impl GcRewriter for GcRewriterImpl {
                 OpCode::GuardAlwaysFails => {
                     let zero = st.const_int(0);
                     let one = st.const_int(1);
-                    let same = Op::new(OpCode::SameAsI, &[zero]);
+                    let same = mk_op(OpCode::SameAsI, &[zero]);
                     let same_pos = st.emit_result(same, OpRef::NONE);
-                    let newop =
-                        op.copy_and_change(OpCode::GuardValue, Some(&[same_pos, one]), None);
+                    let newop = op.copy_and_change(
+                        OpCode::GuardValue,
+                        Some(&[Operand::from_boxref(&same_pos), Operand::from_boxref(&one)]),
+                        None,
+                    );
                     let rewritten = st.rewrite_op(&newop);
                     st.emit(rewritten);
                 }
@@ -3034,7 +3073,7 @@ impl GcRewriter for GcRewriterImpl {
                 // ── Everything else: pass through unchanged. ──
                 OpCode::CondCallGcWb => {
                     let rewritten = st.rewrite_op(op);
-                    let obj = rewritten.arg(0);
+                    let obj = rewritten.arg(0).to_boxref();
                     st.emit(rewritten);
                     st.remember_wb(&obj);
                 }
@@ -3287,14 +3326,17 @@ mod tests {
     }
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
-        let args: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+        let args: Vec<Operand> = args.iter().map(|a| ro(*a)).collect();
         let op = Op::new(opcode, &args);
         op.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         op
     }
 
+    use majit_ir::box_ref::bound_box_from_opref as rb;
+    use majit_ir::box_ref::bound_operand_from_opref as ro;
+
     fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: DescrRef) -> Op {
-        let args: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+        let args: Vec<Operand> = args.iter().map(|a| ro(*a)).collect();
         let op = Op::with_descr(opcode, &args, descr);
         op.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         op
@@ -3435,7 +3477,7 @@ mod tests {
         let length_ref = OpRef::int_op(100); // some prior op producing the length
         let ops = vec![Op::with_descr(
             OpCode::NewArray,
-            &[BoxRef::from_opref(length_ref)],
+            &[ro(length_ref)],
             array_descr_int(),
         )];
 
@@ -3469,11 +3511,7 @@ mod tests {
         //   round_up(GcHeader::SIZE + 4104) = 4112 > 4096 → returns None.
         let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
         constants.insert(10_000, Const::Int(512));
-        let new_array = Op::with_descr(
-            OpCode::NewArray,
-            &[BoxRef::from_opref(len_ref)],
-            array_descr_ref(),
-        );
+        let new_array = Op::with_descr(OpCode::NewArray, &[ro(len_ref)], array_descr_ref());
         new_array.pos.set(OpRef::ref_op(0));
         let ops = vec![new_array, Op::new(OpCode::Finish, &[])];
 
@@ -3533,7 +3571,7 @@ mod tests {
         let val = OpRef::ref_op(1);
         let ops = vec![Op::with_descr(
             OpCode::SetfieldGc,
-            &[BoxRef::from_opref(obj), BoxRef::from_opref(val)],
+            &[ro(obj), ro(val)],
             ref_field_descr(),
         )];
 
@@ -3559,7 +3597,7 @@ mod tests {
         let obj = OpRef::ref_op(0);
         let ops = vec![Op::with_descr(
             OpCode::GetfieldGcPureR,
-            &[BoxRef::from_opref(obj)],
+            &[ro(obj)],
             ref_field_descr(),
         )];
 
@@ -3590,7 +3628,7 @@ mod tests {
         let idx = OpRef::int_op(1);
         let ops = vec![Op::with_descr(
             OpCode::GetarrayitemRawR,
-            &[BoxRef::from_opref(obj), BoxRef::from_opref(idx)],
+            &[ro(obj), ro(idx)],
             array_descr_ref(),
         )];
 
@@ -3615,7 +3653,7 @@ mod tests {
         let val = OpRef::ref_op(1);
         let ops = vec![Op::with_descr(
             OpCode::SetfieldGc,
-            &[BoxRef::from_opref(obj), BoxRef::from_opref(val)],
+            &[ro(obj), ro(val)],
             int_field_descr(),
         )];
 
@@ -3727,10 +3765,7 @@ mod tests {
             Op::with_descr(OpCode::New, &[], descr),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(val),
-                ],
+                &[ro(OpRef::ref_op(0)), ro(val)],
                 ref_field_descr_ref_at(24),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -3764,12 +3799,9 @@ mod tests {
         let ops = vec![
             Op::new(
                 OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
+                &[ro(OpRef::int_op(0)), ro(OpRef::int_op(1))],
             ),
-            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(2))]),
+            Op::new(OpCode::GuardTrue, &[ro(OpRef::int_op(2))]),
             Op::new(OpCode::Jump, &[]),
         ];
 
@@ -3860,7 +3892,7 @@ mod tests {
         let rw = make_rewriter();
         let ops = vec![
             Op::with_descr(OpCode::New, &[], size_descr(24, 1)),
-            Op::new(OpCode::CallN, &[BoxRef::from_opref(OpRef::ref_op(99))]),
+            Op::new(OpCode::CallN, &[ro(OpRef::ref_op(99))]),
             Op::with_descr(OpCode::New, &[], size_descr(24, 2)),
         ];
 
@@ -3884,16 +3916,8 @@ mod tests {
         let val1 = OpRef::ref_op(1);
         let val2 = OpRef::ref_op(2);
         let ops = vec![
-            Op::with_descr(
-                OpCode::SetfieldGc,
-                &[BoxRef::from_opref(obj), BoxRef::from_opref(val1)],
-                ref_field_descr(),
-            ),
-            Op::with_descr(
-                OpCode::SetfieldGc,
-                &[BoxRef::from_opref(obj), BoxRef::from_opref(val2)],
-                ref_field_descr(),
-            ),
+            Op::with_descr(OpCode::SetfieldGc, &[ro(obj), ro(val1)], ref_field_descr()),
+            Op::with_descr(OpCode::SetfieldGc, &[ro(obj), ro(val2)], ref_field_descr()),
         ];
 
         let result = rw.rewrite_for_gc(&ops);
@@ -3931,10 +3955,7 @@ mod tests {
             Op::with_descr(OpCode::New, &[], size_descr(32, 1)),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::ref_op(99)),
-                ], // arg(0) = pos of the alloc = 0
+                &[ro(OpRef::ref_op(0)), ro(OpRef::ref_op(99))], // arg(0) = pos of the alloc = 0
                 ref_field_descr(),
             ),
         ];
@@ -4011,11 +4032,7 @@ mod tests {
         let val = OpRef::ref_op(2);
         let ops = vec![Op::with_descr(
             OpCode::SetarrayitemGc,
-            &[
-                BoxRef::from_opref(obj),
-                BoxRef::from_opref(idx),
-                BoxRef::from_opref(val),
-            ],
+            &[ro(obj), ro(idx), ro(val)],
             array_descr_ref(),
         )];
 
@@ -4036,18 +4053,10 @@ mod tests {
         let obj = OpRef::ref_op(0);
         let val = OpRef::ref_op(1);
         let ops = vec![
-            Op::with_descr(
-                OpCode::SetfieldGc,
-                &[BoxRef::from_opref(obj), BoxRef::from_opref(val)],
-                ref_field_descr(),
-            ),
+            Op::with_descr(OpCode::SetfieldGc, &[ro(obj), ro(val)], ref_field_descr()),
             // This call can collect, clearing the WB set.
-            Op::new(OpCode::CallN, &[BoxRef::from_opref(OpRef::ref_op(99))]),
-            Op::with_descr(
-                OpCode::SetfieldGc,
-                &[BoxRef::from_opref(obj), BoxRef::from_opref(val)],
-                ref_field_descr(),
-            ),
+            Op::new(OpCode::CallN, &[ro(OpRef::ref_op(99))]),
+            Op::with_descr(OpCode::SetfieldGc, &[ro(obj), ro(val)], ref_field_descr()),
         ];
 
         let result = rw.rewrite_for_gc(&ops);
@@ -4158,19 +4167,13 @@ mod tests {
         // rewrite the guard's failargs to reference the SAME_AS_I output.
         let rw = make_rewriter();
 
-        let int_lt = Op::new(
-            OpCode::IntLt,
-            &[
-                BoxRef::from_opref(OpRef::int_op(0)),
-                BoxRef::from_opref(OpRef::int_op(1)),
-            ],
-        );
+        let int_lt = Op::new(OpCode::IntLt, &[ro(OpRef::int_op(0)), ro(OpRef::int_op(1))]);
         int_lt.pos.set(OpRef::int_op(2));
-        let guard = Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(2))]);
+        let guard = Op::new(OpCode::GuardTrue, &[ro(OpRef::int_op(2))]);
         guard.store_final_boxes(vec![
-            BoxRef::from_opref(OpRef::int_op(0)),
-            BoxRef::from_opref(OpRef::int_op(2)),
-            BoxRef::from_opref(OpRef::int_op(1)),
+            rb(OpRef::int_op(0)),
+            rb(OpRef::int_op(2)),
+            rb(OpRef::int_op(1)),
         ]);
         let ops = vec![int_lt, guard, Op::new(OpCode::Finish, &[])];
 
@@ -4212,16 +4215,10 @@ mod tests {
     fn test_comparison_guard_false_hoists_with_one_constant() {
         // GUARD_FALSE: rewrite.py:463 `value = int(opnum == GUARD_FALSE)` ⇒ 1.
         let rw = make_rewriter();
-        let int_eq = Op::new(
-            OpCode::IntEq,
-            &[
-                BoxRef::from_opref(OpRef::int_op(0)),
-                BoxRef::from_opref(OpRef::int_op(1)),
-            ],
-        );
+        let int_eq = Op::new(OpCode::IntEq, &[ro(OpRef::int_op(0)), ro(OpRef::int_op(1))]);
         int_eq.pos.set(OpRef::int_op(2));
-        let guard = Op::new(OpCode::GuardFalse, &[BoxRef::from_opref(OpRef::int_op(2))]);
-        guard.store_final_boxes(vec![BoxRef::from_opref(OpRef::int_op(2))]);
+        let guard = Op::new(OpCode::GuardFalse, &[ro(OpRef::int_op(2))]);
+        guard.store_final_boxes(vec![rb(OpRef::int_op(2))]);
         let ops = vec![int_eq, guard, Op::new(OpCode::Finish, &[])];
 
         let (result, consts, _gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
@@ -4248,10 +4245,7 @@ mod tests {
         // copy_and_change.
         let rw = make_rewriter();
         let guard = Op::new(OpCode::GuardAlwaysFails, &[]);
-        guard.store_final_boxes(vec![
-            BoxRef::from_opref(OpRef::int_op(10)),
-            BoxRef::from_opref(OpRef::int_op(11)),
-        ]);
+        guard.store_final_boxes(vec![rb(OpRef::int_op(10)), rb(OpRef::int_op(11))]);
         let ops = vec![guard, Op::new(OpCode::Finish, &[])];
 
         let (result, consts, _gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
@@ -4297,20 +4291,11 @@ mod tests {
         // Guard that does NOT test the previous op's result: merge does
         // not fire, no SAME_AS_I is emitted.
         let rw = make_rewriter();
-        let int_lt = Op::new(
-            OpCode::IntLt,
-            &[
-                BoxRef::from_opref(OpRef::int_op(0)),
-                BoxRef::from_opref(OpRef::int_op(1)),
-            ],
-        );
+        let int_lt = Op::new(OpCode::IntLt, &[ro(OpRef::int_op(0)), ro(OpRef::int_op(1))]);
         int_lt.pos.set(OpRef::int_op(2));
         // GuardTrue reads some unrelated OpRef::ref_op(5), not OpRef::ref_op(2).
-        let guard = Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(5))]);
-        guard.store_final_boxes(vec![
-            BoxRef::from_opref(OpRef::int_op(0)),
-            BoxRef::from_opref(OpRef::int_op(1)),
-        ]);
+        let guard = Op::new(OpCode::GuardTrue, &[ro(OpRef::int_op(5))]);
+        guard.store_final_boxes(vec![rb(OpRef::int_op(0)), rb(OpRef::int_op(1))]);
         let ops = vec![int_lt, guard, Op::new(OpCode::Finish, &[])];
 
         let result = rw.rewrite_for_gc(&ops);
@@ -4344,7 +4329,7 @@ mod tests {
         rw.malloc_zero_filled = false;
         let new_array = Op::with_descr(
             OpCode::NewArrayClear,
-            &[BoxRef::from_opref(OpRef::int_op(3))],
+            &[ro(OpRef::int_op(3))],
             array_descr_int(),
         );
         new_array.pos.set(OpRef::ref_op(0));
@@ -4355,27 +4340,27 @@ mod tests {
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(10)),
-                    BoxRef::from_opref(OpRef::int_op(100)),
+                    ro(OpRef::ref_op(0)),
+                    ro(OpRef::int_op(10)),
+                    ro(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(11)),
-                    BoxRef::from_opref(OpRef::int_op(100)),
+                    ro(OpRef::ref_op(0)),
+                    ro(OpRef::int_op(11)),
+                    ro(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(12)),
-                    BoxRef::from_opref(OpRef::int_op(100)),
+                    ro(OpRef::ref_op(0)),
+                    ro(OpRef::int_op(12)),
+                    ro(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
             ),
@@ -4411,7 +4396,7 @@ mod tests {
         rw.malloc_zero_filled = false;
         let new_array = Op::with_descr(
             OpCode::NewArrayClear,
-            &[BoxRef::from_opref(OpRef::int_op(4))],
+            &[ro(OpRef::int_op(4))],
             array_descr_int(),
         );
         new_array.pos.set(OpRef::ref_op(0));
@@ -4422,18 +4407,18 @@ mod tests {
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(10)),
-                    BoxRef::from_opref(OpRef::int_op(100)),
+                    ro(OpRef::ref_op(0)),
+                    ro(OpRef::int_op(10)),
+                    ro(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(11)),
-                    BoxRef::from_opref(OpRef::int_op(100)),
+                    ro(OpRef::ref_op(0)),
+                    ro(OpRef::int_op(11)),
+                    ro(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
             ),
@@ -4494,7 +4479,7 @@ mod tests {
         rw.malloc_zero_filled = false;
         let new_array = Op::with_descr(
             OpCode::NewArrayClear,
-            &[BoxRef::from_opref(OpRef::int_op(3))],
+            &[ro(OpRef::int_op(3))],
             array_descr_int(),
         );
         new_array.pos.set(OpRef::ref_op(0));
@@ -4502,7 +4487,7 @@ mod tests {
 
         let ops = vec![
             new_array,
-            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(50))]),
+            Op::new(OpCode::GuardTrue, &[ro(OpRef::int_op(50))]),
             Op::new(OpCode::Finish, &[]),
         ];
 
@@ -4552,7 +4537,7 @@ mod tests {
         rw.malloc_zero_filled = false;
         let new_array = Op::with_descr(
             OpCode::NewArrayClear,
-            &[BoxRef::from_opref(OpRef::int_op(5))],
+            &[ro(OpRef::int_op(5))],
             array_descr_int(),
         );
         new_array.pos.set(OpRef::ref_op(0));
@@ -4563,27 +4548,27 @@ mod tests {
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(10)),
-                    BoxRef::from_opref(OpRef::int_op(100)),
+                    ro(OpRef::ref_op(0)),
+                    ro(OpRef::int_op(10)),
+                    ro(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(12)),
-                    BoxRef::from_opref(OpRef::int_op(100)),
+                    ro(OpRef::ref_op(0)),
+                    ro(OpRef::int_op(12)),
+                    ro(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(14)),
-                    BoxRef::from_opref(OpRef::int_op(100)),
+                    ro(OpRef::ref_op(0)),
+                    ro(OpRef::int_op(14)),
+                    ro(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
             ),
@@ -4622,11 +4607,8 @@ mod tests {
     fn test_pending_zero_no_clear() {
         // Plain NEW_ARRAY (not CLEAR) should NOT produce any ZERO_ARRAY.
         let rw = make_rewriter();
-        let new_array = Op::with_descr(
-            OpCode::NewArray,
-            &[BoxRef::from_opref(OpRef::int_op(3))],
-            array_descr_int(),
-        );
+        let new_array =
+            Op::with_descr(OpCode::NewArray, &[ro(OpRef::int_op(3))], array_descr_int());
         new_array.pos.set(OpRef::ref_op(0));
 
         let ops = vec![new_array, Op::new(OpCode::Finish, &[])];
@@ -4709,20 +4691,17 @@ mod tests {
             let len_ref = OpRef::int_op(10_000);
             let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
             constants.insert(10_000, Const::Int(num_elem));
-            let new_array = Op::with_descr(
-                OpCode::NewArrayClear,
-                &[BoxRef::from_opref(len_ref)],
-                array_descr_ref(),
-            );
+            let new_array =
+                Op::with_descr(OpCode::NewArrayClear, &[ro(len_ref)], array_descr_ref());
             new_array.pos.set(OpRef::ref_op(0));
             let ops = vec![
                 new_array,
                 Op::with_descr(
                     OpCode::SetarrayitemGc,
                     &[
-                        BoxRef::from_opref(OpRef::ref_op(0)),
-                        BoxRef::from_opref(OpRef::int_op(1)),
-                        BoxRef::from_opref(OpRef::ref_op(2)),
+                        ro(OpRef::ref_op(0)),
+                        ro(OpRef::int_op(1)),
+                        ro(OpRef::ref_op(2)),
                     ],
                     array_descr_ref(),
                 ),
@@ -4757,9 +4736,9 @@ mod tests {
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                    BoxRef::from_opref(OpRef::ref_op(2)),
+                    ro(OpRef::ref_op(0)),
+                    ro(OpRef::int_op(1)),
+                    ro(OpRef::ref_op(2)),
                 ],
                 array_descr_ref(),
             ),
@@ -4784,9 +4763,9 @@ mod tests {
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                    BoxRef::from_opref(OpRef::int_op(2)),
+                    ro(OpRef::ref_op(0)),
+                    ro(OpRef::int_op(1)),
+                    ro(OpRef::int_op(2)),
                 ],
                 array_descr_int(),
             ),
@@ -4857,13 +4836,7 @@ mod tests {
         let i_len = OpRef::int_op(4);
         let ops = vec![Op::with_descr(
             OpCode::Copystrcontent,
-            &[
-                BoxRef::from_opref(p0),
-                BoxRef::from_opref(p1),
-                BoxRef::from_opref(i0),
-                BoxRef::from_opref(i1),
-                BoxRef::from_opref(i_len),
-            ],
+            &[ro(p0), ro(p1), ro(i0), ro(i1), ro(i_len)],
             str_array_descr(),
         )];
 
@@ -4934,13 +4907,7 @@ mod tests {
         let i_len = OpRef::int_op(4);
         let ops = vec![Op::with_descr(
             OpCode::Copyunicodecontent,
-            &[
-                BoxRef::from_opref(p0),
-                BoxRef::from_opref(p1),
-                BoxRef::from_opref(i0),
-                BoxRef::from_opref(i1),
-                BoxRef::from_opref(i_len),
-            ],
+            &[ro(p0), ro(p1), ro(i0), ro(i1), ro(i_len)],
             unicode_array_descr(),
         )];
 
@@ -4996,13 +4963,7 @@ mod tests {
         let i_len = OpRef::int_op(4);
         let ops = vec![Op::with_descr(
             OpCode::Copystrcontent,
-            &[
-                BoxRef::from_opref(p0),
-                BoxRef::from_opref(p1),
-                BoxRef::from_opref(i0),
-                BoxRef::from_opref(i1),
-                BoxRef::from_opref(i_len),
-            ],
+            &[ro(p0), ro(p1), ro(i0), ro(i1), ro(i_len)],
             str_array_descr(),
         )];
 
@@ -5063,13 +5024,7 @@ mod tests {
         let i_len = OpRef::int_op(4);
         let ops = vec![Op::with_descr(
             OpCode::Copyunicodecontent,
-            &[
-                BoxRef::from_opref(p0),
-                BoxRef::from_opref(p1),
-                BoxRef::from_opref(i0),
-                BoxRef::from_opref(i1),
-                BoxRef::from_opref(i_len),
-            ],
+            &[ro(p0), ro(p1), ro(i0), ro(i1), ro(i_len)],
             unicode_array_descr(),
         )];
 
@@ -5203,7 +5158,7 @@ mod tests {
         let r = majit_ir::GcRef(0x4000);
         let ops = vec![Op::new(
             OpCode::GuardNonnull,
-            &[BoxRef::new_const(Value::Ref(r))],
+            &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r)))],
         )];
 
         let (result, _consts, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
@@ -5224,8 +5179,14 @@ mod tests {
         let rw = make_rewriter();
         let r = majit_ir::GcRef(0x4000);
         let ops = vec![
-            Op::new(OpCode::GuardNonnull, &[BoxRef::new_const(Value::Ref(r))]),
-            Op::new(OpCode::GuardNonnull, &[BoxRef::new_const(Value::Ref(r))]),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r)))],
+            ),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r)))],
+            ),
         ];
 
         let (result, _consts, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
@@ -5255,8 +5216,14 @@ mod tests {
         let r0 = majit_ir::GcRef(0x4000);
         let r1 = majit_ir::GcRef(0x5000);
         let ops = vec![
-            Op::new(OpCode::GuardNonnull, &[BoxRef::new_const(Value::Ref(r0))]),
-            Op::new(OpCode::GuardNonnull, &[BoxRef::new_const(Value::Ref(r1))]),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r0)))],
+            ),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r1)))],
+            ),
         ];
 
         let (result, _consts, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
@@ -5280,7 +5247,7 @@ mod tests {
         let null = majit_ir::GcRef(0);
         let ops = vec![Op::new(
             OpCode::GuardNonnull,
-            &[BoxRef::new_const(Value::Ref(null))],
+            &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(null)))],
         )];
 
         let (result, _consts, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
@@ -5300,9 +5267,15 @@ mod tests {
         let rw = make_rewriter();
         let r = majit_ir::GcRef(0x4000);
         let ops = vec![
-            Op::new(OpCode::GuardNonnull, &[BoxRef::new_const(Value::Ref(r))]),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r)))],
+            ),
             Op::new(OpCode::Label, &[]),
-            Op::new(OpCode::GuardNonnull, &[BoxRef::new_const(Value::Ref(r))]),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r)))],
+            ),
         ];
 
         let (result, _consts, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
@@ -5323,7 +5296,7 @@ mod tests {
         let r = majit_ir::GcRef(0x4000);
         let ops = vec![Op::new(
             OpCode::JitDebug,
-            &[BoxRef::new_const(Value::Ref(r))],
+            &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r)))],
         )];
 
         let (result, _consts, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());

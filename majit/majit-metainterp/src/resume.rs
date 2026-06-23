@@ -105,7 +105,7 @@ pub const TAG_CONST_OFFSET: i32 = 0;
 /// debug builds rather than silently producing an out-of-RPython-shape
 /// numbering state.
 pub struct LiveboxMap {
-    entries: majit_ir::vec_assoc::VecAssoc<crate::r#box::BoxRef, i16>,
+    entries: majit_ir::vec_assoc::VecAssoc<majit_ir::operand::Operand, i16>,
 }
 
 impl LiveboxMap {
@@ -117,7 +117,9 @@ impl LiveboxMap {
 
     #[inline(always)]
     pub fn get(&self, b: &crate::r#box::BoxRef) -> Option<i16> {
-        self.entries.get(b).copied()
+        self.entries
+            .get(&majit_ir::operand::Operand::from_boxref(b))
+            .copied()
     }
 
     #[inline(always)]
@@ -128,18 +130,20 @@ impl LiveboxMap {
              `_number_boxes` invariant — `isinstance(box, Const)` is encoded \
              via `getconst(box)` and never enters numb_state.liveboxes",
         );
-        self.entries.insert(b, value);
+        self.entries
+            .insert(majit_ir::operand::Operand::from_boxref(&b), value);
     }
 
     #[inline(always)]
     pub fn contains_key(&self, b: &crate::r#box::BoxRef) -> bool {
-        self.entries.contains_key(b)
+        self.entries
+            .contains_key(&majit_ir::operand::Operand::from_boxref(b))
     }
 
     /// Iterate over all (canonical box, tag) pairs in RPython dict insertion
     /// order (Rc::ptr_eq identity = PyPy `box is box`).
     pub fn iter(&self) -> impl Iterator<Item = (crate::r#box::BoxRef, i16)> + '_ {
-        self.entries.iter().map(|(b, v)| (b.clone(), *v))
+        self.entries.iter().map(|(op, v)| (op.to_boxref(), *v))
     }
 }
 
@@ -459,6 +463,13 @@ impl BoxEnv for SimpleBoxEnv {
         if let Some(b) = self.box_cache.borrow().get(&root) {
             return b.clone();
         }
+        // This env holds no producer Ops; in tests, synthesize a rooted bound
+        // producer so the box sheds to `Operand::Op`/`InputArg` (the Operand-
+        // keyed liveboxes/cached maps reject a position-only box). The method
+        // is never reached in non-test builds, where `from_opref` is retained.
+        #[cfg(test)]
+        let b = crate::r#box::test_support::rooted_box_from_opref(root);
+        #[cfg(not(test))]
         let b = crate::r#box::BoxRef::from_opref(root);
         self.box_cache.borrow_mut().insert(root, b.clone());
         b
@@ -3176,8 +3187,8 @@ pub struct ResumeDataLoopMemo {
     /// Becomes storage.rd_consts (resume.py:467).
     ///
     /// resume.py:150-151 — cached box/virtual numbering.
-    pub cached_boxes: crate::optimizeopt::vec_assoc::VecAssoc<crate::r#box::BoxRef, i32>,
-    pub cached_virtuals: crate::optimizeopt::vec_assoc::VecAssoc<crate::r#box::BoxRef, i32>,
+    pub cached_boxes: crate::optimizeopt::vec_assoc::VecAssoc<majit_ir::operand::Operand, i32>,
+    pub cached_virtuals: crate::optimizeopt::vec_assoc::VecAssoc<majit_ir::operand::Operand, i32>,
     /// resume.py:153-155 — statistics.
     pub nvirtuals: usize,
     pub nvholes: usize,
@@ -3362,7 +3373,10 @@ impl ResumeDataLoopMemo {
         b: &crate::r#box::BoxRef,
         boxes: &mut Vec<OpRef>,
     ) -> i32 {
-        if let Some(&num) = self.cached_boxes.get(b) {
+        if let Some(&num) = self
+            .cached_boxes
+            .get(&majit_ir::operand::Operand::from_boxref(b))
+        {
             // resume.py:268: boxes[-num - 1] = box
             let idx = (-num - 1) as usize;
             if idx < boxes.len() {
@@ -3373,7 +3387,8 @@ impl ResumeDataLoopMemo {
         // resume.py:270-271: boxes.append(box); num = -len(boxes)
         boxes.push(b.to_opref());
         let num = -(boxes.len() as i32);
-        self.cached_boxes.insert(b.clone(), num);
+        self.cached_boxes
+            .insert(majit_ir::operand::Operand::from_boxref(b), num);
         num
     }
 
@@ -3384,7 +3399,10 @@ impl ResumeDataLoopMemo {
         b: &crate::r#box::BoxRef,
         boxes: &mut Vec<Option<OpRef>>,
     ) -> i32 {
-        if let Some(&num) = self.cached_boxes.get(b) {
+        if let Some(&num) = self
+            .cached_boxes
+            .get(&majit_ir::operand::Operand::from_boxref(b))
+        {
             let idx = (-num - 1) as usize;
             if idx < boxes.len() {
                 boxes[idx] = Some(b.to_opref());
@@ -3393,18 +3411,23 @@ impl ResumeDataLoopMemo {
         }
         boxes.push(Some(b.to_opref()));
         let num = -(boxes.len() as i32);
-        self.cached_boxes.insert(b.clone(), num);
+        self.cached_boxes
+            .insert(majit_ir::operand::Operand::from_boxref(b), num);
         num
     }
 
     /// resume.py:278 assign_number_to_virtual — returns a negative number.
     pub fn assign_number_to_virtual(&mut self, b: &crate::r#box::BoxRef) -> i32 {
-        if let Some(&num) = self.cached_virtuals.get(b) {
+        if let Some(&num) = self
+            .cached_virtuals
+            .get(&majit_ir::operand::Operand::from_boxref(b))
+        {
             return num;
         }
         // resume.py:283: num = self.cached_virtuals[box] = -len(self.cached_virtuals) - 1
         let num = -(self.num_cached_virtuals() as i32) - 1;
-        self.cached_virtuals.insert(b.clone(), num);
+        self.cached_virtuals
+            .insert(majit_ir::operand::Operand::from_boxref(b), num);
         num
     }
 
@@ -3624,12 +3647,18 @@ impl ResumeDataLoopMemo {
                             }
                             if let Some(t) = new_liveboxes.get(&b) {
                                 if tagged_eq(t, UNASSIGNED) {
-                                    if let Some(&num) = self.cached_boxes.get(&b) {
+                                    if let Some(&num) = self
+                                        .cached_boxes
+                                        .get(&majit_ir::operand::Operand::from_boxref(&b))
+                                    {
                                         return tag(num, TAGBOX).unwrap_or(UNASSIGNED);
                                     }
                                 }
                                 if tagged_eq(t, UNASSIGNEDVIRTUAL) {
-                                    if let Some(&num) = self.cached_virtuals.get(&b) {
+                                    if let Some(&num) = self
+                                        .cached_virtuals
+                                        .get(&majit_ir::operand::Operand::from_boxref(&b))
+                                    {
                                         return tag(num, TAGVIRTUAL).unwrap_or(UNASSIGNEDVIRTUAL);
                                     }
                                 }
@@ -3767,12 +3796,18 @@ impl ResumeDataLoopMemo {
         if let Some(tagged) = new_liveboxes.get(&b) {
             // Resolve UNASSIGNED to real cached number
             if tagged_eq(tagged, UNASSIGNED) {
-                if let Some(&num) = self.cached_boxes.get(&b) {
+                if let Some(&num) = self
+                    .cached_boxes
+                    .get(&majit_ir::operand::Operand::from_boxref(&b))
+                {
                     return tag(num, TAGBOX).unwrap_or(UNASSIGNED);
                 }
             }
             if tagged_eq(tagged, UNASSIGNEDVIRTUAL) {
-                if let Some(&num) = self.cached_virtuals.get(&b) {
+                if let Some(&num) = self
+                    .cached_virtuals
+                    .get(&majit_ir::operand::Operand::from_boxref(&b))
+                {
                     return tag(num, TAGVIRTUAL).unwrap_or(UNASSIGNEDVIRTUAL);
                 }
             }
@@ -4582,20 +4617,30 @@ mod tests {
     #[test]
     fn livebox_map_preserves_box_identity_and_insertion_order() {
         let mut liveboxes = LiveboxMap::new();
-        // Two distinct logical boxes — an InputArg and a ResOp result. Under
-        // Rc::ptr_eq keying they stay distinct keys (PyPy `box is box`), never
-        // collapsed by a shared raw slot index.
-        let input = crate::r#box::BoxRef::from_opref(majit_ir::OpRef::input_arg_int(0));
-        let op = crate::r#box::BoxRef::from_opref(majit_ir::OpRef::int_op(0));
+        // Two distinct logical boxes — an InputArg and a ResOp result, each
+        // bound to a rooted producer so they shed to Operand::InputArg / Op.
+        // Under ptr_eq keying they stay distinct keys (PyPy `box is box`),
+        // never collapsed by a shared raw slot index.
+        let input =
+            crate::r#box::test_support::rooted_box_from_opref(majit_ir::OpRef::input_arg_int(0));
+        let op = crate::r#box::test_support::rooted_box_from_opref(majit_ir::OpRef::int_op(0));
 
         liveboxes.insert(input.clone(), UNASSIGNED);
         liveboxes.insert(op.clone(), UNASSIGNEDVIRTUAL);
 
         assert_eq!(liveboxes.get(&input), Some(UNASSIGNED));
         assert_eq!(liveboxes.get(&op), Some(UNASSIGNEDVIRTUAL));
+        // iter() reconstructs each key's bound BoxRef view via to_boxref, so
+        // compare by the stable (type, position) OpRef identity + order.
         assert_eq!(
-            liveboxes.iter().collect::<Vec<_>>(),
-            vec![(input, UNASSIGNED), (op, UNASSIGNEDVIRTUAL)]
+            liveboxes
+                .iter()
+                .map(|(b, t)| (b.to_opref(), t))
+                .collect::<Vec<_>>(),
+            vec![
+                (input.to_opref(), UNASSIGNED),
+                (op.to_opref(), UNASSIGNEDVIRTUAL)
+            ]
         );
     }
 
@@ -4945,7 +4990,9 @@ mod tests {
                 if let Some(b) = self.box_cache.borrow().get(&root) {
                     return b.clone();
                 }
-                let b = crate::r#box::BoxRef::from_opref(root);
+                // Synthesize a rooted bound producer so the box sheds to
+                // `Operand::Op`/`InputArg` for the Operand-keyed liveboxes map.
+                let b = crate::r#box::test_support::rooted_box_from_opref(root);
                 self.box_cache.borrow_mut().insert(root, b.clone());
                 b
             }

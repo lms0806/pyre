@@ -23,6 +23,7 @@
 use crate::box_ref::BoxRef;
 use crate::resoperation::{OpRc, OpRef};
 use crate::value::{Const, GcRef, InputArgRc, Type, Value};
+use std::cell::Cell;
 use std::rc::Rc;
 
 /// An operand stored in `Op.args` / `Op.fail_args`.
@@ -40,24 +41,20 @@ pub enum Operand {
     /// An input-arg producer (`resoperation.py` `AbstractInputArg`).
     InputArg(InputArgRc),
     /// A constant (`history.py:227/268/314` `ConstInt`/`ConstFloat`/
-    /// `ConstPtr`). Upstream `Const` is a heap object — `_args[i]` returns
-    /// the stored object, `==` is Python `is`, and value equality is the
-    /// explicit `same_constant` (history.py:211) — so the operand carries
-    /// the const box by `Rc` (object identity across reads of one slot,
-    /// `Cell`-backed GC walk of an inline `ConstPtr`), NOT a bare value.
-    /// The carrier is the const-kind [`BoxRef`] for the migration window;
-    /// it type-narrows to a dedicated const-box `Rc` when the `BoxRef`
-    /// wrapper is deleted (#9 endgame).
-    Const(BoxRef),
-    /// MIGRATION-ONLY catch-all (`#9` operand-union flip): a not-yet-converted
-    /// [`BoxRef`] for the operands `from_boxref` cannot yet lower to a pure
-    /// `Op`/`InputArg`/`Const` — position-only operands minted by
-    /// `BoxRef::from_opref` (no live producer to bind). Holding the original
-    /// `BoxRef` makes the storage flip byte-identical: `to_boxref` clones the
-    /// same `Rc<Box>` back, preserving box identity and GC-walkability
-    /// verbatim. Ground down to zero (then deleted) as later slices bind
-    /// these.
-    Box(BoxRef),
+    /// `ConstPtr`). The value lives in an `Rc<Cell<Value>>`: the `Cell` lets
+    /// the GC root walker forward an inline `ConstPtr` `GcRef` in place
+    /// through a shared `&self` borrow of `Op.args` (`walk_const_ptr_refs`
+    /// get/visit/set cycle), and the `Rc` gives the const an object identity
+    /// — `==` is `Rc::ptr_eq` (resoperation.py:29-39 `AbstractValue` keys by
+    /// `is`), so two distinct `const_` mints compare unequal while a clone
+    /// shares the same const object (`getarglist_copy` reuses the same
+    /// `Const`). Value equality is the opt-in `same_constant` (history.py:211),
+    /// surfaced as [`same_box`](Self::same_box). This is the same shared-cell
+    /// in-place-forward contract the const-kind `BoxKind::Const { value:
+    /// Cell<Value> }` `Rc<Box>` carrier provided. The forwarding visitor is
+    /// idempotent on an already-forwarded object (collector.rs:1133), so a
+    /// const cell reachable from two slots forwards safely.
+    Const(Rc<Cell<Value>>),
 }
 
 impl Operand {
@@ -78,7 +75,7 @@ impl Operand {
     /// `ConstInt(value)` object construction; identity starts here and is
     /// shared by every read of the slot).
     pub fn const_(value: Const) -> Operand {
-        Operand::Const(BoxRef::new_const(value.to_value()))
+        Operand::Const(Rc::new(Cell::new(value.to_value())))
     }
 
     /// The absent-slot sentinel.
@@ -98,10 +95,14 @@ impl Operand {
             Operand::None => OpRef::NONE,
             Operand::Op(op) => op.pos.get(),
             Operand::InputArg(ia) => OpRef::input_arg_typed(ia.index, ia.tp),
-            // Re-encodes from the box's live `Cell` value, so a GC-moved
-            // `ConstPtr` reads back at its post-move address.
-            Operand::Const(b) => b.to_opref(),
-            Operand::Box(b) => b.to_opref(),
+            // Re-encodes from the live `Cell` value, so a GC-moved `ConstPtr`
+            // reads back at its post-move address (box_ref.rs:510-514 parity).
+            Operand::Const(cell) => match cell.get() {
+                Value::Int(v) => OpRef::const_int(v),
+                Value::Float(v) => OpRef::const_float(v),
+                Value::Ref(v) => OpRef::const_ptr(v),
+                Value::Void => OpRef::NONE,
+            },
         }
     }
 
@@ -111,7 +112,6 @@ impl Operand {
         match self {
             Operand::Op(op) => Some(op.pos.get().raw()),
             Operand::InputArg(ia) => Some(ia.index),
-            Operand::Box(b) => b.position(),
             Operand::Const(_) | Operand::None => None,
         }
     }
@@ -121,8 +121,7 @@ impl Operand {
         match self {
             Operand::Op(op) => op.pos.get().ty().unwrap_or(Type::Void),
             Operand::InputArg(ia) => ia.tp,
-            Operand::Const(b) => b.type_(),
-            Operand::Box(b) => b.type_(),
+            Operand::Const(cell) => cell.get().get_type(),
             Operand::None => Type::Void,
         }
     }
@@ -131,8 +130,7 @@ impl Operand {
     /// `None` for non-`Const`.
     pub fn const_value(&self) -> Option<Value> {
         match self {
-            Operand::Const(b) => b.const_value(),
-            Operand::Box(b) => b.const_value(),
+            Operand::Const(cell) => Some(cell.get()),
             _ => None,
         }
     }
@@ -141,44 +139,30 @@ impl Operand {
     /// parity).
     pub fn const_int(&self) -> Option<i64> {
         match self {
-            Operand::Const(b) => b.const_int(),
-            Operand::Box(b) => b.const_int(),
+            Operand::Const(cell) => match cell.get() {
+                Value::Int(v) => Some(v),
+                _ => None,
+            },
             _ => None,
         }
     }
 
     /// `resoperation.py:47 is_constant`.
     pub fn is_constant(&self) -> bool {
-        match self {
-            Operand::Const(_) => true,
-            Operand::Box(b) => b.is_constant(),
-            _ => false,
-        }
+        matches!(self, Operand::Const(_))
     }
 
     pub fn is_inputarg(&self) -> bool {
-        match self {
-            Operand::InputArg(_) => true,
-            Operand::Box(b) => b.is_inputarg(),
-            _ => false,
-        }
+        matches!(self, Operand::InputArg(_))
     }
 
     pub fn is_resop(&self) -> bool {
-        match self {
-            Operand::Op(_) => true,
-            Operand::Box(b) => b.is_resop(),
-            _ => false,
-        }
+        matches!(self, Operand::Op(_))
     }
 
     /// True for the absent-slot sentinel — the mirror of `OpRef::is_none`.
     pub fn is_none(&self) -> bool {
-        match self {
-            Operand::None => true,
-            Operand::Box(b) => b.is_none(),
-            _ => false,
-        }
+        matches!(self, Operand::None)
     }
 
     /// `resoperation.py:38 AbstractValue.same_box`: pointer identity
@@ -203,10 +187,10 @@ impl Operand {
             Operand::None => BoxRef::none(),
             Operand::Op(op) => BoxRef::from_bound_op(op),
             Operand::InputArg(ia) => BoxRef::from_bound_inputarg(ia),
-            // The SAME `Rc<Box>` back — `_args[i]` returns the stored
-            // Const object, never a fresh equal-valued one.
-            Operand::Const(b) => b.clone(),
-            Operand::Box(b) => b.clone(),
+            // Re-mint a const box from the live cell value (migration-window
+            // bridge). Const boxes are fresh-per-resolution and never
+            // `ptr_eq`-deduped, so a new identity is faithful.
+            Operand::Const(cell) => BoxRef::new_const(cell.get()),
         }
     }
 
@@ -224,11 +208,17 @@ impl Operand {
     /// otherwise a bound operand reading the already-remapped live pos would
     /// double-remap.
     ///
-    /// A position-only box (no bound handle — e.g. `from_opref`) and a Const
-    /// box (value-typed, GC-walked in place through its `Cell`) carry no
-    /// producer to track and stay `Operand::Box`, whose `to_boxref` returns
-    /// the same `Rc<Box>` (identity, `Cell`-backed GC walk, frozen position
-    /// snapshot all preserved).
+    /// A Const box lowers to `Operand::Const`, whose value is read out into a
+    /// fresh `Rc<Cell<Value>>` (the `Cell`-backed in-place GC walk is
+    /// preserved; the fresh `Rc` is a new const identity, since the source
+    /// `BoxRef` and the operand carrier are distinct `Rc` types). A
+    /// position-only box (no
+    /// bound handle — `BoxRef::from_opref` of a non-const ResOp/InputArg
+    /// position) has no `Operand` to lower to and is a contract violation: by
+    /// #9 every operand source binds its producer (`from_bound_op` /
+    /// `from_bound_inputarg`) or carries a const. The drain to zero was proven
+    /// across the lib corpus and the bench suite (`MAJIT_DIAG_OPERAND_BOX`),
+    /// so this case panics rather than fabricating an untracked operand.
     pub fn from_boxref(b: &BoxRef) -> Operand {
         if b.is_none() {
             return Operand::None;
@@ -238,79 +228,109 @@ impl Operand {
         // `AbstractResOp`/`AbstractInputArg` directly), so its position
         // auto-tracks the producer's `op.pos` and its forwarding resolves
         // through the canonical `Op`/`InputArg`. The strong `Rc` keeps the
-        // producer alive (acyclic on the SSA use-before-def DAG). A
-        // position-only box (no bound handle) and a Const box (value-typed,
-        // GC-walked in place via its `Cell`) have no producer to carry and
-        // stay `Operand::Box`.
+        // producer alive (acyclic on the SSA use-before-def DAG).
         if let Some(op) = b.bound_op() {
             return Operand::Op(op);
         }
         if let Some(ia) = b.bound_inputarg() {
             return Operand::InputArg(ia);
         }
-        // A Const box lowers to the terminal `Operand::Const` carrying the
-        // same `Rc<Box>` (history.py Const object identity + `Cell`-backed
-        // GC walk preserved). Only position-only boxes remain `Operand::Box`.
+        // A Const box lowers to the terminal `Operand::Const`, reading its
+        // value into a fresh `Rc<Cell<Value>>` (the inline-`ConstPtr` GC walk
+        // is preserved; the fresh `Rc` is a new const identity).
         if b.is_constant() {
-            return Operand::Const(b.clone());
+            return Operand::Const(Rc::new(Cell::new(
+                b.const_value()
+                    .expect("is_constant box carries a const value"),
+            )));
         }
-        // Only position-only boxes (no producer Rc) reach here.
-        //
-        // Drain status (#9 keystone): the gauge fires ZERO times across the
-        // full synth corpus (117 benches, measured). The two former live
-        // sources are bound at their origin: short-preamble `short_inputargs`
-        // now mint via `from_bound_inputarg` over a rooted `InputArg` Rc
-        // carried through the preview → export → import channel
-        // (`short_inputarg_refs`, resolving to `Operand::InputArg`), and
-        // `emit_constant_*` SAME_AS placeholders take the constant box as their
-        // source (resolving to `Operand::Const`). `MAJIT_DIAG_OPERAND_BOX=1`
-        // reports each mint's position-only `OpRef`; off by default, no
-        // behavior change in the gate. A new mint from the WIRED pipeline
-        // appearing here is a regression — bind it at its producer.
-        //
-        // The remaining minters are of two kinds, both gating variant deletion:
-        // (1) unit-test fixtures that build `from_opref` / `new_inputarg`
-        // position-only boxes directly (no producer graph); and (2) the ported
-        // SIMD vectorizer machinery — `Renamer::rename` (renamer.rs:51/64),
-        // `vector.rs` pack/unpack/copy, `GuardStrengthenOpt` (guard.rs), and the
-        // vectorizer-coupled unroll peel-remap — which set op args via
-        // `from_opref(renamed)` of a non-const ResOp/InputArg position. That
-        // machinery is NOT in the production pass pipeline
-        // (optimizer.rs `default_pipeline` wires no `OptVector`), so it
-        // never runs and the gauge stays zero — but it is reachable the moment
-        // the vectorizer is wired. Deleting the `Operand::Box` variant — and
-        // with it the `BoxRef` operand carrier — is therefore gated on BOTH
-        // migrating the fixtures to bound producers AND either binding those
-        // vectorizer minters or removing the unwired vectorizer; until then the
-        // fall-through stays a real fallback, NOT an `unreachable!` tripwire
-        // (which would become a latent panic once the vectorizer is enabled).
-        if std::env::var_os("MAJIT_DIAG_OPERAND_BOX").is_some() {
-            eprintln!("OPERAND_BOX_MINT {:?}", b.to_opref());
-        }
-        Operand::Box(b.clone())
+        // A position-only box (no producer Rc, non-const) reaches here only if
+        // some operand source skipped binding its producer — an invariant
+        // violation under the #9 operand-union model where `_args[i]` is
+        // always a producer or a constant. Bind it at its producer
+        // (`from_bound_op` / `from_bound_inputarg`) instead of routing an
+        // unbound position through here.
+        panic!(
+            "from_boxref: position-only box {:?} has no producer to bind — \
+             every operand source must carry a bound producer or a const (#9)",
+            b.to_opref()
+        )
     }
 
-    /// True only for the live-tracking bound variants (`Op` / `InputArg`),
-    /// whose `to_opref()` reads the producer's CURRENT `op.pos`. Excludes the
-    /// frozen `Operand::Box` snapshot even when it wraps a ResOp / InputArg
-    /// box — unlike [`Operand::is_resop`] / [`Operand::is_inputarg`], which
-    /// fold the snapshot case in. The position-remap passes use this to skip
-    /// operands that auto-track a renumbered producer (no snapshot rewrite
-    /// needed); only position-only `Operand::Box` operands carry a stale
-    /// position the remap table must rewrite.
+    /// True for the live-tracking producer variants (`Op` / `InputArg`),
+    /// whose `to_opref()` reads the producer's CURRENT `op.pos`. The
+    /// position-remap passes use this to skip operands that auto-track a
+    /// renumbered producer (no snapshot rewrite needed); `Const` / `None`
+    /// carry no position to remap.
     pub fn is_bound(&self) -> bool {
         matches!(self, Operand::Op(_) | Operand::InputArg(_))
     }
 
     /// GC walk over any inline `ConstPtr` reachable from this operand
-    /// (`resoperation.py` `walk_const_ptr_refs`). Const / position-only
-    /// operands are held `Cell`-backed in their box, so their `GcRef`
-    /// updates in place; pure `Op` / `InputArg` carry no inline const (their
-    /// own `value` slot is walked at the producer).
+    /// (`resoperation.py` `walk_const_ptr_refs`). A `Const` operand is held
+    /// `Cell`-backed in its box, so its `GcRef` updates in place; pure `Op` /
+    /// `InputArg` carry no inline const (their own `value` slot is walked at
+    /// the producer).
     pub fn walk_const_ptr_refs(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
         match self {
-            Operand::Const(b) | Operand::Box(b) => b.walk_const_ptr_refs(visitor),
+            // Forward an inline `ConstPtr` `GcRef` in place through the cell's
+            // get/visit/set cycle (box_ref.rs:561-568 parity) — no `&mut self`
+            // needed, so `Op.args` GC walks keep their shared `borrow()`.
+            Operand::Const(cell) => {
+                let mut v = cell.get();
+                if let Value::Ref(gcref) = &mut v {
+                    visitor(gcref);
+                    cell.set(v);
+                }
+            }
             Operand::None | Operand::Op(_) | Operand::InputArg(_) => {}
+        }
+    }
+}
+
+impl PartialEq for Operand {
+    /// Object identity, mirroring [`BoxRef`]'s pure `Rc::ptr_eq`
+    /// (`box_ref.rs:1050`): `AbstractValue` defines no `__eq__`
+    /// (`resoperation.py:29-39`), so every plain box-keyed dict keys by `is`.
+    /// `Op` / `InputArg` / `Const` each carry an `Rc`, so `==` is `ptr_eq` on
+    /// that producer/const handle; two `none()` sentinels match (Python's
+    /// singleton `None`). Equal-valued constants minted separately are NOT
+    /// equal here — value equality is the opt-in [`same_box`](Self::same_box)
+    /// (`history.py:211`), never `==`, so a `same_box`-deduping table must
+    /// build an explicit value-keyed map, not key on `Operand`.
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Operand::None, Operand::None) => true,
+            (Operand::Op(a), Operand::Op(b)) => Rc::ptr_eq(a, b),
+            (Operand::InputArg(a), Operand::InputArg(b)) => Rc::ptr_eq(a, b),
+            (Operand::Const(a), Operand::Const(b)) => Rc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Operand {}
+
+impl std::hash::Hash for Operand {
+    /// Identity hashing consistent with [`eq`](Self::eq) — the
+    /// `compute_identity_hash` default (`resoperation.py:33-35`). A
+    /// per-variant tag keeps cross-variant collisions from aliasing, and the
+    /// `Rc` address is the identity for `Op` / `InputArg` / `Const`.
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Operand::None => 0u8.hash(state),
+            Operand::Op(op) => {
+                1u8.hash(state);
+                (Rc::as_ptr(op) as *const () as usize).hash(state);
+            }
+            Operand::InputArg(ia) => {
+                2u8.hash(state);
+                (Rc::as_ptr(ia) as *const () as usize).hash(state);
+            }
+            Operand::Const(cell) => {
+                3u8.hash(state);
+                (Rc::as_ptr(cell) as usize).hash(state);
+            }
         }
     }
 }
@@ -431,29 +451,74 @@ mod tests {
         assert!(o.is_bound());
         assert_eq!(o.to_boxref().as_ptr(), bia.as_ptr());
 
-        // Const -> Operand::Const carrying the SAME const box (history.py
-        // Const object identity; Cell-backed GC walk); NOT bound.
+        // Const -> Operand::Const carrying the const VALUE in a fresh
+        // Rc<Cell<Value>> (Cell-backed GC walk); NOT bound. to_boxref
+        // re-mints, so it no longer ptr-aliases the source box.
         let cbox = BoxRef::new_const(Value::Int(11));
         let o = Operand::from_boxref(&cbox);
         assert!(matches!(o, Operand::Const(_)));
         assert!(o.is_constant());
         assert!(!o.is_bound());
         assert_eq!(o.const_int(), Some(11));
-        assert_eq!(o.to_boxref().as_ptr(), cbox.as_ptr());
-
-        // Position-only box (from_opref, no live producer) -> kept as Box
-        // (no bound handle to shed onto); NOT bound, frozen position survives.
-        let pos_only = BoxRef::from_opref(OpRef::op_typed(4, Type::Int));
-        let o = Operand::from_boxref(&pos_only);
-        assert!(matches!(o, Operand::Box(_)));
-        assert!(!o.is_bound());
-        assert_eq!(o.position(), Some(4));
-        assert_eq!(o.to_boxref().as_ptr(), pos_only.as_ptr());
+        assert_eq!(o.to_boxref().const_int(), Some(11));
 
         // None sentinel -> Operand::None.
         assert!(matches!(
             Operand::from_boxref(&BoxRef::none()),
             Operand::None
         ));
+    }
+
+    /// A position-only box (`from_opref`, no live producer, non-const) has no
+    /// `Operand` to lower to under the #9 operand-union model — `from_boxref`
+    /// panics rather than fabricating an untracked operand.
+    #[test]
+    #[should_panic(expected = "has no producer to bind")]
+    fn from_boxref_panics_on_position_only_box() {
+        let pos_only = BoxRef::from_opref(OpRef::op_typed(4, Type::Int));
+        let _ = Operand::from_boxref(&pos_only);
+    }
+
+    /// `Eq` is object identity (`Rc::ptr_eq`), the `BoxRef`-key behaviour the
+    /// re-keyed side tables depend on: same `Rc` is equal, a fresh mint is
+    /// not — including for constants (value equality is `same_box`, never
+    /// `==`). A clone shares the `Rc`, so it stays equal and `HashSet`-stable.
+    #[test]
+    fn eq_and_hash_are_object_identity() {
+        use std::collections::HashSet;
+
+        let op = op_at(0, Type::Int);
+        // Same producer Rc -> equal; a clone shares the Rc -> equal.
+        let a = Operand::from_bound_op(&op);
+        assert_eq!(a, a.clone());
+        assert_eq!(Operand::from_bound_op(&op), Operand::from_bound_op(&op));
+        // Distinct ops at the same position -> distinct identity.
+        let op_other = op_at(0, Type::Int);
+        assert_ne!(
+            Operand::from_bound_op(&op),
+            Operand::from_bound_op(&op_other)
+        );
+
+        // Equal-valued constants minted separately are NOT `==` (distinct Rc),
+        // even though they are `same_box`-equal.
+        let c1 = Operand::const_(Const::Int(4));
+        let c2 = Operand::const_(Const::Int(4));
+        assert_ne!(c1, c2);
+        assert!(c1.same_box(&c2));
+        // A clone shares the const Rc -> equal.
+        assert_eq!(c1, c1.clone());
+
+        // None is a singleton; cross-variant never matches.
+        assert_eq!(Operand::none(), Operand::none());
+        assert_ne!(Operand::none(), Operand::const_(Const::Int(0)));
+
+        // Hash agrees with Eq: a clone resolves the same bucket/membership.
+        let mut set = HashSet::new();
+        set.insert(Operand::from_bound_op(&op));
+        assert!(set.contains(&Operand::from_bound_op(&op)));
+        assert!(!set.contains(&Operand::from_bound_op(&op_other)));
+        set.insert(c1.clone());
+        assert!(set.contains(&c1));
+        assert!(!set.contains(&c2));
     }
 }

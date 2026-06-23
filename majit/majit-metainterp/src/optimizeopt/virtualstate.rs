@@ -26,6 +26,7 @@ use std::rc::Rc;
 use majit_ir::vec_set::VecSet;
 
 use majit_ir::descr::descr_identity;
+use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 
 /// virtualstate.py: VirtualStatesCantMatch — raised when two virtual states
@@ -2324,7 +2325,10 @@ impl GuardRequirement {
                 let class_const = ctx.make_constant_int(*expected_class);
                 let arg_b = ctx.materialize_box_at(arg);
                 let class_b = ctx.materialize_box_at(class_const);
-                let mut op = Op::new(OpCode::GuardClass, &[arg_b, class_b]);
+                let mut op = Op::new(
+                    OpCode::GuardClass,
+                    &[Operand::from_boxref(&arg_b), Operand::from_boxref(&class_b)],
+                );
                 op.setfailargs(Default::default());
                 vec![op]
             }
@@ -2347,7 +2351,10 @@ impl GuardRequirement {
                 let class_const = ctx.make_constant_int(*expected_class);
                 let arg_b = ctx.materialize_box_at(arg);
                 let class_b = ctx.materialize_box_at(class_const);
-                let mut op = Op::new(OpCode::GuardNonnullClass, &[arg_b, class_b]);
+                let mut op = Op::new(
+                    OpCode::GuardNonnullClass,
+                    &[Operand::from_boxref(&arg_b), Operand::from_boxref(&class_b)],
+                );
                 op.setfailargs(Default::default());
                 vec![op]
             }
@@ -2363,7 +2370,10 @@ impl GuardRequirement {
                         None => return Vec::new(),
                     }
                 };
-                let mut op = Op::new(OpCode::GuardNonnull, &[ctx.materialize_box_at(arg)]);
+                let mut op = Op::new(
+                    OpCode::GuardNonnull,
+                    &[Operand::from_boxref(&ctx.materialize_box_at(arg))],
+                );
                 op.setfailargs(Default::default());
                 vec![op]
             }
@@ -2394,7 +2404,10 @@ impl GuardRequirement {
                 };
                 let arg_b = ctx.materialize_box_at(arg);
                 let val_b = ctx.materialize_box_at(val_const);
-                let mut op = Op::new(OpCode::GuardValue, &[arg_b, val_b]);
+                let mut op = Op::new(
+                    OpCode::GuardValue,
+                    &[Operand::from_boxref(&arg_b), Operand::from_boxref(&val_b)],
+                );
                 op.setfailargs(Default::default());
                 vec![op]
             }
@@ -2488,9 +2501,11 @@ pub(crate) struct ExportCache {
     // assert traps that as a bind-at-alloc gap rather than silently
     // mis-deduping. `VecAssoc`/`VecSet` are Vec-backed and compare by `Eq` only
     // (never hash), so no GC pointer is hashed here.
-    pub finished:
-        crate::optimizeopt::vec_assoc::VecAssoc<crate::r#box::BoxRef, Rc<VirtualStateInfoNode>>,
-    pub in_progress: majit_ir::vec_set::VecSet<crate::r#box::BoxRef>,
+    pub finished: crate::optimizeopt::vec_assoc::VecAssoc<
+        majit_ir::operand::Operand,
+        Rc<VirtualStateInfoNode>,
+    >,
+    pub in_progress: majit_ir::vec_set::VecSet<majit_ir::operand::Operand>,
 }
 
 impl ExportCache {
@@ -2549,7 +2564,10 @@ fn export_single_value(
          must be a bound box; virtualstate.py:711-720)"
     );
     // virtualstate.py:714-716: cache hit returns the cached state directly.
-    if let Some(cached) = cache.finished.get(&box_) {
+    if let Some(cached) = cache
+        .finished
+        .get(&majit_ir::operand::Operand::from_boxref(&box_))
+    {
         return Rc::clone(cached);
     }
     // Cycle: this opref is currently being exported on the parent stack.
@@ -2563,7 +2581,10 @@ fn export_single_value(
     // spectral_norm, inline_helper). The cyclic-virtual-graph regression
     // (RPython parity gap documented above) is therefore latent — no
     // benchmark constructs the necessary self-referential structures.
-    if cache.in_progress.contains(&box_) {
+    if cache
+        .in_progress
+        .contains(&majit_ir::operand::Operand::from_boxref(&box_))
+    {
         // Fallback to Ref for the cycle leaf: pyre's virtual DAGs only
         // form through ptr fields, so the only reachable cycles are on
         // Ref-typed nodes. Matches `not_virtual(cpu, 'r', None)` in
@@ -2571,12 +2592,13 @@ fn export_single_value(
         // with LEVEL_UNKNOWN.
         return VirtualStateInfoNode::new_rc(VirtualStateInfo::Unknown(Type::Ref));
     }
-    cache.in_progress.insert(box_.clone());
+    let key = majit_ir::operand::Operand::from_boxref(&box_);
+    cache.in_progress.insert(key.clone());
 
     let info = export_single_value_inner(box_.to_opref(), ctx, cache);
     let rc = VirtualStateInfoNode::new_rc(info);
-    cache.in_progress.remove(&box_);
-    cache.finished.insert(box_, Rc::clone(&rc));
+    cache.in_progress.remove(&key);
+    cache.finished.insert(key, Rc::clone(&rc));
     rc
 }
 
