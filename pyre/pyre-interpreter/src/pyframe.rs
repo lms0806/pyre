@@ -1699,6 +1699,35 @@ impl PyFrame {
         }
     }
 
+    /// `run`, but dispatching the non-generator body through the registered
+    /// eval function (`call::get_eval_fn`) instead of the plain interpreter.
+    ///
+    /// `interp_jit.py:81-99` applies the jitdriver to every frame uniformly,
+    /// so module / class / exec'd code reaches `jit_merge_point` exactly like
+    /// a called function does.  `run` hardcodes the plain interpreter, which
+    /// keeps these entry frames off the portal; this variant restores the
+    /// uniform routing for the run-sites that want it (exec / eval / import /
+    /// class body), matching how `call_user_function` reaches the portal via
+    /// `get_eval_fn`.
+    ///
+    /// `settrace` is honored without forcing plain eval: installing a tracefunc
+    /// does not set `FORCE_PLAIN_EVAL` (that flag is a blackhole / `force_fn`
+    /// re-entry guard, unrelated to tracing).  The JIT eval override
+    /// (`eval_with_jit`) instead reads `ec.w_tracefunc` inline each bytecode
+    /// for line events and routes non-JIT-eligible frames through
+    /// `execute_frame` (so `call_trace` / `return_trace` frame events still
+    /// fire), exactly as a normal call reaches the portal via `get_eval_fn`;
+    /// and when the portal declines a frame it falls back to `execute_frame`
+    /// (plain), so this never re-enters the portal.
+    #[inline]
+    pub fn run_with_jit(&mut self) -> crate::PyResult {
+        if self._is_generator_or_coroutine() {
+            self.initialize_as_generator()
+        } else {
+            crate::call::get_eval_fn()(self)
+        }
+    }
+
     /// pyframe.py:300 resume_execute_frame (send-path only).
     ///
     /// pyre does not emit YIELD_FROM/SEND yet, so `w_yielding_from` is

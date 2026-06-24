@@ -2222,6 +2222,36 @@ pub(crate) fn instruction_needs_pre_opcode_snapshot(instruction: Instruction) ->
             | Instruction::UnaryNot
             | Instruction::UnaryInvert
             | Instruction::RaiseVarargs { .. }
+            // Both pop the operand stack (BUILD_TUPLE pop_n, UNPACK_SEQUENCE
+            // pop_value) before emitting a guard: trace_build_tuple_value emits
+            // the specialised-tuple w_class guards on the popped items, and
+            // unpack_sequence_value emits the sequence class / length guards on
+            // the popped sequence. Without the opcode-start snapshot the guard's
+            // resume state reflects the post-pop stack, so resuming at the
+            // opcode start restores the consumed operands as null / mismatched.
+            | Instruction::BuildTuple { .. }
+            | Instruction::UnpackSequence { .. }
+            // LOAD_ATTR reaches the trait leg (execute_opcode_step) in two
+            // cases the dispatch gate carves out of the arm walk: the foldable
+            // builtin list-method form (append/pop/reverse on a list receiver)
+            // and any method-load inside an inline frame. Both run load_method,
+            // which pop_value's the receiver first, then emits a non-residual
+            // receiver class guard (guard_class) plus a version_tag guard_value
+            // — resume_pc=orgpc, so the consumed receiver must be in the
+            // opcode-start snapshot. The arm-walk leg (the common non-foldable
+            // form) ignores pre_opcode_registers_r, so capturing it there is
+            // inert; only the trait leg consults it.
+            | Instruction::LoadAttr { .. }
+            // LIST_APPEND reaches the trait leg in an inline frame (it is
+            // walker-routed at the root). list_append_value pop_value's the
+            // appended value, then the strategy fast path emits non-residual
+            // guards at resume_pc=orgpc: guard_class / guard_list_strategy on
+            // the peeked list and, for int/float-storage lists, an unbox
+            // guard_class / guard_value on the popped value. The sibling
+            // comprehension helpers (SET_ADD / MAP_ADD / LIST_EXTEND / …) have
+            // no tracer override and abort before popping, so only LIST_APPEND
+            // qualifies.
+            | Instruction::ListAppend { .. }
     )
 }
 
@@ -9021,6 +9051,39 @@ mod tests {
         assert!(contains_instruction(&raise_code, |instruction| {
             matches!(instruction, Instruction::RaiseVarargs { .. })
                 && !instruction_may_raise(instruction)
+                && instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        // BUILD_TUPLE pops its operands before trace_build_tuple_value emits
+        // the specialised-tuple w_class guards.
+        let build_tuple_code = compile_function_body("def f(a, b):\n    return (a, b)\n");
+        assert!(contains_instruction(&build_tuple_code, |instruction| {
+            matches!(instruction, Instruction::BuildTuple { .. })
+                && instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        // UNPACK_SEQUENCE pops the sequence before unpack_sequence_value emits
+        // the sequence class / length guards.
+        let unpack_code = compile_function_body("def f(s):\n    a, b = s\n    return a + b\n");
+        assert!(contains_instruction(&unpack_code, |instruction| {
+            matches!(instruction, Instruction::UnpackSequence { .. })
+                && instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        // LOAD_ATTR's foldable list-method form (lst.append) reaches the trait
+        // leg load_method, which pop_value's the receiver before emitting the
+        // receiver class / version_tag guards.
+        let load_attr_code = compile_function_body("def f(lst, x):\n    return lst.append(x)\n");
+        assert!(contains_instruction(&load_attr_code, |instruction| {
+            matches!(instruction, Instruction::LoadAttr { .. })
+                && instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        // LIST_APPEND (list comprehension) pops the appended value before the
+        // strategy fast path emits its list class / strategy / unbox guards.
+        let list_append_code = compile_function_body("def f(xs):\n    return [x for x in xs]\n");
+        assert!(contains_instruction(&list_append_code, |instruction| {
+            matches!(instruction, Instruction::ListAppend { .. })
                 && instruction_needs_pre_opcode_snapshot(instruction)
         }));
     }

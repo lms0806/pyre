@@ -620,6 +620,45 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// surfaces the `DispatchError` so a guard recorded without a resume
     /// snapshot aborts the walk instead of compiling.
     pub pending_guard_snapshot_error: Option<DispatchError>,
+    /// #73 PyPy-faithful kept-operand-stack snapshot: the walk-level
+    /// symbolic operand stack, indexed by ABSOLUTE operand-stack depth
+    /// (slot `s`, `s in 0..vstack_depth`).  The Python operand stack is
+    /// all-Ref (`W_Root`), so a single `Vec<OpRef>` (Ref bank) suffices.
+    /// This is the walker analog of PyPy's `MIFrame.registers_r`
+    /// valuestack array snapshotted by `get_list_of_active_boxes`
+    /// (`pyjitpl.py:177-234`) — the authoritative per-slot box source the
+    /// `stack_sync` vable overlay reads at a branch guard instead of the
+    /// unreliable `registers_r[stack_slot_color_map[s]]` static-color read.
+    ///
+    /// Maintained ONLY when `sym.owns_virtualizable_shadow()`; on any
+    /// unmodeled stack effect the maintenance sets `vstack_valid = false`
+    /// and `stack_sync` falls back to the legacy read (zero regression).
+    ///
+    /// SLICE 1 (#423): infrastructure landed fully INERT — the mirror is
+    /// maintained but the snapshot read stays LEGACY unless `PYRE_VSTACK_USE`
+    /// is set; `PYRE_VSTACK_DIAG` only logs mirror-vs-legacy disagreement.
+    pub vstack_boxes: Vec<OpRef>,
+    /// #73: the absolute operand-stack depth `vstack_boxes` currently
+    /// reflects — the depth ON ENTRY to the Python opcode at
+    /// `vstack_cur_pypc` (i.e. AFTER the previous opcode's stack effect
+    /// was reconciled).
+    pub vstack_depth: usize,
+    /// #73: the Python pc of the opcode currently being walked.  A change
+    /// in `python_pc_for_jitcode_pc(jit_pc)` from this value marks a
+    /// Python-opcode boundary, where the previous opcode's stack effect is
+    /// reconciled into `vstack_boxes` (see [`reconcile_vstack_at_boundary`]).
+    pub vstack_cur_pypc: u32,
+    /// #73: whether `vstack_boxes` is a trustworthy mirror of the live
+    /// operand stack.  Set `false` at walk entry until seeded, and latched
+    /// `false` permanently on the first unmodeled stack effect so the
+    /// `stack_sync` overlay declines to use it.
+    pub vstack_valid: bool,
+    /// #73: the last Ref box written via [`write_ref_reg`] during the
+    /// CURRENT Python opcode — the box a value-producing opcode lands on
+    /// the operand-stack TOS.  Reset to `OpRef::NONE` at every opcode
+    /// boundary; read by [`reconcile_vstack_at_boundary`] for the
+    /// RESULT-TO-TOS class.
+    pub vstack_last_ref: OpRef,
 }
 
 /// Outcome of dispatching one opcode. The walker uses this to decide
@@ -1064,6 +1103,21 @@ pub enum DispatchError {
     /// interpreter fallback (correct, untraced) instead of compiling a trace
     /// whose guard-failure path corrupts the frame.
     BranchGuardKeptStackUnsupported { pc: usize },
+    /// A kept-stack branch guard's not-taken (resume) arm READS a regular
+    /// Ref register (`< num_regs_r`) that is neither snapshot-live nor
+    /// produced inside the arm, so the blackhole resumes it as NULL and
+    /// feeds NULL into the consuming op — the boxed-int short-circuit /
+    /// conditional-expression resume miscompile (a heap `ConstPtr`, an int
+    /// outside the small-int cache, parked in a register live-across the
+    /// guard).  Unlike [`BranchGuardKeptStackUnsupported`], this shape is
+    /// miscompiled the SAME way by BOTH the full-body walk and the trait
+    /// leg (both re-execute the identical not-taken arm on deopt), so a
+    /// recoverable [`TraceAction::Abort`] that re-routes to the trait leg
+    /// only crashes there too.  The driver maps this to
+    /// `TraceAction::AbortPermanent` → `DONT_TRACE_HERE`: the loop runs in
+    /// the interpreter (correct, matching the pre-#416/#420 decline) and is
+    /// never retraced by either leg.
+    BranchGuardUnrestorableKeptStackPermanent { pc: usize },
     /// A callee compiled as its own Finish portal (reached via
     /// `call_user_function_with_eval`) accessed its frame through a
     /// `vable_*` op that found it to be a non-standard virtualizable,
@@ -1106,6 +1160,15 @@ pub fn step(
     ctx: &mut WalkContext<'_, '_>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let op: DecodedOp = decode_op_at(code, pc).ok_or(DispatchError::UndecodableOpcode { pc })?;
+    // #73 (SLICE 1, INERT): maintain the walk-level operand-stack box
+    // mirror.  Detects a Python-opcode boundary at this jitcode pc and
+    // reconciles the previous opcode's stack effect into `ctx.vstack_boxes`
+    // BEFORE this op runs.  Writes ONLY the new `vstack_*` fields — never
+    // the existing registers / snapshot / control flow — so the mirror is
+    // pure side-data until a later slice flips `PYRE_VSTACK_USE`.  No-op
+    // unless the full-body walk owns the virtualizable shadow and the
+    // mirror is still valid.
+    step_vstack_mirror(ctx, pc);
     handle(&op, code, ctx)
 }
 
@@ -1532,6 +1595,14 @@ fn write_ref_reg(
     if let Some(c_slot) = ctx.concrete_registers_r.get_mut(dst) {
         *c_slot = sanitized;
     }
+    // #73 (SLICE 1, INERT): record the box just written as the candidate
+    // operand-stack TOS for the current Python opcode.  A value-producing
+    // opcode (LOAD_*, BINARY_OP, COPY, …) lands its result on the stack
+    // TOS; this is the last Ref it writes, so capturing it here lets
+    // `reconcile_vstack_at_boundary` reconstruct the new TOS without a
+    // per-opcode hook.  Cheap unconditional write to a new side-field;
+    // only consumed when the mirror is valid (never alters existing state).
+    ctx.vstack_last_ref = value;
     Ok(())
 }
 
@@ -2213,7 +2284,22 @@ pub fn dispatch_via_miframe(
             // STORE_SUBSCR specialization off on this entry.
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
+        // #73 (SLICE 1, INERT): seed the walk-level operand-stack box mirror
+        // at entry.  The mirror is only enabled when the outer sym owns the
+        // virtualizable shadow (the production full-body loop trace) — the
+        // synthetic/test entries leave it disabled (`vstack_valid = false`).
+        // Seed at the FIRST-walked jitcode pc (`position`), not `entry_py_pc`,
+        // so the first `step_vstack_mirror` is a no-op (no spurious
+        // entry-boundary reconcile of the not-yet-executed first opcode).
+        // Pure side-data: the snapshot read stays LEGACY unless a later slice
+        // flips `PYRE_VSTACK_USE`.
+        seed_vstack_mirror(&mut wc, sym, position);
         let outcome = walk(jitcode_code, position, &mut wc);
         // Read final last_exc_value before wc drops so the borrow
         // checker can release sym for the writeback below.
@@ -2452,6 +2538,11 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
             outer_active_boxes,
             store_subscr_fn_addr: bh_store_subscr_fn_addr_cached(),
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let outcome = walk(entry_jitcode.code.as_slice(), 0, &mut wc);
         let final_last_exc = wc.last_exc_value;
@@ -3366,6 +3457,26 @@ fn setarrayitem_vable_via_metainterp(
         concrete,
     );
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;
+    // #73 (SLICE 1, INERT): a Ref stored to the operand-stack region of the
+    // vable array is an operand-stack PUSH (portal `pyframe.pushvalue`
+    // lowers to `setarrayitem_vable_r(locals_cells_stack_w, depth, w_obj)`).
+    // Capture it as the current opcode's TOS box for the walk-level
+    // operand-stack mirror — this is the chokepoint that catches pushes which
+    // never go through `write_ref_reg` (notably COPY, whose duplicate is
+    // emitted as a bare pushvalue with no compute step).  Gate on the stack
+    // region (`index >= nlocals`) so a STORE_FAST/local-slot store does not
+    // masquerade as a stack TOS.  Writes ONLY `vstack_last_ref` (side-data);
+    // consumed only when the mirror is valid.
+    if value_bank == 'r' && ctx.vstack_valid {
+        let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+        if !full_body_sym.is_null() {
+            // SAFETY: pointer live for the full-body walk; read-only.
+            let nlocals = unsafe { (*full_body_sym).nlocals } as i64;
+            if index_value >= nlocals {
+                ctx.vstack_last_ref = value;
+            }
+        }
+    }
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
@@ -6145,6 +6256,446 @@ fn fbw_terminate_void_with_finish(
     Ok(())
 }
 
+/// #73: classification of a Python opcode's effect on the walk-level
+/// symbolic operand stack ([`WalkContext::vstack_boxes`]), used by
+/// [`reconcile_vstack_at_boundary`] to update `vstack_boxes` at an
+/// opcode boundary.  The depth delta is already known from
+/// `depth_at_py_pc`; this only decides WHERE the new boxes come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VstackOpClass {
+    /// A single net-result lands on the new TOS, and its box is the last
+    /// Ref written via [`write_ref_reg`] during this opcode
+    /// (`vstack_last_ref`).  Truncate to the new depth, then overwrite the
+    /// new TOS with `vstack_last_ref`.  Covers value producers whose
+    /// result is the topmost stack slot: LOAD_FAST / LOAD_CONST /
+    /// LOAD_GLOBAL(result) / LOAD_NAME / LOAD_ATTR / BINARY_OP /
+    /// BINARY_SUBSCR / COMPARE_OP / unary ops / TO_BOOL / CALL / COPY /
+    /// IS_OP / CONTAINS_OP / single-result BUILD_*.
+    ResultToTos,
+    /// The opcode only pops (and/or stores to a local/global/attr/subscr,
+    /// or is an unconditional control transfer).  Truncate to the new
+    /// depth WITHOUT touching the surviving TOS — the box already in that
+    /// slot is the live value.  Covers POP_TOP / POP_JUMP_IF_* /
+    /// STORE_FAST / STORE_GLOBAL / STORE_NAME / STORE_ATTR /
+    /// STORE_SUBSCR / STORE_SLICE / JUMP_* / RETURN_* / DELETE_*.
+    PopOnlyOrSideStore,
+    /// Anything that does not fit the two simple shapes above — SWAP,
+    /// UNPACK_SEQUENCE / UNPACK_EX (net push > 1), LOAD_GLOBAL pushing a
+    /// NULL sentinel beneath the result, STORE_FAST__STORE_FAST (net pop
+    /// 2), FOR_ITER, or any opcode this classifier does not recognise.
+    /// (The LOAD_FAST/STORE_FAST super-instructions whose net result is
+    /// the new TOS are modeled as `ResultToTos` above, not here.)
+    /// Latches `vstack_valid = false` so the overlay falls back to the
+    /// legacy behaviour (zero regression).
+    Unmodeled,
+}
+
+/// #73: classify `instr` for the [`VstackOpClass`] taxonomy.  Mirrors the
+/// stack-effect grouping in [`crate::liveness`]'s `stack_effects`, but
+/// collapsed to the three categories the operand-stack box maintenance
+/// cares about.  `op_arg` is read only where the net effect depends on it
+/// (LOAD_GLOBAL's NULL-sentinel low bit).
+fn classify_vstack_opcode(
+    instr: &pyre_interpreter::bytecode::Instruction,
+    op_arg: pyre_interpreter::OpArg,
+) -> VstackOpClass {
+    use pyre_interpreter::bytecode::Instruction;
+    match instr {
+        // Trivia / no stack effect — neither produces a TOS box nor pops.
+        // Treat as pop-only-or-side-store: truncate to the (unchanged)
+        // depth, leave the surviving slots intact.
+        Instruction::Nop
+        | Instruction::Resume { .. }
+        | Instruction::Cache
+        | Instruction::NotTaken
+        | Instruction::ExtendedArg => VstackOpClass::PopOnlyOrSideStore,
+
+        // Single value lands on the new TOS = the last Ref written.
+        Instruction::LoadConst { .. }
+        | Instruction::LoadSmallInt { .. }
+        | Instruction::LoadFast { .. }
+        | Instruction::LoadFastBorrow { .. }
+        | Instruction::LoadFastCheck { .. }
+        | Instruction::LoadFastAndClear { .. }
+        | Instruction::LoadName { .. }
+        | Instruction::LoadDeref { .. }
+        | Instruction::LoadLocals
+        | Instruction::Copy { .. }
+        | Instruction::UnaryNegative
+        | Instruction::UnaryNot
+        | Instruction::UnaryInvert
+        | Instruction::GetIter
+        | Instruction::GetLen
+        | Instruction::LoadAttr { .. }
+        | Instruction::ImportFrom { .. }
+        | Instruction::BinaryOp { .. }
+        | Instruction::CompareOp { .. }
+        | Instruction::IsOp { .. }
+        | Instruction::ContainsOp { .. }
+        | Instruction::Call { .. }
+        | Instruction::BuildTuple { .. }
+        | Instruction::BuildList { .. }
+        | Instruction::BuildSet { .. }
+        | Instruction::BuildMap { .. }
+        | Instruction::BuildString { .. }
+        // #73 SLICE 2: LOAD_FAST/STORE_FAST super-instructions.  Their net
+        // result still lands on the new TOS as the LAST Ref written (the
+        // second load, resp. the load following the store), so `ResultToTos`
+        // models the top slot correctly.  A two-push pair
+        // (`LoadFast(Borrow)LoadFast(Borrow)`, net +2) additionally leaves the
+        // slot BELOW the new TOS a NONE hole; the general hole-fill in
+        // `reconcile_vstack_at_boundary` recovers it from the virtualizable
+        // shadow (or defers it to the legacy read when unsourceable) WITHOUT
+        // invalidating the mirror.  Net-0 `StoreFastLoadFast` overwrites the
+        // consumed TOS with the loaded value (no hole).  Before this slice
+        // these fell through to `Unmodeled`, killing the mirror at the first
+        // super-instruction in a short-circuit / condexpr loop body.
+        | Instruction::LoadFastLoadFast { .. }
+        | Instruction::LoadFastBorrowLoadFastBorrow { .. }
+        | Instruction::StoreFastLoadFast { .. } => VstackOpClass::ResultToTos,
+
+        // Pop-only / side-store / control transfer: the surviving TOS box
+        // is already in `vstack_boxes`, do NOT overwrite it from the last
+        // ref (which targets a local/global/attr, not the new stack TOS).
+        Instruction::PopTop
+        | Instruction::PopIter
+        | Instruction::PopExcept
+        | Instruction::StoreFast { .. }
+        | Instruction::StoreName { .. }
+        | Instruction::StoreGlobal { .. }
+        | Instruction::StoreDeref { .. }
+        | Instruction::StoreAttr { .. }
+        | Instruction::DeleteAttr { .. }
+        | Instruction::StoreSubscr
+        | Instruction::DeleteSubscr
+        | Instruction::StoreSlice
+        | Instruction::DeleteFast { .. }
+        | Instruction::DeleteName { .. }
+        | Instruction::DeleteGlobal { .. }
+        | Instruction::DeleteDeref { .. }
+        | Instruction::PopJumpIfTrue { .. }
+        | Instruction::PopJumpIfFalse { .. }
+        | Instruction::PopJumpIfNone { .. }
+        | Instruction::PopJumpIfNotNone { .. }
+        | Instruction::JumpForward { .. }
+        | Instruction::JumpBackward { .. }
+        | Instruction::JumpBackwardNoInterrupt { .. }
+        | Instruction::ReturnValue => VstackOpClass::PopOnlyOrSideStore,
+
+        // LOAD_GLOBAL: when `namei & 1`, a NULL sentinel is pushed BENEATH
+        // the result (+2), so the result is not the sole new TOS box and a
+        // single `vstack_last_ref` write cannot reconstruct both slots —
+        // decline.  When `namei & 1 == 0` it is a plain single-result push.
+        Instruction::LoadGlobal { namei } => {
+            if namei.get(op_arg) as usize & 1 != 0 {
+                VstackOpClass::Unmodeled
+            } else {
+                VstackOpClass::ResultToTos
+            }
+        }
+
+        // Everything else (SWAP, UNPACK_*, FOR_ITER, STORE_FAST__STORE_FAST,
+        // TO_BOOL if present as a distinct variant, exception machinery,
+        // …) is not modeled — decline and fall back to the legacy read.
+        _ => VstackOpClass::Unmodeled,
+    }
+}
+
+/// #73: reconcile the PREVIOUS Python opcode's stack effect into
+/// [`WalkContext::vstack_boxes`] at an opcode boundary, BEFORE the new
+/// opcode (`new_pypc`) is walked.  Running this before the new op means
+/// that when the new op is a branch guard, `vstack_boxes` already holds
+/// the correct boxes for the guard's resume depth.
+///
+/// `code` is the Python `CodeObject` of the outer (full-body) jitcode;
+/// `new_pypc` is the Python pc the walk is about to enter; `new_depth` is
+/// `depth_at_py_pc[new_pypc]` (stack-only).  The previous opcode is
+/// decoded from `code` at `ctx.vstack_cur_pypc`.
+///
+/// On any unmodeled effect (or a structurally impossible depth) the
+/// function latches `ctx.vstack_valid = false` so the `stack_sync`
+/// overlay declines to use `vstack_boxes` (legacy fallback, zero
+/// regression).
+fn reconcile_vstack_at_boundary(
+    ctx: &mut WalkContext<'_, '_>,
+    code: &pyre_interpreter::CodeObject,
+    new_pypc: u32,
+    new_depth: usize,
+) {
+    if !ctx.vstack_valid {
+        return;
+    }
+    let prev_pypc = ctx.vstack_cur_pypc as usize;
+    let Some((instr, op_arg)) = pyre_interpreter::decode_instruction_at(code, prev_pypc) else {
+        ctx.vstack_valid = false;
+        return;
+    };
+    let class = classify_vstack_opcode(&instr, op_arg);
+    if std::env::var_os("PYRE_VSTACK_DIAG").is_some() {
+        eprintln!(
+            "[vstack-reconcile] prev_pypc={prev_pypc} new_pypc={new_pypc} \
+             new_depth={new_depth} prev_depth={} class={class:?} last_ref={:?} instr={instr:?}",
+            ctx.vstack_depth, ctx.vstack_last_ref
+        );
+    }
+    // PER-OP RECONCILE.  In the SEQUENTIAL case the previous opcode's stack
+    // effect explains the depth change: a producer (`ResultToTos`) lands its
+    // result box (`vstack_last_ref`) on the new TOS; a pop / side-store just
+    // truncates.  This captures the kept boxes from the walk register file
+    // (LOAD_FAST / LOAD_NAME / COPY results) — values that may NOT be present
+    // in the virtualizable shadow (function-local LOAD_FAST temps live only
+    // in the walk register bank, never written through to the portal array).
+    match class {
+        VstackOpClass::ResultToTos => {
+            ctx.vstack_boxes.truncate(new_depth);
+            if ctx.vstack_boxes.len() < new_depth {
+                ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
+            }
+            if new_depth > 0 && ctx.vstack_last_ref != OpRef::NONE {
+                ctx.vstack_boxes[new_depth - 1] = ctx.vstack_last_ref;
+            }
+        }
+        VstackOpClass::PopOnlyOrSideStore => {
+            ctx.vstack_boxes.truncate(new_depth);
+        }
+        VstackOpClass::Unmodeled => {
+            ctx.vstack_valid = false;
+        }
+    }
+    // The FBW walk follows jitcode control flow, not just sequential opcodes:
+    // an `and`/`or` chain's short-circuit continuation jumps BACKWARD to a
+    // deeper merge point, so the previous opcode did NOT produce the slots
+    // below the new TOS — the per-op reconcile leaves a NONE hole there.
+    // Recover those slots from the virtualizable shadow (kept current by the
+    // portal `setarrayitem_vable_r` pushes for values that ARE written
+    // through).  `reseed_vstack_from_shadow` rejects a NULL-const shadow slot
+    // (a function-local temp the portal never wrote), so a genuinely
+    // unrecoverable kept slot fails the re-seed.
+    //
+    // A non-reseedable hole does NOT latch `vstack_valid = false`: an
+    // Int/Float-bank operand-stack temp (e.g. the `while i < N` loop
+    // condition's `LoadConst N`, a transient `BINARY_OP` int result) is not
+    // a Ref the Ref-only mirror can ever hold, but it is CONSUMED before the
+    // all-Ref short-circuit guard region — invalidating the whole mirror
+    // there made it die at the loop condition, never reaching the kept-stack
+    // guard.  Instead keep the mirror TRACKING (advance position / depth)
+    // with the NONE slot left in place; `stack_sync` (USE) defers any NONE
+    // mirror slot to the legacy read.
+    if ctx.vstack_valid {
+        let hole = ctx
+            .vstack_boxes
+            .get(..new_depth)
+            .map(|s| s.iter().any(|&b| b == OpRef::NONE))
+            .unwrap_or(true);
+        if hole {
+            // Best-effort fill from the shadow; leave un-fillable slots NONE.
+            let _ = reseed_vstack_from_shadow(ctx, new_depth);
+        }
+    }
+    if ctx.vstack_valid {
+        ctx.vstack_cur_pypc = new_pypc;
+        ctx.vstack_depth = new_depth;
+        ctx.vstack_last_ref = OpRef::NONE;
+    }
+}
+
+/// #73: re-seed `ctx.vstack_boxes[0..new_depth]` from the virtualizable
+/// shadow's operand-stack slots (`virtualizable_box_at(nvs + nlocals + s)`).
+/// Used when a control-flow edge makes the per-opcode reconcile model
+/// inapplicable (a backward/forward jump landing at a different stack
+/// level).  The portal `pyframe.pushvalue` lowers every Ref push to
+/// `setarrayitem_vable_r(locals_cells_stack_w, depth, w_obj)`, so the
+/// shadow holds the live operand stack at a merge point.
+///
+/// Returns `true` on success (every slot `0..new_depth` sourced as a
+/// non-NONE box), `false` if any slot is unsourceable (caller then
+/// latches `vstack_valid = false`).
+fn reseed_vstack_from_shadow(ctx: &mut WalkContext<'_, '_>, new_depth: usize) -> bool {
+    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    if full_body_sym.is_null() {
+        return false;
+    }
+    // SAFETY: pointer live for the full-body walk; read-only nlocals.
+    let nlocals = unsafe { (*full_body_sym).nlocals };
+    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+    // Only FILL the NONE holes the per-op reconcile could not source from
+    // the walk register file; keep the boxes the reconcile DID capture (the
+    // shadow may carry a stale value in a non-hole slot).  A hole the shadow
+    // also cannot source (NONE / NULL const-ptr — a function-local temp the
+    // portal never wrote through) fails the whole re-seed so the caller
+    // declines to the legacy read.
+    if ctx.vstack_boxes.len() < new_depth {
+        ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
+    }
+    let mut all_present = true;
+    for s in 0..new_depth {
+        if ctx.vstack_boxes[s] != OpRef::NONE {
+            continue;
+        }
+        match ctx.trace_ctx.virtualizable_box_at(nvs + nlocals + s) {
+            Some(b) if b != OpRef::NONE && !opref_is_null_const_ptr(b) => {
+                ctx.vstack_boxes[s] = b;
+            }
+            // Fill what we can; an unsourceable hole (NONE / NULL const-ptr —
+            // an Int/Float-bank temp or a function-local the portal never
+            // wrote) stays NONE.  `stack_sync` defers a NONE slot to the
+            // legacy read, so an unfilled slot is never a corrupt box.
+            _ => all_present = false,
+        }
+    }
+    all_present
+}
+
+/// #73: map a jitcode pc to the Python opcode whose lowering region
+/// CONTAINS it, WITHOUT the `python_pc_for_jitcode_pc` block-head marker
+/// special-case.  For the operand-stack mirror we want the containing
+/// opcode (where the walk physically is), not the resume block-head a
+/// `-live-` marker names — the marker case returns an EARLIER py_pc and
+/// makes the mirror's boundary detection oscillate.  Uses only the
+/// `first_jit_pc_by_py_pc` containment table (largest `py` with
+/// `first_jit[py] <= jit_pc`); falls back to the nearest-`pc_map` heuristic
+/// when that table is empty (portal-bridge / fixture installs).
+fn vstack_containing_py_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
+    let first_jit = &metadata.first_jit_pc_by_py_pc;
+    if !first_jit.is_empty() {
+        let mut best: Option<(usize, u32)> = None;
+        for (py, &pos) in first_jit.iter().enumerate() {
+            if pos != usize::MAX && pos <= jit_pc && best.is_none_or(|(b, _)| pos >= b) {
+                best = Some((pos, py as u32));
+            }
+        }
+        if let Some((_, py)) = best {
+            return py;
+        }
+    }
+    let mut best_py = 0u32;
+    let mut best_jc = 0usize;
+    for (py, &jc) in metadata.pc_map.iter().enumerate() {
+        if jc <= jit_pc && jc >= best_jc {
+            best_jc = jc;
+            best_py = py as u32;
+        }
+    }
+    best_py
+}
+
+/// #73 (SLICE 1, INERT): step the walk-level operand-stack box mirror at
+/// the top of every jitcode `step`.  Detects a Python-opcode boundary by
+/// mapping the current `jit_pc` back to its containing Python opcode; when
+/// that differs from `ctx.vstack_cur_pypc`, reconciles the previous
+/// opcode's stack effect into `vstack_boxes` (see
+/// [`reconcile_vstack_at_boundary`]).
+///
+/// No-op unless the outer full-body sym owns the virtualizable shadow and
+/// `vstack_valid` is still set.  Reached only on the full-body walk
+/// (`FULL_BODY_SNAPSHOT_SYM` non-null); the per-opcode arm walk leaves the
+/// mirror untouched (its guards use the static outer coordinate).  Writes
+/// only the `vstack_*` side-fields; never the registers / snapshot.
+fn step_vstack_mirror(ctx: &mut WalkContext<'_, '_>, jit_pc: usize) {
+    if !ctx.vstack_valid {
+        return;
+    }
+    // Inside an inline sub-walk the `jit_pc` is a CALLEE coordinate that
+    // does not exist in the outer (`FULL_BODY_SNAPSHOT_SYM`) jitcode's
+    // pc_map, so `python_pc_for_jitcode_pc` would return garbage and a
+    // callee `write_ref_reg` would clobber `vstack_last_ref`.  Decline the
+    // whole mirror for any walk that inlines a Python call — the benches
+    // this targets (short-circuit `or`/`and` chains) are call-free, and
+    // declining is a clean fallback to the legacy read.
+    if INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get()) {
+        ctx.vstack_valid = false;
+        return;
+    }
+    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    if full_body_sym.is_null() {
+        return;
+    }
+    // SAFETY: the pointer is live for the lifetime of the full-body walk
+    // (set in `dispatch_via_miframe`); read-only access to immutable
+    // layout fields (jitcode / code_ptr / metadata).
+    let sym = unsafe { &*full_body_sym };
+    if sym.jitcode.is_null() {
+        return;
+    }
+    let (new_pypc, code_ptr) = unsafe {
+        let jc = &*sym.jitcode;
+        if jc.payload.code_ptr.is_null() {
+            return;
+        }
+        (
+            vstack_containing_py_pc(&jc.payload.metadata, jit_pc),
+            jc.payload.code_ptr,
+        )
+    };
+    if new_pypc == ctx.vstack_cur_pypc {
+        return;
+    }
+    let code = unsafe { &*code_ptr };
+    let new_depth = crate::liveness::liveness_for(code_ptr)
+        .depth_at_py_pc()
+        .get(new_pypc as usize)
+        .copied()
+        .unwrap_or(0) as usize;
+    reconcile_vstack_at_boundary(ctx, code, new_pypc, new_depth);
+}
+
+/// #73 (SLICE 1, INERT): seed the walk-level operand-stack box mirror
+/// ([`WalkContext::vstack_boxes`]) at full-body-walk entry.  Enables the
+/// mirror (`vstack_valid = true`) only when the outer `sym` owns the
+/// virtualizable shadow AND the entry operand stack can be fully sourced
+/// from that shadow.  Sets `vstack_cur_pypc = entry_py_pc` and
+/// `vstack_depth = depth_at_py_pc[entry_py_pc]`, filling
+/// `vstack_boxes[0..depth]` from the virtualizable shadow's operand-stack
+/// slots (`virtualizable_box_at(nvs + nlocals + s)`) — the SAME source
+/// `collect_outer_active_boxes` / `stack_sync` read.  Any unsourceable
+/// slot leaves `vstack_valid = false` (legacy fallback, zero regression).
+fn seed_vstack_mirror(ctx: &mut WalkContext<'_, '_>, sym: &crate::state::PyreSym, start_pc: usize) {
+    if sym.jitcode.is_null() || !sym.owns_virtualizable_shadow() {
+        return;
+    }
+    // Seed the mirror's current coordinate at the containment py_pc of the
+    // ACTUAL first-walked jitcode op (`start_pc`), NOT the resume/loop-header
+    // `entry_py_pc`.  A loop trace's `walk()` starts at `position = start_pc`,
+    // whose containing Python opcode may precede `entry_py_pc` (the
+    // loop-header resume coordinate the snapshot reader uses).  Seeding
+    // `cur_pypc = entry_py_pc` then made the FIRST `step_vstack_mirror`
+    // produce a spurious "backward" boundary (e.g. `5 -> 4`) that reconciled
+    // the not-yet-executed first opcode with `last_ref = None`, leaving a
+    // NONE hole that latched `vstack_valid = false` for the whole walk.
+    // Seeding at the first op's own py_pc makes the first step a no-op
+    // (`new_pypc == cur_pypc` early-out), so the mirror only reconciles
+    // boundaries AFTER the entry — where a previous opcode actually ran.
+    let (first_pypc, depth, nlocals) = unsafe {
+        let jc = &*sym.jitcode;
+        if jc.payload.code_ptr.is_null() {
+            return;
+        }
+        let first_pypc = vstack_containing_py_pc(&jc.payload.metadata, start_pc);
+        let d = crate::liveness::liveness_for(jc.payload.code_ptr)
+            .depth_at_py_pc()
+            .get(first_pypc as usize)
+            .copied()
+            .unwrap_or(0) as usize;
+        (first_pypc, d, sym.nlocals)
+    };
+    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+    let mut boxes = Vec::with_capacity(depth);
+    for s in 0..depth {
+        // Read the operand-stack slot `s` from the virtualizable shadow.
+        // A missing / NONE slot means the entry stack box is not
+        // reconstructible here — decline the whole mirror for this walk.
+        match ctx.trace_ctx.virtualizable_box_at(nvs + nlocals + s) {
+            Some(b) if b != OpRef::NONE => boxes.push(b),
+            _ => return,
+        }
+    }
+    ctx.vstack_boxes = boxes;
+    ctx.vstack_depth = depth;
+    ctx.vstack_cur_pypc = first_pypc;
+    ctx.vstack_last_ref = OpRef::NONE;
+    ctx.vstack_valid = true;
+}
+
 /// Map a JitCode byte offset back to the Python PC of the opcode whose
 /// JitCode region contains it: the largest `py_pc` with
 /// `pc_map[py_pc] <= jit_pc` (ties → larger `py_pc`).  `pc_map[py_pc]` is
@@ -6417,6 +6968,203 @@ fn branch_resume_stack_colors(target: usize) -> Option<Vec<u16>> {
         }
         Some((0..depth).map(|s| scm[s]).collect())
     }
+}
+
+/// The resume snapshot's live Ref register colors at a kept-stack branch
+/// guard's not-taken arm, plus the jitcode `num_regs_r` (the const-window
+/// boundary `n()`).  These are exactly the registers the blackhole restores
+/// into `registers_r` before re-executing the arm: the snapshot live set
+/// (`collect_outer_active_boxes` → `frame_liveness_reg_indices_by_bank_at`)
+/// plus the const-window registers at index `>= num_regs_r` (auto-loaded
+/// from `jitcode.constants_r` by `init_register_files_from_runtime_jitcode`).
+/// Same `FULL_BODY_SNAPSHOT_SYM` contract as [`branch_resume_stack_colors`].
+fn branch_arm_resume_ref_liveness(
+    target: usize,
+    outer_jitcode_index: u32,
+) -> Option<(std::collections::HashSet<u16>, u16)> {
+    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    if full_body_sym.is_null() {
+        return None;
+    }
+    let sym = unsafe { &*full_body_sym };
+    if sym.jitcode.is_null() {
+        return None;
+    }
+    unsafe {
+        let jc = &*sym.jitcode;
+        if jc.payload.code_ptr.is_null() {
+            return None;
+        }
+        let code = &*jc.payload.code_ptr;
+        let py = python_pc_for_jitcode_pc(&jc.payload.metadata, target) as usize;
+        let py = skip_python_trivia_forward(code, py);
+        let banks = crate::state::frame_liveness_reg_indices_by_bank_at(
+            outer_jitcode_index as i32,
+            py as i32,
+        );
+        let live: std::collections::HashSet<u16> = banks.ref_.iter().map(|&c| c as u16).collect();
+        let num_regs_r = jc.payload.jitcode.num_regs_r() as u16;
+        Some((live, num_regs_r))
+    }
+}
+
+/// Scan a kept-stack branch guard's not-taken (resume) arm for a Ref
+/// register READ the blackhole cannot reconstruct on guard failure.
+///
+/// On deopt the blackhole rebuilds `registers_r` from the guard's resume
+/// snapshot — the snapshot-live Ref colors (`live_ref`) plus the auto-loaded
+/// const-window registers (index `>= num_regs_r`) — then re-executes the
+/// not-taken arm's static jitcode from `arm_start`.  A *regular* Ref
+/// register (`< num_regs_r`) the arm READS but that is neither in the
+/// snapshot nor produced by an earlier op in the arm is left at its
+/// init-zero (NULL): the blackhole then feeds NULL into the consuming op
+/// (e.g. `bh_binary_op(acc, NULL)` → SIGSEGV / wrong result).
+///
+/// That is the boxed-int short-circuit / conditional-expression resume
+/// miscompile: when the codewriter parks a heap constant (a co_consts
+/// `ConstPtr` — an int outside the small-int cache, `>= 257` or negative —
+/// or any value computed before the branch) in a regular register
+/// live-ACROSS the guard rather than materializing it inside the arm, the
+/// resume cannot restore it.  Cached small ints materialize via an in-arm
+/// `residual_call` (a write the blackhole re-executes), so their arms stay
+/// restorable and keep compiling.
+///
+/// Returns `true` (→ decline → interpreter, which is correct) on any read
+/// it cannot prove restorable, any op it cannot decode, and on overrun.
+/// Conservative by construction: a spurious `true` only forfeits a JIT
+/// optimization; a spurious `false` would compile a NULL-resuming guard.
+fn branch_arm_reads_unrestorable_ref(
+    code: &[u8],
+    arm_start: usize,
+    live_ref: &std::collections::HashSet<u16>,
+    num_regs_r: u16,
+) -> bool {
+    let restorable = |reg: u16, written: &std::collections::HashSet<u16>| {
+        reg >= num_regs_r || live_ref.contains(&reg) || written.contains(&reg)
+    };
+    let mut written: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    let mut pc = arm_start;
+    for _ in 0..512 {
+        let Some(op) = decode_op_at(code, pc) else {
+            return true;
+        };
+        match op.opname {
+            // Straight-line trivia: skip.  `catch_exception/L` is a no-op on
+            // the normal fall-through path — it only diverts to its handler
+            // target when an exception is in flight — so it is NOT a fresh
+            // resume coordinate.  The protected body after it is still part of
+            // this arm's straight-line resume region and its Ref reads must be
+            // scanned; treating it as a boundary (returning "restorable") would
+            // let an unrestorable read in the protected body slip through.
+            "live" | "catch_exception" => {
+                pc = op.next_pc;
+                continue;
+            }
+            // Unconditional jump: follow it (the conditional-expression
+            // then-arm reaches the merge through a `goto`).
+            "goto" => {
+                pc = read_label(code, &op, 0);
+                continue;
+            }
+            // Any merge / loop header / further guard / terminator ends this
+            // arm's straight-line resume region.  A Ref read past such a
+            // boundary belongs to a different resume coordinate that gets its
+            // own guard check, so nothing unrestorable was found here.
+            "goto_if_not" | "jit_merge_point" | "loop_header" | "finish" | "leave_frame"
+            | "rvmprof_code" => {
+                return false;
+            }
+            _ => {}
+        }
+        // Walk the operand bytes per `decode_op_at`'s argcode contract
+        // (`jitcode_runtime.rs`), flagging an unrestorable Ref read (`r` /
+        // `R`) and tracking the Ref destination write (`>r`).
+        let mut cursor = op.pc + 1;
+        let mut chars = op.argcodes.chars();
+        let mut dst_ref: Option<u16> = None;
+        while let Some(c) = chars.next() {
+            match c {
+                'i' | 'c' | 'f' => cursor += 1,
+                'r' => {
+                    let Some(&b) = code.get(cursor) else {
+                        return true;
+                    };
+                    if !restorable(b as u16, &written) {
+                        return true;
+                    }
+                    cursor += 1;
+                }
+                'L' | 'd' | 'j' => cursor += 2,
+                'I' | 'F' => {
+                    let Some(&len) = code.get(cursor) else {
+                        return true;
+                    };
+                    cursor += 1 + len as usize;
+                }
+                'R' => {
+                    let Some(&len) = code.get(cursor) else {
+                        return true;
+                    };
+                    cursor += 1;
+                    for _ in 0..len as usize {
+                        let Some(&b) = code.get(cursor) else {
+                            return true;
+                        };
+                        if !restorable(b as u16, &written) {
+                            return true;
+                        }
+                        cursor += 1;
+                    }
+                }
+                '>' => match chars.next() {
+                    Some('r') => {
+                        let Some(&b) = code.get(cursor) else {
+                            return true;
+                        };
+                        dst_ref = Some(b as u16);
+                        cursor += 1;
+                    }
+                    Some('i') | Some('f') => cursor += 1,
+                    _ => return true,
+                },
+                // Pyre helper payload (`*_pyre/P`): opaque operand shape —
+                // conservatively decline rather than mis-walk it.
+                'P' => return true,
+                _ => return true,
+            }
+        }
+        if let Some(d) = dst_ref {
+            written.insert(d);
+        }
+        if op.next_pc <= pc {
+            return true;
+        }
+        pc = op.next_pc;
+    }
+    true
+}
+
+/// The not-taken-arm Python stack depth at a branch guard's resume target,
+/// resolved leg-INDEPENDENTLY through the `MetaInterpStaticData` jitcode
+/// store (`pyjitcode_for_jitcode_index`) rather than the full-body-walk-only
+/// `FULL_BODY_SNAPSHOT_SYM`.  [`branch_resume_target_stack_depth`] returns
+/// `None` in the trait leg (where the bug surfaces just as it does in the
+/// full-body walk — both legs re-execute the same not-taken arm on deopt),
+/// so the unrestorable-kept-stack decline needs a depth probe that works in
+/// either leg.  A depth `> 0` marks the short-circuit / conditional-
+/// expression / chained-comparison kept-stack shape.
+fn branch_resume_target_stack_depth_any_leg(target: usize, jitcode_index: u32) -> Option<u16> {
+    let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)?;
+    if pjc.code_ptr.is_null() {
+        return None;
+    }
+    let code_obj = unsafe { &*pjc.code_ptr };
+    let py = python_pc_for_jitcode_pc(&pjc.metadata, target) as usize;
+    let py = skip_python_trivia_forward(code_obj, py);
+    crate::liveness::liveness_for(pjc.code_ptr)
+        .depth_at_py_pc()
+        .get(py)
+        .copied()
 }
 
 /// `generate_guard` (`pyjitpl.py:2599-2603`) keys `after_residual_call`
@@ -6775,19 +7523,91 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 // kept operand, not the stale merge-color read.
                 let recovered: Vec<(u16, OpRef)> =
                     BRANCH_GUARD_KEPT_RECOVERED.with(|c| c.borrow().clone());
-                (0..depth.min(stack_color_map.len()))
+                // #73 (SLICE 1) PyPy-faithful kept-stack source — MEASUREMENT
+                // HARNESS, fully INERT by default.  The legacy read
+                // (`registers_r[stack_slot_color_map[s]]` + #420 recovered
+                // patch) is unreliable in loop traces: loop-carried slots are
+                // renamed to inputarg colors and chordal coloring reuses
+                // colors, so a static-color read can return a stale / reused
+                // box.  The walk-level operand-stack box mirror
+                // (`ctx.vstack_boxes[s]`, maintained per-op by
+                // `step_vstack_mirror`) is the analog of PyPy
+                // `MIFrame.registers_r` valuestack array.
+                //
+                // Default (both env vars UNSET): keep the legacy read EXACTLY
+                // — byte-identical to the prior `(0..depth.min(len))` loop (a
+                // slot with no color contributes a NONE legacy value, filtered
+                // out below, same as the old min-bound).  `PYRE_VSTACK_DIAG`:
+                // log every slot where the mirror disagrees with the legacy
+                // read (read-only — never changes the value used).
+                // `PYRE_VSTACK_USE`: flip to the mirror as the actual source
+                // (a LATER slice may lift this; out of scope for Slice 1).
+                // Both gated behind `ctx.vstack_valid` so an undermodeled walk
+                // falls back.
+                let vstack_diag = std::env::var_os("PYRE_VSTACK_DIAG").is_some();
+                let vstack_use = std::env::var_os("PYRE_VSTACK_USE").is_some();
+                // Iterate the FULL resume depth, not just
+                // `depth.min(stack_color_map.len())`.  Under `PYRE_VSTACK_USE`
+                // the mirror is the primary source for every slot `0..depth`,
+                // so a slot beyond the (possibly shorter) static color map is
+                // still covered.  Default / non-USE keeps the legacy bound
+                // semantics: a slot with no color reads NONE (legacy) → it is
+                // filtered out, identical to the old min-bounded loop.
+                (0..depth)
                     .filter_map(|s| {
-                        let color = stack_color_map[s];
-                        let v = recovered
-                            .iter()
-                            .find(|&&(dst, _)| dst == color)
-                            .map(|&(_, v)| v)
-                            .unwrap_or_else(|| {
-                                ctx.registers_r
-                                    .get(color as usize)
-                                    .copied()
-                                    .unwrap_or(OpRef::NONE)
-                            });
+                        // Legacy read: only defined for slots the static color
+                        // map covers; beyond it there is no legacy source.
+                        let color = stack_color_map.get(s).copied();
+                        let legacy = color.map_or(OpRef::NONE, |color| {
+                            recovered
+                                .iter()
+                                .find(|&&(dst, _)| dst == color)
+                                .map(|&(_, v)| v)
+                                .unwrap_or_else(|| {
+                                    ctx.registers_r
+                                        .get(color as usize)
+                                        .copied()
+                                        .unwrap_or(OpRef::NONE)
+                                })
+                        });
+                        // The mirror value for slot `s`, when the mirror is
+                        // valid and covers this depth.
+                        let mirror = if ctx.vstack_valid {
+                            ctx.vstack_boxes.get(s).copied()
+                        } else {
+                            None
+                        };
+                        if vstack_diag {
+                            match mirror {
+                                Some(m) if m != legacy => eprintln!(
+                                    "[vstack-diag] py_pc={py_pc} slot={s} color={color:?} \
+                                     legacy={legacy:?} mirror={m:?} \
+                                     vstack_depth={} vstack_valid={}",
+                                    ctx.vstack_depth, ctx.vstack_valid
+                                ),
+                                Some(_) => {}
+                                None => eprintln!(
+                                    "[vstack-diag] py_pc={py_pc} slot={s} color={color:?} \
+                                     legacy={legacy:?} mirror=NONE(valid={})",
+                                    ctx.vstack_valid
+                                ),
+                            }
+                        }
+                        let v = if vstack_use {
+                            // PRIMARY: the mirror for every slot `0..depth`.
+                            // Fall back to legacy only when the mirror lacks a
+                            // box for this slot (mirror invalid, slot beyond
+                            // the mirror, or a slot the mirror left NONE — e.g.
+                            // an Int-bank stack temp the Ref-only mirror does
+                            // not hold).  Never worse than the default read.
+                            match mirror {
+                                Some(m) if m != OpRef::NONE => m,
+                                _ => legacy,
+                            }
+                        } else {
+                            // INERT DEFAULT (Slice 1): legacy source only.
+                            legacy
+                        };
                         if v != OpRef::NONE && !opref_is_null_const_ptr(v) {
                             Some((nvs + nlocals + s, v))
                         } else {
@@ -8688,6 +9508,11 @@ fn try_walker_inline_user_call(
             is_full_body_walk: ctx.is_full_body_walk,
             store_subscr_fn_addr: ctx.store_subscr_fn_addr,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
             done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
@@ -12274,6 +13099,11 @@ fn run_sub_jitcode_walk(
             outer_active_boxes: ctx.outer_active_boxes.clone(),
             store_subscr_fn_addr: ctx.store_subscr_fn_addr,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         walk(sub_body.code, 0, &mut sub_wc)?
     };
@@ -12883,6 +13713,15 @@ fn handle(
                 let kept_stack = resume_depth.is_some_and(|d| d > 0);
                 let depth_gt_1 = resume_depth.is_some_and(|d| d > 1);
                 let relax_124 = std::env::var_os("PYRE_RELAX_124").is_some();
+                // `branch_resume_target_stack_depth` reads the full-body-walk-
+                // only `FULL_BODY_SNAPSHOT_SYM`, so `kept_stack` is always
+                // false in the trait leg — yet the trait leg re-executes the
+                // same not-taken arm on deopt and miscompiles the exact same
+                // boxed-int kept-stack shapes.  Probe the depth leg-
+                // independently for the unrestorable-arm decline below.
+                let kept_stack_any_leg =
+                    branch_resume_target_stack_depth_any_leg(other_target, ctx.outer_jitcode_index)
+                        .is_some_and(|d| d > 0);
                 // A kept-stack guard's not-taken arm keeps one or more
                 // operand-stack temps live across the guard.  The not-taken
                 // edge resolves the merge through inline `ref_copy(dst <- src)`
@@ -12952,6 +13791,103 @@ fn handle(
                     }
                     _ => false,
                 };
+                // PARITY DEVIATION (converges at the symbolic-valuestack
+                // capture, #73/#423): `opimpl_goto_if_not` (pyjitpl.py:511/520)
+                // always records GUARD_TRUE/FALSE for a non-constant condition
+                // and captures resumedata (pyjitpl.py:2603), never declining —
+                // its resume reconstruction is complete.  pyre's kept-stack
+                // resume reconstruction is NOT yet complete (the walker
+                // snapshot is partial; the trait leg has no snapshot at all, see
+                // `kept_stack_any_leg` above), so recording the guard and
+                // resuming would rebuild a kept slot as NULL / a wrong value:
+                // the #416/#420 boxed-int short-circuit / conditional-expression
+                // SIGSEGV + silent miscompile.  Until that capture lands pyre
+                // deviates by declining here.  A kept-stack guard's not-taken
+                // arm is only safe to compile when the blackhole can reconstruct
+                // every value the arm reads on resume.  Two resume hazards make
+                // a kept-stack arm unsafe; each is described at its check below.
+                // Decline → interpreter (correct).  Applies to depth-1 and
+                // depth > 1.
+                if kept_stack_any_leg && !relax_124 {
+                    let liveness =
+                        branch_arm_resume_ref_liveness(other_target, ctx.outer_jitcode_index);
+                    // Hazard (1): the not-taken arm reads a regular Ref register
+                    // the blackhole resumes as NULL (the conditional-expression
+                    // boxed-int NULL-deref crash).
+                    let reads_null_ref = match &liveness {
+                        Some((live_ref, num_regs_r)) => branch_arm_reads_unrestorable_ref(
+                            code,
+                            other_target,
+                            live_ref,
+                            *num_regs_r,
+                        ),
+                        // Liveness unavailable (the trait leg, where
+                        // `FULL_BODY_SNAPSHOT_SYM` is null, or an unresolved
+                        // coordinate) — cannot prove restorable, so decline.
+                        None => true,
+                    };
+                    // Hazard (2): the not-taken edge carries `ref_copy` renames
+                    // (`kept_recovered` non-empty) — the #416/#420 short-circuit
+                    // / chained-comparison kept-stack recovery.  That recovery
+                    // re-uses ONE register's snapshot value for the kept slot,
+                    // but the two branch arms produce DIFFERENT values there; it
+                    // happens to work only when the not-taken arm re-materializes
+                    // the value in-arm (a small-int `c`-immediate `w_int_new`).
+                    // A heap int constant (`< 0` or `>= 256`) is pre-built and
+                    // hoisted as a loop-invariant the arm does NOT re-materialize,
+                    // so the recovery reconstructs a WRONG value — the boxed-int
+                    // short-circuit silent miscompile (`((i & 1) and 1000000)`).
+                    // The boxed vs small distinction is not recoverable at record
+                    // time (the const is dedup'd with the loop bound, never read
+                    // directly by the resume arm — it would need the
+                    // symbolic-valuestack capture of #73/#124), so decline the
+                    // whole recovery path: correct, matching the pre-#416 decline.
+                    // Conditional expressions carry no edge rename (empty
+                    // `kept_recovered`) and keep compiling.
+                    let uses_edge_recovery = kept_recovered
+                        .as_deref()
+                        .is_some_and(|moves| !moves.is_empty());
+                    // Hazard (3): a kept operand-stack slot itself holds a heap
+                    // int outside the 1-byte immediate range `[0, 256)` (the
+                    // accumulator in `acc += (x if c else y)`).  A kept-stack
+                    // branch guard resumes MID-jitcode; the blackhole rebuilds
+                    // that slot from the guard's resume snapshot, but a hoisted
+                    // boxed-int slot is reconstructed with a WRONG / NULL value
+                    // (the conditional-expression boxed-int crash, e.g.
+                    // `257 if (i < 1000000) else 3` where the optimizer folds
+                    // the always-true guard yet leaves a stale resume coord).
+                    // A cached small int (`0..=255`) re-materializes losslessly,
+                    // so a small-int kept slot stays restorable and keeps
+                    // compiling.  Whether the boxed slot's restore happens to
+                    // succeed depends on optimizer guard-folding the record does
+                    // not see, so decline whenever a kept slot is a boxed int —
+                    // correct (interpreter), matching the pre-#416 decline.
+                    let kept_boxed_int = branch_resume_stack_colors(other_target)
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .any(|&c| match ctx.concrete_registers_r.get(c as usize) {
+                            // The concrete shadow unboxes exact ints
+                            // (`ConcreteValue::from_pyobj`), so a kept slot that
+                            // holds a heap int can surface either already-unboxed
+                            // as `Int(v)` or still-boxed as `Ref(W_IntObject)`.
+                            // Match both shapes: a large (`< 0` or `>= 256`) value
+                            // is the unrestorable boxed-int hazard either way, and
+                            // matching only `Ref` would let an unboxed large int
+                            // bypass the decline.
+                            Some(ConcreteValue::Int(v)) => !(0..256).contains(v),
+                            Some(ConcreteValue::Ref(p)) if !p.is_null() => unsafe {
+                                pyre_object::is_int(*p)
+                                    && !(0..256).contains(&pyre_object::w_int_get_value(*p))
+                            },
+                            _ => false,
+                        });
+                    if reads_null_ref || uses_edge_recovery || kept_boxed_int {
+                        return Err(DispatchError::BranchGuardUnrestorableKeptStackPermanent {
+                            pc: op.pc,
+                        });
+                    }
+                }
                 if depth_gt_1 && !recovery_complete && !relax_124 {
                     return Err(DispatchError::BranchGuardKeptStackUnsupported { pc: op.pc });
                 }
@@ -14356,6 +15292,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
 
         // Synthesize a 2-byte op fixture: `<opcode_byte> <reg_idx>`.
@@ -14414,6 +15355,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         // `getfield_vable_i/rd>i`: operand 0 (the box) sits at code[pc+1].
         let code = [0u8, 0x00, 0x00, 0x00, 0x00];
@@ -14462,6 +15408,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         // `setfield_vable_i/rid`: operand 0 (the box) sits at code[pc+1].
         let code = [0u8, 0x00, 0x00, 0x00, 0x00];
@@ -14528,6 +15479,11 @@ mod tests {
                 outer_active_boxes: Vec::new(),
                 store_subscr_fn_addr: None,
                 pending_guard_snapshot_error: None,
+                vstack_boxes: Vec::new(),
+                vstack_depth: 0,
+                vstack_cur_pypc: 0,
+                vstack_valid: false,
+                vstack_last_ref: OpRef::NONE,
             };
             let op = DecodedOp {
                 key,
@@ -14705,6 +15661,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("switch hit must dispatch");
@@ -14754,6 +15715,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("switch miss must dispatch");
@@ -14802,6 +15768,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
 
         let err = step(&code, 0, &mut wc).expect_err("non-constant switch value must not guess");
@@ -14859,6 +15830,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("truthy branch must dispatch");
@@ -14908,6 +15884,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("falsy branch must dispatch");
@@ -14956,6 +15937,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
 
         let err = step(&code, 0, &mut wc).expect_err("non-constant branch value must not guess");
@@ -15176,6 +16162,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         fbw_finish_payload_reset();
         let (outcome, end_pc) =
@@ -15337,6 +16328,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_r_i must dispatch");
@@ -15446,6 +16442,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_ir_r must dispatch");
@@ -15549,6 +16550,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_irf_r must dispatch");
@@ -15641,6 +16647,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err =
             step(&caller_code, 0, &mut wc).expect_err("I-list overflow must surface typed error");
@@ -15730,6 +16741,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, _) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
         assert_eq!(
@@ -15800,6 +16816,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err = step(&caller_code, 0, &mut wc)
             .expect_err("FailDescr at inline_call's d-slot must hit ExpectedJitCodeDescr");
@@ -15849,6 +16870,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err = step(&caller_code, 0, &mut wc)
             .expect_err("missing sub-jitcode must hit SubJitCodeNotFound");
@@ -15894,6 +16920,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("live/ must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -15948,6 +16979,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         fbw_finish_payload_reset();
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_return/r must dispatch");
@@ -16000,6 +17036,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err = step(&code, 0, &mut wc).expect_err("must surface RegisterOutOfRange");
         assert_eq!(
@@ -16055,6 +17096,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let ops_before = wc.trace_ctx.num_ops();
         fbw_finish_payload_reset();
@@ -16126,6 +17172,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = step(&code, 0, &mut wc).expect("int_return/i must dispatch");
@@ -16185,6 +17236,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let ops_before = wc.trace_ctx.num_ops();
         fbw_finish_payload_reset();
@@ -16245,6 +17301,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = step(&code, 0, &mut wc).expect("void_return/ must dispatch");
@@ -16293,6 +17354,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err = step(&code, 0, &mut wc).expect_err("raise/r must read its operand");
         assert_eq!(
@@ -16344,6 +17410,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("goto/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -16395,6 +17466,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("goto/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -16494,6 +17570,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err =
             step(&code, 0, &mut wc).expect_err("catch_exception/L with active exc must error");
@@ -16541,6 +17622,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("catch_exception/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -16600,6 +17686,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -16692,6 +17783,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, _next_pc) = step(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -16766,6 +17862,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("reraise/ must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -16834,6 +17935,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err = step(&code, 0, &mut wc).expect_err("reraise/ without last_exc_value must error");
         assert_eq!(err, DispatchError::ReraiseWithoutLastExcValue { pc: 0 });
@@ -16880,6 +17986,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let _ = step(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(
@@ -16990,6 +18101,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         fbw_finish_payload_reset();
         let (outcome, end_pc) =
@@ -17104,6 +18220,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
@@ -17165,6 +18286,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int_copy/i>i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -17223,6 +18349,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let _ = step(&code, 0, &mut wc).expect("int_copy/i>i must dispatch");
         assert_eq!(
@@ -17272,6 +18403,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_copy dst OOR must surface a typed error");
         assert_eq!(
@@ -17320,6 +18456,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_copy/i>i must read its src operand");
         assert_eq!(
@@ -17388,6 +18529,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_copy/r>r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -17444,6 +18590,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let _ = step(&code, 0, &mut wc).expect("ref_copy/r>r must dispatch");
         assert_eq!(
@@ -17491,6 +18642,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err = step(&code, 0, &mut wc).expect_err("ref_copy dst OOR must surface a typed error");
         assert_eq!(
@@ -17537,6 +18693,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err = step(&code, 0, &mut wc).expect_err("ref_copy/r>r must read its src operand");
         assert_eq!(
@@ -17594,6 +18755,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -17777,6 +18943,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) =
             int_between_record(&code, &op, &mut wc).expect("int_between_record must dispatch");
@@ -17906,6 +19077,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -17987,6 +19163,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("float_neg/f>f must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -18046,6 +19227,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -18130,6 +19316,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -18194,6 +19385,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err = step(&code, 0, &mut wc).expect_err("float_add must read its src operand");
         assert_eq!(
@@ -18241,6 +19437,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_add must read its src operand");
         assert_eq!(
@@ -18290,6 +19491,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_add dst OOR must surface a typed error");
         assert_eq!(
@@ -18347,6 +19553,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err =
             step(&code, 0, &mut wc).expect_err("unsupported opname must hit UnsupportedOpname");
@@ -18396,6 +19607,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ptr_nonzero must record PtrNe");
         assert!(matches!(outcome, DispatchOutcome::Continue));
@@ -18472,6 +19688,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("abort/>r must dispatch");
         assert!(matches!(outcome, DispatchOutcome::Continue));
@@ -18530,6 +19751,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("ref_guard_value must record GuardValue");
@@ -18604,6 +19830,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_guard_value Const arm");
         assert!(matches!(outcome, DispatchOutcome::Continue));
@@ -18691,6 +19922,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
@@ -18850,6 +20086,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -18926,6 +20167,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let _ = try_execute_residual_call_via_executor(
             &mut wc,
@@ -18975,6 +20221,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let _ = try_execute_residual_call_via_executor(
             &mut wc,
@@ -19039,6 +20290,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let _ = try_execute_residual_call_via_executor(
             &mut wc,
@@ -19127,6 +20383,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let result = try_execute_residual_call_via_executor(
             &mut wc,
@@ -19219,6 +20480,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let result = try_execute_residual_call_via_executor(
             &mut wc,
@@ -19286,6 +20552,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err = step(&code, 0, &mut wc).expect_err("OS_NOT_IN_TRACE must surface a typed error");
         assert_eq!(
@@ -19341,6 +20612,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err =
             step(&code, 0, &mut wc).expect_err("OS_JIT_FORCE_VIRTUAL must surface a typed error");
@@ -19391,6 +20667,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -19450,6 +20731,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -19511,6 +20797,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         // The dst slot must hold the OpRef of the recorded CallR. Each
@@ -19592,6 +20883,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -19662,6 +20958,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
         drop(wc);
@@ -19731,6 +21032,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err = step(&code, 0, &mut wc).expect_err("dst OOR must surface a typed error");
         assert_eq!(
@@ -19782,6 +21088,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("descr index 5 with pool size 2 must surface DescrIndexOutOfRange");
@@ -19871,6 +21182,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_r_i/iRd>i must dispatch");
@@ -19957,6 +21273,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_i/iRd>i must dispatch");
         drop(wc);
@@ -20053,6 +21374,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
@@ -20179,6 +21505,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
         drop(wc);
@@ -20241,6 +21572,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("FailDescr (not CallDescr) must surface ResidualCallDescrNotCallDescr");
@@ -20291,6 +21627,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("R-list member out of range must surface RegisterOutOfRange");
@@ -20365,6 +21706,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, end_pc) =
             walk(&jc.code, 0, &mut wc).expect("ReturnValue arm must walk to a terminator");
@@ -20484,6 +21830,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, end_pc) =
             walk(&jc.code, 0, &mut wc).expect("PopTop arm must walk to a terminator");
@@ -20579,6 +21930,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err = step(&caller_code, 0, &mut wc).expect_err("arity overflow must surface error");
         assert_eq!(
@@ -20673,6 +22029,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, _) =
             walk(&caller_code, 0, &mut wc).expect("inline_call_r_v with void callee must succeed");
@@ -20746,6 +22107,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_r_v with non-void callee must reject");
@@ -20822,6 +22188,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, _) =
             walk(&caller_code, 0, &mut wc).expect("inline_call_ir_v with void callee must succeed");
@@ -20896,6 +22267,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_ir_v with non-void callee must reject");
@@ -20975,6 +22351,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, _) = walk(&caller_code, 0, &mut wc)
             .expect("inline_call_irf_v with void callee must succeed");
@@ -21052,6 +22433,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_irf_v with non-void callee must reject");
@@ -21118,6 +22504,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getfield_gc_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -21205,6 +22596,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let _ = step(&code, 0, &mut wc).expect("getfield_gc_i must dispatch");
         let dst_post = wc.registers_i[5];
@@ -21270,6 +22666,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let _ = step(&code, 0, &mut wc).expect("getfield_gc_r must dispatch");
         let dst_post = wc.registers_r[6];
@@ -21323,6 +22724,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let err = step(&code, 0, &mut wc).expect_err("getfield_gc must validate r-reg");
         assert_eq!(
@@ -21388,6 +22794,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getfield_vable_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -21473,6 +22884,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("setfield_vable_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -21548,6 +22964,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_i must dispatch");
         drop(wc);
@@ -21601,6 +23022,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_i must dispatch");
         drop(wc);
@@ -21680,6 +23106,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_r must dispatch");
         drop(wc);
@@ -21742,6 +23173,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getarrayitem_gc_r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -21818,6 +23254,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let _ = step(&code, 0, &mut wc).expect("getarrayitem_gc_r must dispatch");
         let dst_post = wc.registers_r[5];
@@ -21879,6 +23320,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("setarrayitem_gc_r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -22182,6 +23628,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         assert_eq!(
             walk(&code, 0, &mut wc),
@@ -22245,6 +23696,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
 
         // Arrival without a preceding `loop_header` stamp and with no
@@ -22326,6 +23782,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
         let (outcome, next) = step(&code, 0, &mut wc).expect("loop_header must dispatch");
@@ -22382,6 +23843,11 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
         };
         assert_eq!(
             step(&code, 0, &mut wc),
