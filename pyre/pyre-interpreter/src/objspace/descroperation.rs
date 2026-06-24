@@ -2557,7 +2557,7 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // PyPy: typeobject.py descr_or → _pypy_generic_alias._create_union,
         // which collapses identical operands (`int | int` is `int`).
         if unionable(a) && unionable(b) {
-            return crate::genericalias::create_union(a, b);
+            return crate::_pypy_generic_alias::create_union(a, b);
         }
         if let Some(result) = try_instance_binop(a, b, "__ror__") {
             return result;
@@ -2798,19 +2798,19 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
         // through to `object.__eq__`'s identity check and return
         // False even when the contents match.
         if (pyre_object::is_set_or_frozenset(a) || pyre_object::is_set_or_frozenset(b))
-            && (pyre_object::dictviewobject::is_dict_view(a)
-                || pyre_object::dictviewobject::is_dict_view(b))
+            && (pyre_object::dictmultiobject::is_dict_view(a)
+                || pyre_object::dictmultiobject::is_dict_view(b))
         {
             let view_set_like = |obj: PyObjectRef| -> bool {
                 if pyre_object::is_set_or_frozenset(obj) {
                     return true;
                 }
-                if pyre_object::dictviewobject::is_dict_view(obj) {
-                    let kind = pyre_object::dictviewobject::w_dict_view_get_kind(obj);
+                if pyre_object::dictmultiobject::is_dict_view(obj) {
+                    let kind = pyre_object::dictmultiobject::w_dict_view_get_kind(obj);
                     return matches!(
                         kind,
-                        pyre_object::dictviewobject::DictViewKind::Keys
-                            | pyre_object::dictviewobject::DictViewKind::Items
+                        pyre_object::dictmultiobject::DictViewKind::Keys
+                            | pyre_object::dictmultiobject::DictViewKind::Items
                     );
                 }
                 false
@@ -2897,7 +2897,7 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Ne => la != lb,
             }));
         }
-        // range value comparison — rangeobject.py W_Range.descr_eq:
+        // range value comparison — functional.py W_Range.descr_eq:
         // two ranges are equal iff they generate the same sequence
         // (equal length, and for non-empty ranges equal start and —
         // for length > 1 — equal step).  Only `==` / `!=` are defined;

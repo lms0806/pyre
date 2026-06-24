@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::annotator::bookkeeper::Bookkeeper;
 use crate::annotator::model::{AnnotatorError, SomeBuiltin, SomeValue, s_none};
 use crate::flowspace::model::{ConstValue, Hlvalue, HostObject};
-use crate::rlib::jit_marker::{
+use crate::rlib::jit::{
     JitDriverMeta, JitMarkerKind, ext_enter_leave_marker_compute_result_annotation,
 };
 
@@ -84,6 +84,9 @@ pub enum ExtRegistryEntry {
         instance: Option<HostObject>,
         annotation: RegisteredAnnotation,
     },
+    /// Upstream `rpython/rtyper/extfunc.py:92-102`
+    /// `class ExtFuncEntry(ExtRegistryEntry)`.
+    ExternalFunction(super::extfunc::ExtFuncEntry),
     /// Upstream `rpython/rlib/jit.py:881-1006`:
     ///
     /// ```python
@@ -172,6 +175,62 @@ pub enum RegisteredAnnotation {
     Str,
 }
 
+/// RPython `class FlexibleWeakDict(UserDict.DictMixin)` (`extregistry.py:78-112`).
+///
+/// Upstream stores hashable non-weakrefable keys in `_regdict`,
+/// weakrefable keys in `_weakdict`, and unhashable keys wrapped in
+/// `Hashable` in `_iddict`. Rust registry keys in this module are
+/// already hashable carriers, so this helper exposes the same three
+/// stores and routes ordinary insert/get/remove operations through
+/// `_regdict`; call sites that need true weak-key behavior should keep
+/// using explicit `Weak` carriers as the surrounding port already does.
+#[derive(Clone, Debug, Default)]
+pub struct FlexibleWeakDict<K, V> {
+    pub _regdict: HashMap<K, V>,
+    pub _weakdict: HashMap<K, V>,
+    pub _iddict: HashMap<K, V>,
+}
+
+impl<K, V> FlexibleWeakDict<K, V>
+where
+    K: Eq + std::hash::Hash + Clone,
+{
+    pub fn new() -> Self {
+        FlexibleWeakDict {
+            _regdict: HashMap::new(),
+            _weakdict: HashMap::new(),
+            _iddict: HashMap::new(),
+        }
+    }
+
+    pub fn __setitem__(&mut self, key: K, value: V) {
+        self._regdict.insert(key, value);
+    }
+
+    pub fn __getitem__(&self, key: &K) -> Option<&V> {
+        self._regdict
+            .get(key)
+            .or_else(|| self._weakdict.get(key))
+            .or_else(|| self._iddict.get(key))
+    }
+
+    pub fn __delitem__(&mut self, key: &K) -> Option<V> {
+        self._regdict
+            .remove(key)
+            .or_else(|| self._weakdict.remove(key))
+            .or_else(|| self._iddict.remove(key))
+    }
+
+    pub fn keys(&self) -> Vec<K> {
+        self._regdict
+            .keys()
+            .chain(self._weakdict.keys())
+            .chain(self._iddict.keys())
+            .cloned()
+            .collect()
+    }
+}
+
 /// Cache-key identity for `SomeBuiltin.rtyper_makekey` after the
 /// upstream `extregistry.lookup(const)` remap.
 ///
@@ -191,6 +250,9 @@ pub enum ExtRegistryEntryKey {
     HostTypeAnnotation {
         type_identity: usize,
         instance_identity: Option<usize>,
+    },
+    ExternalFunction {
+        function_identity: usize,
     },
     EnterLeaveMarker {
         driver_identity: usize,
@@ -224,6 +286,9 @@ impl ExtRegistryEntry {
             } => ExtRegistryEntryKey::HostTypeAnnotation {
                 type_identity: type_obj.identity_id(),
                 instance_identity: instance.as_ref().map(HostObject::identity_id),
+            },
+            ExtRegistryEntry::ExternalFunction(entry) => ExtRegistryEntryKey::ExternalFunction {
+                function_identity: entry.function.identity_id(),
             },
             ExtRegistryEntry::EnterLeaveMarker { meta, marker_kind } => {
                 ExtRegistryEntryKey::EnterLeaveMarker {
@@ -293,6 +358,9 @@ impl ExtRegistryEntry {
                 RegisteredAnnotation::Int => Ok(SomeValue::Integer(Default::default())),
                 RegisteredAnnotation::Str => Ok(SomeValue::String(Default::default())),
             },
+            ExtRegistryEntry::ExternalFunction(entry) => {
+                Ok(SomeValue::ExternalFunction(entry.compute_annotation(false)))
+            }
             // upstream extregistry.py:58-67 base implementation —
             // marker subclasses do not override `compute_annotation`,
             // so the base returns
@@ -315,9 +383,9 @@ impl ExtRegistryEntry {
                 )))
             }
             ExtRegistryEntry::LoopHeader { .. } => Ok(SomeValue::Builtin(SomeBuiltin::new(
-                crate::rlib::jit_marker::LOOP_HEADER_ANALYSER_NAME,
+                crate::rlib::jit::LOOP_HEADER_ANALYSER_NAME,
                 None,
-                Some(crate::rlib::jit_marker::LOOP_HEADER_METHOD_NAME.to_string()),
+                Some(crate::rlib::jit::LOOP_HEADER_METHOD_NAME.to_string()),
             ))),
             // upstream extregistry.py:58-67 base implementation —
             // `ForTypeEntry` inherits `compute_annotation` returning
@@ -428,7 +496,8 @@ impl ExtRegistryEntry {
                 "'ExtRegistryEntry' object has no attribute 'specialize_call'",
             )),
             ExtRegistryEntry::HostValueBuiltin { .. }
-            | ExtRegistryEntry::HostTypeAnnotation { .. } => Err(TyperError::message(
+            | ExtRegistryEntry::HostTypeAnnotation { .. }
+            | ExtRegistryEntry::ExternalFunction(_) => Err(TyperError::message(
                 "'ExtRegistryEntry' object has no attribute 'specialize_call'",
             )),
             // Marker variants override `specialize_call` upstream
@@ -591,7 +660,7 @@ impl ExtRegistryEntry {
                 let vlist = vec![
                     Hlvalue::Constant(HighLevelOp::inputconst(
                         &lltype::LowLevelType::Void,
-                        &ConstValue::byte_str(crate::rlib::jit_marker::LOOP_HEADER_METHOD_NAME),
+                        &ConstValue::byte_str(crate::rlib::jit::LOOP_HEADER_METHOD_NAME),
                     )?),
                     Hlvalue::Constant(HighLevelOp::inputconst(
                         &lltype::LowLevelType::Void,
@@ -856,6 +925,25 @@ mod tests {
         let cv = ConstValue::HostObject(host);
         assert!(!is_registered(&cv));
         assert!(lookup(&cv).is_none());
+    }
+
+    #[test]
+    fn flexible_weak_dict_exposes_three_store_shape() {
+        let mut dict = FlexibleWeakDict::new();
+        dict.__setitem__("a".to_string(), 1);
+        dict._weakdict.insert("b".to_string(), 2);
+        dict._iddict.insert("c".to_string(), 3);
+
+        assert_eq!(dict.__getitem__(&"a".to_string()), Some(&1));
+        assert_eq!(dict.__getitem__(&"b".to_string()), Some(&2));
+        assert_eq!(dict.__getitem__(&"c".to_string()), Some(&3));
+        let mut keys = dict.keys();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert_eq!(dict.__delitem__(&"a".to_string()), Some(1));
     }
 
     /// rlib/jit.py:396 `class Entry(ExtRegistryEntry): _about_ =

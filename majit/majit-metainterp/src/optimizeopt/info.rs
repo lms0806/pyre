@@ -5,8 +5,8 @@
 /// pointer info, virtual object state).
 use crate::r#box::BoxRef;
 use crate::optimizeopt::intutils::{IntBound, IntBoundMakeGuards};
+pub use crate::optimizeopt::rawbuffer::{RawBuffer, RawBufferError};
 use majit_ir::operand::Operand;
-pub use majit_ir::rawbuffer::{RawBuffer, RawBufferError};
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 
 fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<DescrRef> {

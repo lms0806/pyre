@@ -483,8 +483,8 @@ pub const VREF_GC_TYPE_ID: u32 = 4;
 /// (heaptracker.py:23-30 setup_cache_gcstruct2vtable — one typeid per
 /// distinct STRUCT, not per root layout).
 pub const W_BOOL_GC_TYPE_ID: u32 = 5;
-/// GC type id for W_RangeIterator. Inherits from `object`
-/// (rangeobject.rs:10 RANGE_ITER_TYPE).
+/// GC type id for W_IntRangeIterator. Inherits from `object`
+/// (functional.rs:10 RANGE_ITER_TYPE).
 pub const RANGE_ITER_GC_TYPE_ID: u32 = 6;
 // `W_LIST_GC_TYPE_ID` / `W_TUPLE_GC_TYPE_ID` live in `pyre-object`
 // alongside their structs (matching W_INT/W_FLOAT pattern); re-exported
@@ -524,45 +524,45 @@ pub use pyre_object::specialisedtupleobject::{
 // for the JIT registration site (`pyre-jit/src/eval.rs`).
 pub use pyre_interpreter::function::FUNCTION_GC_TYPE_ID;
 pub use pyre_interpreter::gateway::BUILTIN_CODE_GC_TYPE_ID;
-// `W_CELL_GC_TYPE_ID` lives in `pyre-object::cellobject` alongside the
-// `W_CellObject` struct it describes. Re-exported for the JIT
+// `W_CELL_GC_TYPE_ID` lives in `pyre-object::nestedscope` alongside the
+// `Cell` struct it describes. Re-exported for the JIT
 // registration site.
-pub use pyre_object::cellobject::W_CELL_GC_TYPE_ID;
-// `W_METHOD_GC_TYPE_ID` lives in `pyre-object::methodobject` alongside
-// the `W_MethodObject` struct it describes. Re-exported for the JIT
+pub use pyre_object::nestedscope::W_CELL_GC_TYPE_ID;
+// `W_METHOD_GC_TYPE_ID` lives in `pyre-object::function` alongside
+// the `Method` struct it describes. Re-exported for the JIT
 // registration site.
-pub use pyre_object::methodobject::W_METHOD_GC_TYPE_ID;
+pub use pyre_object::function::W_METHOD_GC_TYPE_ID;
 // `W_SLICE_GC_TYPE_ID` lives in `pyre-object::sliceobject` alongside
 // the `W_SliceObject` struct it describes. Re-exported for the JIT
 // registration site.
 pub use pyre_object::sliceobject::W_SLICE_GC_TYPE_ID;
-// `W_SUPER_GC_TYPE_ID` lives in `pyre-object::superobject` alongside
+// `W_SUPER_GC_TYPE_ID` lives in `pyre-object::descriptor` alongside
 // the `W_Super` struct it describes. Re-exported for the JIT
 // registration site.
-pub use pyre_object::superobject::W_SUPER_GC_TYPE_ID;
-// `W_PROPERTY_GC_TYPE_ID` / `W_STATICMETHOD_GC_TYPE_ID` /
-// `W_CLASSMETHOD_GC_TYPE_ID` live in `pyre-object::propertyobject`
-// alongside their structs. Re-exported for the JIT registration site.
-pub use pyre_object::propertyobject::{
-    W_CLASSMETHOD_GC_TYPE_ID, W_PROPERTY_GC_TYPE_ID, W_STATICMETHOD_GC_TYPE_ID,
-};
-// `W_UNION_GC_TYPE_ID` lives in `pyre-object::unionobject` alongside
-// the `W_UnionType` struct it describes. Re-exported for the JIT
+pub use pyre_object::descriptor::W_SUPER_GC_TYPE_ID;
+// `W_PROPERTY_GC_TYPE_ID` lives in `pyre-object::descriptor`, while
+// `W_STATICMETHOD_GC_TYPE_ID` / `W_CLASSMETHOD_GC_TYPE_ID` live in
+// `pyre-object::function` alongside their structs. Re-exported for the JIT
 // registration site.
-pub use pyre_object::unionobject::W_UNION_GC_TYPE_ID;
-// `W_SEQ_ITER_GC_TYPE_ID` lives in `pyre-object::rangeobject`
-// alongside the `W_SeqIterator` struct it describes. Re-exported for
+pub use pyre_object::descriptor::W_PROPERTY_GC_TYPE_ID;
+pub use pyre_object::function::{W_CLASSMETHOD_GC_TYPE_ID, W_STATICMETHOD_GC_TYPE_ID};
+// `W_UNION_GC_TYPE_ID` lives in `pyre-object::_pypy_generic_alias` alongside
+// the `UnionType` struct it describes. Re-exported for the JIT
+// registration site.
+pub use pyre_object::_pypy_generic_alias::W_UNION_GC_TYPE_ID;
+// `W_SEQ_ITER_GC_TYPE_ID` lives in `pyre-object::iterobject`
+// alongside the `W_SeqIterObject` struct it describes. Re-exported for
 // the JIT registration site.
-pub use pyre_object::rangeobject::W_SEQ_ITER_GC_TYPE_ID;
+pub use pyre_object::iterobject::W_SEQ_ITER_GC_TYPE_ID;
 // `W_COUNT_GC_TYPE_ID` / `W_REPEAT_GC_TYPE_ID` live in
-// `pyre-object::itertoolsmodule` alongside the `W_Count` /
+// `pyre-object::interp_itertools` alongside the `W_Count` /
 // `W_Repeat` structs they describe. Re-exported for the JIT
 // registration site.
-pub use pyre_object::itertoolsmodule::{W_COUNT_GC_TYPE_ID, W_REPEAT_GC_TYPE_ID};
-// `W_MEMBER_GC_TYPE_ID` lives in `pyre-object::memberobject`
+pub use pyre_object::interp_itertools::{W_COUNT_GC_TYPE_ID, W_REPEAT_GC_TYPE_ID};
+// `W_MEMBER_GC_TYPE_ID` lives in `pyre-object::typedef`
 // alongside the `W_MemberDescr` struct it describes. Re-exported for
 // the JIT registration site.
-pub use pyre_object::memberobject::W_MEMBER_GC_TYPE_ID;
+pub use pyre_object::typedef::W_MEMBER_GC_TYPE_ID;
 // `W_BYTES_GC_TYPE_ID` lives in `pyre-object::bytesobject` alongside
 // the `W_BytesObject` struct it describes. Re-exported for the JIT
 // registration site.
@@ -585,14 +585,14 @@ pub use pyre_object::dictmultiobject::W_MODULE_DICT_GC_TYPE_ID;
 // `frozenset` PyTypes — same Rust struct). Re-exported for the JIT
 // registration site.
 pub use pyre_object::setobject::W_SET_GC_TYPE_ID;
-// `W_EXCEPTION_GC_TYPE_ID` lives in `pyre-object::excobject`
-// alongside the `W_ExceptionObject` struct it describes. Re-exported
+// `W_BASE_EXCEPTION_GC_TYPE_ID` lives in `pyre-object::interp_exceptions`
+// alongside the `W_BaseException` struct it describes. Re-exported
 // for the JIT registration site.
-pub use pyre_object::excobject::W_EXCEPTION_GC_TYPE_ID;
-// `W_GENERATOR_GC_TYPE_ID` lives in `pyre-object::generatorobject`
-// alongside the `W_GeneratorObject` struct it describes. Re-exported
+pub use pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_TYPE_ID;
+// `W_GENERATOR_GC_TYPE_ID` lives in `pyre-object::generator`
+// alongside the `GeneratorIterator` struct it describes. Re-exported
 // for the JIT registration site.
-pub use pyre_object::generatorobject::W_GENERATOR_GC_TYPE_ID;
+pub use pyre_object::generator::W_GENERATOR_GC_TYPE_ID;
 // `W_TYPE_GC_TYPE_ID` lives in `pyre-object::typeobject` alongside
 // the `W_TypeObject` struct it describes. Re-exported for the JIT
 // registration site. (`TYPE_TYPE` is in `all_foreign_pytypes()` but
@@ -601,12 +601,12 @@ pub use pyre_object::generatorobject::W_GENERATOR_GC_TYPE_ID;
 pub use pyre_object::typeobject::W_TYPE_GC_TYPE_ID;
 // `W_UNICODE_GC_TYPE_ID` / `W_LONG_GC_TYPE_ID` / `W_MODULE_GC_TYPE_ID`
 // live alongside their structs in
-// `pyre-object::{unicodeobject, longobject, moduleobject}`. Re-exported
-// for the JIT registration site. `W_InstanceObject` shares
+// `pyre-object::{unicodeobject, longobject, module}`. Re-exported
+// for the JIT registration site. `W_ObjectObject` shares
 // `OBJECT_GC_TYPE_ID` with the `object` root (see comment on the
 // struct) so it has no separate id.
 pub use pyre_object::longobject::W_LONG_GC_TYPE_ID;
-pub use pyre_object::moduleobject::W_MODULE_GC_TYPE_ID;
+pub use pyre_object::module::W_MODULE_GC_TYPE_ID;
 // `W_DICT_PROXY_GC_TYPE_ID` lives in `pyre-object::dictproxyobject`
 // alongside the `W_DictProxyObject` struct it describes.  Re-exported
 // for the JIT registration site so the typeid stays in the
@@ -809,12 +809,12 @@ static W_BOOL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 
 static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
-        std::mem::size_of::<pyre_object::rangeobject::W_RangeIterator>(),
+        std::mem::size_of::<pyre_object::functional::W_IntRangeIterator>(),
         RANGE_ITER_GC_TYPE_ID,
-        &pyre_object::rangeobject::RANGE_ITER_TYPE as *const _ as usize,
+        &pyre_object::functional::RANGE_ITER_TYPE as *const _ as usize,
         &[
             (
-                "W_RangeIterator.current",
+                "W_IntRangeIterator.current",
                 RANGE_ITER_CURRENT_OFFSET,
                 8,
                 Type::Int,
@@ -823,8 +823,8 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
                 false,
             ),
             (
-                "W_RangeIterator.stop",
-                RANGE_ITER_STOP_OFFSET,
+                "W_IntRangeIterator.remaining",
+                RANGE_ITER_REMAINING_OFFSET,
                 8,
                 Type::Int,
                 true,
@@ -832,7 +832,7 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
                 false,
             ),
             (
-                "W_RangeIterator.step",
+                "W_IntRangeIterator.step",
                 RANGE_ITER_STEP_OFFSET,
                 8,
                 Type::Int,
@@ -841,13 +841,13 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
                 false,
             ),
         ],
-        "W_RangeIterator",
-        "rangeobject::W_RangeIterator",
+        "W_IntRangeIterator",
+        "functional::W_IntRangeIterator",
     )
 });
 
-/// `W_MethodObject` field layout — `w_function`, `w_self`, `w_class` per
-/// `methodobject.rs:9-15`. All three are Ref slots; the JIT only consumes
+/// `Method` field layout — `w_function`, `w_self`, `w_class` per
+/// `function.rs:9-15`. All three are Ref slots; the JIT only consumes
 /// `w_function` (for guarding which method) and `w_self` (for recovering
 /// the receiver `OpRef` discarded by `LOAD_METHOD`). `w_class` is included
 /// for layout completeness so the descrs match the struct order.
@@ -857,17 +857,17 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
 /// `_Method._immutable_fields_ = ['w_function', 'w_instance']`. `w_class`
 /// is not listed there and stays mutable.
 static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    use pyre_object::methodobject::{
+    use pyre_object::function::{
         METHOD_W_CLASS_OFFSET, METHOD_W_FUNCTION_OFFSET, METHOD_W_SELF_OFFSET, W_METHOD_GC_TYPE_ID,
         W_METHOD_OBJECT_SIZE,
     };
     build_object_descr_group_with_def_path(
         W_METHOD_OBJECT_SIZE,
         W_METHOD_GC_TYPE_ID,
-        &pyre_object::methodobject::METHOD_TYPE as *const _ as usize,
+        &pyre_object::function::METHOD_TYPE as *const _ as usize,
         &[
             (
-                "W_MethodObject.w_function",
+                "Method.w_function",
                 METHOD_W_FUNCTION_OFFSET,
                 8,
                 Type::Ref,
@@ -876,7 +876,7 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "W_MethodObject.w_self",
+                "Method.w_self",
                 METHOD_W_SELF_OFFSET,
                 8,
                 Type::Ref,
@@ -885,7 +885,7 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "W_MethodObject.w_class",
+                "Method.w_class",
                 METHOD_W_CLASS_OFFSET,
                 8,
                 Type::Ref,
@@ -894,8 +894,8 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
         ],
-        "W_MethodObject",
-        "methodobject::W_MethodObject",
+        "Method",
+        "function::Method",
     )
 });
 
@@ -916,7 +916,7 @@ static W_OBJECT_MUTABLE_CELL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyL
         W_OBJECT_MUTABLE_CELL_GC_TYPE_ID,
         &OBJECT_MUTABLE_CELL_TYPE as *const _ as usize,
         &[(
-            "W_ObjectMutableCell.w_value",
+            "ObjectMutableCell.w_value",
             W_OBJECT_MUTABLE_CELL_GC_PTR_OFFSETS[0],
             8,
             Type::Ref,
@@ -924,8 +924,8 @@ static W_OBJECT_MUTABLE_CELL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyL
             false,
             false,
         )],
-        "W_ObjectMutableCell",
-        "celldict::W_ObjectMutableCell",
+        "ObjectMutableCell",
+        "celldict::ObjectMutableCell",
     )
 });
 
@@ -1526,7 +1526,7 @@ impl SizeDescr for PyreSizeDescr {
     }
     /// descr.py SizeDescr.is_object: every PyreSizeDescr that ships a
     /// vtable corresponds to a Python object (W_IntObject / W_ListObject /
-    /// W_RangeIterator / …). `ensure_ptr_info_arg0` (optimizer.py:480)
+    /// W_IntRangeIterator / …). `ensure_ptr_info_arg0` (optimizer.py:480)
     /// uses this to dispatch InstancePtrInfo vs StructPtrInfo.
     fn is_object(&self) -> bool {
         self.vtable != 0
@@ -1675,16 +1675,16 @@ pub fn make_array_descr_with_full_id(
 // ── Range iterator field descriptors ─────────────────────────────────
 
 use pyre_interpreter::{DICT_STORAGE_VALUES_LEN_OFFSET, DICT_STORAGE_VALUES_OFFSET};
-use pyre_object::excobject::{
-    EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_W_CONTEXT_OFFSET, ExcKind,
-    W_EXCEPTION_OBJECT_SIZE, exc_kind_to_pytype,
-};
 use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
+use pyre_object::functional::{
+    RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_REMAINING_OFFSET, RANGE_ITER_STEP_OFFSET,
+};
+use pyre_object::interp_exceptions::{
+    EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_W_CONTEXT_OFFSET, ExcKind,
+    W_BASE_EXCEPTION_SIZE, exc_kind_to_pytype,
+};
 use pyre_object::intobject::W_IntObject;
 use pyre_object::pyobject::{OB_TYPE_OFFSET, W_CLASS_OFFSET};
-use pyre_object::rangeobject::{
-    RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_STEP_OFFSET, RANGE_ITER_STOP_OFFSET,
-};
 use pyre_object::unicodeobject::UNICODE_LEN_OFFSET;
 use pyre_object::{
     BOOL_INTVAL_OFFSET, FLOAT_ARRAY_BLOCK_OFFSET, FLOAT_ARRAY_HEAP_CAP_OFFSET,
@@ -1730,23 +1730,23 @@ pub fn instance_w_type_descr() -> DescrRef {
     w_class_descr()
 }
 
-/// Field descriptor for `W_RangeIterator.current` (i64, signed).
+/// Field descriptor for `W_IntRangeIterator.current` (i64, signed).
 pub fn range_iter_current_descr() -> DescrRef {
     field_descr_from_group(&RANGE_ITER_DESCR_GROUP, 0)
 }
 
-/// Field descriptor for `W_RangeIterator.stop` (i64, signed).
-pub fn range_iter_stop_descr() -> DescrRef {
+/// Field descriptor for `W_IntRangeIterator.remaining` (i64, signed).
+pub fn range_iter_remaining_descr() -> DescrRef {
     field_descr_from_group(&RANGE_ITER_DESCR_GROUP, 1)
 }
 
-/// Field descriptor for `W_RangeIterator.step` (i64, signed).
+/// Field descriptor for `W_IntRangeIterator.step` (i64, signed).
 pub fn range_iter_step_descr() -> DescrRef {
     field_descr_from_group(&RANGE_ITER_DESCR_GROUP, 2)
 }
 
-/// `W_MethodObject.w_function` — the underlying function (W_FunctionObject
-/// or W_BuiltinFunction) bound by `getattr(obj, name)`. Marked immutable
+/// `Method.w_function` — the underlying function (`Function` or
+/// `BuiltinFunction`) bound by `getattr(obj, name)`. Marked immutable
 /// per `pypy/interpreter/function.py:567` `_Method._immutable_fields_`,
 /// so reads survive cache invalidation across calls. Used by the
 /// bound-method specialization in `call_callable_value`.
@@ -1754,7 +1754,7 @@ pub fn method_w_function_descr() -> DescrRef {
     field_descr_from_group(&W_METHOD_DESCR_GROUP, 0)
 }
 
-/// `W_MethodObject.w_self` — the receiver object. The bound-method
+/// `Method.w_self` — the receiver object. The bound-method
 /// specialization extracts this via `GetfieldGcR` to recover the receiver
 /// `OpRef` after `LOAD_METHOD` discarded it (load_method.rs:6334 pushes
 /// `null_value` for `is_method` attrs). Immutable per
@@ -1993,7 +1993,7 @@ pub fn w_bool_size_descr() -> DescrRef {
     W_BOOL_DESCR_GROUP.size_descr.clone()
 }
 
-/// Size descriptor for W_RangeIterator allocation via NewWithVtable.
+/// Size descriptor for W_IntRangeIterator allocation via NewWithVtable.
 /// vtable = &RANGE_ITER_TYPE; type_id = 0.
 pub fn w_range_iter_size_descr() -> DescrRef {
     RANGE_ITER_DESCR_GROUP.size_descr.clone()
@@ -2025,7 +2025,7 @@ pub fn specialised_tuple_oo_size_descr() -> DescrRef {
     SPECIALISED_TUPLE_OO_DESCR_GROUP.size_descr.clone()
 }
 
-/// SizeDescr + field descrs for `W_ExceptionObject` allocation via
+/// SizeDescr + field descrs for `W_BaseException` allocation via
 /// NewWithVtable, one set per `ExcKind`.  The vtable (`ob_type`) differs
 /// per kind (`exc_kind_to_pytype`), so each kind owns its group; the
 /// three SetField'd fields — `kind`, `w_class`, `args_w` — share the
@@ -2034,13 +2034,13 @@ pub fn specialised_tuple_oo_size_descr() -> DescrRef {
 /// `w_exception_new_empty`.
 fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
     build_object_descr_group_with_def_path(
-        W_EXCEPTION_OBJECT_SIZE,
-        W_EXCEPTION_GC_TYPE_ID,
+        W_BASE_EXCEPTION_SIZE,
+        W_BASE_EXCEPTION_GC_TYPE_ID,
         exc_kind_to_pytype(kind) as *const _ as usize,
         &[
             // `kind` is a `u8` tag (1 byte, unsigned).
             (
-                "W_ExceptionObject.kind",
+                "W_BaseException.kind",
                 EXC_KIND_OFFSET,
                 1,
                 Type::Int,
@@ -2049,7 +2049,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_ExceptionObject.w_class",
+                "W_BaseException.w_class",
                 W_CLASS_OFFSET,
                 8,
                 Type::Ref,
@@ -2058,7 +2058,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_ExceptionObject.args_w",
+                "W_BaseException.args_w",
                 EXC_ARGS_W_OFFSET,
                 8,
                 Type::Ref,
@@ -2071,7 +2071,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             // (`exc.w_context = ec.sys_exc_value`) so the optimizer can
             // track it on the virtual exception; carried at field index 3.
             (
-                "W_ExceptionObject.w_context",
+                "W_BaseException.w_context",
                 EXC_W_CONTEXT_OFFSET,
                 8,
                 Type::Ref,
@@ -2080,7 +2080,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
         ],
-        // Empty name: the per-kind vtable means a shared "W_ExceptionObject"
+        // Empty name: the per-kind vtable means a shared "W_BaseException"
         // name-registry slot would be first-write-wins and lose the other
         // kinds' vtables.  NewWithVtable embeds the SizeDescr in the op, so
         // the name-registry publish is not needed here.
@@ -2089,14 +2089,14 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
     )
 }
 
-static W_EXCEPTION_DESCR_CACHE: LazyLock<Mutex<Vec<Option<PyreObjectDescrGroup>>>> =
+static W_BASE_EXCEPTION_DESCR_CACHE: LazyLock<Mutex<Vec<Option<PyreObjectDescrGroup>>>> =
     LazyLock::new(|| Mutex::new((0..EXC_KIND_COUNT).map(|_| None).collect()));
 
 /// Field descrs for the exception construction emit: `(size, kind,
 /// w_class, args_w)`.  Built and cached per `ExcKind` on first use.
 pub fn w_exception_descrs(kind: ExcKind) -> (DescrRef, DescrRef, DescrRef, DescrRef) {
     let idx = kind as u8 as usize;
-    let mut cache = W_EXCEPTION_DESCR_CACHE.lock().unwrap();
+    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock().unwrap();
     if cache[idx].is_none() {
         cache[idx] = Some(build_w_exception_group(kind));
     }
@@ -2109,14 +2109,14 @@ pub fn w_exception_descrs(kind: ExcKind) -> (DescrRef, DescrRef, DescrRef, Descr
     )
 }
 
-/// Field descr for `W_ExceptionObject.w_context` (the `__context__`
+/// Field descr for `W_BaseException.w_context` (the `__context__`
 /// slot), index 3 of the per-kind exception descr group.  Used by the
 /// RAISE_VARARGS `__context__` chaining lowering; shares the same parent
 /// `SizeDescr` as the `NewWithVtable` emit so the optimizer recognises
 /// the store as a field of the virtual exception.
 pub fn w_exception_context_descr(kind: ExcKind) -> DescrRef {
     let idx = kind as u8 as usize;
-    let mut cache = W_EXCEPTION_DESCR_CACHE.lock().unwrap();
+    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock().unwrap();
     if cache[idx].is_none() {
         cache[idx] = Some(build_w_exception_group(kind));
     }

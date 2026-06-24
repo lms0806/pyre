@@ -14,7 +14,7 @@ use pyre_object::PyObjectRef;
 #[cfg(all(unix, feature = "host_env"))]
 #[crate::pyre_class("select.poll")]
 #[derive(Default)]
-pub struct W_Poll {
+pub struct Poll {
     fddict: std::collections::HashMap<i32, i16>,
     running: bool,
 }
@@ -60,7 +60,7 @@ pub(crate) fn filedescriptor_w(w_fd: PyObjectRef) -> Result<i32, crate::PyError>
     doc = "Returns a polling object.\n\nSee the poll() documentation.",
     unhashable
 )]
-impl W_Poll {
+impl Poll {
     /// `interp_select.py:115-117 descr_new` — the type is not directly
     /// instantiable; `select.poll()` is the module-level factory.
     #[staticmethod]
@@ -190,7 +190,7 @@ impl W_Poll {
                 // retry with a recomputed timeout.  Reset `running` first so
                 // a raised handler does not leave the poll object wedged
                 // (PyPy's `finally: self.running = False`).
-                if let Err(err) = crate::module::_signal::interp_signal::checksignals_now() {
+                if let Err(err) = crate::module::signal::interp_signal::checksignals_now() {
                     self.running = false;
                     return Err(err);
                 }
@@ -365,7 +365,7 @@ pub fn register_module(ns: &mut DictStorage) {
                             // `interp_select.py:182` — deliver a pending
                             // signal, then retry with the remaining timeout
                             // recomputed at the loop head.
-                            crate::module::_signal::interp_signal::checksignals_now()?;
+                            crate::module::signal::interp_signal::checksignals_now()?;
                             continue;
                         }
                         Err(e) => {
@@ -418,7 +418,7 @@ pub fn register_module(ns: &mut DictStorage) {
             "poll",
             crate::make_builtin_function_with_arity(
                 "poll",
-                |_args| Ok(W_Poll::allocate(W_Poll::default())),
+                |_args| Ok(Poll::allocate(Poll::default())),
                 0,
             ),
         );

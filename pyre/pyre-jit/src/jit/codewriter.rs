@@ -215,13 +215,13 @@ fn frame_blocks_for_offset(code: &CodeObject, next_offset: usize) -> Vec<FrameBl
         return Vec::new();
     }
 
-    // `exception_table::decode_exceptiontable` yields byte offsets; pyre's
+    // `pycode::decode_exceptiontable` yields byte offsets; pyre's
     // JIT codewriter tracks instruction-index offsets (`next_offset` is a
     // code-unit index into `code.instructions`), so divide by 2 at the
     // boundary.  Entries are emitted in ascending `start` order so we walk
     // the whole list rather than break early — multiple ranges may cover
     // the same PC (`pypy/interpreter/pycode.py:250-253` last-matching-wins).
-    pyre_interpreter::exception_table::decode_exceptiontable(&code.exceptiontable)
+    pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable)
         .filter_map(|entry| {
             let start = entry.start as usize / 2;
             let end = entry.end as usize / 2;
@@ -868,7 +868,7 @@ fn derive_pc_live_indices_from_sparse(
             continue;
         }
         if let Some(call_pc) = owner_pc(q) {
-            let fallthrough = pyre_jit_trace::metainterp::semantic_fallthrough_pc(code, call_pc);
+            let fallthrough = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, call_pc);
             // Only re-key STACK-ONLY fallthrough PCs (pos None). A
             // fallthrough PC with its OWN first-insn marker already resolves
             // to that marker, which is the branch's not-taken arm entry —
@@ -982,7 +982,7 @@ fn derive_pc_live_indices_from_sparse(
             ))
         );
         if is_trivia {
-            let next = pyre_jit_trace::metainterp::semantic_fallthrough_pc(code, pc);
+            let next = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, pc);
             if next < n_pcs {
                 pos_for_pc[pc] = pos_for_pc[next];
             }
@@ -3249,7 +3249,7 @@ fn frontend_global_object(w_code: *const (), name: &str) -> Option<pyre_object::
 fn frontend_global_flow_value(w_code: *const (), name: &str) -> Option<super::flow::FlowValue> {
     // `flowcontext.py:845-858 find_global` resolves globals during flow
     // analysis and pushes a Constant.  Do the same when the current
-    // W_CodeObject exposes its globals/builtins; callers fall back to a
+    // PyCode exposes its globals/builtins; callers fall back to a
     // fresh Ref only when pyre cannot reproduce the static lookup.
     frontend_global_object(w_code, name).map(pyobject_const_ref_value)
 }
@@ -4469,7 +4469,7 @@ fn decode_exception_catch_sites(
     // `decode_exceptiontable` yields byte offsets; codewriter operates in
     // instruction-index units.  Convert at the boundary.
     let exception_entries: Vec<_> =
-        pyre_interpreter::exception_table::decode_exceptiontable(&code.exceptiontable)
+        pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable)
             .map(|e| {
                 (
                     e.start as usize / 2,
@@ -8405,7 +8405,7 @@ impl CodeWriter {
                             // rtyper-surrogate operands threaded into the
                             // `bh_store_attr_fn(obj, value, code, name_idx)`
                             // residual, identical to the LoadAttr arm: the
-                            // jitcode's own W_CodeObject as a post-rtype
+                            // jitcode's own PyCode as a post-rtype
                             // `Signed(ptr) + Kind::Ref` constant and the
                             // `co_names` index the helper resolves the name
                             // with.
@@ -8451,7 +8451,7 @@ impl CodeWriter {
                             let attr_name =
                                 super::flow::Constant::string(code.names[name_idx].as_str());
                             // rtyper-surrogate operands for the splice
-                            // lowering: the jitcode's own W_CodeObject as a
+                            // lowering: the jitcode's own PyCode as a
                             // post-rtype `Signed(ptr) + Kind::Ref` constant
                             // (per-code jitcode ⇒ fixed pointer) and the
                             // co_names index `bh_load_attr_fn` resolves the
@@ -9081,7 +9081,7 @@ impl CodeWriter {
                             // rtyper-surrogate operands threaded into the
                             // `bh_delete_attr_fn(obj, code, name_idx)` residual,
                             // identical to the StoreAttr arm: the jitcode's own
-                            // W_CodeObject as a post-rtype `Signed(ptr) + Kind::Ref`
+                            // PyCode as a post-rtype `Signed(ptr) + Kind::Ref`
                             // constant and the `co_names` index the helper resolves
                             // the name with.
                             let code_const: super::flow::FlowValue = super::flow::Constant::new(
@@ -9185,7 +9185,7 @@ impl CodeWriter {
                         // 1 module. Net: -1.  `import_name(fromlist, level, code,
                         // name_idx)` HLOp → `residual_call_ir_r(import_name_fn,
                         // ListI[name_idx], ListR[fromlist, level, code])`.  The
-                        // jitcode's own W_CodeObject travels as a post-rtype
+                        // jitcode's own PyCode travels as a post-rtype
                         // `Signed(ptr) + Kind::Ref` constant and the `co_names`
                         // index the helper resolves the module name with — the
                         // same surrogate-operand shape as the LoadAttr arm.
@@ -9227,7 +9227,7 @@ impl CodeWriter {
                             // ListI([name_idx]), ListR([module, code]))`.  Net
                             // +1; the module stays on the stack.  Surrogate
                             // operands mirror the LoadAttr / ImportName arms: the
-                            // jitcode's own W_CodeObject as a post-rtype
+                            // jitcode's own PyCode as a post-rtype
                             // `Signed(ptr) + Kind::Ref` constant and the
                             // `co_names` index the helper resolves the attribute
                             // name with.  `bh_import_from_fn` runs the import
@@ -10265,7 +10265,7 @@ impl CodeWriter {
         //     splice resume-liveness machinery validated against the pruned
         //     graph before they can be wired.
         //   - `ssa_to_ssi` runs CORRECTLY on walker graphs (the
-        //     `backendopt_ssa.rs` stop-at-startblock adaptation), but is
+        //     `ssa.rs` stop-at-startblock adaptation), but is
         //     overhead-only: it threads values the walker already routes
         //     through its register/slot model, adding redundant coalesce pairs
         //     / `ref_copy` that measurably regress exception-heavy code
@@ -11180,7 +11180,7 @@ pub fn register_portal_jitdriver(
     // RPython warmspot.py:281-282 stores the complete
     // `make_jitcodes()` result on MetaInterpStaticData before tracing
     // can observe it. Pyre keeps trace-side SD in a separate crate
-    // keyed by W_CodeObject, so install the whole just-drained list at
+    // keyed by PyCode, so install the whole just-drained list at
     // this codewriter boundary. A missing portal entry after the drain
     // is an impossible postcondition and must fail loudly.
     if !jitcodes.is_empty() {
@@ -11192,7 +11192,7 @@ pub fn register_portal_jitdriver(
         .expect("make_jitcodes must populate the registered portal jitcode");
     assert_eq!(
         portal_jitcode.w_code, w_code,
-        "registered portal jitcode must preserve the W_CodeObject identity"
+        "registered portal jitcode must preserve the PyCode identity"
     );
 }
 
@@ -11247,7 +11247,7 @@ pub fn register_portal_jitdriver(
 ///     match it in the known-result cache — a ConstRef would break that
 ///     fold.  A trial wire of the dormant
 ///     `build_load_global_fn_residual_call_ir_r_insn_with_all_consts`
-///     (all-three ConstRef: namespace from `W_CodeObject.w_globals`,
+///     (all-three ConstRef: namespace from `PyCode.w_globals`,
 ///     pycode = callee `w_code`, frame = `ConstRef(0)`) was attempted and
 ///     reverted — **root cause found and CLOSED**.  `_with_all_consts`
 ///     is doubly unsound: the null frame skips the `get_builtin()`
@@ -12856,11 +12856,10 @@ mod tests {
         let code = first_nested_function_code(
             "def f(a):\n    try:\n        return a\n    except Exception:\n        return 0\n",
         );
-        // `exception_table::decode_exceptiontable` yields byte offsets;
+        // `pycode::decode_exceptiontable` yields byte offsets;
         // codewriter operates in code-unit indices (offset/2).
         let entries: Vec<_> =
-            pyre_interpreter::exception_table::decode_exceptiontable(&code.exceptiontable)
-                .collect();
+            pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable).collect();
         assert!(!entries.is_empty());
 
         let first = &entries[0];

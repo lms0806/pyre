@@ -59,6 +59,7 @@
 
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, ThreadId};
@@ -82,7 +83,7 @@ pub enum DescOrConst {
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::llannotation::lltype_to_annotation;
 use crate::translator::rtyper::lltypesystem::lltype::{self, LowLevelType};
-use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult, HighLevelOp};
+use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult, HighLevelOp, RPythonTyper};
 
 /// Result shape returned by `Repr.rtype_*` methods.
 ///
@@ -1190,6 +1191,17 @@ pub fn inputconst_from_lltype(
     Ok(Constant::with_concretetype(value.clone(), lltype.clone()))
 }
 
+/// RPython `getgcflavor(classdef)` (`rmodel.py:412-415`).
+///
+/// `rclass.py` carries the same helper in the Rust port because
+/// `InstanceRepr` consumes it directly; keep the `rmodel.py` spelling
+/// as the public parity surface and delegate to that implementation.
+pub fn getgcflavor(
+    classdef: &std::rc::Rc<std::cell::RefCell<crate::annotator::classdesc::ClassDef>>,
+) -> Result<super::rclass::Flavor, TyperError> {
+    super::rclass::getgcflavor(classdef)
+}
+
 /// RPython `mangle(prefix, name)` (`rmodel.py:402-408`).
 ///
 /// ```python
@@ -1207,6 +1219,66 @@ pub fn mangle(prefix: &str, name: &str) -> String {
     } else {
         format!("{prefix}_{name}")
     }
+}
+
+/// RPython `class DummyValueBuilder(object)` (`rmodel.py:432-464`).
+///
+/// The lazy `ll_dummy_value` allocation depends on
+/// `RPythonTyper.cache_dummy_values`, which is still absent in this
+/// port. The identity, hash, and freeze surfaces are present so
+/// `Repr.get_ll_dummyval_obj` can return the same object shape.
+#[allow(non_snake_case)]
+#[derive(Clone, Debug)]
+pub struct DummyValueBuilder {
+    rtyper_id: usize,
+    TYPE: LowLevelType,
+}
+
+#[allow(non_snake_case)]
+impl DummyValueBuilder {
+    pub fn new(rtyper: &RPythonTyper, TYPE: LowLevelType) -> Self {
+        DummyValueBuilder {
+            rtyper_id: rtyper as *const RPythonTyper as usize,
+            TYPE,
+        }
+    }
+
+    pub fn rtyper_id(&self) -> usize {
+        self.rtyper_id
+    }
+
+    pub fn TYPE(&self) -> &LowLevelType {
+        &self.TYPE
+    }
+
+    pub fn _freeze_(&self) -> bool {
+        true
+    }
+
+    pub fn ll_dummy_value(&self) -> Result<lltype::LowLevelValue, TyperError> {
+        Err(TyperError::missing_rtype_operation(
+            "DummyValueBuilder.ll_dummy_value - RPythonTyper.cache_dummy_values deferred",
+        ))
+    }
+}
+
+impl PartialEq for DummyValueBuilder {
+    fn eq(&self, other: &Self) -> bool {
+        self.rtyper_id == other.rtyper_id && self.TYPE == other.TYPE
+    }
+}
+
+impl Eq for DummyValueBuilder {}
+
+impl Hash for DummyValueBuilder {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.TYPE.hash(state);
+    }
+}
+
+/// RPython `warning(msg)` (`rmodel.py:473-474`).
+pub fn warning(msg: &str) {
+    eprintln!("rtyper WARNING: {msg}");
 }
 
 /// RPython `class CanBeNull(object).rtype_bool(self, hop)`
@@ -2911,12 +2983,12 @@ pub fn rtyper_makerepr(
         SomeValue::UnicodeString(_) => {
             Ok(crate::translator::rtyper::rstr::unicode_repr() as std::sync::Arc<dyn Repr>)
         }
-        // rbytearray.py:6-23 — `SomeByteArray.rtyper_makerepr` returns
-        // a `ByteArrayRepr`. Pyre defers the dedicated rbytearray.rs
-        // port to a separate epic; surface the missing-rtype anchor.
-        SomeValue::ByteArray(_) => Err(TyperError::missing_rtype_operation(
-            "SomeByteArray.rtyper_makerepr — port rpython/rtyper/rbytearray.py ByteArrayRepr",
-        )),
+        // rbytearray.py:55-61 — `SomeByteArray.rtyper_makerepr`
+        // imports and returns `lltypesystem.rbytearray.bytearray_repr`.
+        SomeValue::ByteArray(_) => Ok(
+            crate::translator::rtyper::lltypesystem::rbytearray::bytearray_repr()
+                as std::sync::Arc<dyn Repr>,
+        ),
         // rclass.py:445-447 — SomeInstance.rtyper_makerepr.
         SomeValue::Instance(s) => {
             let rtyper_rc = rtyper.self_rc()?;
@@ -3050,6 +3122,12 @@ pub fn rtyper_makerepr(
             let self_rc = rtyper.self_rc()?;
             crate::translator::rtyper::rpbc::somepbc_rtyper_makerepr(s_pbc, &self_rc)
         }
+        // extfunc.py:33-40 — SomeExternalFunction.rtyper_makerepr
+        // returns ExternalFunctionRepr(self, impl, fakeimpl).
+        SomeValue::ExternalFunction(s_func) => {
+            let repr = s_func.rtyper_makerepr(None, None)?;
+            Ok(std::sync::Arc::new(repr) as std::sync::Arc<dyn Repr>)
+        }
         // rbuiltin.py:23-39 — SomeBuiltin.rtyper_makerepr /
         // SomeBuiltinMethod.rtyper_makerepr. Routed into the rbuiltin
         // module which owns the concrete repr types.
@@ -3113,6 +3191,8 @@ impl fmt::Display for SimplePointerRepr {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
     use std::rc::Rc;
 
     use crate::annotator::annrpython::RPythonAnnotator;
@@ -3168,6 +3248,49 @@ mod tests {
         let mut s_attr = SomeString::new(false, false);
         s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str(value)));
         SomeValue::String(s_attr)
+    }
+
+    #[test]
+    fn getgcflavor_reads_alloc_flavor_from_classdesc_like_rmodel() {
+        let classdef = crate::annotator::classdesc::ClassDef::new_standalone("pkg.RawC", None);
+        assert_eq!(
+            getgcflavor(&classdef).unwrap(),
+            super::super::rclass::Flavor::Gc
+        );
+        classdef
+            .borrow()
+            .classdesc
+            .borrow()
+            .pyobj
+            .class_set("_alloc_flavor_", ConstValue::byte_str("raw"));
+        assert_eq!(
+            getgcflavor(&classdef).unwrap(),
+            super::super::rclass::Flavor::Raw
+        );
+    }
+
+    #[test]
+    fn dummy_value_builder_freezes_and_compares_by_rtyper_identity_and_type() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper_a = RPythonTyper::new(&ann);
+        let rtyper_b = RPythonTyper::new(&ann);
+        let a1 = DummyValueBuilder::new(&rtyper_a, LowLevelType::Signed);
+        let a2 = DummyValueBuilder::new(&rtyper_a, LowLevelType::Signed);
+        let b = DummyValueBuilder::new(&rtyper_b, LowLevelType::Signed);
+        let a_bool = DummyValueBuilder::new(&rtyper_a, LowLevelType::Bool);
+
+        assert!(a1._freeze_());
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b);
+        assert_ne!(a1, a_bool);
+        assert_eq!(a1.TYPE(), &LowLevelType::Signed);
+        assert!(a1.ll_dummy_value().is_err());
+
+        let mut h1 = DefaultHasher::new();
+        let mut h2 = DefaultHasher::new();
+        a1.hash(&mut h1);
+        a2.hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
     }
 
     fn empty_hop(rtyper: &Rc<RPythonTyper>, opname: &str) -> HighLevelOp {
@@ -4184,17 +4307,21 @@ mod tests {
         ));
     }
 
-    /// `SomeByteArray` remains parked behind a missing-rtype anchor —
-    /// `rbytearray.py:6-23` `ByteArrayRepr` is its own port.
+    /// `SomeByteArray.rtyper_makerepr` imports and returns
+    /// `lltypesystem.rbytearray.bytearray_repr` (`rbytearray.py:55-61`).
     #[test]
-    fn rtyper_makerepr_somebytearray_surfaces_missing_rtype_to_rbytearray() {
+    fn rtyper_makerepr_somebytearray_returns_bytearray_repr() {
         use crate::annotator::model::SomeByteArray;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));
 
         let sv = SomeValue::ByteArray(SomeByteArray::new(false));
-        let err = rtyper_makerepr(&sv, &rtyper).expect_err("ByteArray repr not yet ported");
-        assert!(err.to_string().contains("rbytearray.py"));
+        let repr = rtyper_makerepr(&sv, &rtyper).expect("ByteArray repr");
+        assert_eq!(repr.class_name(), "ByteArrayRepr");
+        assert_eq!(
+            repr.repr_class_id(),
+            crate::translator::rtyper::pairtype::ReprClassId::ByteArrayRepr
+        );
     }
 
     // -----------------------------------------------------------------

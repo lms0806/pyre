@@ -263,11 +263,11 @@ pub fn new_instance_terminator(w_cls: PyObjectRef, hasdict: bool, typedef_hasdic
 /// instance map. Must run before any `node_read`/`node_write`/`node_delete`.
 ///
 /// # Safety
-/// `obj` must be a live `W_InstanceObject` (the caller guards with
+/// `obj` must be a live `W_ObjectObject` (the caller guards with
 /// `is_instance`). The instance is an immortal `Box` in Slice C, so the raw
 /// pointer is stable across this call.
 pub unsafe fn ensure_mapdict_initialized(obj: PyObjectRef) {
-    let inst = &mut *(obj as *mut pyre_object::W_InstanceObject);
+    let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     if !inst.map.is_null() {
         return;
     }
@@ -294,7 +294,7 @@ unsafe fn type_terminator_or_create(w_type: PyObjectRef) -> MapRef {
 
 /// mapdict.py:754-756 `MapdictDictSupport.setclass` — re-root `obj`'s map chain
 /// onto `w_cls`'s terminator and transplant the rebuilt storage+map. Called from
-/// `descr_set___class__` for a `W_InstanceObject`. pyre additionally keeps the
+/// `descr_set___class__` for a `W_ObjectObject`. pyre additionally keeps the
 /// `w_class` field authoritative for `type()` (the node layer's
 /// `terminator.w_cls` is never read for `getclass`), so the caller sets that
 /// after this returns.
@@ -306,12 +306,12 @@ unsafe fn type_terminator_or_create(w_type: PyObjectRef) -> MapRef {
 /// not annotator-lowerable.
 ///
 /// # Safety
-/// `obj` must be a live `W_InstanceObject`.
+/// `obj` must be a live `W_ObjectObject`.
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_setclass(obj: PyObjectRef, w_cls: PyObjectRef) {
     unsafe { ensure_mapdict_initialized(obj) };
     let new_term = unsafe { type_terminator_or_create(w_cls) };
-    let inst = unsafe { &mut *(obj as *mut pyre_object::W_InstanceObject) };
+    let inst = unsafe { &mut *(obj as *mut pyre_object::W_ObjectObject) };
     let map = inst._get_mapdict_map();
     let new_obj = unsafe { node_set_terminator(map, inst, new_term) };
     let new_map = new_obj.map;
@@ -333,7 +333,7 @@ pub unsafe fn instance_setclass(obj: PyObjectRef, w_cls: PyObjectRef) {
 /// future convergence, once the unboxed storage shape is JIT-representable.
 ///
 /// # Safety
-/// `obj` must be a live `W_InstanceObject` (caller guards with `is_instance`).
+/// `obj` must be a live `W_ObjectObject` (caller guards with `is_instance`).
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_node_setdictvalue(
     obj: PyObjectRef,
@@ -341,7 +341,7 @@ pub unsafe fn instance_node_setdictvalue(
     value: PyObjectRef,
 ) -> bool {
     ensure_mapdict_initialized(obj);
-    let inst = &mut *(obj as *mut pyre_object::W_InstanceObject);
+    let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
     let flag = node_write(map, inst, name, DICT, value);
     debug_assert!(
@@ -361,11 +361,11 @@ pub unsafe fn instance_node_setdictvalue(
 /// annotator-lowerable.
 ///
 /// # Safety
-/// `obj` must be a live `W_InstanceObject` (caller guards with `is_instance`).
+/// `obj` must be a live `W_ObjectObject` (caller guards with `is_instance`).
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_node_getdictvalue(obj: PyObjectRef, name: &Wtf8) -> Option<PyObjectRef> {
     ensure_mapdict_initialized(obj);
-    let inst = &mut *(obj as *mut pyre_object::W_InstanceObject);
+    let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
     let w_res = unsafe { node_read(map, inst, name, DICT) };
     // mapdict.py:846-847 getdictvalue → read → _direct_read (592-598): lazily
@@ -385,11 +385,11 @@ pub unsafe fn instance_node_getdictvalue(obj: PyObjectRef, name: &Wtf8) -> Optio
 /// is not JIT-traced while the unboxed branches remain unported.
 ///
 /// # Safety
-/// `obj` must be a live `W_InstanceObject` (caller guards with `is_instance`).
+/// `obj` must be a live `W_ObjectObject` (caller guards with `is_instance`).
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_node_deldictvalue(obj: PyObjectRef, name: &Wtf8) -> bool {
     ensure_mapdict_initialized(obj);
-    let inst = &mut *(obj as *mut pyre_object::W_InstanceObject);
+    let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
     match node_delete(map, &*inst, name, DICT) {
         None => false,
@@ -410,11 +410,11 @@ pub unsafe fn instance_node_deldictvalue(obj: PyObjectRef, name: &Wtf8) -> bool 
 /// unported unboxed branch the annotator cannot lower.
 ///
 /// # Safety
-/// `obj` must be a live `W_InstanceObject` (caller guards with `is_instance`).
+/// `obj` must be a live `W_ObjectObject` (caller guards with `is_instance`).
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_get_dict_slot(obj: PyObjectRef) -> Option<PyObjectRef> {
     ensure_mapdict_initialized(obj);
-    let inst = &*(obj as *const pyre_object::W_InstanceObject);
+    let inst = &*(obj as *const pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
     node_read(map, inst, Wtf8::new("dict"), SPECIAL)
 }
@@ -429,11 +429,11 @@ pub unsafe fn instance_get_dict_slot(obj: PyObjectRef) -> Option<PyObjectRef> {
 /// [`instance_node_setdictvalue`].
 ///
 /// # Safety
-/// `obj` must be a live `W_InstanceObject` (caller guards with `is_instance`).
+/// `obj` must be a live `W_ObjectObject` (caller guards with `is_instance`).
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_set_dict_slot(obj: PyObjectRef, w_dict: PyObjectRef) -> bool {
     ensure_mapdict_initialized(obj);
-    let inst = &mut *(obj as *mut pyre_object::W_InstanceObject);
+    let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
     node_write(map, inst, Wtf8::new("dict"), SPECIAL, w_dict)
 }
@@ -447,7 +447,7 @@ pub unsafe fn instance_set_dict_slot(obj: PyObjectRef, w_dict: PyObjectRef) -> b
 /// [`instance_node_getdictvalue`].
 ///
 /// # Safety
-/// `obj` must be a live object reference. A non-`W_InstanceObject`
+/// `obj` must be a live object reference. A non-`W_ObjectObject`
 /// receiver hits the `W_Root.getslotvalue` default — NotImplementedError
 /// (baseobjspace.py:119-120) — as a panic.
 #[majit_macros::dont_look_inside]
@@ -457,7 +457,7 @@ pub unsafe fn getslotvalue(obj: PyObjectRef, slotindex: u32) -> Option<PyObjectR
         "W_Root.getslotvalue: receiver has no mapdict slot storage"
     );
     ensure_mapdict_initialized(obj);
-    let inst = &mut *(obj as *mut pyre_object::W_InstanceObject);
+    let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
     let attrkind = SLOTS_STARTING_FROM + slotindex as u16;
     let w_res = unsafe { node_read(map, inst, Wtf8::new("slot"), attrkind) };
@@ -474,7 +474,7 @@ pub unsafe fn getslotvalue(obj: PyObjectRef, slotindex: u32) -> Option<PyObjectR
 /// [`instance_node_setdictvalue`].
 ///
 /// # Safety
-/// `obj` must be a live object reference. A non-`W_InstanceObject`
+/// `obj` must be a live object reference. A non-`W_ObjectObject`
 /// receiver hits the `W_Root.setslotvalue` default — NotImplementedError
 /// (baseobjspace.py:122-123) — as a panic.
 #[majit_macros::dont_look_inside]
@@ -484,7 +484,7 @@ pub unsafe fn setslotvalue(obj: PyObjectRef, slotindex: u32, w_value: PyObjectRe
         "W_Root.setslotvalue: receiver has no mapdict slot storage"
     );
     ensure_mapdict_initialized(obj);
-    let inst = &mut *(obj as *mut pyre_object::W_InstanceObject);
+    let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
     let attrkind = SLOTS_STARTING_FROM + slotindex as u16;
     let flag = node_write(map, inst, Wtf8::new("slot"), attrkind, w_value);
@@ -500,7 +500,7 @@ pub unsafe fn setslotvalue(obj: PyObjectRef, slotindex: u32, w_value: PyObjectRe
 /// [`instance_node_setdictvalue`].
 ///
 /// # Safety
-/// `obj` must be a live object reference. A non-`W_InstanceObject`
+/// `obj` must be a live object reference. A non-`W_ObjectObject`
 /// receiver hits the `W_Root.delslotvalue` default — NotImplementedError
 /// (baseobjspace.py:125-126) — as a panic.
 #[majit_macros::dont_look_inside]
@@ -510,7 +510,7 @@ pub unsafe fn delslotvalue(obj: PyObjectRef, slotindex: u32) -> bool {
         "W_Root.delslotvalue: receiver has no mapdict slot storage"
     );
     ensure_mapdict_initialized(obj);
-    let inst = &mut *(obj as *mut pyre_object::W_InstanceObject);
+    let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
     let attrkind = SLOTS_STARTING_FROM + slotindex as u16;
     match node_delete(map, &*inst, Wtf8::new("slot"), attrkind) {
@@ -921,7 +921,7 @@ unsafe fn mapdict_map_or_null(w_obj: PyObjectRef) -> MapRef {
         return std::ptr::null();
     }
     unsafe { ensure_mapdict_initialized(w_obj) };
-    let inst = unsafe { &*(w_obj as *const pyre_object::W_InstanceObject) };
+    let inst = unsafe { &*(w_obj as *const pyre_object::W_ObjectObject) };
     inst._get_mapdict_map()
 }
 
@@ -960,7 +960,7 @@ unsafe fn direct_read<O: MapdictObject>(attr: MapRef, obj: &mut O) -> PyObjectRe
 /// `not we_are_jitted()`.
 ///
 /// # Safety
-/// `pycode` must be a live `W_CodeObject`; `map`/`attr` live map nodes.
+/// `pycode` must be a live `PyCode`; `map`/`attr` live map nodes.
 #[majit_macros::dont_look_inside]
 unsafe fn fill_cache(
     pycode: PyObjectRef,
@@ -1065,7 +1065,7 @@ unsafe fn descr_type_is_heaptype(w_descr: PyObjectRef) -> bool {
 /// executor, never this function.
 ///
 /// # Safety
-/// `pycode` must be a live `W_CodeObject`; `w_obj` a live object.
+/// `pycode` must be a live `PyCode`; `w_obj` a live object.
 #[majit_macros::dont_look_inside]
 pub unsafe fn load_attr_caching(
     pycode: PyObjectRef,
@@ -1081,7 +1081,7 @@ pub unsafe fn load_attr_caching(
         if !map.is_null() && unsafe { e.is_valid_for_map(map, false) } && e.w_method.is_null() {
             // mapdict.py:1485-1487 `attr = entry.attr_wref(); if attr is not None`.
             if !e.cached_attr.is_null() {
-                let inst = unsafe { &mut *(w_obj as *mut pyre_object::W_InstanceObject) };
+                let inst = unsafe { &mut *(w_obj as *mut pyre_object::W_ObjectObject) };
                 // mapdict.py:1487 `return attr._direct_read(w_obj)`.
                 return Ok(unsafe { direct_read(e.cached_attr, inst) });
             }
@@ -1096,7 +1096,7 @@ pub unsafe fn load_attr_caching(
 /// thread-locals; only called from `load_attr_caching`.
 ///
 /// # Safety
-/// `pycode` must be a live `W_CodeObject`; `w_obj` a live object; `map` its map
+/// `pycode` must be a live `PyCode`; `w_obj` a live object; `map` its map
 /// (or null).
 #[majit_macros::dont_look_inside]
 unsafe fn load_attr_slowpath(
@@ -1146,7 +1146,7 @@ unsafe fn load_attr_slowpath(
                         );
                     }
                     // mapdict.py:1533 `return attr._direct_read(w_obj)`.
-                    let inst = unsafe { &mut *(w_obj as *mut pyre_object::W_InstanceObject) };
+                    let inst = unsafe { &mut *(w_obj as *mut pyre_object::W_ObjectObject) };
                     return Ok(unsafe { direct_read(attr, inst) });
                 }
             }
@@ -1164,7 +1164,7 @@ unsafe fn load_attr_slowpath(
 /// `dont_look_inside` — same rationale as `load_attr_caching`.
 ///
 /// # Safety
-/// `pycode` must be a live `W_CodeObject`; `w_obj` a live object.
+/// `pycode` must be a live `PyCode`; `w_obj` a live object.
 #[majit_macros::dont_look_inside]
 pub unsafe fn store_attr_caching(
     pycode: PyObjectRef,
@@ -1189,7 +1189,7 @@ pub unsafe fn store_attr_caching(
                     p.ever_mutated.set(true);
                 }
                 // mapdict.py:1584 `attr._direct_write(w_obj, w_value)`.
-                let inst = unsafe { &mut *(w_obj as *mut pyre_object::W_InstanceObject) };
+                let inst = unsafe { &mut *(w_obj as *mut pyre_object::W_ObjectObject) };
                 unsafe { plain_direct_write(attr, inst, w_value) };
                 return Ok(());
             }
@@ -1203,7 +1203,7 @@ pub unsafe fn store_attr_caching(
 /// `dont_look_inside` — same rationale as `load_attr_slowpath`.
 ///
 /// # Safety
-/// `pycode` must be a live `W_CodeObject`; `w_obj` a live object; `map` its map
+/// `pycode` must be a live `PyCode`; `w_obj` a live object; `map` its map
 /// (or null).
 #[majit_macros::dont_look_inside]
 unsafe fn store_attr_slowpath(
@@ -1244,7 +1244,7 @@ unsafe fn store_attr_slowpath(
                     };
                     if typsafe {
                         // mapdict.py:1610 `_switch_map_and_write_increase_storage1`.
-                        let inst = unsafe { &mut *(w_obj as *mut pyre_object::W_InstanceObject) };
+                        let inst = unsafe { &mut *(w_obj as *mut pyre_object::W_ObjectObject) };
                         unsafe {
                             switch_map_and_write_increase_storage1(attr_to_add, inst, w_value)
                         };
@@ -1293,7 +1293,7 @@ unsafe fn store_attr_slowpath(
                             p.ever_mutated.set(true);
                         }
                         // mapdict.py:1634 `attr._direct_write(w_obj, w_value)`.
-                        let inst = unsafe { &mut *(w_obj as *mut pyre_object::W_InstanceObject) };
+                        let inst = unsafe { &mut *(w_obj as *mut pyre_object::W_ObjectObject) };
                         unsafe { plain_direct_write(attr, inst, w_value) };
                         return Ok(());
                     }
@@ -1306,8 +1306,7 @@ unsafe fn store_attr_slowpath(
                                 == TerminatorKind::Dict
                         {
                             let term = unsafe { (*map).terminator() };
-                            let inst =
-                                unsafe { &mut *(w_obj as *mut pyre_object::W_InstanceObject) };
+                            let inst = unsafe { &mut *(w_obj as *mut pyre_object::W_ObjectObject) };
                             // mapdict.py:1639 `map.terminator._write_terminator(...)`.
                             unsafe {
                                 write_terminator(term, inst, Wtf8::new(name), attrkind, w_value)
@@ -1351,7 +1350,7 @@ unsafe fn store_attr_slowpath(
 //
 // The map-node layer reads and writes attribute values through this trait.
 // PyPy mixes `MapdictStorageMixin` into the instance class; pyre's instance
-// (W_InstanceObject) implements this trait instead (Slice 2). Storage holds
+// (W_ObjectObject) implements this trait instead (Slice 2). Storage holds
 // `PyObjectRef`, so PyPy's `erase_item`/`unerase_item` (rerased boxing of a
 // W_Root into the untyped storage list) are the identity here.
 
@@ -1382,7 +1381,7 @@ pub trait MapdictObject {
     fn getdict(&self) -> PyObjectRef;
 }
 
-/// `W_InstanceObject` (`pyre-object`) is pyre's `MapdictStorageMixin`
+/// `W_ObjectObject` (`pyre-object`) is pyre's `MapdictStorageMixin`
 /// carrier (`mapdict.py:904-963`): PyPy mixes the mixin into the instance
 /// class, here the instance implements the trait. `map` is the erased
 /// `*const MapNode`; `storage` is a heap `Vec<PyObjectRef>` (null =
@@ -1393,14 +1392,14 @@ pub trait MapdictObject {
 /// pyre's `storage` is an off-GC `*mut Vec<PyObjectRef>`, so the store bypasses
 /// the collector's remembered-set tracking and must call the barrier
 /// explicitly. Without it a nursery value stored into an old-gen instance is
-/// not forwarded during a minor collection: `instance_object_custom_trace`
-/// (`W_INSTANCE_GC_TYPE_ID`) runs only for remembered-set objects in
+/// not forwarded during a minor collection: `object_object_custom_trace`
+/// (`W_OBJECT_OBJECT_GC_TYPE_ID`) runs only for remembered-set objects in
 /// `do_collect_nursery`, never blanket-scanned.
 fn instance_write_barrier(obj: PyObjectRef) {
     pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
-impl MapdictObject for pyre_object::W_InstanceObject {
+impl MapdictObject for pyre_object::W_ObjectObject {
     fn _get_mapdict_map(&self) -> MapRef {
         // `jit.promote(self.map)` (mapdict.py:905-906).
         self.map as MapRef
@@ -1490,7 +1489,7 @@ impl MapdictObject for pyre_object::W_InstanceObject {
 /// to back instance dictionaries and to hold the result of `delete`/`copy`
 /// (its `storage`/`map` are transplanted into the real instance by
 /// `_set_mapdict_storage_and_map`). pyre uses this lightweight owned-`Vec`
-/// carrier rather than allocating a throwaway `W_InstanceObject`.
+/// carrier rather than allocating a throwaway `W_ObjectObject`.
 pub(crate) struct Object {
     map: MapRef,
     storage: Vec<PyObjectRef>,
@@ -2039,14 +2038,14 @@ unsafe fn node_materialize_dict<O: MapdictObject>(
 /// mapdict.py:1305-1308 `materialize_r_dict` / 1310-1313 `materialize_str_dict`
 /// (module-level) — run the chain over `obj`'s map to fill `w_dict`, then
 /// transplant the rebuilt (devolved) storage+map back onto `obj`. The backing
-/// instance is always a `W_InstanceObject` (the only `MapdictDictSupport`
+/// instance is always a `W_ObjectObject` (the only `MapdictDictSupport`
 /// carrier whose `__dict__` adopts `MapDictStrategy`).
 ///
 /// # Safety
-/// `obj` must be a live `W_InstanceObject`; `w_dict` a live `W_DictObject` on
+/// `obj` must be a live `W_ObjectObject`; `w_dict` a live `W_DictObject` on
 /// its post-switch strategy.
 unsafe fn materialize_dict(obj: PyObjectRef, w_dict: PyObjectRef) {
-    let inst = unsafe { &mut *(obj as *mut pyre_object::W_InstanceObject) };
+    let inst = unsafe { &mut *(obj as *mut pyre_object::W_ObjectObject) };
     let map = inst._get_mapdict_map();
     let new_obj = unsafe { node_materialize_dict(map, &*inst, w_dict) };
     inst._set_mapdict_storage_and_map(new_obj.storage, new_obj.map);
@@ -2367,7 +2366,7 @@ unsafe fn write_terminator<O: MapdictObject>(
         // view installed by the `_obj_getdict` flip (asserted MapDictStrategy at
         // mapdict.py:320-322); `switch_to_text_strategy` materialises the DICT
         // attributes into the fresh strategy and rebuilds the map rooted at the
-        // DevolvedDictTerminator. Only reachable for a `W_InstanceObject` carrier:
+        // DevolvedDictTerminator. Only reachable for a `W_ObjectObject` carrier:
         // a devolved instance returns early through the Devolved arm above, and an
         // `Object` carrier never accrues DICT writes through a Dict terminator.
         let w_dict = obj.getdict();
@@ -2377,7 +2376,7 @@ unsafe fn write_terminator<O: MapdictObject>(
                     .dstrategy
                     .strategy_kind()
             },
-            pyre_object::dictstrategy::StrategyKind::Map,
+            pyre_object::dictmultiobject::StrategyKind::Map,
             "LIMIT-devolve expects a MapDictStrategy __dict__ view",
         );
         unsafe { mapdict_switch_to_text_strategy(w_dict) };
@@ -2440,11 +2439,11 @@ thread_local! {
 /// [`instance_node_getdictvalue`].
 ///
 /// # Safety
-/// `obj` must be a live `W_InstanceObject` backing a hasdict instance.
+/// `obj` must be a live `W_ObjectObject` backing a hasdict instance.
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_node_dict_length(obj: PyObjectRef) -> usize {
     ensure_mapdict_initialized(obj);
-    let inst = &*(obj as *const pyre_object::W_InstanceObject);
+    let inst = &*(obj as *const pyre_object::W_ObjectObject);
     let mut res: usize = 0;
     let mut curr = node_search(inst._get_mapdict_map(), DICT);
     while let Some(node) = curr {
@@ -2461,11 +2460,11 @@ pub unsafe fn instance_node_dict_length(obj: PyObjectRef) -> usize {
 /// as [`instance_node_dict_length`]).
 ///
 /// # Safety
-/// `obj` must be a live `W_InstanceObject` backing a hasdict instance.
+/// `obj` must be a live `W_ObjectObject` backing a hasdict instance.
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_node_dict_clear(obj: PyObjectRef) {
     ensure_mapdict_initialized(obj);
-    let inst = &mut *(obj as *mut pyre_object::W_InstanceObject);
+    let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
     let new_obj = node_remove_dict_entries(map, &*inst);
     inst._set_mapdict_storage_and_map(new_obj.storage, new_obj.map);
@@ -2477,7 +2476,7 @@ pub unsafe fn instance_node_dict_clear(obj: PyObjectRef) {
 ///
 /// # Safety
 /// `inst` must be a live carrier whose map chain is live.
-unsafe fn dict_nodes_in_order(inst: &pyre_object::W_InstanceObject) -> Vec<MapRef> {
+unsafe fn dict_nodes_in_order(inst: &pyre_object::W_ObjectObject) -> Vec<MapRef> {
     let mut newest_first: Vec<MapRef> = Vec::new();
     let mut curr = node_search(inst._get_mapdict_map(), DICT);
     while let Some(node) = curr {
@@ -2499,11 +2498,11 @@ unsafe fn dict_nodes_in_order(inst: &pyre_object::W_InstanceObject) -> Vec<MapRe
 /// `dont_look_inside` (same rationale).
 ///
 /// # Safety
-/// `obj` must be a live `W_InstanceObject` backing a hasdict instance.
+/// `obj` must be a live `W_ObjectObject` backing a hasdict instance.
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_node_dict_keys(obj: PyObjectRef) -> Vec<PyObjectRef> {
     ensure_mapdict_initialized(obj);
-    let inst = &*(obj as *const pyre_object::W_InstanceObject);
+    let inst = &*(obj as *const pyre_object::W_ObjectObject);
     let nodes = dict_nodes_in_order(inst);
     let mut keys: Vec<PyObjectRef> = Vec::new();
     let mut i: usize = 0;
@@ -2531,11 +2530,11 @@ pub unsafe fn instance_node_dict_keys(obj: PyObjectRef) -> Vec<PyObjectRef> {
 /// boundary (`instance_node_getdictvalue`), matching upstream's read site.
 ///
 /// # Safety
-/// `obj` must be a live `W_InstanceObject` backing a hasdict instance.
+/// `obj` must be a live `W_ObjectObject` backing a hasdict instance.
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_node_dict_values(obj: PyObjectRef) -> Vec<PyObjectRef> {
     ensure_mapdict_initialized(obj);
-    let inst = &*(obj as *const pyre_object::W_InstanceObject);
+    let inst = &*(obj as *const pyre_object::W_ObjectObject);
     let nodes = dict_nodes_in_order(inst);
     let mut vals: Vec<PyObjectRef> = Vec::new();
     let mut i: usize = 0;
@@ -2554,11 +2553,11 @@ pub unsafe fn instance_node_dict_values(obj: PyObjectRef) -> Vec<PyObjectRef> {
 /// read tail for the same reason as [`instance_node_dict_values`].
 ///
 /// # Safety
-/// `obj` must be a live `W_InstanceObject` backing a hasdict instance.
+/// `obj` must be a live `W_ObjectObject` backing a hasdict instance.
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_node_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
     ensure_mapdict_initialized(obj);
-    let inst = &*(obj as *const pyre_object::W_InstanceObject);
+    let inst = &*(obj as *const pyre_object::W_ObjectObject);
     let nodes = dict_nodes_in_order(inst);
     let mut out: Vec<(PyObjectRef, PyObjectRef)> = Vec::new();
     let mut i: usize = 0;
@@ -2575,7 +2574,7 @@ pub unsafe fn instance_node_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, Py
 
 /// rerased unerase for [`MapDictStrategy`] (mapdict.py:1125-1127): the dict's
 /// erased `dstorage` IS the backing instance (mapdict.py:1502
-/// `strategy.erase(self)`), so unerasing yields the `W_InstanceObject`
+/// `strategy.erase(self)`), so unerasing yields the `W_ObjectObject`
 /// PyObjectRef directly.
 ///
 /// # Safety
@@ -2594,21 +2593,21 @@ unsafe fn mapdict_strategy_unerase(w_dict: PyObjectRef) -> PyObjectRef {
 /// callers (`getitem`/`setitem`/`delitem` non-str arms) stay lowerable.
 ///
 /// Unlike a typed strategy's switch, the old `dstorage` here is the backing
-/// `W_InstanceObject` (mapdict.py:1502 `strategy.erase(self)`), an immortal Box,
+/// `W_ObjectObject` (mapdict.py:1502 `strategy.erase(self)`), an immortal Box,
 /// not an owned r_dict — so it is overwritten, never freed.
 ///
 /// # Safety
 /// `w_dict` must be a `W_DictObject` whose strategy is [`MapDictStrategy`].
 #[majit_macros::dont_look_inside]
 pub unsafe fn mapdict_switch_to_object_strategy(w_dict: PyObjectRef) {
-    use pyre_object::dictstrategy::DictStrategy;
+    use pyre_object::dictmultiobject::DictStrategy;
     // w_obj = self.unerase(w_dict.dstorage) — the backing instance.
     let w_obj = unsafe { mapdict_strategy_unerase(w_dict) };
     // dict_w = strategy.unerase(strategy.get_empty_storage()); set_strategy(Object);
     // w_dict.dstorage = strategy.erase(dict_w).
     let dict = unsafe { &mut *(w_dict as *mut pyre_object::W_DictObject) };
-    dict.dstorage = pyre_object::dictstrategy::OBJECT_DICT_STRATEGY.get_empty_storage();
-    dict.dstrategy = &pyre_object::dictstrategy::OBJECT_DICT_STRATEGY;
+    dict.dstorage = pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY.get_empty_storage();
+    dict.dstrategy = &pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY;
     // materialize_r_dict(space, w_obj, dict_w).
     unsafe { materialize_dict(w_obj, w_dict) };
 }
@@ -2622,29 +2621,29 @@ pub unsafe fn mapdict_switch_to_object_strategy(w_dict: PyObjectRef) {
 /// `w_dict` must be a `W_DictObject` whose strategy is [`MapDictStrategy`].
 #[majit_macros::dont_look_inside]
 pub unsafe fn mapdict_switch_to_text_strategy(w_dict: PyObjectRef) {
-    use pyre_object::dictstrategy::DictStrategy;
+    use pyre_object::dictmultiobject::DictStrategy;
     let w_obj = unsafe { mapdict_strategy_unerase(w_dict) };
     let dict = unsafe { &mut *(w_dict as *mut pyre_object::W_DictObject) };
-    dict.dstorage = pyre_object::dictstrategy::UNICODE_DICT_STRATEGY.get_empty_storage();
-    dict.dstrategy = &pyre_object::dictstrategy::UNICODE_DICT_STRATEGY;
+    dict.dstorage = pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY.get_empty_storage();
+    dict.dstrategy = &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY;
     // materialize_str_dict(space, w_obj, str_dict).
     unsafe { materialize_dict(w_obj, w_dict) };
 }
 
 /// mapdict.py:1123-1279 `MapDictStrategy` — the dict strategy a user instance's
-/// `__dict__` adopts. `dstorage` erases the backing `W_InstanceObject`
+/// `__dict__` adopts. `dstorage` erases the backing `W_ObjectObject`
 /// (mapdict.py:1502), so every routed get/set/del/iter funnels into the
 /// instance's mapdict map+storage. Unwired in Slice C — the C5 `_obj_getdict`
 /// flip installs it; defined now so that flip is a one-line strategy swap.
 pub struct MapDictStrategy;
 
 /// `space.fromcache(MapDictStrategy)` process-wide singleton — same `&'static`
-/// ZST contract as [`pyre_object::dictstrategy::OBJECT_DICT_STRATEGY`].
+/// ZST contract as [`pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY`].
 pub static MAP_DICT_STRATEGY: MapDictStrategy = MapDictStrategy;
 
-impl pyre_object::dictstrategy::DictStrategy for MapDictStrategy {
-    fn strategy_kind(&self) -> pyre_object::dictstrategy::StrategyKind {
-        pyre_object::dictstrategy::StrategyKind::Map
+impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
+    fn strategy_kind(&self) -> pyre_object::dictmultiobject::StrategyKind {
+        pyre_object::dictmultiobject::StrategyKind::Map
     }
 
     /// mapdict.py:1132-1137 `get_empty_storage` — "mainly used for tests": a
@@ -2723,7 +2722,7 @@ impl pyre_object::dictstrategy::DictStrategy for MapDictStrategy {
             return false;
         }
         self.switch_to_object_strategy(w_dict);
-        pyre_object::dictstrategy::OBJECT_DICT_STRATEGY.delitem(w_dict, w_key)
+        pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY.delitem(w_dict, w_key)
     }
 
     /// mapdict.py:1213-1220 `length`.
@@ -2810,7 +2809,7 @@ pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
     // makes the view funnel every get/set/del/iter through the instance map+storage
     // — the single `__dict__` authority.
     //
-    // Only a `W_InstanceObject` carries a mapdict. User subclasses of builtin
+    // Only a `W_ObjectObject` carries a mapdict. User subclasses of builtin
     // types (`class MyInt(int)`) keep the builtin layout (no map) while their
     // type is hasdict, so their `__dict__` stays in the address-keyed
     // INSTANCE_DICT side table as a plain own-storage dict until subclass
@@ -2857,18 +2856,18 @@ fn current_owner_key(key: usize) -> usize {
 /// relocates each boxed slot's `PyObjectRef` contents in place, exactly
 /// as `dict_object_custom_trace` relocates dict entry slots.
 ///
-/// Registered as `W_INSTANCE_GC_TYPE_ID`'s custom trace
-/// (`instance_object_custom_trace`) so a moving collector forwards an
+/// Registered as `W_OBJECT_OBJECT_GC_TYPE_ID`'s custom trace
+/// (`object_object_custom_trace`) so a moving collector forwards an
 /// instance's attributes. With unboxing live, the mask skips each
 /// `firstunwrapped` slot — an erased `*mut Vec<i64>` longlong list holds
 /// no `PyObjectRef` to forward — while every boxed slot is relocated in
 /// place.
 ///
 /// # Safety
-/// `obj` must point to a live `W_InstanceObject`.
+/// `obj` must point to a live `W_ObjectObject`.
 pub unsafe fn instance_walk_boxed_storage(obj: PyObjectRef, f: &mut dyn FnMut(*mut PyObjectRef)) {
     unsafe {
-        let inst = &mut *(obj as *mut pyre_object::W_InstanceObject);
+        let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
         if inst.storage.is_null() {
             return;
         }
@@ -2909,9 +2908,9 @@ pub unsafe fn instance_walk_boxed_storage(obj: PyObjectRef, f: &mut dyn FnMut(*m
 /// Walk roots held by pyre's temporary mapdict side tables.
 ///
 /// PyPy stores the instance dict and weakref lifeline in mapdict SPECIAL slots,
-/// so the translated GC sees them as ordinary object fields. A `W_InstanceObject`
-/// is GC-managed (`W_INSTANCE_GC_TYPE_ID`): its attribute storage and "dict"
-/// SPECIAL-slot wrapper are forwarded by `instance_object_custom_trace`, so this
+/// so the translated GC sees them as ordinary object fields. A `W_ObjectObject`
+/// is GC-managed (`W_OBJECT_OBJECT_GC_TYPE_ID`): its attribute storage and "dict"
+/// SPECIAL-slot wrapper are forwarded by `object_object_custom_trace`, so this
 /// walk no longer touches instances. The remaining side tables hold the weakref
 /// lifeline and the wrappers of non-instance hasdict objects (property/member)
 /// which have no map and live in immortal `Box`es the GC never scans. Expose
@@ -2951,7 +2950,7 @@ pub fn walk_mapdict_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
             (*(dict as *const pyre_object::W_DictObject))
                 .dstrategy
                 .strategy_kind()
-                == pyre_object::dictstrategy::StrategyKind::Map
+                == pyre_object::dictmultiobject::StrategyKind::Map
         };
         if !is_map_view {
             unsafe {
@@ -2964,8 +2963,8 @@ pub fn walk_mapdict_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
         // wrapper — including a devolved wrapper's own IndexMap, since that
         // wrapper is a GC-managed `W_DictObject` (`w_dict_new_with` →
         // `try_gc_alloc`) carrying its own `dict_object_custom_trace` and write
-        // barrier — are forwarded by `instance_object_custom_trace`
-        // (`W_INSTANCE_GC_TYPE_ID`): in major marking, and in minor collection
+        // barrier — are forwarded by `object_object_custom_trace`
+        // (`W_OBJECT_OBJECT_GC_TYPE_ID`): in major marking, and in minor collection
         // via the instance/wrapper write barriers that enter the remembered set.
         // So no instance is walked here.
     }
@@ -3012,7 +3011,7 @@ pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), Py
     // Upstream `space.isinstance_w(w_dict, space.w_dict)` also accepts
     // dict subclasses (their instances are dict-layout
     // W_DictMultiObject).  Pyre dict-subclass instances are
-    // `__dict_data__`-composed W_InstanceObject (typedef.rs
+    // `__dict_data__`-composed W_ObjectObject (typedef.rs
     // dict_descr_new), and the devolved/cache readers below this slot
     // (node SPECIAL reads, classify_attr) do raw layout dict ops, so
     // only layout dicts are accepted until the subclass layout
@@ -3034,7 +3033,7 @@ pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), Py
         let w_olddict = _obj_getdict(self_ref);
         let is_map_view = unsafe {
             pyre_object::dictmultiobject::w_dict_get_strategy(w_olddict).strategy_kind()
-                == pyre_object::dictstrategy::StrategyKind::Map
+                == pyre_object::dictmultiobject::StrategyKind::Map
         };
         if is_map_view {
             unsafe { mapdict_switch_to_object_strategy(w_olddict) };
@@ -3364,14 +3363,14 @@ mod tests {
     #[test]
     fn instance_object_write_grows_map_and_storage() {
         unsafe {
-            // The real W_InstanceObject (pyre-object) is the
+            // The real W_ObjectObject (pyre-object) is the
             // MapdictStorageMixin carrier; exercise its trait impl rather
             // than the MockObj double. `map`/`storage` start null
             // (_mapdict_init_empty), so the map terminator is installed
             // here as the mapdict layer would on first attribute access.
             let term = boxed_dict_terminator();
             let obj_ref = pyre_object::w_instance_new(pyre_object::PY_NULL);
-            let obj = &mut *(obj_ref as *mut pyre_object::W_InstanceObject);
+            let obj = &mut *(obj_ref as *mut pyre_object::W_ObjectObject);
             obj._set_mapdict_map(term);
 
             let m = obj._get_mapdict_map();
@@ -3403,7 +3402,7 @@ mod tests {
             // wrappers the attribute read/write paths call.
             let term = boxed_dict_terminator();
             let obj_ref = pyre_object::w_instance_new(pyre_object::PY_NULL);
-            let obj = &mut *(obj_ref as *mut pyre_object::W_InstanceObject);
+            let obj = &mut *(obj_ref as *mut pyre_object::W_ObjectObject);
             obj._set_mapdict_map(term);
 
             assert!(instance_node_setdictvalue(obj_ref, wn("x"), sentinel(0x11)));
@@ -3436,7 +3435,7 @@ mod tests {
             // key — surrogate-bearing included — through getdictvalue.
             let term = boxed_dict_terminator();
             let obj_ref = pyre_object::w_instance_new(pyre_object::PY_NULL);
-            let obj = &mut *(obj_ref as *mut pyre_object::W_InstanceObject);
+            let obj = &mut *(obj_ref as *mut pyre_object::W_ObjectObject);
             obj._set_mapdict_map(term);
 
             // A '\udc81' lone surrogate, interleaved with a plain-named attr.
@@ -3516,7 +3515,7 @@ mod tests {
         unsafe {
             let term = boxed_dict_terminator();
             let obj_ref = pyre_object::w_instance_new(pyre_object::PY_NULL);
-            let obj = &mut *(obj_ref as *mut pyre_object::W_InstanceObject);
+            let obj = &mut *(obj_ref as *mut pyre_object::W_ObjectObject);
             obj._set_mapdict_map(term);
 
             assert!(instance_node_setdictvalue(obj_ref, wn("x"), sentinel(0x1)));
@@ -3534,7 +3533,7 @@ mod tests {
 
     #[test]
     fn map_dict_strategy_routes_through_instance() {
-        use pyre_object::dictstrategy::{DictStrategy, StrategyKind};
+        use pyre_object::dictmultiobject::{DictStrategy, StrategyKind};
         unsafe {
             // Back the strategy with a real instance whose terminator is
             // pre-installed (ensure_mapdict_initialized is then a no-op, no
@@ -3542,7 +3541,7 @@ mod tests {
             // dict's dstorage.
             let term = boxed_dict_terminator();
             let obj_ref = pyre_object::w_instance_new(pyre_object::PY_NULL);
-            let obj = &mut *(obj_ref as *mut pyre_object::W_InstanceObject);
+            let obj = &mut *(obj_ref as *mut pyre_object::W_ObjectObject);
             obj._set_mapdict_map(term);
             assert!(instance_node_setdictvalue(obj_ref, wn("x"), sentinel(0x11)));
             assert!(instance_node_setdictvalue(obj_ref, wn("y"), sentinel(0x22)));
@@ -3599,12 +3598,12 @@ mod tests {
 
     #[test]
     fn map_dict_strategy_switch_to_object_materialises() {
-        use pyre_object::dictstrategy::{DictStrategy, StrategyKind};
+        use pyre_object::dictmultiobject::{DictStrategy, StrategyKind};
         crate::test_hooks::install_hash_hook();
         unsafe {
             let term = boxed_dict_terminator();
             let obj_ref = pyre_object::w_instance_new(pyre_object::PY_NULL);
-            let obj = &mut *(obj_ref as *mut pyre_object::W_InstanceObject);
+            let obj = &mut *(obj_ref as *mut pyre_object::W_ObjectObject);
             obj._set_mapdict_map(term);
             assert!(instance_node_setdictvalue(obj_ref, wn("x"), sentinel(0x11)));
             assert!(instance_node_setdictvalue(obj_ref, wn("y"), sentinel(0x22)));
@@ -3641,12 +3640,12 @@ mod tests {
 
     #[test]
     fn map_dict_strategy_switch_to_text_materialises() {
-        use pyre_object::dictstrategy::{DictStrategy, StrategyKind};
+        use pyre_object::dictmultiobject::{DictStrategy, StrategyKind};
         crate::test_hooks::install_hash_hook();
         unsafe {
             let term = boxed_dict_terminator();
             let obj_ref = pyre_object::w_instance_new(pyre_object::PY_NULL);
-            let obj = &mut *(obj_ref as *mut pyre_object::W_InstanceObject);
+            let obj = &mut *(obj_ref as *mut pyre_object::W_ObjectObject);
             obj._set_mapdict_map(term);
             assert!(instance_node_setdictvalue(obj_ref, wn("a"), sentinel(0x55)));
 
@@ -3681,7 +3680,7 @@ mod tests {
         unsafe {
             let term = boxed_dict_terminator();
             let obj_ref = pyre_object::w_instance_new(pyre_object::PY_NULL);
-            let obj = &mut *(obj_ref as *mut pyre_object::W_InstanceObject);
+            let obj = &mut *(obj_ref as *mut pyre_object::W_ObjectObject);
             obj._set_mapdict_map(term);
 
             let v1 = sentinel(0xA1);
@@ -3704,7 +3703,7 @@ mod tests {
 
     #[test]
     fn instance_dict_wrapper_in_special_slot_not_instance_dict() {
-        use pyre_object::dictstrategy::{DictStrategy, StrategyKind};
+        use pyre_object::dictmultiobject::{DictStrategy, StrategyKind};
         // Phase G slice 2: an instance's `__dict__` wrapper is stored in the
         // mapdict "dict" SPECIAL slot (mapdict.py:826-840 _obj_getdict), not in
         // the INSTANCE_DICT side table. Repeated access returns the same wrapper,
@@ -3713,7 +3712,7 @@ mod tests {
         unsafe {
             let term = boxed_dict_terminator();
             let obj_ref = pyre_object::w_instance_new(pyre_object::PY_NULL);
-            let obj = &mut *(obj_ref as *mut pyre_object::W_InstanceObject);
+            let obj = &mut *(obj_ref as *mut pyre_object::W_ObjectObject);
             obj._set_mapdict_map(term);
 
             let w1 = _obj_getdict(obj_ref);
@@ -3747,7 +3746,7 @@ mod tests {
         unsafe {
             let term = boxed_dict_terminator();
             let obj_ref = pyre_object::w_instance_new(pyre_object::PY_NULL);
-            let obj = &mut *(obj_ref as *mut pyre_object::W_InstanceObject);
+            let obj = &mut *(obj_ref as *mut pyre_object::W_ObjectObject);
             obj._set_mapdict_map(term);
 
             let w_dict = _obj_getdict(obj_ref);
@@ -3766,7 +3765,7 @@ mod tests {
 
     #[test]
     fn instance_custom_trace_and_wrapper_cover_devolved_values() {
-        use pyre_object::dictstrategy::{DictStrategy, StrategyKind};
+        use pyre_object::dictmultiobject::{DictStrategy, StrategyKind};
         // UAF-prevention case: once an instance devolves (>= LIMIT DICT attrs,
         // mapdict.py:316-323), its materialised DICT values move into the
         // wrapper's own backing storage and leave the instance storage. The
@@ -3779,7 +3778,7 @@ mod tests {
         unsafe {
             let term = boxed_dict_terminator();
             let obj_ref = pyre_object::w_instance_new(pyre_object::PY_NULL);
-            let obj = &mut *(obj_ref as *mut pyre_object::W_InstanceObject);
+            let obj = &mut *(obj_ref as *mut pyre_object::W_ObjectObject);
             obj._set_mapdict_map(term);
 
             for i in 0..LIMIT_MAP_ATTRIBUTES {
@@ -3819,14 +3818,14 @@ mod tests {
 
     #[test]
     fn write_terminator_devolves_at_limit_map_attributes() {
-        use pyre_object::dictstrategy::{DictStrategy, StrategyKind};
+        use pyre_object::dictmultiobject::{DictStrategy, StrategyKind};
         crate::test_hooks::install_hash_hook();
         unsafe {
             // mapdict.py:316-323: the (LIMIT_MAP_ATTRIBUTES)th DICT write on a
             // non-devolved instance auto-devolves its `__dict__` to text strategy.
             let term = boxed_dict_terminator();
             let obj_ref = pyre_object::w_instance_new(pyre_object::PY_NULL);
-            let obj = &mut *(obj_ref as *mut pyre_object::W_InstanceObject);
+            let obj = &mut *(obj_ref as *mut pyre_object::W_ObjectObject);
             obj._set_mapdict_map(term);
 
             for i in 0..LIMIT_MAP_ATTRIBUTES {

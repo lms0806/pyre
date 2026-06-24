@@ -165,7 +165,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             match host_time::nanosleep(remaining) {
                 Ok(()) => return Ok(w_none()),
                 Err(e) if e.raw_os_error() == Some(libc::EINTR) => {
-                    crate::module::_signal::interp_signal::checksignals_now()?;
+                    crate::module::signal::interp_signal::checksignals_now()?;
                     let now = std::time::Instant::now();
                     if now >= deadline {
                         return Ok(w_none());
@@ -636,7 +636,7 @@ pub(crate) fn struct_time_type() -> PyObjectRef {
         *c.get_or_init(|| {
             #[cfg(unix)]
             {
-                crate::structseq::make_struct_seq_with_extra(
+                crate::_structseq::make_struct_seq_with_extra(
                     "time.struct_time",
                     SEQ,
                     &["tm_zone", "tm_gmtoff"],
@@ -644,7 +644,7 @@ pub(crate) fn struct_time_type() -> PyObjectRef {
             }
             #[cfg(not(unix))]
             {
-                crate::structseq::make_struct_seq("time.struct_time", SEQ)
+                crate::_structseq::make_struct_seq("time.struct_time", SEQ)
             }
         })
     })
@@ -670,11 +670,11 @@ fn _tm_to_tuple(tm: &c_tm) -> PyObjectRef {
             ("tm_zone", pyre_object::w_str_new(&tm.tm_zone)),
             ("tm_gmtoff", w_int_new(tm.tm_gmtoff)),
         ];
-        crate::structseq::new_instance_with_extra(struct_time_type(), seq, extras)
+        crate::_structseq::new_instance_with_extra(struct_time_type(), seq, extras)
     }
     #[cfg(not(unix))]
     {
-        crate::structseq::new_instance(struct_time_type(), seq)
+        crate::_structseq::new_instance(struct_time_type(), seq)
     }
 }
 

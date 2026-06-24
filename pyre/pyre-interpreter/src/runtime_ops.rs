@@ -3,8 +3,8 @@ use std::sync::OnceLock;
 
 use crate::bytecode::{BinaryOperator, ComparisonOperator, ConvertValueOparg};
 use pyre_object::{
-    PY_NULL, PyObjectRef, W_SeqIterator, is_instance, is_list, is_range_iter, is_seq_iter, is_str,
-    is_tuple, w_dict_new, w_dict_store_checked, w_int_get_value, w_int_new, w_list_getitem,
+    PY_NULL, PyObjectRef, W_SeqIterObject, is_instance, is_list, is_range_iter, is_seq_iter,
+    is_str, is_tuple, w_dict_new, w_dict_store_checked, w_int_get_value, w_int_new, w_list_getitem,
     w_list_len, w_list_new, w_range_iter_has_next, w_range_iter_next, w_str_from_wtf8,
     w_str_get_wtf8, w_str_len, w_tuple_getitem, w_tuple_len, w_tuple_new,
 };
@@ -370,7 +370,7 @@ where
     unsafe {
         if is_function(callable) {
             // All callables are Function objects. Check code type to distinguish
-            // builtins (BuiltinCode) from user functions (W_CodeObject).
+            // builtins (BuiltinCode) from user functions (PyCode).
             let code = crate::getcode(callable);
             if is_builtin_code(code as PyObjectRef) {
                 on_builtin(callable)
@@ -1198,7 +1198,7 @@ pub fn ensure_range_iter(iter: PyObjectRef) -> Result<(), PyError> {
     )))
 }
 
-/// Current length of the sequence a `W_SeqIterator` walks. `None` for a
+/// Current length of the sequence a `W_SeqIterObject` walks. `None` for a
 /// payload outside list/tuple/str/array, leaving callers to fall back to
 /// the length captured at iterator creation.  The covered set mirrors the
 /// item-fetch arms of `baseobjspace::next` / `range_iter_next_or_null`, so
@@ -1217,8 +1217,8 @@ unsafe fn seq_iter_current_len(seq: PyObjectRef) -> Option<i64> {
             // Code-point count, not byte count (matches the str seq-iter
             // seed in baseobjspace::iter).
             Some(w_str_len(seq) as i64)
-        } else if pyre_object::array_object::is_array(seq) {
-            Some(pyre_object::array_object::w_array_len(seq) as i64)
+        } else if pyre_object::interp_array::is_array(seq) {
+            Some(pyre_object::interp_array::w_array_len(seq) as i64)
         } else {
             None
         }
@@ -1234,8 +1234,8 @@ pub fn range_iter_continues(iter: PyObjectRef) -> Result<bool, PyError> {
             return Ok(pyre_object::w_long_range_iter_has_next(iter));
         }
         if is_seq_iter(iter) {
-            let si = &*(iter as *const W_SeqIterator);
-            // listiterator re-reads PyList_GET_SIZE(seq) each step and PyPy's
+            let si = &*(iter as *const W_SeqIterObject);
+            // sequenceiterator re-reads the live sequence length and PyPy's
             // W_FastListIterObject.descr_next ends on a getitem IndexError;
             // neither snapshots a length. Read the CURRENT sequence length so
             // an element appended during iteration is observed (and a removed
@@ -1257,7 +1257,7 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
             return Ok(pyre_object::w_long_range_iter_next(iter).unwrap_or(PY_NULL));
         }
         if is_seq_iter(iter) {
-            let si = &mut *(iter as *mut W_SeqIterator);
+            let si = &mut *(iter as *mut W_SeqIterObject);
             let idx = si.index;
             // Bounds come from the sequence's CURRENT state (see
             // range_iter_continues): getitem returns None past the live
@@ -1288,9 +1288,9 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
                     n += 1;
                 }
                 found
-            } else if pyre_object::array_object::is_array(si.seq) {
-                if (idx as usize) < pyre_object::array_object::w_array_len(si.seq) {
-                    Some(pyre_object::array_object::w_array_unpack_item(
+            } else if pyre_object::interp_array::is_array(si.seq) {
+                if (idx as usize) < pyre_object::interp_array::w_array_len(si.seq) {
+                    Some(pyre_object::interp_array::w_array_unpack_item(
                         si.seq,
                         idx as usize,
                     ))
@@ -1356,7 +1356,7 @@ mod tests {
 
     #[test]
     fn test_range_iter_helpers_share_iterator_semantics() {
-        let iter = pyre_object::w_range_iter_new(1, 3, 1);
+        let iter = pyre_object::w_range_iter_new(1, 2, 1);
         assert!(range_iter_continues(iter).unwrap());
         let first = range_iter_next_or_null(iter).unwrap();
         let second = range_iter_next_or_null(iter).unwrap();
@@ -1370,7 +1370,7 @@ mod tests {
 
     #[test]
     fn test_jit_range_iter_helper_shares_iterator_semantics() {
-        let iter = pyre_object::w_range_iter_new(1, 3, 1);
+        let iter = pyre_object::w_range_iter_new(1, 2, 1);
         let first = jit_range_iter_next_or_null(iter as i64) as PyObjectRef;
         let second = jit_range_iter_next_or_null(iter as i64) as PyObjectRef;
         let done = jit_range_iter_next_or_null(iter as i64) as PyObjectRef;

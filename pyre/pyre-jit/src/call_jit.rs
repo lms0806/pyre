@@ -835,7 +835,7 @@ impl BlackholeResult {
 /// Each decoded frame section from rd_numb.
 pub struct ResumedFrame {
     /// resume.py:1050 jitcode_pos → jitcodes[jitcode_pos].
-    /// W_CodeObject pointer — same level as frame.pycode / getcode(func).
+    /// PyCode pointer — same level as frame.pycode / getcode(func).
     pub code: *const (),
     /// Python bytecode PC the resume data carries (from `frame.pc =
     /// orgpc` at trace time).  pyre's tracer records Python bytecode
@@ -1209,12 +1209,12 @@ pub fn install_jit_call_bridge() {
         register_jit_exc_raiser(jit_exc_raise_shim);
         // compile.py:1090 `memory_error = MemoryError()` parity — give
         // the backend malloc helpers a way to set `JIT_EXC_VALUE` to
-        // pyre's lazy `W_ExceptionObject(MemoryError, "")` singleton
+        // pyre's lazy `W_BaseException(MemoryError, "")` singleton
         // before propagating NULL on OOM.  Backend-shared (mirrors
         // RPython where the same `memory_error` instance is reachable
         // from both the x86 and aarch64 backends).
         majit_backend::register_memory_error_provider(|| {
-            pyre_object::excobject::memory_error_singleton() as i64
+            pyre_object::interp_exceptions::memory_error_singleton() as i64
         });
         // rpython/translator/c/src/stack.h:42-43 LL_stack_criticalcode_start
         // /stop hooks — wrap blackhole_from_resumedata,
@@ -3909,7 +3909,7 @@ pub extern "C" fn bh_load_super_attr_fn(
         return 0;
     }
     let name = code.names[idx].as_ref();
-    let proxy = pyre_object::superobject::w_super_new(
+    let proxy = pyre_object::descriptor::w_super_new(
         cls as pyre_object::PyObjectRef,
         self_obj as pyre_object::PyObjectRef,
     );

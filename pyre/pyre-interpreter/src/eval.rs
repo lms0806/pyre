@@ -186,7 +186,7 @@ unsafe fn walk_raw_function_roots(
 }
 
 /// Mark the GC-reachable children of a `getset_descriptor`
-/// (`W_GetSetProperty`).  The descriptor itself is Box-immortal
+/// (`GetSetProperty`).  The descriptor itself is Box-immortal
 /// (`pyre_class` `allocate` → `malloc_typed`), so its `W_TYPE_GC_TYPE_ID`
 /// custom trace never fires.  Its `fget`/`fset`/`fdel` getters are
 /// GC-managed `try_gc_alloc_stable` functions — non-moving but still
@@ -205,8 +205,8 @@ unsafe fn walk_raw_getset_roots(value: PyObjectRef, visitor: &mut dyn FnMut(&mut
         // Positive predicate: the annotator cannot lower `!` over a
         // cross-crate bool result (`UnaryNotUnknownOperand`), so guard with
         // a positive `if` rather than negating `is_getset_property`.
-        if pyre_object::getsetproperty::is_getset_property(value) {
-            let d = &mut *(value as *mut pyre_object::getsetproperty::W_GetSetProperty);
+        if pyre_object::typedef::is_getset_property(value) {
+            let d = &mut *(value as *mut pyre_object::typedef::GetSetProperty);
             visitor(&mut *(&mut d.fget as *mut PyObjectRef as *mut majit_ir::GcRef));
             visitor(&mut *(&mut d.fset as *mut PyObjectRef as *mut majit_ir::GcRef));
             visitor(&mut *(&mut d.fdel as *mut PyObjectRef as *mut majit_ir::GcRef));
@@ -844,7 +844,7 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Resul
     // exception occurred:". Skip self-context to avoid the obvious
     // cycle (re-raising the same exception object).  Both
     // `__context__` and `__cause__`/`__suppress_context__` writes land
-    // in the typed slots on `W_ExceptionObject` per
+    // in the typed slots on `W_BaseException` per
     // `interp_exceptions.py:113-117`.
     let active = get_current_exception();
     if !active.is_null()
@@ -855,9 +855,9 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Resul
         // `interp_exceptions.py:115 W_BaseException.w_context = None`
         // class default — only write if no `__context__` is already
         // stamped on the exception (mirrors `or_insert` semantics).
-        let existing = unsafe { pyre_object::excobject::w_exception_get_context(exc) };
+        let existing = unsafe { pyre_object::interp_exceptions::w_exception_get_context(exc) };
         if existing.is_null() {
-            unsafe { pyre_object::excobject::w_exception_set_context(exc, active) };
+            unsafe { pyre_object::interp_exceptions::w_exception_set_context(exc, active) };
         }
     }
     if let Some(cause_obj) = cause {
@@ -865,8 +865,8 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Resul
             // `interp_exceptions.py:166-174 descr_setcause` — writes
             // `w_cause` and flips `suppress_context` to True.
             unsafe {
-                pyre_object::excobject::w_exception_set_cause(exc, cause_obj);
-                pyre_object::excobject::w_exception_set_suppress_context(exc, true);
+                pyre_object::interp_exceptions::w_exception_set_cause(exc, cause_obj);
+                pyre_object::interp_exceptions::w_exception_set_suppress_context(exc, true);
             };
         }
     }
@@ -1014,7 +1014,7 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
             }
         }
         // `pyopcode.py:147-148 pytraceback.record_application_traceback`
-        // — prepends a `W_PyTraceback` wrapping the current frame onto
+        // — prepends a `PyTraceback` wrapping the current frame onto
         // the exception's `w_traceback` chain.
         unsafe {
             crate::pytraceback::record_application_traceback(
@@ -1045,7 +1045,7 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
     let code = unsafe { &*crate::pyframe_get_pycode(frame) };
     // pyre's `last_instr` is a rustpython code-unit index; the PyPy-shaped
     // `lookup_exceptiontable` lookup takes byte offsets, so multiply by 2.
-    // (See exception_table.rs: varint values are word offsets but the lookup
+    // (See pycode.rs: varint values are word offsets but the lookup
     // operates in byte space, mirroring `pycode.py:241-246`.)
     //
     // `frame.last_instr == -1` is the pre-first-opcode sentinel
@@ -1061,7 +1061,7 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
         None
     } else {
         let pc_bytes = (frame.last_instr as u32) * 2;
-        crate::exception_table::lookup_exceptiontable(&code.exceptiontable, pc_bytes)
+        crate::pycode::lookup_exceptiontable(&code.exceptiontable, pc_bytes)
     };
     let pc_units = if frame.last_instr < 0 {
         0u32
@@ -1739,7 +1739,7 @@ impl IterOpcodeHandler for PyFrame {
             } else {
                 iter
             };
-            // `range` sequence → fresh `W_RangeIterator` cursor; replace
+            // `range` sequence → fresh `W_IntRangeIterator` cursor; replace
             // the stack operand so FOR_ITER advances the iterator, not the
             // reusable range object.  (Mirrors the dict-proxy rewrite
             // above.)  This runs in the loop preheader, outside the traced
@@ -1755,35 +1755,35 @@ impl IterOpcodeHandler for PyFrame {
             if pyre_object::is_range_iter(iter)
                 || pyre_object::is_long_range_iter(iter)
                 || pyre_object::is_seq_iter(iter)
-                || pyre_object::generatorobject::is_generator(iter)
-                || pyre_object::itertoolsmodule::is_repeat(iter)
-                || pyre_object::itertoolsmodule::is_count(iter)
-                || pyre_object::itertoolsmodule::is_takewhile(iter)
-                || pyre_object::itertoolsmodule::is_dropwhile(iter)
-                || pyre_object::itertoolsmodule::is_filterfalse(iter)
-                || pyre_object::itertoolsmodule::is_pairwise(iter)
-                || pyre_object::dictviewobject::is_dict_view_iterator(iter)
-                || pyre_object::enumerateobject::is_enumerate(iter)
-                || pyre_object::reversedobject::is_reversed(iter)
-                || pyre_object::filterobject::is_filter(iter)
-                || pyre_object::mapobject::is_map(iter)
-                || pyre_object::zipobject::is_zip(iter)
-                || pyre_object::callableiteratorobject::is_callable_iterator(iter)
-                || pyre_object::sreobject::is_sre_scanner(iter)
+                || pyre_object::generator::is_generator(iter)
+                || pyre_object::interp_itertools::is_repeat(iter)
+                || pyre_object::interp_itertools::is_count(iter)
+                || pyre_object::interp_itertools::is_takewhile(iter)
+                || pyre_object::interp_itertools::is_dropwhile(iter)
+                || pyre_object::interp_itertools::is_filterfalse(iter)
+                || pyre_object::interp_itertools::is_pairwise(iter)
+                || pyre_object::dictmultiobject::is_dict_view_iterator(iter)
+                || pyre_object::functional::is_enumerate(iter)
+                || pyre_object::functional::is_reversed(iter)
+                || pyre_object::functional::is_filter(iter)
+                || pyre_object::functional::is_map(iter)
+                || pyre_object::functional::is_zip(iter)
+                || pyre_object::operation::is_callable_iterator(iter)
+                || pyre_object::interp_sre::is_sre_scanner(iter)
             {
                 return Ok(());
             }
-            // `pypy/objspace/std/dictmultiobject.py W_DictMulti
-            // ViewKeysObject.descr_iter` (and values / items siblings)
-            // — `_iter_*` returns a live `W_BaseDictIterator`.  Pyre
-            // produces a `W_DictViewIterator` carrying the source
+            // `pypy/objspace/std/dictmultiobject.py`
+            // `W_DictViewKeysObject.descr_iter` (and values / items
+            // siblings) returns a live `W_BaseDictMultiIterObject`. Pyre
+            // produces a `W_BaseDictMultiIterObject` carrying the source
             // dict's `dictversion` counter so mid-iteration mutation
             // surfaces as `RuntimeError("dictionary changed size during
             // iteration")` per `:1719-1741 descr_next`.
-            if pyre_object::dictviewobject::is_dict_view(iter) {
-                let kind = pyre_object::dictviewobject::w_dict_view_get_kind(iter);
-                let w_dict = pyre_object::dictviewobject::w_dict_view_get_dict(iter);
-                let it = pyre_object::dictviewobject::w_dict_view_iterator_new(w_dict, kind);
+            if pyre_object::dictmultiobject::is_dict_view(iter) {
+                let kind = pyre_object::dictmultiobject::w_dict_view_get_kind(iter);
+                let w_dict = pyre_object::dictmultiobject::w_dict_view_get_dict(iter);
+                let it = pyre_object::dictmultiobject::w_dict_view_iterator_new(w_dict, kind);
                 let tos = self.valuestackdepth - 1;
                 self.locals_w_mut()[tos] = it;
                 return Ok(());
@@ -1853,17 +1853,18 @@ impl IterOpcodeHandler for PyFrame {
                 self.locals_w_mut()[tos] = seq_iter;
                 return Ok(());
             }
-            // dict → iterate over keys.  `pypy/objspace/std/dict
-            // multiobject.py W_DictMultiObject.descr_iter` returns
-            // `W_DictMultiIterKeys(self)` — pyre's `W_DictViewIterator`
-            // with kind=Keys plays the same role, capturing the
+            // dict → iterate over keys.
+            // `pypy/objspace/std/dictmultiobject.py:W_DictMultiObject.descr_iter` returns
+            // `W_DictMultiIterKeysObject` — pyre's
+            // `W_BaseDictMultiIterObject` with kind=Keys plays the same
+            // role, capturing the
             // dict's `dictversion` so mid-iteration mutation raises
             // `RuntimeError("dictionary changed size during
             // iteration")`.
             if pyre_object::is_dict(iter) {
-                let it = pyre_object::dictviewobject::w_dict_view_iterator_new(
+                let it = pyre_object::dictmultiobject::w_dict_view_iterator_new(
                     iter,
-                    pyre_object::dictviewobject::DictViewKind::Keys,
+                    pyre_object::dictmultiobject::DictViewKind::Keys,
                 );
                 let tos = self.valuestackdepth - 1;
                 self.locals_w_mut()[tos] = it;
@@ -1882,8 +1883,8 @@ impl IterOpcodeHandler for PyFrame {
             }
             // array.array → seq_iter cursor (interp_array.py descr_iter
             // returns space.newseqiter(self)).
-            if pyre_object::array_object::is_array(iter) {
-                let len = pyre_object::array_object::w_array_len(iter);
+            if pyre_object::interp_array::is_array(iter) {
+                let len = pyre_object::interp_array::w_array_len(iter);
                 let seq_iter = pyre_object::w_seq_iter_new(iter, len);
                 let tos = self.valuestackdepth - 1;
                 self.locals_w_mut()[tos] = seq_iter;
@@ -1933,7 +1934,7 @@ impl IterOpcodeHandler for PyFrame {
     fn concrete_iter_continues(&mut self, iter: Self::Value) -> Result<bool, PyError> {
         unsafe {
             // Generator iterator
-            if pyre_object::generatorobject::is_generator(iter) {
+            if pyre_object::generator::is_generator(iter) {
                 match crate::baseobjspace::next(iter) {
                     Ok(result) => {
                         USER_ITER_NEXT_CACHE.with(|c| c.set(result));
@@ -1946,24 +1947,24 @@ impl IterOpcodeHandler for PyFrame {
                     Err(e) => return Err(e),
                 }
             }
-            // itertools iterators + W_Enumerate + W_DictViewIterator
+            // itertools iterators + W_Enumerate + W_BaseDictMultiIterObject
             // — delegate to baseobjspace::next.  The shared cache slot
             // (USER_ITER_NEXT_CACHE) carries the most recent value
             // across the iter_continues / iter_next_value pair.
-            if pyre_object::itertoolsmodule::is_repeat(iter)
-                || pyre_object::itertoolsmodule::is_count(iter)
-                || pyre_object::itertoolsmodule::is_takewhile(iter)
-                || pyre_object::itertoolsmodule::is_dropwhile(iter)
-                || pyre_object::itertoolsmodule::is_filterfalse(iter)
-                || pyre_object::itertoolsmodule::is_pairwise(iter)
-                || pyre_object::enumerateobject::is_enumerate(iter)
-                || pyre_object::reversedobject::is_reversed(iter)
-                || pyre_object::filterobject::is_filter(iter)
-                || pyre_object::mapobject::is_map(iter)
-                || pyre_object::zipobject::is_zip(iter)
-                || pyre_object::callableiteratorobject::is_callable_iterator(iter)
-                || pyre_object::dictviewobject::is_dict_view_iterator(iter)
-                || pyre_object::sreobject::is_sre_scanner(iter)
+            if pyre_object::interp_itertools::is_repeat(iter)
+                || pyre_object::interp_itertools::is_count(iter)
+                || pyre_object::interp_itertools::is_takewhile(iter)
+                || pyre_object::interp_itertools::is_dropwhile(iter)
+                || pyre_object::interp_itertools::is_filterfalse(iter)
+                || pyre_object::interp_itertools::is_pairwise(iter)
+                || pyre_object::functional::is_enumerate(iter)
+                || pyre_object::functional::is_reversed(iter)
+                || pyre_object::functional::is_filter(iter)
+                || pyre_object::functional::is_map(iter)
+                || pyre_object::functional::is_zip(iter)
+                || pyre_object::operation::is_callable_iterator(iter)
+                || pyre_object::dictmultiobject::is_dict_view_iterator(iter)
+                || pyre_object::interp_sre::is_sre_scanner(iter)
             {
                 match crate::baseobjspace::next(iter) {
                     Ok(result) => {
@@ -2003,22 +2004,22 @@ impl IterOpcodeHandler for PyFrame {
         // Generator/user-defined/itertools/enumerate/dict-iter:
         // return cached value populated by concrete_iter_continues.
         if unsafe {
-            pyre_object::generatorobject::is_generator(iter)
+            pyre_object::generator::is_generator(iter)
                 || pyre_object::is_instance(iter)
-                || pyre_object::itertoolsmodule::is_repeat(iter)
-                || pyre_object::itertoolsmodule::is_count(iter)
-                || pyre_object::itertoolsmodule::is_takewhile(iter)
-                || pyre_object::itertoolsmodule::is_dropwhile(iter)
-                || pyre_object::itertoolsmodule::is_filterfalse(iter)
-                || pyre_object::itertoolsmodule::is_pairwise(iter)
-                || pyre_object::enumerateobject::is_enumerate(iter)
-                || pyre_object::reversedobject::is_reversed(iter)
-                || pyre_object::filterobject::is_filter(iter)
-                || pyre_object::mapobject::is_map(iter)
-                || pyre_object::zipobject::is_zip(iter)
-                || pyre_object::callableiteratorobject::is_callable_iterator(iter)
-                || pyre_object::dictviewobject::is_dict_view_iterator(iter)
-                || pyre_object::sreobject::is_sre_scanner(iter)
+                || pyre_object::interp_itertools::is_repeat(iter)
+                || pyre_object::interp_itertools::is_count(iter)
+                || pyre_object::interp_itertools::is_takewhile(iter)
+                || pyre_object::interp_itertools::is_dropwhile(iter)
+                || pyre_object::interp_itertools::is_filterfalse(iter)
+                || pyre_object::interp_itertools::is_pairwise(iter)
+                || pyre_object::functional::is_enumerate(iter)
+                || pyre_object::functional::is_reversed(iter)
+                || pyre_object::functional::is_filter(iter)
+                || pyre_object::functional::is_map(iter)
+                || pyre_object::functional::is_zip(iter)
+                || pyre_object::operation::is_callable_iterator(iter)
+                || pyre_object::dictmultiobject::is_dict_view_iterator(iter)
+                || pyre_object::interp_sre::is_sre_scanner(iter)
         } {
             let cached = USER_ITER_NEXT_CACHE.with(|c| c.get());
             if !cached.is_null() {
@@ -2190,7 +2191,7 @@ impl ConstantOpcodeHandler for PyFrame {
     }
 
     fn ellipsis_constant(&mut self) -> Result<Self::Value, PyError> {
-        Ok(pyre_object::noneobject::w_ellipsis())
+        Ok(pyre_object::special::w_ellipsis())
     }
 
     fn slice_constant(
@@ -2400,7 +2401,9 @@ impl OpcodeStepExecutor for PyFrame {
                 // itself, so `assert x` raises `AssertionError()` and
                 // `assert x, msg` raises `AssertionError(msg)`.
                 crate::builtins::lookup_exc_class("AssertionError").unwrap_or_else(|| {
-                    crate::typedef::gettypeobject(&pyre_object::excobject::EXC_ASSERTION_ERROR_TYPE)
+                    crate::typedef::gettypeobject(
+                        &pyre_object::interp_exceptions::EXC_ASSERTION_ERROR_TYPE,
+                    )
                 })
             }
             CommonConstant::NotImplementedError => {
@@ -2501,10 +2504,10 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
-    /// MAKE_CELL — wrap the slot value in a W_CellObject.
+    /// MAKE_CELL — wrap the slot value in a Cell.
     ///
     /// CPython 3.13 / RustPython MAKE_CELL — create cell object in slot.
-    /// Wraps the current value (PY_NULL if uninitialized) in a W_CellObject.
+    /// Wraps the current value (PY_NULL if uninitialized) in a Cell.
     /// LoadFast on cell slots returns the cell object itself (needed for
     /// closure creation via BUILD_TUPLE + SET_FUNCTION_ATTRIBUTE).
     ///
@@ -3247,7 +3250,7 @@ impl OpcodeStepExecutor for PyFrame {
         let cls = self.pop();
         let _global_super = self.pop();
 
-        let proxy = pyre_object::superobject::w_super_new(cls, self_obj);
+        let proxy = pyre_object::descriptor::w_super_new(cls, self_obj);
         let result = crate::baseobjspace::getattr_str(proxy, name)?;
 
         // CPython _PySuper_Lookup: determines whether the resolved attr

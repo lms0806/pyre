@@ -14,17 +14,17 @@ pub mod compile;
 pub use compile::*;
 
 // ── Core interpreter modules ──
+pub mod _pypy_generic_alias;
+pub mod _structseq;
 pub mod argument;
 pub mod baseobjspace;
 pub mod builtins;
 pub mod display;
 pub mod error;
-pub mod exception_table;
 pub mod executioncontext;
 pub mod frame_array;
 pub mod function;
 pub mod gateway;
-pub mod genericalias;
 pub mod jit_fnaddr;
 pub mod listobject;
 pub mod opcode_ops;
@@ -37,7 +37,6 @@ pub mod sandbox;
 pub mod shared_opcode;
 pub mod sliceobject;
 pub mod stack_check;
-pub mod structseq;
 pub mod type_methods;
 pub mod typedef;
 pub mod warn;
@@ -132,7 +131,7 @@ pub(crate) mod test_hooks {
 ///         "log"   / *  = interp_math::log,          // varargs
 ///     },
 ///     module_functions: {
-///         "getweakrefcount" / 1 = interp_weakref::getweakrefcount,
+///         "getweakrefcount" / 1 = interp__weakref::getweakrefcount,
 ///     },
 /// }
 /// ```

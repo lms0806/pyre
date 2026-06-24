@@ -211,7 +211,7 @@ unsafe fn pyre_object_compares_by_identity_trampoline(w_type: pyre_object::PyObj
 /// `'mro_w?[*]'`, `'bases_w?[*]'`, the namespace `dict_w`, `terminator`):
 ///
 ///   * `ob_header.w_class` — the metaclass, the type's own class edge
-///     (the inline header word, same as `instance_object_custom_trace`).
+///     (the inline header word, same as `object_object_custom_trace`).
 ///   * `bases` — the movable bases tuple.
 ///   * `mro_w` — the out-of-line MRO type list.
 ///   * `weak_subclasses` — the out-of-line list populated by
@@ -223,7 +223,7 @@ unsafe fn pyre_object_compares_by_identity_trampoline(w_type: pyre_object::PyObj
 ///     WEAKREF alive without forcing the target alive.
 ///   * the off-GC namespace `DictStorage` values (methods, class
 ///     attributes, getset descriptor copies) via the interpreter helper,
-///     mirroring `instance_object_custom_trace`'s off-GC storage walk.
+///     mirroring `object_object_custom_trace`'s off-GC storage walk.
 ///
 /// Inert while heap types remain `malloc_typed` Box-immortal (the
 /// collector never fires this trace for an immortal object, and the
@@ -254,7 +254,7 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     );
 }
 
-/// Custom trace for `W_GeneratorObject` (generator.py GeneratorIterator).
+/// Custom trace for `GeneratorIterator` (generator.py GeneratorIterator).
 ///
 /// The suspended frame is held behind an opaque `frame_ptr`
 /// (`Box<PyFrame>`, off the active `CURRENT_FRAME` chain), so none of its
@@ -266,8 +266,7 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 /// suspended generator (e.g. a local held across a `yield` while
 /// `gc.collect()` runs) is not reclaimed.
 unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    let gen_obj =
-        unsafe { &mut *(obj_addr as *mut pyre_object::generatorobject::W_GeneratorObject) };
+    let gen_obj = unsafe { &mut *(obj_addr as *mut pyre_object::generator::GeneratorIterator) };
     if !gen_obj.frame_ptr.is_null() {
         let frame = gen_obj.frame_ptr as *mut PyFrame;
         let mut adapter = |slot: &mut majit_ir::GcRef| f(slot as *mut majit_ir::GcRef);
@@ -278,7 +277,7 @@ unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
 unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     // Strategy-side dispatch — `W_DictObject.dstorage: *mut u8` erases
     // the storage layout, so each strategy walks its own native shape
-    // through `DictStrategy::walk_gc_refs` (`dictstrategy.rs`).  PyPy's
+    // through `DictStrategy::walk_gc_refs` (`dictmultiobject.rs`).  PyPy's
     // counterpart is the per-`rerased`-pair GC trace fn generated from
     // `new_erasing_pair("name")` at translation time
     // (`rpython/rlib/rerased.py:24-72`); the trait method is pyre's
@@ -291,7 +290,7 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     unsafe { strategy.walk_gc_refs(w_dict, &mut adapter) };
 }
 
-/// Custom trace for `W_InstanceObject` (instance `map`+`storage`,
+/// Custom trace for `W_ObjectObject` (instance `map`+`storage`,
 /// `mapdict.py:907-910`).  The `storage` list is an off-GC
 /// `Box<Vec<PyObjectRef>>`, so — exactly as `dict_object_custom_trace`
 /// reaches the off-GC dict entries — this forwards each boxed
@@ -305,7 +304,7 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 /// equivalent of PyPy reaching the class through the traced
 /// `terminator.w_cls` (`mapdict.py:751-752`, a strong `_immutable_field_`).
 /// Pyre stores the class in the inline header word
-/// (`instanceobject.rs:24`, `typeptr` in `rclass.py`), so it must be
+/// (`objectobject.rs:24`, `typeptr` in `rclass.py`), so it must be
 /// forwarded here or an instance whose class is reachable only through
 /// it would have that class reclaimed once heap types become
 /// GC-managed.  Inert while heap types remain `malloc_typed`
@@ -313,9 +312,9 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 /// guard skips the non-managed type pointer — exactly as
 /// `generator_object_custom_trace` forwards `pycode` ahead of the
 /// code-object migration.
-unsafe fn instance_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+unsafe fn object_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let obj = obj_addr as pyre_object::PyObjectRef;
-    let inst = unsafe { &mut *(obj_addr as *mut pyre_object::instanceobject::W_InstanceObject) };
+    let inst = unsafe { &mut *(obj_addr as *mut pyre_object::objectobject::W_ObjectObject) };
     f(&mut inst.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
         obj,
@@ -437,9 +436,9 @@ use crate::jit::descr::{
     GC_INT_ARRAY_GC_TYPE_ID, JITFRAME_GC_TYPE_ID, OBJECT_GC_TYPE_ID, PY_OBJECT_ARRAY_GC_TYPE_ID,
     PYFRAME_GC_TYPE_ID, RANGE_ITER_GC_TYPE_ID, SPECIALISED_TUPLE_FF_GC_TYPE_ID,
     SPECIALISED_TUPLE_II_GC_TYPE_ID, SPECIALISED_TUPLE_OO_GC_TYPE_ID, VREF_GC_TYPE_ID,
-    W_BOOL_GC_TYPE_ID, W_BYTEARRAY_GC_TYPE_ID, W_BYTES_GC_TYPE_ID, W_CELL_GC_TYPE_ID,
-    W_CLASSMETHOD_GC_TYPE_ID, W_COUNT_GC_TYPE_ID, W_DICT_GC_TYPE_ID, W_DICT_PROXY_GC_TYPE_ID,
-    W_EXCEPTION_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID, W_GENERATOR_GC_TYPE_ID, W_INT_GC_TYPE_ID,
+    W_BASE_EXCEPTION_GC_TYPE_ID, W_BOOL_GC_TYPE_ID, W_BYTEARRAY_GC_TYPE_ID, W_BYTES_GC_TYPE_ID,
+    W_CELL_GC_TYPE_ID, W_CLASSMETHOD_GC_TYPE_ID, W_COUNT_GC_TYPE_ID, W_DICT_GC_TYPE_ID,
+    W_DICT_PROXY_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID, W_GENERATOR_GC_TYPE_ID, W_INT_GC_TYPE_ID,
     W_LIST_GC_TYPE_ID, W_LONG_GC_TYPE_ID, W_MEMBER_GC_TYPE_ID, W_METHOD_GC_TYPE_ID,
     W_MODULE_DICT_GC_TYPE_ID, W_MODULE_GC_TYPE_ID, W_PROPERTY_GC_TYPE_ID, W_REPEAT_GC_TYPE_ID,
     W_SEQ_ITER_GC_TYPE_ID, W_SET_GC_TYPE_ID, W_SLICE_GC_TYPE_ID, W_STATICMETHOD_GC_TYPE_ID,
@@ -604,7 +603,7 @@ thread_local! {
         ));
         debug_assert_eq!(w_bool_tid, W_BOOL_GC_TYPE_ID);
         let range_iter_tid = gc.register_type(TypeInfo::object_subclass(
-            std::mem::size_of::<pyre_object::rangeobject::W_RangeIterator>(),
+            std::mem::size_of::<pyre_object::functional::W_IntRangeIterator>(),
             object_tid,
         ));
         debug_assert_eq!(range_iter_tid, RANGE_ITER_GC_TYPE_ID);
@@ -797,11 +796,11 @@ thread_local! {
         );
         majit_gc::GcAllocator::register_vtable_for_type(
             &mut gc,
-            &pyre_object::rangeobject::RANGE_ITER_TYPE as *const _ as usize,
+            &pyre_object::functional::RANGE_ITER_TYPE as *const _ as usize,
             range_iter_tid,
         );
         pytype_to_tid.insert(
-            &pyre_object::rangeobject::RANGE_ITER_TYPE as *const _ as usize,
+            &pyre_object::functional::RANGE_ITER_TYPE as *const _ as usize,
             range_iter_tid,
         );
         majit_gc::GcAllocator::register_vtable_for_type(
@@ -875,7 +874,7 @@ thread_local! {
             &pyre_interpreter::function::BUILTIN_FUNCTION_TYPE as *const _ as usize,
             function_tid,
         );
-        // W_CellObject / W_MethodObject / W_SliceObject — typed payload
+        // Cell / Method / W_SliceObject — typed payload
         // via `#[pyre_class]`.  Pre-registered ahead of the foreign-
         // pytype loop because that loop's `size_of::<PyObject>()`
         // approximation drops the GC ptr offsets, leaving cells / bound
@@ -883,13 +882,13 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::cellobject::W_CellObject
+            <pyre_object::nestedscope::Cell
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::methodobject::W_MethodObject
+            <pyre_object::function::Method
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         register_pyre_class(
@@ -905,49 +904,49 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::superobject::W_Super
+            <pyre_object::descriptor::W_Super
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
-        // W_PropertyObject (3 PyObjectRef fields: fget/fset/fdel),
-        // W_StaticMethodObject and W_ClassMethodObject (1 PyObjectRef
+        // W_Property (3 PyObjectRef fields: fget/fset/fdel),
+        // StaticMethod and ClassMethod (1 PyObjectRef
         // field each: w_function) — typed payload via `#[pyre_class]`.
         // Pre-registered ahead of the foreign-pytype loop so the GC
         // walker reaches the inline descriptor refs.
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::propertyobject::W_PropertyObject
+            <pyre_object::descriptor::W_Property
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::propertyobject::W_StaticMethodObject
+            <pyre_object::function::StaticMethod
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::propertyobject::W_ClassMethodObject
+            <pyre_object::function::ClassMethod
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
-        // W_UnionType (PEP 604 `X | Y`) — typed payload via `#[pyre_class]`.
+        // UnionType (PEP 604 `X | Y`) — typed payload via `#[pyre_class]`.
         // Pre-registered ahead of the foreign-pytype loop because that
         // loop's `size_of::<PyObject>()` approximation drops gc_ptr_offsets,
         // leaving live unions unscanned across a minor collection.
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::unionobject::W_UnionType
+            <pyre_object::_pypy_generic_alias::UnionType
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
-        // W_SeqIterator (list/tuple iterator) — typed payload via
+        // W_SeqIterObject (list/tuple iterator) — typed payload via
         // `#[pyre_class]`.  Pre-registered ahead of the foreign-pytype
         // loop so the GC walker reaches the inline `seq` field.
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::rangeobject::W_SeqIterator
+            <pyre_object::iterobject::W_SeqIterObject
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_Count / W_Repeat (`itertools.count` / `itertools.repeat`) —
@@ -957,13 +956,13 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::itertoolsmodule::W_Count
+            <pyre_object::interp_itertools::W_Count
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::itertoolsmodule::W_Repeat
+            <pyre_object::interp_itertools::W_Repeat
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_MemberDescr (`__slots__` member descriptor) carries one
@@ -974,7 +973,7 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::memberobject::W_MemberDescr
+            <pyre_object::typedef::W_MemberDescr
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_BytesObject (immutable byte sequence) carries a raw
@@ -1059,7 +1058,7 @@ thread_local! {
             &pyre_object::setobject::FROZENSET_TYPE as *const _ as usize,
             w_set_tid,
         );
-        // W_ExceptionObject carries an `ExcKind` tag, a `*mut String`
+        // W_BaseException carries an `ExcKind` tag, a `*mut String`
         // pointer (raw heap, not a `PyObjectRef`), and a `args_w`
         // tuple `PyObjectRef` (`interp_exceptions.py:123-124
         // W_BaseException.descr_init` parity — the constructor stores
@@ -1067,58 +1066,58 @@ thread_local! {
         // `args_w` offset so the GC traces it across minor
         // collections.
         let w_exception_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::excobject::W_ExceptionObject>(),
+            std::mem::size_of::<pyre_object::interp_exceptions::W_BaseException>(),
             object_tid,
-            pyre_object::excobject::W_EXCEPTION_GC_PTR_OFFSETS.to_vec(),
+            pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_PTR_OFFSETS.to_vec(),
         ));
-        debug_assert_eq!(w_exception_tid, W_EXCEPTION_GC_TYPE_ID);
+        debug_assert_eq!(w_exception_tid, W_BASE_EXCEPTION_GC_TYPE_ID);
         // Pre-register every per-ExcKind PyType to the same
-        // `W_ExceptionObject` GC tid — they share one storage layout
+        // `W_BaseException` GC tid — they share one storage layout
         // (the per-kind discriminator lives in `ob_type`, payload is
         // identical) so the GC must size them identically.  The
         // `all_foreign_pytypes` loop below skips entries already in
         // `pytype_to_tid`, so this pre-registration wins over its
         // generic `object_subclass(sizeof(PyObject), parent_tid)`
-        // default which would underallocate `W_ExceptionObject`.
-        for kind_idx in 0u8..=(pyre_object::excobject::ExcKind::SyntaxError as u8) {
+        // default which would underallocate `W_BaseException`.
+        for kind_idx in 0u8..=(pyre_object::interp_exceptions::ExcKind::SyntaxError as u8) {
             // Round-trip the byte through the enum so we don't depend
             // on unsafe transmute; every value in [0, SyntaxError] is
             // a valid `ExcKind` variant by construction.
             let kind = match kind_idx {
-                0 => pyre_object::excobject::ExcKind::BaseException,
-                1 => pyre_object::excobject::ExcKind::Exception,
-                2 => pyre_object::excobject::ExcKind::TypeError,
-                3 => pyre_object::excobject::ExcKind::ValueError,
-                4 => pyre_object::excobject::ExcKind::ZeroDivisionError,
-                5 => pyre_object::excobject::ExcKind::NameError,
-                6 => pyre_object::excobject::ExcKind::IndexError,
-                7 => pyre_object::excobject::ExcKind::KeyError,
-                8 => pyre_object::excobject::ExcKind::AttributeError,
-                9 => pyre_object::excobject::ExcKind::RuntimeError,
-                10 => pyre_object::excobject::ExcKind::StopIteration,
-                11 => pyre_object::excobject::ExcKind::OverflowError,
-                12 => pyre_object::excobject::ExcKind::ArithmeticError,
-                13 => pyre_object::excobject::ExcKind::ImportError,
-                14 => pyre_object::excobject::ExcKind::NotImplementedError,
-                15 => pyre_object::excobject::ExcKind::AssertionError,
-                16 => pyre_object::excobject::ExcKind::ReferenceError,
-                17 => pyre_object::excobject::ExcKind::GeneratorExit,
-                18 => pyre_object::excobject::ExcKind::RecursionError,
-                19 => pyre_object::excobject::ExcKind::OSError,
-                20 => pyre_object::excobject::ExcKind::FileNotFoundError,
-                21 => pyre_object::excobject::ExcKind::UnicodeDecodeError,
-                22 => pyre_object::excobject::ExcKind::UnicodeEncodeError,
-                23 => pyre_object::excobject::ExcKind::SystemExit,
-                24 => pyre_object::excobject::ExcKind::MemoryError,
-                25 => pyre_object::excobject::ExcKind::SystemError,
-                26 => pyre_object::excobject::ExcKind::LookupError,
-                27 => pyre_object::excobject::ExcKind::UnicodeError,
-                28 => pyre_object::excobject::ExcKind::UnicodeTranslateError,
-                29 => pyre_object::excobject::ExcKind::ModuleNotFoundError,
-                30 => pyre_object::excobject::ExcKind::SyntaxError,
+                0 => pyre_object::interp_exceptions::ExcKind::BaseException,
+                1 => pyre_object::interp_exceptions::ExcKind::Exception,
+                2 => pyre_object::interp_exceptions::ExcKind::TypeError,
+                3 => pyre_object::interp_exceptions::ExcKind::ValueError,
+                4 => pyre_object::interp_exceptions::ExcKind::ZeroDivisionError,
+                5 => pyre_object::interp_exceptions::ExcKind::NameError,
+                6 => pyre_object::interp_exceptions::ExcKind::IndexError,
+                7 => pyre_object::interp_exceptions::ExcKind::KeyError,
+                8 => pyre_object::interp_exceptions::ExcKind::AttributeError,
+                9 => pyre_object::interp_exceptions::ExcKind::RuntimeError,
+                10 => pyre_object::interp_exceptions::ExcKind::StopIteration,
+                11 => pyre_object::interp_exceptions::ExcKind::OverflowError,
+                12 => pyre_object::interp_exceptions::ExcKind::ArithmeticError,
+                13 => pyre_object::interp_exceptions::ExcKind::ImportError,
+                14 => pyre_object::interp_exceptions::ExcKind::NotImplementedError,
+                15 => pyre_object::interp_exceptions::ExcKind::AssertionError,
+                16 => pyre_object::interp_exceptions::ExcKind::ReferenceError,
+                17 => pyre_object::interp_exceptions::ExcKind::GeneratorExit,
+                18 => pyre_object::interp_exceptions::ExcKind::RecursionError,
+                19 => pyre_object::interp_exceptions::ExcKind::OSError,
+                20 => pyre_object::interp_exceptions::ExcKind::FileNotFoundError,
+                21 => pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError,
+                22 => pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError,
+                23 => pyre_object::interp_exceptions::ExcKind::SystemExit,
+                24 => pyre_object::interp_exceptions::ExcKind::MemoryError,
+                25 => pyre_object::interp_exceptions::ExcKind::SystemError,
+                26 => pyre_object::interp_exceptions::ExcKind::LookupError,
+                27 => pyre_object::interp_exceptions::ExcKind::UnicodeError,
+                28 => pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError,
+                29 => pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError,
+                30 => pyre_object::interp_exceptions::ExcKind::SyntaxError,
                 _ => unreachable!(),
             };
-            let pytype_ptr = pyre_object::excobject::exc_kind_to_pytype(kind)
+            let pytype_ptr = pyre_object::interp_exceptions::exc_kind_to_pytype(kind)
                 as *const _ as usize;
             majit_gc::GcAllocator::register_vtable_for_type(
                 &mut gc,
@@ -1127,7 +1126,7 @@ thread_local! {
             );
             pytype_to_tid.insert(pytype_ptr, w_exception_tid);
         }
-        // W_GeneratorObject carries `frame_ptr: *mut u8` (opaque
+        // GeneratorIterator carries `frame_ptr: *mut u8` (opaque
         // PyFrame pointer, owned by the generator) plus three bools.
         // The suspended frame is held behind an opaque `frame_ptr`; a
         // custom trace visits the frame's `pycode` so a code object
@@ -1136,18 +1135,18 @@ thread_local! {
         // remain reachable only through the PyFrame indirection
         // (pre-existing limitation).
         let w_generator_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
-            std::mem::size_of::<pyre_object::generatorobject::W_GeneratorObject>(),
+            std::mem::size_of::<pyre_object::generator::GeneratorIterator>(),
             object_tid,
             generator_object_custom_trace,
         ));
         debug_assert_eq!(w_generator_tid, W_GENERATOR_GC_TYPE_ID);
         majit_gc::GcAllocator::register_vtable_for_type(
             &mut gc,
-            &pyre_object::generatorobject::GENERATOR_TYPE as *const _ as usize,
+            &pyre_object::generator::GENERATOR_TYPE as *const _ as usize,
             w_generator_tid,
         );
         pytype_to_tid.insert(
-            &pyre_object::generatorobject::GENERATOR_TYPE as *const _ as usize,
+            &pyre_object::generator::GENERATOR_TYPE as *const _ as usize,
             w_generator_tid,
         );
         // W_TypeObject carries one inline `PyObjectRef` (`bases`)
@@ -1202,15 +1201,15 @@ thread_local! {
             w_long_tid,
         );
         pytype_to_tid.insert(&pyre_object::LONG_TYPE as *const _ as usize, w_long_tid);
-        // W_ModuleObject carries `name: *mut String` (raw heap),
+        // Module carries `name: *mut String` (raw heap),
         // `dict: *mut u8` (DictStorage*, non-PyObject), and
         // `w_dict: PyObjectRef` (aliased `W_DictObject`,
         // `pypy/interpreter/module.py:22 self.w_dict = w_dict`).  Only
         // the last is GC-traceable.
         let w_module_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::moduleobject::W_ModuleObject>(),
+            std::mem::size_of::<pyre_object::module::Module>(),
             object_tid,
-            pyre_object::moduleobject::W_MODULE_GC_PTR_OFFSETS.to_vec(),
+            pyre_object::module::W_MODULE_GC_PTR_OFFSETS.to_vec(),
         ));
         debug_assert_eq!(w_module_tid, W_MODULE_GC_TYPE_ID);
         majit_gc::GcAllocator::register_vtable_for_type(
@@ -1240,7 +1239,7 @@ thread_local! {
         //     produce nested nursery `PyFrame`s the parent pointer
         //     must be forwarded to the new address.
         // Excluded: `execution_context` (Rc::into_raw, persistent),
-        // `pycode` (static W_CodeObject), `debugdata` / `lastblock`
+        // `pycode` (static PyCode), `debugdata` / `lastblock`
         // (heap-allocated, not GC), `w_globals` (Box-allocated
         // DictStorage, not GC).
         //
@@ -1295,27 +1294,27 @@ thread_local! {
             &pyre_object::MAPPING_PROXY_TYPE as *const _ as usize,
             w_dict_proxy_tid,
         );
-        // `pypy/objspace/std/dictmultiobject.py:449-470` — three
-        // sibling W_DictMultiView* classes (Keys / Values / Items)
-        // each carry a `w_dict` PyObjectRef back to the source.  Pyre
-        // folds the three into one `W_DictView` struct + tag; all
+        // `pypy/objspace/std/dictmultiobject.py` — three sibling
+        // W_DictView*Object classes (Keys / Values / Items) each
+        // carry a `w_dict` PyObjectRef back to the source.  Pyre
+        // folds the three into one `W_DictViewObject` struct + tag; all
         // three Python-visible PyTypes (`DICT_KEYS_TYPE` /
         // `DICT_VALUES_TYPE` / `DICT_ITEMS_TYPE`) share the same tid
         // / vtable / size / offsets so the view's `w_dict` slot is
         // traced regardless of which kind it represents.
         let w_dict_view_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::dictviewobject::W_DictView>(),
+            std::mem::size_of::<pyre_object::dictmultiobject::W_DictViewObject>(),
             object_tid,
-            pyre_object::dictviewobject::W_DICT_VIEW_GC_PTR_OFFSETS.to_vec(),
+            pyre_object::dictmultiobject::W_DICT_VIEW_GC_PTR_OFFSETS.to_vec(),
         ));
         debug_assert_eq!(
             w_dict_view_tid,
-            pyre_object::dictviewobject::W_DICT_VIEW_GC_TYPE_ID
+            pyre_object::dictmultiobject::W_DICT_VIEW_GC_TYPE_ID
         );
         for tp in [
-            &pyre_object::dictviewobject::DICT_KEYS_TYPE,
-            &pyre_object::dictviewobject::DICT_VALUES_TYPE,
-            &pyre_object::dictviewobject::DICT_ITEMS_TYPE,
+            &pyre_object::dictmultiobject::DICT_KEYS_TYPE,
+            &pyre_object::dictmultiobject::DICT_VALUES_TYPE,
+            &pyre_object::dictmultiobject::DICT_ITEMS_TYPE,
         ] {
             majit_gc::GcAllocator::register_vtable_for_type(
                 &mut gc,
@@ -1326,7 +1325,7 @@ thread_local! {
         }
         // `pypy/interpreter/typedef.py:312-326 class GetSetProperty`
         // — fget/fset/fdel/doc/reqcls/name are W_Root references.
-        // Pyre's `W_GetSetProperty` ports them as inline fields; the
+        // Pyre's `GetSetProperty` ports them as inline fields; the
         // GC must trace each so descriptors built before
         // `init_typeobjects` (e.g. function.__doc__ / __annotations__)
         // survive minor collection.  Registered after the dict-view
@@ -1335,7 +1334,7 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::getsetproperty::W_GetSetProperty
+            <pyre_object::typedef::GetSetProperty
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // resume.py:1444-1447 allocate_array(length, arraydescr, clear)
@@ -1362,13 +1361,13 @@ thread_local! {
         debug_assert_eq!(gc_float_array_tid, GC_FLOAT_ARRAY_GC_TYPE_ID);
         // `pypy/interpreter/pycode.py:52 class PyCode(W_Root)` — code
         // objects are normal GC heap objects in PyPy.  Pre-register
-        // `W_CodeObject` here, immediately after the GcArray tids and
+        // `PyCode` here, immediately after the GcArray tids and
         // before the foreign-pytype loop, so it takes tid 43 and the
         // loop skips `CODE_TYPE` via the `pytype_to_tid.contains_key`
         // guard below.  This keeps the net register-call count up to
         // `W_MODULE_DICT_GC_TYPE_ID = 48` unchanged (one explicit
         // registration here, one fewer from the loop), so no downstream
-        // hardcoded tid shifts.  `W_CodeObject` carries only raw /
+        // hardcoded tid shifts.  `PyCode` carries only raw /
         // non-GC pointers today (`code_ptr`, `w_globals`,
         // `globals_caches`), so it registers with empty gc_ptr offsets;
         // it has no `w_globals` PyObjectRef slot to trace.
@@ -1377,7 +1376,7 @@ thread_local! {
         // — the collector never reaches a code object until `w_code_new`
         // is switched to `try_gc_alloc_stable`.
         let w_code_tid = gc.register_type(TypeInfo::object_subclass(
-            std::mem::size_of::<pyre_interpreter::pycode::W_CodeObject>(),
+            std::mem::size_of::<pyre_interpreter::pycode::PyCode>(),
             object_tid,
         ));
         debug_assert_eq!(w_code_tid, pyre_interpreter::pycode::W_CODE_GC_TYPE_ID);
@@ -1390,13 +1389,13 @@ thread_local! {
             &pyre_interpreter::pycode::CODE_TYPE as *const _ as usize,
             w_code_tid,
         );
-        // W_InstanceObject's PyType (`INSTANCE_TYPE`) stays bound to
+        // W_ObjectObject's PyType (`INSTANCE_TYPE`) stays bound to
         // `object_tid` (`OBJECT_GC_TYPE_ID = 0`) in `pytype_to_tid`:
         // it is the `object` root, and giving the *vtable* a separate
         // preorder id would corrupt the `subclass_range` hierarchy
         // (disjoint sub-ranges for one root, breaking `object ⊇ int` —
         // see eval::tests::test_subclass_range_preorder_bounds). The
-        // dedicated `W_INSTANCE_GC_TYPE_ID` registered above is a GC
+        // dedicated `W_OBJECT_OBJECT_GC_TYPE_ID` registered above is a GC
         // *header* id (size + custom trace), an independent axis that
         // the collector reads off the header `w_instance_new` stamps;
         // it is deliberately absent from `pytype_to_tid`.
@@ -1481,13 +1480,13 @@ thread_local! {
         // internal-only; allocate distinct GC tids so the bump
         // allocator can size them independently.
         //
-        // `W_ObjectMutableCell.w_value` is a live `PyObjectRef` field
+        // `ObjectMutableCell.w_value` is a live `PyObjectRef` field
         // that must be traced during minor collection — otherwise the
         // wrapped value could be reclaimed while a still-installed
-        // cell holds the pointer.  Mirrors `W_CellObject`'s
-        // `contents` registration (`cellobject.rs:42`).
+        // cell holds the pointer.  Mirrors `Cell`'s
+        // `contents` registration (`nestedscope.rs:42`).
         let w_object_mutable_cell_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::celldict::W_ObjectMutableCell>(),
+            std::mem::size_of::<pyre_object::celldict::ObjectMutableCell>(),
             object_tid,
             pyre_object::celldict::W_OBJECT_MUTABLE_CELL_GC_PTR_OFFSETS.to_vec(),
         ));
@@ -1505,7 +1504,7 @@ thread_local! {
             w_object_mutable_cell_tid,
         );
         let w_int_mutable_cell_tid = gc.register_type(TypeInfo::object_subclass(
-            std::mem::size_of::<pyre_object::celldict::W_IntMutableCell>(),
+            std::mem::size_of::<pyre_object::celldict::IntMutableCell>(),
             object_tid,
         ));
         debug_assert_eq!(
@@ -1540,30 +1539,30 @@ thread_local! {
             majit_gc::weakref::WEAKPTR_OFFSET,
             "weakptr field must sit at the offset majit_gc expects",
         );
-        // W_GcWeakref — instance-dict-slot wrapper around `*mut Weakref`.
+        // GcWeakrefBox — instance-dict-slot wrapper around `*mut Weakref`.
         // Carries a single inline GcRef-shaped field (`inner`) so the
         // Weakref struct itself survives across collections; the
         // weakptr inside the Weakref is invalidated separately by the
         // collector's invalidate_*_weakrefs hooks.
-        let w_gc_weakref_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::weakref::W_GcWeakref>(),
+        let gc_weakref_box_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+            std::mem::size_of::<pyre_object::weakref::GcWeakrefBox>(),
             object_tid,
-            pyre_object::weakref::W_GC_WEAKREF_GC_PTR_OFFSETS.to_vec(),
+            pyre_object::weakref::GC_WEAKREF_BOX_GC_PTR_OFFSETS.to_vec(),
         ));
         debug_assert_eq!(
-            w_gc_weakref_tid,
-            pyre_object::weakref::W_GC_WEAKREF_GC_TYPE_ID,
+            gc_weakref_box_tid,
+            pyre_object::weakref::GC_WEAKREF_BOX_GC_TYPE_ID,
         );
         majit_gc::GcAllocator::register_vtable_for_type(
             &mut gc,
-            &pyre_object::weakref::GC_WEAKREF_TYPE as *const _ as usize,
-            w_gc_weakref_tid,
+            &pyre_object::weakref::GC_WEAKREF_BOX_TYPE as *const _ as usize,
+            gc_weakref_box_tid,
         );
         pytype_to_tid.insert(
-            &pyre_object::weakref::GC_WEAKREF_TYPE as *const _ as usize,
-            w_gc_weakref_tid,
+            &pyre_object::weakref::GC_WEAKREF_BOX_TYPE as *const _ as usize,
+            gc_weakref_box_tid,
         );
-        // `W_InstanceObject` keeps its attributes in an off-GC
+        // `W_ObjectObject` keeps its attributes in an off-GC
         // `Box<Vec<PyObjectRef>>` `storage` list reachable only via a
         // custom trace (instance map+storage, `mapdict.py:907-910`).
         // Register a dedicated GC type id — stamped into the GC header
@@ -1574,18 +1573,18 @@ thread_local! {
         // (read by the collector for size + custom trace) and the
         // vtable preorder id are independent axes, so this id is NOT
         // inserted into `pytype_to_tid` and gets no `register_vtable`.
-        let w_instance_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
-            pyre_object::instanceobject::W_INSTANCE_OBJECT_SIZE,
+        let w_object_object_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+            pyre_object::objectobject::W_OBJECT_OBJECT_SIZE,
             object_tid,
-            instance_object_custom_trace,
+            object_object_custom_trace,
         ));
         debug_assert_eq!(
-            w_instance_tid,
-            pyre_object::instanceobject::W_INSTANCE_GC_TYPE_ID,
+            w_object_object_tid,
+            pyre_object::objectobject::W_OBJECT_OBJECT_GC_TYPE_ID,
         );
         // W_ComplexObject carries two f64s after the `PyObject` header and
         // no managed pointers — a GC leaf like W_FloatObject.  Registered
-        // immediately after the last hardcoded-constant tid (instance = 53)
+        // immediately after the last hardcoded-constant tid (W_ObjectObject = 53)
         // so its fixed id 54 precedes the auto-numbered `#[pyre_class]` /
         // per-ExcKind tids registered below.  Bound to `COMPLEX_TYPE` so the
         // collector reads the correct size + leaf trace when a managed
@@ -1621,8 +1620,8 @@ thread_local! {
         );
         // Per-`ExcKind` GC type ids.  The pre-registration loop at the
         // top of this function mapped every exception PyType to a
-        // single `W_EXCEPTION_GC_TYPE_ID` so `new_with_vtable` knows
-        // the `W_ExceptionObject` payload size for allocation; the
+        // single `W_BASE_EXCEPTION_GC_TYPE_ID` so `new_with_vtable` knows
+        // the `W_BaseException` payload size for allocation; the
         // shared tid also meant `gc.subclass_range(any_exception_
         // pytype)` returned the same range for every subclass, which
         // collapses RPython's per-class `subclassrange_{min,max}`
@@ -1634,8 +1633,8 @@ thread_local! {
         // PYTRACEBACK_GC_TYPE_ID = 43) or the W_MODULE_DICT /
         // W_*MUTABLE_CELL tids registered above, register a fresh tid
         // per `ExcKind` (except BaseException, which keeps
-        // `W_EXCEPTION_GC_TYPE_ID`) AFTER all hardcoded registrations.
-        // Each new TypeInfo carries the W_ExceptionObject layout
+        // `W_BASE_EXCEPTION_GC_TYPE_ID`) AFTER all hardcoded registrations.
+        // Each new TypeInfo carries the W_BaseException layout
         // (size + GC ptr offsets) so allocation still works, and the
         // correct `parent_typeid` so `freeze_types` builds the
         // preorder subclass tree.  Then `register_vtable_for_type`
@@ -1645,9 +1644,9 @@ thread_local! {
         // Order is topological: each entry's `parent_kind` is already
         // registered by the time the entry is reached.  `None` parent
         // means "direct child of BaseException" — the parent_tid is
-        // `W_EXCEPTION_GC_TYPE_ID`.
-        use pyre_object::excobject::{
-            EXC_KIND_COUNT, ExcKind, W_EXCEPTION_GC_PTR_OFFSETS, exc_kind_to_pytype,
+        // `W_BASE_EXCEPTION_GC_TYPE_ID`.
+        use pyre_object::interp_exceptions::{
+            EXC_KIND_COUNT, ExcKind, W_BASE_EXCEPTION_GC_PTR_OFFSETS, exc_kind_to_pytype,
         };
         let exc_hierarchy: &[(ExcKind, Option<ExcKind>)] = &[
             (ExcKind::Exception, None),
@@ -1693,20 +1692,20 @@ thread_local! {
             (ExcKind::SystemError, Some(ExcKind::Exception)),
         ];
         // Per-kind tid lookup, seeded so BaseException resolves to
-        // `W_EXCEPTION_GC_TYPE_ID`; unmapped slots also fall back to
+        // `W_BASE_EXCEPTION_GC_TYPE_ID`; unmapped slots also fall back to
         // it which is harmless because every reachable kind is
         // assigned its own tid by the loop below.
         let mut per_exc_tid: [u32; EXC_KIND_COUNT] =
-            [W_EXCEPTION_GC_TYPE_ID; EXC_KIND_COUNT];
+            [W_BASE_EXCEPTION_GC_TYPE_ID; EXC_KIND_COUNT];
         per_exc_tid[ExcKind::BaseException as u8 as usize] = w_exception_tid;
         for (kind, parent_kind) in exc_hierarchy {
             let parent_tid = parent_kind
                 .map(|p| per_exc_tid[p as u8 as usize])
-                .unwrap_or(W_EXCEPTION_GC_TYPE_ID);
+                .unwrap_or(W_BASE_EXCEPTION_GC_TYPE_ID);
             let new_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-                std::mem::size_of::<pyre_object::excobject::W_ExceptionObject>(),
+                std::mem::size_of::<pyre_object::interp_exceptions::W_BaseException>(),
                 parent_tid,
-                W_EXCEPTION_GC_PTR_OFFSETS.to_vec(),
+                W_BASE_EXCEPTION_GC_PTR_OFFSETS.to_vec(),
             ));
             per_exc_tid[*kind as u8 as usize] = new_tid;
             let pytype_ptr = exc_kind_to_pytype(*kind) as *const _ as usize;
@@ -1725,22 +1724,22 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::sreobject::W_SRE_Pattern
+            <pyre_object::interp_sre::W_SRE_Pattern
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::sreobject::W_SRE_Match
+            <pyre_object::interp_sre::W_SRE_Match
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::sreobject::W_SRE_Scanner
+            <pyre_object::interp_sre::W_SRE_Scanner
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
-        // W_GenericAlias (`types.GenericAlias`, PEP 585) — typed payload
+        // GenericAlias (`types.GenericAlias`, PEP 585) — typed payload
         // via `#[pyre_class]` in AUTO-ID mode.  Its three `PyObjectRef`
         // fields (origin/args/parameters) are traced edges; registered at
         // the tail of the tid chain alongside the `_sre` types so no
@@ -1749,7 +1748,7 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::genericaliasobject::W_GenericAlias
+            <pyre_object::_pypy_generic_alias::GenericAlias
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_Pickler / W_Unpickler (`_pickle` accelerator) — typed payloads
@@ -1785,13 +1784,13 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_interpreter::module::_pickle::W_PicklerMemoProxy
+            <pyre_interpreter::module::_pickle::PicklerMemoProxy
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_interpreter::module::_pickle::W_UnpicklerMemoProxy
+            <pyre_interpreter::module::_pickle::UnpicklerMemoProxy
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_ReversedIterator (`reversed`) — typed payload via `#[pyre_class]`
@@ -1800,7 +1799,7 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::reversedobject::W_ReversedIterator
+            <pyre_object::functional::W_ReversedIterator
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_Filter (`filter`) — AUTO-ID; its `w_predicate` / `w_iterable`
@@ -1808,21 +1807,21 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::filterobject::W_Filter
+            <pyre_object::functional::W_Filter
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_Map (`map`) — AUTO-ID; `w_fun` / `w_iterators` are traced edges.
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::mapobject::W_Map
+            <pyre_object::functional::W_Map
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_Zip (`zip`) — AUTO-ID; `w_iterators` is a traced edge.
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::zipobject::W_Zip
+            <pyre_object::functional::W_Zip
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_Cycle (`itertools.cycle`) — typed payload via `#[pyre_class]` in
@@ -1833,10 +1832,10 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::itertoolsmodule::W_Cycle
+            <pyre_object::interp_itertools::W_Cycle
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
-        // W_ArrayObject (`array.array`) — typed payload via `#[pyre_class]`
+        // W_Array (`array.array`) — typed payload via `#[pyre_class]`
         // in AUTO-ID mode; its elements are unboxed scalars in an off-GC
         // `*mut Vec<u8>` buffer (the bytearray storage model), so the
         // descriptor reports zero traced pointer fields.  Tail of the tid
@@ -1844,7 +1843,7 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::array_object::W_ArrayObject
+            <pyre_object::interp_array::W_Array
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // rclass.py:340-346 — assign subclassrange_{min,max} to each
@@ -2400,7 +2399,7 @@ pub fn _call_not_in_trace(
 
 #[inline]
 fn green_key_from_pycode(next_instr: usize, w_pycode: pyre_object::PyObjectRef) -> Option<u64> {
-    // Safety: this follows existing wrappers that treat `W_CodeObject`
+    // Safety: this follows existing wrappers that treat `PyCode`
     // as an owned pointer to a `CodeObject`.
     let code_ptr = unsafe { pyre_interpreter::pycode::w_code_get_ptr(w_pycode) };
     if code_ptr.is_null() {

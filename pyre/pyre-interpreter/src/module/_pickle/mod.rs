@@ -24,8 +24,8 @@ use crate::PyError;
 mod pickler;
 mod unpickler;
 
-pub use pickler::{W_Pickler, W_PicklerMemoProxy};
-pub use unpickler::{W_Unpickler, W_UnpicklerMemoProxy};
+pub use pickler::{PicklerMemoProxy, W_Pickler};
+pub use unpickler::{UnpicklerMemoProxy, W_Unpickler};
 
 pub(crate) const HIGHEST_PROTOCOL: i64 = 5;
 pub(crate) const DEFAULT_PROTOCOL: i64 = 5;
@@ -425,7 +425,7 @@ crate::py_module! {
         "Unpickler" => unpickler::type_object(),
         // Shared singleton with `__pypy__.PickleBuffer`; `pickle.py` does
         // `from _pickle import PickleBuffer` to set `_HAVE_PICKLE_BUFFER`.
-        "PickleBuffer" => crate::module::__pypy__::pickle_buffer::type_object(),
+        "PickleBuffer" => crate::module::__pypy__::interp_buffer::type_object(),
     },
     exceptions: {
         "PickleError" => crate::builtins::lookup_exc_class("Exception")

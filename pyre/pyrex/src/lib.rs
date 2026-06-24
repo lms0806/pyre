@@ -102,7 +102,7 @@ pub fn main_entry(binary_name: &'static str) {
     // spawned below, where they can interrupt blocking syscalls.  The
     // interpreter thread inherits this mask and unblocks them at the top of
     // `real_main`.
-    pyre_interpreter::module::_signal::signalstate::block_async_signals_on_origin_thread();
+    pyre_interpreter::module::signal::signalstate::block_async_signals_on_origin_thread();
     std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(|| real_main(binary_name))
@@ -115,7 +115,7 @@ fn real_main(binary_name: &str) {
     // Receive process-directed async signals on this thread (see
     // `main_entry`) so blocking syscalls here are interrupted by Ctrl-C /
     // alarms.
-    pyre_interpreter::module::_signal::signalstate::unblock_async_signals_on_interp_thread();
+    pyre_interpreter::module::signal::signalstate::unblock_async_signals_on_interp_thread();
     // Suppress panic messages for the optimizer's silent control-flow panics
     // (InvalidLoop, SpeculativeError) — these are caught by catch_unwind in
     // the JIT compile paths but the default panic hook still prints to stderr,
@@ -254,7 +254,7 @@ fn setup_exec_context() -> Rc<PyExecutionContext> {
     set_last_exec_ctx(Rc::as_ptr(&execution_context));
     unsafe {
         let ec_ptr = Rc::as_ptr(&execution_context) as *mut PyExecutionContext;
-        pyre_interpreter::module::_signal::interp_signal::install_signal_handling(&mut *ec_ptr);
+        pyre_interpreter::module::signal::interp_signal::install_signal_handling(&mut *ec_ptr);
     }
     execution_context
 }
@@ -279,7 +279,7 @@ fn run_module(module: &str) {
     );
     let namespace = Box::into_raw(namespace);
     let canonical = pyre_interpreter::baseobjspace::dict_storage_to_dict(namespace);
-    let main_module = pyre_object::moduleobject::w_module_new_aliasing_dict(
+    let main_module = pyre_object::module::w_module_new_aliasing_dict(
         "__main__",
         namespace as *mut u8,
         canonical,
@@ -344,7 +344,7 @@ fn run_source(source: &str, mode: Mode, filename: &str) {
     // `function.__globals__` (PyPy `module.py:77 Module.getdict()`
     // parity).
     let canonical = frame.get_w_globals();
-    let main_module = pyre_object::moduleobject::w_module_new_aliasing_dict(
+    let main_module = pyre_object::module::w_module_new_aliasing_dict(
         "__main__",
         unsafe { pyre_object::w_dict_get_dict_storage_proxy(canonical) },
         canonical,

@@ -37,6 +37,7 @@ use crate::translator::rtyper::llannotation::lltype_to_annotation;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _ptr, LowLevelType, LowLevelValue, PtrTarget, getfunctionptr,
 };
+use crate::translator::rtyper::lltypesystem::rgcref::GCRefRepr;
 use crate::translator::rtyper::rclass::{
     CLASSTYPE, Flavor, InstanceRepr, InstanceReprKey, NONGCOBJECTPTR, OBJECTPTR, RootClassRepr,
     getinstancerepr,
@@ -370,6 +371,12 @@ pub enum PbcReprKey {
     Access(usize),
 }
 
+// RPython's `RTyperBackend` / `GenCBackend` / `LLInterpBackend` backend
+// selection (`rtyper.py`) is intentionally absent: pyre emits native code via
+// Charon/LLBC + Cranelift/dynasm and never generates C nor LL-interprets a
+// whole program, so the rtyper is a single fixed pipeline with no backend to
+// select.
+
 pub struct RPythonTyper {
     /// RPython `self.annotator`.
     ///
@@ -396,6 +403,10 @@ pub struct RPythonTyper {
     /// (rtyper.py:59). `None` classdef mirrors upstream Python's ability
     /// to use `None` as a dict key (option 3A from the porting plan).
     pub instance_reprs: RefCell<HashMap<InstanceReprKey, Arc<InstanceRepr>>>,
+    /// RPython `self.gcrefreprcache = {}` (`rtyper.py:60`) — used by
+    /// `rgcref.GCRefRepr.make(r_base, cache)` when container reprs
+    /// request `externalvsinternal(..., gcref=True)`.
+    pub gcrefreprcache: RefCell<HashMap<usize, Arc<GCRefRepr>>>,
     /// RPython `self.exceptiondata = ExceptionData(self)` assigned in
     /// `__init__` (rtyper.py:71). Stays `None` until
     /// [`RPythonTyper::initialize_exceptiondata`] runs.
@@ -516,6 +527,7 @@ impl RPythonTyper {
             annotator: Rc::downgrade(annotator),
             rootclass_repr: RefCell::new(None),
             instance_reprs: RefCell::new(HashMap::new()),
+            gcrefreprcache: RefCell::new(HashMap::new()),
             exceptiondata: RefCell::new(None),
             self_weak: RefCell::new(Weak::new()),
             already_seen: RefCell::new(HashMap::new()),
@@ -7137,16 +7149,19 @@ mod tests {
         // `MissingRTypeOperation` so cascading callers can anchor on
         // the upstream module name in the error message.
         //
-        // `SomeByteArray` is the still-unported witness variant
-        // (rbytearray.py port not landed).
-        use crate::annotator::model::SomeByteArray;
+        // `SomeObject` is the still-unported witness variant: it has
+        // no direct rtyper module in upstream.
+        use crate::annotator::model::{KnownType, SomeObjectBase};
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
         let err = rtyper
-            .getrepr(&SomeValue::ByteArray(SomeByteArray::new(false)))
+            .getrepr(&SomeValue::Object(SomeObjectBase::new(
+                KnownType::Other,
+                false,
+            )))
             .unwrap_err();
         assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("rbytearray.py"));
+        assert!(err.to_string().contains("SomeObject.rtyper_makerepr"));
     }
 
     #[test]
@@ -7325,15 +7340,15 @@ mod tests {
         // silently fail, the setup path returns the structured
         // TyperError so callers know which upstream module to land.
         //
-        // `SomeByteArray` is the still-unported witness variant
-        // (rbytearray.py).
-        use crate::annotator::model::SomeByteArray;
+        // `SomeObject` is the still-unported witness variant.
+        use crate::annotator::model::{KnownType, SomeObjectBase};
         let ann_rc = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann_rc));
         let arg_var = Variable::new();
         arg_var
             .annotation
-            .replace(Some(Rc::new(SomeValue::ByteArray(SomeByteArray::new(
+            .replace(Some(Rc::new(SomeValue::Object(SomeObjectBase::new(
+                KnownType::Other,
                 false,
             )))));
         let result_var = Variable::new();

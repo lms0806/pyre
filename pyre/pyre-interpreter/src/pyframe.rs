@@ -42,7 +42,7 @@ pub struct PyFrame {
     /// The top-level frame leaks the Rc via `Rc::into_raw`.
     /// Callee frames just copy the pointer (no atomic refcount ops).
     pub execution_context: *const PyExecutionContext,
-    /// Pointer to the Code object (W_CodeObject).
+    /// Pointer to the Code object (PyCode).
     ///
     /// PyPy: pyframe.py `self.pycode = code` — stores the PyCode instance.
     /// Same pointer as `func.getcode()`, so `getcode(func) == frame.pycode`.
@@ -309,7 +309,7 @@ impl FrameBox {
         // itself is a plain heap allocation (not a nursery object), so only the
         // locals array needs protecting.
         let _root = LocalsRoot::new(frame_ptr);
-        let generator = pyre_object::generatorobject::w_generator_new(frame_ptr as *mut u8);
+        let generator = pyre_object::generator::w_generator_new(frame_ptr as *mut u8);
         unsafe {
             (*frame_ptr).f_generator_nowref = generator;
         }
@@ -466,10 +466,10 @@ impl PyFrame {
     }
 }
 
-/// Extract raw CodeObject from frame's W_CodeObject.
+/// Extract raw CodeObject from frame's PyCode.
 ///
 /// PyPy: `frame.pycode` gives `PyCode` which IS the code object.
-/// pyre: W_CodeObject wraps a raw CodeObject — this extracts it.
+/// pyre: PyCode wraps a raw CodeObject — this extracts it.
 ///
 /// `@jit.elidable` (`rlib/jit.py:13`): deterministic, no allocation,
 /// no raise — pure pointer cast through `w_code_get_ptr`.
@@ -1759,7 +1759,7 @@ impl PyFrame {
     /// frames.  Hidden-applevel user frames (the `app_main.py`
     /// case) are not reachable in pyre yet either — pyre has no
     /// `pycompiler.compile(hidden_applevel=True)` call site.  The
-    /// field still lives on W_CodeObject, and this accessor mirrors
+    /// field still lives on PyCode, and this accessor mirrors
     /// PyPy's object-field read.
     #[inline]
     pub fn hide(&self) -> bool {
@@ -2654,13 +2654,13 @@ fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObjectR
         // `eval.rs:1321-1323 bytes_constant`.
         ConstantData::Bytes { value } => pyre_object::bytesobject::w_bytes_from_bytes(value),
         // `eval.rs:1325-1331 code_constant` — intern so the blackhole
-        // reifies the same shared `W_CodeObject` the interpreter
+        // reifies the same shared `PyCode` the interpreter
         // `LOAD_CONST` does (stable `__code__` identity + JIT green key).
         ConstantData::Code { code } => crate::pycode::intern_code_constant(code),
         // `eval.rs:1333-1335 none_constant`.
         ConstantData::None => pyre_object::w_none(),
         // `eval.rs:1337-1339 ellipsis_constant`.
-        ConstantData::Ellipsis => pyre_object::noneobject::w_ellipsis(),
+        ConstantData::Ellipsis => pyre_object::special::w_ellipsis(),
         // `pyopcode.rs:360-366` — recurse + delegate to the default
         // `build_tuple` body (`eval.rs:767 build_tuple_from_refs`).
         ConstantData::Tuple { elements } => {
@@ -2913,6 +2913,6 @@ mod tests {
             .expect("compiled code should contain an Ellipsis constant");
 
         let loaded = load_const_from_code(&code, ellipsis_index);
-        assert_eq!(loaded, pyre_object::noneobject::w_ellipsis());
+        assert_eq!(loaded, pyre_object::special::w_ellipsis());
     }
 }

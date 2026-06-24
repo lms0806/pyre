@@ -205,13 +205,13 @@ use pyre_interpreter::{
 };
 
 use pyre_object::PyObjectRef;
+use pyre_object::function::{METHOD_TYPE, is_method, w_method_get_func, w_method_get_self};
+use pyre_object::functional::RANGE_ITER_TYPE;
 use pyre_object::listobject::w_list_getitem;
-use pyre_object::methodobject::{METHOD_TYPE, is_method, w_method_get_func, w_method_get_self};
 use pyre_object::pyobject::{
     FLOAT_TYPE, INT_TYPE, LIST_TYPE, LONG_TYPE, PyType, TUPLE_TYPE, get_instantiate, is_float,
     is_int, is_list, is_long, is_tuple,
 };
-use pyre_object::rangeobject::RANGE_ITER_TYPE;
 use pyre_object::specialisedtupleobject::{
     SPECIALISED_TUPLE_FF_TYPE, SPECIALISED_TUPLE_II_TYPE, SPECIALISED_TUPLE_OO_TYPE,
 };
@@ -628,7 +628,7 @@ pub(crate) fn stack_slot_reg_idx(sym: &PyreSym, stack_idx: usize) -> usize {
 /// Write a Ref-boxed value to the symbolic operand stack at depth
 /// offset `stack_idx`. Centralizes the dual-shadow update that
 /// `push_typed_value`, `finishframe_exception`'s exception/lasti push,
-/// the `caller_result_stack_idx` writeback (metainterp.rs:475+) and
+/// the `caller_result_stack_idx` writeback (pyjitpl.rs:475+) and
 /// inline-call setup all duplicated:
 ///
 /// - `registers_r[reg_idx]` — the semantic frame mirror slot
@@ -953,7 +953,7 @@ impl MIFrame {
         opcode_start_pc: usize,
     ) -> Self {
         // sym was initialized when its owning MetaInterpFrame was pushed
-        // (trace.rs root push / metainterp.rs perform_call). MIFrame is a
+        // (trace.rs root push / pyjitpl.rs perform_call). MIFrame is a
         // borrowed per-instruction view; no re-initialization here.
         // RPython pyjitpl.py: orgpc = opcode start PC passed to each handler.
         let orgpc = opcode_start_pc;
@@ -1165,7 +1165,7 @@ impl MIFrame {
     ///
     /// Deliberately NOT marked: deferred stores (`STORE_SUBSCR` — the compiled
     /// loop performs the write exactly once, nbody/fannkuch), non-mutating
-    /// calls, and the W_MethodObject method-form arms (`m = xs.pop; m(0)`) —
+    /// calls, and the Method method-form arms (`m = xs.pop; m(0)`) —
     /// the trait impl only executes `is_function` callables concretely, so no
     /// during-trace mutation happens on that path and marking it would
     /// wrongly advance past an iteration whose mutation only exists as
@@ -2605,7 +2605,7 @@ impl MIFrame {
     /// RPython parity: always use orgpc (opcode start PC) as the semantic
     /// next instruction, so the heap frame stores `last_instr = orgpc - 1`.
     /// The trace loop advancement uses pending_next_instr separately
-    /// (in metainterp.rs step_*_frame).
+    /// (in pyjitpl.rs step_*_frame).
     pub(crate) fn flush_to_frame(&mut self, ctx: &mut TraceCtx) {
         let resume_pc = self.orgpc;
         let frame_addr = self.concrete_frame_addr;
@@ -4294,7 +4294,7 @@ impl MIFrame {
     /// Issue #143 core: synthesize a framestack whose innermost frame is a
     /// Rust runtime-helper jitcode (the folded `list.append`/`pop` body),
     /// not a Python frame.  Because `PyreMetaInterp::interpret`
-    /// (metainterp.rs:88) can only decode a `W_CodeObject` jitcode, the
+    /// (pyjitpl.rs:88) can only decode a `PyCode` jitcode, the
     /// helper callee can never be *traced*; instead the resize `GuardTrue`
     /// captures a snapshot in which the helper is the top/callee frame and
     /// the current Python frame is demoted to its immediate caller.  On
@@ -5175,7 +5175,7 @@ impl MIFrame {
         op: ComparisonOperator,
     ) -> Result<Option<TraceAction>, PyError> {
         // Peek next non-trivia instruction for PopJumpIf*.
-        let branch_pc = crate::metainterp::semantic_fallthrough_pc(code, compare_pc);
+        let branch_pc = crate::pyjitpl::semantic_fallthrough_pc(code, compare_pc);
         let Some((branch_instr, branch_op_arg)) = decode_instruction_at(code, branch_pc) else {
             return Ok(None);
         };
@@ -5233,7 +5233,7 @@ impl MIFrame {
         // Compute branch destinations (matches opcode_pop_jump_if at
         // pyopcode.rs:556). `fallthrough` is MIFrame's semantic_fallthrough_pc
         // past trivia; `target` is jump_target_forward (skip_caches + delta).
-        let branch_fallthrough = crate::metainterp::semantic_fallthrough_pc(code, branch_pc);
+        let branch_fallthrough = crate::pyjitpl::semantic_fallthrough_pc(code, branch_pc);
         let branch_target =
             pyre_interpreter::jump_target_forward(&code.instructions, branch_pc + 1, delta);
 
@@ -6107,7 +6107,7 @@ impl MIFrame {
     /// verified `concrete_len > 0`; this function picks a strategy fast
     /// path or falls back to generic call dispatch.
     ///
-    /// `callable` is the bound `W_MethodObject` OpRef: fallback paths pass
+    /// `callable` is the bound `Method` OpRef: fallback paths pass
     /// it to `trace_call_callable` so the residual emits `jit_call_callable_0`
     /// on the *method*, not on the receiver (calling the list itself would be
     /// a TypeError).
@@ -6459,10 +6459,10 @@ impl MIFrame {
         // path: port the rtyper/codewriter inlining + oopspec
         // recognition and remove this arm.
         //
-        // `baseobjspace::getattr_str` returns a fresh `W_MethodObject` per
+        // `baseobjspace::getattr_str` returns a fresh `Method` per
         // iteration, so the receiver is pushed by `load_method` as
         // `null_value` (load_method:6334) and call sees
-        // `concrete_callable = W_MethodObject`, with the receiver missing
+        // `concrete_callable = Method`, with the receiver missing
         // from `args`. Recover the receiver via `GetfieldGcR(callable,
         // w_self)` after guarding the method object's class. The function
         // pointer inside the method object IS stable across iterations
@@ -7212,10 +7212,10 @@ impl MIFrame {
     /// (`helpers::emit_trace_call_callable`).
     ///
     /// The GC rewrite pass lowers the `NewWithVtable` to a nursery
-    /// allocation carrying the `W_EXCEPTION` type id + per-kind vtable
+    /// allocation carrying the `W_BASE_EXCEPTION` type id + per-kind vtable
     /// (`rewrite.rs gen_malloc_nursery` / `gen_initialize_tid` /
     /// `gen_initialize_vtable`), so the result is a fully GC-managed
-    /// `W_ExceptionObject` identical to the runtime `malloc_typed` +
+    /// `W_BaseException` identical to the runtime `malloc_typed` +
     /// `exc_new_wrapper` + `descr_init` path.  `args_w` is built inline
     /// (`emit_exception_args_list_inline`) when `w_list_new` would pick
     /// the Object strategy, so the args list virtualizes too; Empty /
@@ -7245,7 +7245,7 @@ impl MIFrame {
         // trace attempt (a user-visible side effect on top of the real
         // execution).  Canonical per-kind classes have a pure Rust
         // `descr_init`, so probing them is unobservable.
-        if !pyre_object::excobject::is_canonical_exc_class(concrete_callable) {
+        if !pyre_object::interp_exceptions::is_canonical_exc_class(concrete_callable) {
             return Ok(None);
         }
         // Build the exception concretely on the plain eval loop (no tracer
@@ -7260,12 +7260,12 @@ impl MIFrame {
             if !pyre_object::is_exception(exc) {
                 return Ok(None);
             }
-            pyre_object::excobject::w_exception_get_kind(exc)
+            pyre_object::interp_exceptions::w_exception_get_kind(exc)
         };
         // Only the canonical per-kind builtin class maps to the flat
         // NewWithVtable layout; a user subclass resolves to its builtin
         // parent here and is rejected.
-        if pyre_object::excobject::lookup_exc_class_for_kind(kind) != concrete_callable {
+        if pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind) != concrete_callable {
             return Ok(None);
         }
         // The inline constructor reproduces only kind / w_class / args_w.
@@ -7866,15 +7866,16 @@ impl MIFrame {
         concrete_iter: PyObjectRef,
     ) -> Result<FrontendOp, PyError> {
         let concrete_continues = range_iter_continues(concrete_iter)?;
-        let concrete_step =
-            unsafe { (*(concrete_iter as *const pyre_object::rangeobject::W_RangeIterator)).step };
+        let concrete_step = unsafe {
+            (*(concrete_iter as *const pyre_object::functional::W_IntRangeIterator)).step
+        };
         let concrete_current = unsafe {
-            (*(concrete_iter as *const pyre_object::rangeobject::W_RangeIterator)).current
+            (*(concrete_iter as *const pyre_object::functional::W_IntRangeIterator)).current
         };
 
         // Delegate to auto-generated function (RPython jitcode parity:
-        // getfield(current/stop/step) → step sign guard → continues guard
-        // → int_add_ovf → guard_no_overflow → setfield).
+        // getfield(current/remaining/step) → remaining guard →
+        // int_add_ovf → guard_no_overflow → setfield current/remaining).
         let gen_result: Option<(OpRef, i64)> = self.with_ctx(|this, ctx| {
             Ok::<_, PyError>(crate::generated_iter_next_value(
                 this,
@@ -9053,7 +9054,7 @@ impl MIFrame {
             // pyjitpl.py:3382-3384: ALWAYS emit GUARD_EXCEPTION first,
             // regardless of class_of_last_exc_is_const.
             let exc_type_ptr = unsafe {
-                (*(exc_obj as *const pyre_object::excobject::W_ExceptionObject))
+                (*(exc_obj as *const pyre_object::interp_exceptions::W_BaseException))
                     .ob_header
                     .ob_type as i64
             };
@@ -9187,16 +9188,16 @@ impl MIFrame {
     ///
     /// `GuardClass(exc_box, cls_const)` reads `ob_header.ob_type` at
     /// `cpu.vtable_offset = OB_TYPE_OFFSET = 0`.  Pyre allocates each
-    /// `W_ExceptionObject` with `ob_type` pointing at the per-`ExcKind`
+    /// `W_BaseException` with `ob_type` pointing at the per-`ExcKind`
     /// `PyType` static (`EXC_VALUE_ERROR_TYPE`, `EXC_OVERFLOW_ERROR_TYPE`,
-    /// …; `excobject.rs::exc_kind_to_pytype`), so this guard
+    /// …; `interp_exceptions.rs::exc_kind_to_pytype`), so this guard
     /// discriminates the actual subclass.  Matches RPython's
     /// `OBJECT.typeptr = specific class` (`rclass.py:167-174`) and
     /// `opimpl_raise`'s `cls_of_box(exc)` shape (`pyjitpl.py:1687-1693`).
     fn seed_raised_exception(&mut self, exc_box: OpRef, concrete_exc: PyObjectRef) {
         if !concrete_exc.is_null() {
             let exc_class_ptr = unsafe {
-                (*(concrete_exc as *const pyre_object::excobject::W_ExceptionObject))
+                (*(concrete_exc as *const pyre_object::interp_exceptions::W_BaseException))
                     .ob_header
                     .ob_type
             };
@@ -9242,10 +9243,7 @@ impl MIFrame {
         // `lookup_exceptiontable` takes byte offsets; pyre tracks `pc` as
         // a code-unit index, so multiply/divide by 2 at the boundary.
         if let Some((target_bytes, depth, lasti)) =
-            pyre_interpreter::exception_table::lookup_exceptiontable(
-                &code.exceptiontable,
-                (pc * 2) as u32,
-            )
+            pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, (pc * 2) as u32)
         {
             let handler_pc = target_bytes as usize / 2;
             let handler_depth = depth as usize;
@@ -10709,7 +10707,7 @@ impl OpcodeStepExecutor for MIFrame {
         // Resolve the foldable builtin list methods (append/pop/reverse) to
         // a Const unbound function guarded by class, with self in the
         // receiver slot, instead of a residual `jit_getattr` that
-        // materialises a fresh bound `W_MethodObject` every iteration. A
+        // materialises a fresh bound `Method` every iteration. A
         // Const callable is trivially reconstructed at guard-failure resume
         // (a residual bound method is not — it resolves to a null callable
         // on the blackhole CALL re-execution) and routes the following CALL
@@ -11379,7 +11377,7 @@ impl OpcodeStepExecutor for MIFrame {
                 // `exc.w_context = ec.sys_exc_value` (storing null when no
                 // exception is active is a no-op that DCEs).
                 if trace_built.is_some() && cause.is_none() {
-                    let kind = pyre_object::excobject::w_exception_get_kind(exc);
+                    let kind = pyre_object::interp_exceptions::w_exception_get_kind(exc);
                     let ec = self.with_ctx(|this, ctx| this.ensure_execution_context(ctx));
                     let active = self.with_ctx(|_this, ctx| {
                         ctx.record_op_with_descr(

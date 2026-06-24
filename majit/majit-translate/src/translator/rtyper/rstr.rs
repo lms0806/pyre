@@ -45,6 +45,9 @@ use crate::flowspace::model::{
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+use crate::translator::rtyper::lltypesystem::rbytearray::{
+    BYTEARRAYPTR, build_ll_str2bytearray_helper_graph,
+};
 use crate::translator::rtyper::lltypesystem::rstr::{
     STRPTR, UNICODEPTR, build_ll_chr2str_helper_graph, build_ll_count_char_helper_graph,
     build_ll_endswith_char_helper_graph, build_ll_endswith_helper_graph,
@@ -66,6 +69,52 @@ use crate::translator::rtyper::rtyper::{
     ConvertedTo, GenopResult, HighLevelOp, LowLevelFunction, LowLevelOpList, RPythonTyper,
     constant_with_lltype, helper_pygraph_from_graph, variable_with_lltype,
 };
+
+pub fn str_decode_utf8(s: &[u8]) -> Result<String, TyperError> {
+    std::str::from_utf8(s)
+        .map(str::to_string)
+        .map_err(|e| TyperError::message(format!("UnicodeDecodeError('utf8'): {e}")))
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AbstractStringIteratorRepr;
+
+impl AbstractStringIteratorRepr {
+    /// RPython `AbstractStringIteratorRepr.newiter(self, hop)` (`rstr.py:829-832`).
+    pub fn newiter(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(TyperError::missing_rtype_operation(
+            "AbstractStringIteratorRepr.newiter",
+        ))
+    }
+
+    /// RPython `AbstractStringIteratorRepr.rtype_next(self, hop)` (`rstr.py:834-839`).
+    pub fn rtype_next(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(TyperError::missing_rtype_operation(
+            "AbstractStringIteratorRepr.rtype_next",
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AbstractLLHelpers;
+
+impl AbstractLLHelpers {
+    pub fn ll_char_isspace(ch: u32) -> bool {
+        ch == 32 || (9..=13).contains(&ch)
+    }
+
+    pub fn ll_char_isdigit(ch: u32) -> bool {
+        (48..=57).contains(&ch)
+    }
+
+    pub fn ll_char_isalpha(ch: u32) -> bool {
+        (65..=90).contains(&ch) || (97..=122).contains(&ch)
+    }
+
+    pub fn ll_char_isalnum(ch: u32) -> bool {
+        Self::ll_char_isalpha(ch) || Self::ll_char_isdigit(ch)
+    }
+}
 
 // ____________________________________________________________
 // StringRepr / UnicodeRepr — `rpython/rtyper/lltypesystem/rstr.py:229`
@@ -187,6 +236,19 @@ impl Repr for StringRepr {
     /// non-constant byte strings lower through `LLHelpers.ll_str2unicode`.
     fn rtype_unicode(&self, hop: &HighLevelOp) -> RTypeResult {
         rtype_abstract_string_unicode(self, hop)
+    }
+
+    /// RPython `AbstractStringRepr.rtype_bytearray` (`rstr.py:398-401`).
+    fn rtype_bytearray(&self, hop: &HighLevelOp) -> RTypeResult {
+        hop.exception_is_here()?;
+        let v_str = hop.inputarg(ConvertedTo::Repr(self), 0)?;
+        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_str2bytearray".to_string(),
+            vec![STRPTR.clone()],
+            BYTEARRAYPTR.clone(),
+            move |_rtyper, _args, _result| build_ll_str2bytearray_helper_graph("ll_str2bytearray"),
+        )?;
+        hop.gendirectcall(&helper, vec![v_str])
     }
 
     /// RPython `AbstractStringRepr.rtype_int` (`rstr.py:371-383`):
@@ -3251,6 +3313,29 @@ mod tests {
     use super::*;
     use crate::annotator::annrpython::RPythonAnnotator;
 
+    #[test]
+    fn str_decode_utf8_decodes_valid_utf8_and_rejects_invalid_bytes() {
+        assert_eq!(str_decode_utf8(b"abc").unwrap(), "abc");
+        assert_eq!(
+            str_decode_utf8(b"snowman: \xe2\x98\x83").unwrap(),
+            "snowman: \u{2603}"
+        );
+        assert!(str_decode_utf8(&[0xf0, 0x28, 0x8c, 0x28]).is_err());
+    }
+
+    #[test]
+    fn abstract_llhelpers_char_predicates_match_ascii_helpers() {
+        assert!(AbstractLLHelpers::ll_char_isspace(b'\n' as u32));
+        assert!(AbstractLLHelpers::ll_char_isspace(b' ' as u32));
+        assert!(AbstractLLHelpers::ll_char_isdigit(b'7' as u32));
+        assert!(!AbstractLLHelpers::ll_char_isdigit(b'x' as u32));
+        assert!(AbstractLLHelpers::ll_char_isalpha(b'A' as u32));
+        assert!(AbstractLLHelpers::ll_char_isalpha(b'z' as u32));
+        assert!(AbstractLLHelpers::ll_char_isalnum(b'9' as u32));
+        assert!(!AbstractLLHelpers::ll_char_isalnum(b'_' as u32));
+        let _iter = AbstractStringIteratorRepr;
+    }
+
     /// rstr.py:496-500 — `CharRepr.get_ll_eq_function` returns None;
     /// `get_ll_hash_function` returns `ll_char_hash` which casts to int.
     #[test]
@@ -5790,6 +5875,54 @@ mod tests {
         assert!(
             dbg.contains("ll_str2unicode"),
             "expected ll_str2unicode in {dbg}"
+        );
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+    }
+
+    /// rstr.py:398-401 — `bytearray(s)` for a byte string emits
+    /// `direct_call(ll_str2bytearray, s)` and marks the operation as
+    /// exception-capable, matching upstream's unconditional
+    /// `hop.exception_is_here()`.
+    #[test]
+    fn string_repr_rtype_bytearray_emits_direct_call_to_ll_str2bytearray() {
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let hop = build_string_unary_hop(
+            rtyper.clone(),
+            llops.clone(),
+            "bytearray",
+            STRPTR.clone(),
+            BYTEARRAYPTR.clone(),
+            string_repr() as Arc<dyn Repr>,
+            crate::annotator::model::SomeValue::String(crate::annotator::model::SomeString::new(
+                false, false,
+            )),
+        );
+
+        let result = string_repr()
+            .rtype_bytearray(&hop)
+            .unwrap_or_else(|err| panic!("StringRepr.rtype_bytearray: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr");
+        };
+        let dbg = format!("{:?}", c.value);
+        assert!(
+            dbg.contains("ll_str2bytearray"),
+            "expected ll_str2bytearray in {dbg}"
         );
         assert!(ops._called_exception_is_here_or_cannot_occur);
     }

@@ -444,7 +444,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // bridge that reconstructs the `ExcKind` from the integer arg slot.
     push_alias_pair(
         &mut entries,
-        "pyre_object::excobject::lookup_exc_class_for_kind",
+        "pyre_object::interp_exceptions::lookup_exc_class_for_kind",
         "pyre_object::lookup_exc_class_for_kind",
         crate::opcode_ops::bh_lookup_exc_class_for_kind as *const (),
     );
@@ -554,7 +554,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
-        "pyre_object::rangeobject::jit_range_iter_new",
+        "pyre_object::functional::jit_range_iter_new",
         "pyre_object::jit_range_iter_new",
         pyre_object::jit_range_iter_new as *const (),
     );
@@ -782,17 +782,17 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         take_pending_hash_error as *const (),
     );
     let proxy_type: fn() -> pyre_object::PyObjectRef =
-        crate::module::_weakref::interp_weakref::proxy_type;
+        crate::module::_weakref::interp__weakref::proxy_type;
     push_fnaddr(
         &mut entries,
-        "pyre_interpreter::module::_weakref::interp_weakref::proxy_type",
+        "pyre_interpreter::module::_weakref::interp__weakref::proxy_type",
         proxy_type as *const (),
     );
     let callable_proxy_type: fn() -> pyre_object::PyObjectRef =
-        crate::module::_weakref::interp_weakref::callable_proxy_type;
+        crate::module::_weakref::interp__weakref::callable_proxy_type;
     push_fnaddr(
         &mut entries,
-        "pyre_interpreter::module::_weakref::interp_weakref::callable_proxy_type",
+        "pyre_interpreter::module::_weakref::interp__weakref::callable_proxy_type",
         callable_proxy_type as *const (),
     );
 
@@ -1100,151 +1100,154 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             dictmultiobject::MODULE_DICT_TYPE
         ),
         pytype_addr!(
-            "dictviewobject::DICT_KEYS_TYPE",
-            dictviewobject::DICT_KEYS_TYPE
+            "dictmultiobject::DICT_KEYS_TYPE",
+            dictmultiobject::DICT_KEYS_TYPE
         ),
         pytype_addr!(
-            "dictviewobject::DICT_VALUES_TYPE",
-            dictviewobject::DICT_VALUES_TYPE
+            "dictmultiobject::DICT_VALUES_TYPE",
+            dictmultiobject::DICT_VALUES_TYPE
         ),
         pytype_addr!(
-            "dictviewobject::DICT_ITEMS_TYPE",
-            dictviewobject::DICT_ITEMS_TYPE
+            "dictmultiobject::DICT_ITEMS_TYPE",
+            dictmultiobject::DICT_ITEMS_TYPE
         ),
         pytype_addr!(
-            "dictviewobject::DICT_KEYITERATOR_TYPE",
-            dictviewobject::DICT_KEYITERATOR_TYPE
+            "dictmultiobject::DICT_KEYITERATOR_TYPE",
+            dictmultiobject::DICT_KEYITERATOR_TYPE
         ),
         pytype_addr!(
-            "dictviewobject::DICT_VALUEITERATOR_TYPE",
-            dictviewobject::DICT_VALUEITERATOR_TYPE
+            "dictmultiobject::DICT_VALUEITERATOR_TYPE",
+            dictmultiobject::DICT_VALUEITERATOR_TYPE
         ),
         pytype_addr!(
-            "dictviewobject::DICT_ITEMITERATOR_TYPE",
-            dictviewobject::DICT_ITEMITERATOR_TYPE
-        ),
-        pytype_addr!("excobject::EXCEPTION_TYPE", excobject::EXCEPTION_TYPE),
-        pytype_addr!(
-            "excobject::EXC_EXCEPTION_TYPE",
-            excobject::EXC_EXCEPTION_TYPE
+            "dictmultiobject::DICT_ITEMITERATOR_TYPE",
+            dictmultiobject::DICT_ITEMITERATOR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_ARITHMETIC_ERROR_TYPE",
-            excobject::EXC_ARITHMETIC_ERROR_TYPE
+            "interp_exceptions::EXCEPTION_TYPE",
+            interp_exceptions::EXCEPTION_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_OVERFLOW_ERROR_TYPE",
-            excobject::EXC_OVERFLOW_ERROR_TYPE
+            "interp_exceptions::EXC_EXCEPTION_TYPE",
+            interp_exceptions::EXC_EXCEPTION_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_ZERO_DIVISION_ERROR_TYPE",
-            excobject::EXC_ZERO_DIVISION_ERROR_TYPE
+            "interp_exceptions::EXC_ARITHMETIC_ERROR_TYPE",
+            interp_exceptions::EXC_ARITHMETIC_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_TYPE_ERROR_TYPE",
-            excobject::EXC_TYPE_ERROR_TYPE
+            "interp_exceptions::EXC_OVERFLOW_ERROR_TYPE",
+            interp_exceptions::EXC_OVERFLOW_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_VALUE_ERROR_TYPE",
-            excobject::EXC_VALUE_ERROR_TYPE
+            "interp_exceptions::EXC_ZERO_DIVISION_ERROR_TYPE",
+            interp_exceptions::EXC_ZERO_DIVISION_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_NAME_ERROR_TYPE",
-            excobject::EXC_NAME_ERROR_TYPE
+            "interp_exceptions::EXC_TYPE_ERROR_TYPE",
+            interp_exceptions::EXC_TYPE_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_INDEX_ERROR_TYPE",
-            excobject::EXC_INDEX_ERROR_TYPE
+            "interp_exceptions::EXC_VALUE_ERROR_TYPE",
+            interp_exceptions::EXC_VALUE_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_KEY_ERROR_TYPE",
-            excobject::EXC_KEY_ERROR_TYPE
+            "interp_exceptions::EXC_NAME_ERROR_TYPE",
+            interp_exceptions::EXC_NAME_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_ATTRIBUTE_ERROR_TYPE",
-            excobject::EXC_ATTRIBUTE_ERROR_TYPE
+            "interp_exceptions::EXC_INDEX_ERROR_TYPE",
+            interp_exceptions::EXC_INDEX_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_RUNTIME_ERROR_TYPE",
-            excobject::EXC_RUNTIME_ERROR_TYPE
+            "interp_exceptions::EXC_KEY_ERROR_TYPE",
+            interp_exceptions::EXC_KEY_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_STOP_ITERATION_TYPE",
-            excobject::EXC_STOP_ITERATION_TYPE
+            "interp_exceptions::EXC_ATTRIBUTE_ERROR_TYPE",
+            interp_exceptions::EXC_ATTRIBUTE_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_IMPORT_ERROR_TYPE",
-            excobject::EXC_IMPORT_ERROR_TYPE
+            "interp_exceptions::EXC_RUNTIME_ERROR_TYPE",
+            interp_exceptions::EXC_RUNTIME_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_NOT_IMPLEMENTED_ERROR_TYPE",
-            excobject::EXC_NOT_IMPLEMENTED_ERROR_TYPE
+            "interp_exceptions::EXC_STOP_ITERATION_TYPE",
+            interp_exceptions::EXC_STOP_ITERATION_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_ASSERTION_ERROR_TYPE",
-            excobject::EXC_ASSERTION_ERROR_TYPE
+            "interp_exceptions::EXC_IMPORT_ERROR_TYPE",
+            interp_exceptions::EXC_IMPORT_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_REFERENCE_ERROR_TYPE",
-            excobject::EXC_REFERENCE_ERROR_TYPE
+            "interp_exceptions::EXC_NOT_IMPLEMENTED_ERROR_TYPE",
+            interp_exceptions::EXC_NOT_IMPLEMENTED_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_GENERATOR_EXIT_TYPE",
-            excobject::EXC_GENERATOR_EXIT_TYPE
+            "interp_exceptions::EXC_ASSERTION_ERROR_TYPE",
+            interp_exceptions::EXC_ASSERTION_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_RECURSION_ERROR_TYPE",
-            excobject::EXC_RECURSION_ERROR_TYPE
-        ),
-        pytype_addr!("excobject::EXC_OS_ERROR_TYPE", excobject::EXC_OS_ERROR_TYPE),
-        pytype_addr!(
-            "excobject::EXC_FILE_NOT_FOUND_ERROR_TYPE",
-            excobject::EXC_FILE_NOT_FOUND_ERROR_TYPE
+            "interp_exceptions::EXC_REFERENCE_ERROR_TYPE",
+            interp_exceptions::EXC_REFERENCE_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_UNICODE_DECODE_ERROR_TYPE",
-            excobject::EXC_UNICODE_DECODE_ERROR_TYPE
+            "interp_exceptions::EXC_GENERATOR_EXIT_TYPE",
+            interp_exceptions::EXC_GENERATOR_EXIT_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_UNICODE_ENCODE_ERROR_TYPE",
-            excobject::EXC_UNICODE_ENCODE_ERROR_TYPE
+            "interp_exceptions::EXC_RECURSION_ERROR_TYPE",
+            interp_exceptions::EXC_RECURSION_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_UNICODE_TRANSLATE_ERROR_TYPE",
-            excobject::EXC_UNICODE_TRANSLATE_ERROR_TYPE
+            "interp_exceptions::EXC_OS_ERROR_TYPE",
+            interp_exceptions::EXC_OS_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_SYSTEM_EXIT_TYPE",
-            excobject::EXC_SYSTEM_EXIT_TYPE
+            "interp_exceptions::EXC_FILE_NOT_FOUND_ERROR_TYPE",
+            interp_exceptions::EXC_FILE_NOT_FOUND_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_MEMORY_ERROR_TYPE",
-            excobject::EXC_MEMORY_ERROR_TYPE
+            "interp_exceptions::EXC_UNICODE_DECODE_ERROR_TYPE",
+            interp_exceptions::EXC_UNICODE_DECODE_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_SYSTEM_ERROR_TYPE",
-            excobject::EXC_SYSTEM_ERROR_TYPE
+            "interp_exceptions::EXC_UNICODE_ENCODE_ERROR_TYPE",
+            interp_exceptions::EXC_UNICODE_ENCODE_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_LOOKUP_ERROR_TYPE",
-            excobject::EXC_LOOKUP_ERROR_TYPE
+            "interp_exceptions::EXC_UNICODE_TRANSLATE_ERROR_TYPE",
+            interp_exceptions::EXC_UNICODE_TRANSLATE_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_UNICODE_ERROR_TYPE",
-            excobject::EXC_UNICODE_ERROR_TYPE
+            "interp_exceptions::EXC_SYSTEM_EXIT_TYPE",
+            interp_exceptions::EXC_SYSTEM_EXIT_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_MODULE_NOT_FOUND_ERROR_TYPE",
-            excobject::EXC_MODULE_NOT_FOUND_ERROR_TYPE
+            "interp_exceptions::EXC_MEMORY_ERROR_TYPE",
+            interp_exceptions::EXC_MEMORY_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_SYNTAX_ERROR_TYPE",
-            excobject::EXC_SYNTAX_ERROR_TYPE
+            "interp_exceptions::EXC_SYSTEM_ERROR_TYPE",
+            interp_exceptions::EXC_SYSTEM_ERROR_TYPE
         ),
         pytype_addr!(
-            "generatorobject::GENERATOR_TYPE",
-            generatorobject::GENERATOR_TYPE
+            "interp_exceptions::EXC_LOOKUP_ERROR_TYPE",
+            interp_exceptions::EXC_LOOKUP_ERROR_TYPE
         ),
+        pytype_addr!(
+            "interp_exceptions::EXC_UNICODE_ERROR_TYPE",
+            interp_exceptions::EXC_UNICODE_ERROR_TYPE
+        ),
+        pytype_addr!(
+            "interp_exceptions::EXC_MODULE_NOT_FOUND_ERROR_TYPE",
+            interp_exceptions::EXC_MODULE_NOT_FOUND_ERROR_TYPE
+        ),
+        pytype_addr!(
+            "interp_exceptions::EXC_SYNTAX_ERROR_TYPE",
+            interp_exceptions::EXC_SYNTAX_ERROR_TYPE
+        ),
+        pytype_addr!("generator::GENERATOR_TYPE", generator::GENERATOR_TYPE),
         pytype_addr!("pyobject::INT_TYPE", pyobject::INT_TYPE),
         pytype_addr!("pyobject::BOOL_TYPE", pyobject::BOOL_TYPE),
         pytype_addr!("pyobject::FLOAT_TYPE", pyobject::FLOAT_TYPE),
@@ -1278,76 +1281,64 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             "specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE",
             specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE
         ),
-        pytype_addr!("weakref::GC_WEAKREF_TYPE", weakref::GC_WEAKREF_TYPE),
-        pytype_addr!("cellobject::CELL_TYPE", cellobject::CELL_TYPE),
+        pytype_addr!("weakref::GC_WEAKREF_BOX_TYPE", weakref::GC_WEAKREF_BOX_TYPE),
+        pytype_addr!("nestedscope::CELL_TYPE", nestedscope::CELL_TYPE),
         pytype_addr!("sliceobject::SLICE_TYPE", sliceobject::SLICE_TYPE),
-        pytype_addr!("rangeobject::RANGE_TYPE", rangeobject::RANGE_TYPE),
-        pytype_addr!("rangeobject::RANGE_ITER_TYPE", rangeobject::RANGE_ITER_TYPE),
-        pytype_addr!("rangeobject::SEQ_ITER_TYPE", rangeobject::SEQ_ITER_TYPE),
-        pytype_addr!("methodobject::METHOD_TYPE", methodobject::METHOD_TYPE),
-        pytype_addr!("memberobject::MEMBER_TYPE", memberobject::MEMBER_TYPE),
+        pytype_addr!("functional::RANGE_TYPE", functional::RANGE_TYPE),
+        pytype_addr!("functional::RANGE_ITER_TYPE", functional::RANGE_ITER_TYPE),
+        pytype_addr!("iterobject::SEQ_ITER_TYPE", iterobject::SEQ_ITER_TYPE),
+        pytype_addr!("function::METHOD_TYPE", function::METHOD_TYPE),
+        pytype_addr!("typedef::MEMBER_TYPE", MEMBER_TYPE),
+        pytype_addr!("descriptor::PROPERTY_TYPE", descriptor::PROPERTY_TYPE),
+        pytype_addr!("function::STATICMETHOD_TYPE", function::STATICMETHOD_TYPE),
+        pytype_addr!("function::CLASSMETHOD_TYPE", function::CLASSMETHOD_TYPE),
+        pytype_addr!("typedef::GETSET_DESCRIPTOR_TYPE", GETSET_DESCRIPTOR_TYPE),
+        pytype_addr!("functional::ENUMERATE_TYPE", functional::ENUMERATE_TYPE),
+        pytype_addr!("functional::REVERSED_TYPE", functional::REVERSED_TYPE),
+        pytype_addr!("functional::FILTER_TYPE", functional::FILTER_TYPE),
+        pytype_addr!("functional::MAP_TYPE", functional::MAP_TYPE),
+        pytype_addr!("functional::ZIP_TYPE", functional::ZIP_TYPE),
         pytype_addr!(
-            "propertyobject::PROPERTY_TYPE",
-            propertyobject::PROPERTY_TYPE
+            "operation::CALLABLE_ITERATOR_TYPE",
+            operation::CALLABLE_ITERATOR_TYPE
+        ),
+        pytype_addr!("interp_itertools::COUNT_TYPE", interp_itertools::COUNT_TYPE),
+        pytype_addr!(
+            "interp_itertools::REPEAT_TYPE",
+            interp_itertools::REPEAT_TYPE
         ),
         pytype_addr!(
-            "propertyobject::STATICMETHOD_TYPE",
-            propertyobject::STATICMETHOD_TYPE
+            "interp_itertools::TAKEWHILE_TYPE",
+            interp_itertools::TAKEWHILE_TYPE
         ),
         pytype_addr!(
-            "propertyobject::CLASSMETHOD_TYPE",
-            propertyobject::CLASSMETHOD_TYPE
+            "interp_itertools::DROPWHILE_TYPE",
+            interp_itertools::DROPWHILE_TYPE
         ),
         pytype_addr!(
-            "getsetproperty::GETSET_DESCRIPTOR_TYPE",
-            getsetproperty::GETSET_DESCRIPTOR_TYPE
+            "interp_itertools::FILTERFALSE_TYPE",
+            interp_itertools::FILTERFALSE_TYPE
         ),
         pytype_addr!(
-            "enumerateobject::ENUMERATE_TYPE",
-            enumerateobject::ENUMERATE_TYPE
+            "interp_itertools::PAIRWISE_TYPE",
+            interp_itertools::PAIRWISE_TYPE
         ),
+        pytype_addr!("interp_sre::SRE_SCANNER_TYPE", interp_sre::SRE_SCANNER_TYPE),
         pytype_addr!(
-            "reversedobject::REVERSED_TYPE",
-            reversedobject::REVERSED_TYPE
+            "functional::LONG_RANGE_ITER_TYPE",
+            functional::LONG_RANGE_ITER_TYPE
         ),
-        pytype_addr!("filterobject::FILTER_TYPE", filterobject::FILTER_TYPE),
-        pytype_addr!("mapobject::MAP_TYPE", mapobject::MAP_TYPE),
-        pytype_addr!("zipobject::ZIP_TYPE", zipobject::ZIP_TYPE),
+        pytype_addr!("interp_sre::SRE_MATCH_TYPE", interp_sre::SRE_MATCH_TYPE),
+        pytype_addr!("interp_sre::SRE_PATTERN_TYPE", interp_sre::SRE_PATTERN_TYPE),
         pytype_addr!(
-            "callableiteratorobject::CALLABLE_ITERATOR_TYPE",
-            callableiteratorobject::CALLABLE_ITERATOR_TYPE
+            "_pypy_generic_alias::GENERIC_ALIAS_TYPE",
+            _pypy_generic_alias::GENERIC_ALIAS_TYPE
         ),
-        pytype_addr!("itertoolsmodule::COUNT_TYPE", itertoolsmodule::COUNT_TYPE),
-        pytype_addr!("itertoolsmodule::REPEAT_TYPE", itertoolsmodule::REPEAT_TYPE),
+        pytype_addr!("descriptor::SUPER_TYPE", descriptor::SUPER_TYPE),
         pytype_addr!(
-            "itertoolsmodule::TAKEWHILE_TYPE",
-            itertoolsmodule::TAKEWHILE_TYPE
+            "_pypy_generic_alias::UNION_TYPE",
+            _pypy_generic_alias::UNION_TYPE
         ),
-        pytype_addr!(
-            "itertoolsmodule::DROPWHILE_TYPE",
-            itertoolsmodule::DROPWHILE_TYPE
-        ),
-        pytype_addr!(
-            "itertoolsmodule::FILTERFALSE_TYPE",
-            itertoolsmodule::FILTERFALSE_TYPE
-        ),
-        pytype_addr!(
-            "itertoolsmodule::PAIRWISE_TYPE",
-            itertoolsmodule::PAIRWISE_TYPE
-        ),
-        pytype_addr!("sreobject::SRE_SCANNER_TYPE", sreobject::SRE_SCANNER_TYPE),
-        pytype_addr!(
-            "rangeobject::LONG_RANGE_ITER_TYPE",
-            rangeobject::LONG_RANGE_ITER_TYPE
-        ),
-        pytype_addr!("sreobject::SRE_MATCH_TYPE", sreobject::SRE_MATCH_TYPE),
-        pytype_addr!("sreobject::SRE_PATTERN_TYPE", sreobject::SRE_PATTERN_TYPE),
-        pytype_addr!(
-            "genericaliasobject::GENERIC_ALIAS_TYPE",
-            genericaliasobject::GENERIC_ALIAS_TYPE
-        ),
-        pytype_addr!("superobject::SUPER_TYPE", superobject::SUPER_TYPE),
-        pytype_addr!("unionobject::UNION_TYPE", unionobject::UNION_TYPE),
         // `pyre_interpreter`-local `PyType` singletons.  The `pytype_addr!`
         // macro emits `&pyre_object::$path` and cannot reach these
         // crate-local statics, so capture their addresses directly.  The
@@ -1391,28 +1382,28 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
     }
     vec![
         ref_addr!(
-            "dictstrategy::OBJECT_DICT_STRATEGY",
-            dictstrategy::OBJECT_DICT_STRATEGY
+            "dictmultiobject::OBJECT_DICT_STRATEGY",
+            dictmultiobject::OBJECT_DICT_STRATEGY
         ),
         ref_addr!(
-            "dictstrategy::EMPTY_DICT_STRATEGY",
-            dictstrategy::EMPTY_DICT_STRATEGY
+            "dictmultiobject::EMPTY_DICT_STRATEGY",
+            dictmultiobject::EMPTY_DICT_STRATEGY
         ),
         ref_addr!(
-            "dictstrategy::EMPTY_KWARGS_DICT_STRATEGY",
-            dictstrategy::EMPTY_KWARGS_DICT_STRATEGY
+            "dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY",
+            dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY
         ),
         ref_addr!(
-            "dictstrategy::BYTES_DICT_STRATEGY",
-            dictstrategy::BYTES_DICT_STRATEGY
+            "dictmultiobject::BYTES_DICT_STRATEGY",
+            dictmultiobject::BYTES_DICT_STRATEGY
         ),
         ref_addr!(
-            "dictstrategy::UNICODE_DICT_STRATEGY",
-            dictstrategy::UNICODE_DICT_STRATEGY
+            "dictmultiobject::UNICODE_DICT_STRATEGY",
+            dictmultiobject::UNICODE_DICT_STRATEGY
         ),
         ref_addr!(
-            "dictstrategy::INT_DICT_STRATEGY",
-            dictstrategy::INT_DICT_STRATEGY
+            "dictmultiobject::INT_DICT_STRATEGY",
+            dictmultiobject::INT_DICT_STRATEGY
         ),
         ref_addr!(
             "identitydict::IDENTITY_DICT_STRATEGY",
@@ -1437,11 +1428,11 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
             pyre_object::w_none() as usize as i64,
         ),
         (
-            "noneobject::NOT_IMPLEMENTED_SINGLETON",
+            "special::NOT_IMPLEMENTED_SINGLETON",
             pyre_object::w_not_implemented() as usize as i64,
         ),
         (
-            "noneobject::ELLIPSIS_SINGLETON",
+            "special::ELLIPSIS_SINGLETON",
             pyre_object::w_ellipsis() as usize as i64,
         ),
         (
@@ -1492,8 +1483,8 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
             pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_OBJECT_SIZE as i64,
         ),
         (
-            "instanceobject::W_INSTANCE_OBJECT_SIZE",
-            pyre_object::instanceobject::W_INSTANCE_OBJECT_SIZE as i64,
+            "objectobject::W_OBJECT_OBJECT_SIZE",
+            pyre_object::objectobject::W_OBJECT_OBJECT_SIZE as i64,
         ),
     ]
 }

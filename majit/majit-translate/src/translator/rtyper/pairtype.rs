@@ -114,6 +114,8 @@ pub enum ReprClassId {
     MethodOfFrozenPBCRepr,
     /// `rpbc.py:1126 MethodsPBCRepr`.
     MethodsPBCRepr,
+    /// `controllerentry.py:211 ControlledInstanceRepr`.
+    ControlledInstanceRepr,
     /// `rpbc.py:920 ClassesPBCRepr`.
     ClassesPBCRepr,
     /// `rclass.py:467 InstanceRepr(Repr)`.
@@ -132,6 +134,16 @@ pub enum ReprClassId {
     /// Ptr(GcArray(ITEM)))))`. Minted when the `listdef` is `resized`
     /// (an `.append()` consumer marks it so).
     ListRepr,
+    /// `rdict.py:35 AbstractDictRepr`.
+    AbstractDictRepr,
+    /// `lltypesystem/rdict.py:42 DictRepr(AbstractDictRepr)`.
+    DictRepr,
+    /// `lltypesystem/rordereddict.py:61 OrderedDictRepr(AbstractDictRepr)`.
+    OrderedDictRepr,
+    /// `rdict.py:90 AbstractDictIteratorRepr`.
+    AbstractDictIteratorRepr,
+    /// `lltypesystem/rdict.py:693 DictIteratorRepr(AbstractDictIteratorRepr)`.
+    DictIteratorRepr,
     /// `rstr.py:483 AbstractCharRepr` (`CharRepr` lltypesystem
     /// realisation, `lowleveltype = Char`).
     CharRepr,
@@ -144,12 +156,18 @@ pub enum ReprClassId {
     /// `rstr.py:450 AbstractUnicodeRepr` (`lltypesystem.rstr.UnicodeRepr`
     /// realisation, `lowleveltype = Ptr(UNICODE)`).
     UnicodeRepr,
+    /// `rbytearray.py:8 AbstractByteArrayRepr(AbstractStringRepr)`
+    /// (`lltypesystem.rbytearray.ByteArrayRepr`, `lowleveltype =
+    /// Ptr(BYTEARRAY)`).
+    ByteArrayRepr,
     /// Abstract base shared by `StringRepr` and `UnicodeRepr`.
     AbstractStringRepr,
     /// `rweakref.py:51 WeakRefRepr(BaseWeakRefRepr)`.
     WeakRefRepr,
     /// `rweakref.py:67 EmulatedWeakRefRepr(BaseWeakRefRepr)`.
     EmulatedWeakRefRepr,
+    /// `lltypesystem/rgcref.py:8 GCRefRepr`.
+    GCRefRepr,
     /// `rrange.py:43 RangeRepr(AbstractRangeRepr)` — the immutable
     /// `range()`-result list repr (`GcStruct("range", start, stop)`).
     RangeRepr,
@@ -199,18 +217,26 @@ impl ReprClassId {
             MultipleFrozenPBCRepr => &[MultipleFrozenPBCRepr, Repr],
             MethodOfFrozenPBCRepr => &[MethodOfFrozenPBCRepr, Repr],
             MethodsPBCRepr => &[MethodsPBCRepr, Repr],
+            ControlledInstanceRepr => &[ControlledInstanceRepr, Repr],
             ClassesPBCRepr => &[ClassesPBCRepr, Repr],
             InstanceRepr => &[InstanceRepr, Repr],
             FixedSizeListRepr => &[FixedSizeListRepr, Repr],
             ListRepr => &[ListRepr, Repr],
             TupleRepr => &[TupleRepr, Repr],
+            AbstractDictRepr => &[AbstractDictRepr, Repr],
+            DictRepr => &[DictRepr, AbstractDictRepr, Repr],
+            OrderedDictRepr => &[OrderedDictRepr, AbstractDictRepr, Repr],
+            AbstractDictIteratorRepr => &[AbstractDictIteratorRepr, Repr],
+            DictIteratorRepr => &[DictIteratorRepr, AbstractDictIteratorRepr, Repr],
             CharRepr => &[CharRepr, Repr],
             UniCharRepr => &[UniCharRepr, Repr],
             StringRepr => &[StringRepr, AbstractStringRepr, Repr],
             UnicodeRepr => &[UnicodeRepr, AbstractStringRepr, Repr],
+            ByteArrayRepr => &[ByteArrayRepr, AbstractStringRepr, Repr],
             AbstractStringRepr => &[AbstractStringRepr, Repr],
             WeakRefRepr => &[WeakRefRepr, Repr],
             EmulatedWeakRefRepr => &[EmulatedWeakRefRepr, Repr],
+            GCRefRepr => &[GCRefRepr, Repr],
             RangeRepr => &[RangeRepr, Repr],
             // `ListIteratorRepr → AbstractListIteratorRepr → IteratorRepr
             // → Repr`; the abstract bases carry no pairtype entries, so
@@ -414,6 +440,15 @@ fn dispatch_convert_from_to(
         // Different-arity returns NotImplemented.
         (TupleRepr, TupleRepr) => {
             super::rtuple::pair_tuple_tuple_convert_from_to(r_from, r_to, v, llops)
+        }
+        // rgcref.py:52-63 — conversions to/from the generic GCREF
+        // wrapper use `cast_opaque_ptr`, optionally converting through
+        // the wrapped base repr first.
+        (GCRefRepr, Repr) => {
+            super::lltypesystem::rgcref::pair_gcref_repr_convert_from_to(r_from, r_to, v, llops)
+        }
+        (Repr, GCRefRepr) => {
+            super::lltypesystem::rgcref::pair_repr_gcref_convert_from_to(r_from, r_to, v, llops)
         }
         // rstr.py:805-814 — Char→String and UniChar→Unicode conversion
         // routes through `ll_chr2str`, allocating a one-character

@@ -54,7 +54,7 @@ pub fn run_repl(quiet: bool) {
     // process, and register the periodic signal-check action.
     unsafe {
         let ec_ptr = Rc::as_ptr(&execution_context) as *mut PyExecutionContext;
-        pyre_interpreter::module::_signal::interp_signal::install_signal_handling(&mut *ec_ptr);
+        pyre_interpreter::module::signal::interp_signal::install_signal_handling(&mut *ec_ptr);
     }
 
     let mut namespace = Box::new(execution_context.fresh_dict_storage());
@@ -71,7 +71,7 @@ pub fn run_repl(quiet: bool) {
     // `globals()`, `f.__globals__`, and `__main__.__dict__` all share
     // one identity.
     let canonical = pyre_interpreter::baseobjspace::dict_storage_to_dict(namespace);
-    let main_module = pyre_object::moduleobject::w_module_new_aliasing_dict(
+    let main_module = pyre_object::module::w_module_new_aliasing_dict(
         "__main__",
         namespace as *mut u8,
         canonical,
@@ -379,11 +379,8 @@ mod tests {
         // populated by `dict_storage_to_dict`'s lazy mirror_target
         // registration.
         let canonical = pyre_interpreter::baseobjspace::dict_storage_to_dict(ns_ptr);
-        let sys_module = pyre_object::moduleobject::w_module_new_aliasing_dict(
-            "sys",
-            ns_ptr as *mut u8,
-            canonical,
-        );
+        let sys_module =
+            pyre_object::module::w_module_new_aliasing_dict("sys", ns_ptr as *mut u8, canonical);
 
         assert_eq!(read_prompt(sys_module, "ps1").as_deref(), Some("py> "));
     }

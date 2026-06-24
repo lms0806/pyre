@@ -5,6 +5,7 @@
 /// The optimizer chains multiple passes, each implementing the Optimization trait.
 /// Operations flow through the chain: IntBounds → Rewrite → Virtualize → String →
 /// Pure → Guard → Simplify → Heap (configurable).
+pub mod autogenintrules;
 pub mod bridgeopt;
 pub mod dependency;
 pub mod earlyforce;
@@ -18,12 +19,14 @@ pub mod vec_assoc;
 // optimize module is at crate::optimize (RPython: metainterp/optimize.py)
 pub mod optimizer;
 pub mod pure;
+pub mod rawbuffer;
 pub mod renamer;
 pub mod rewrite;
 pub mod schedule;
 pub mod shortpreamble;
 pub mod simplify;
 pub mod unroll;
+pub mod util;
 pub mod vector;
 pub mod version;
 pub mod virtualize;

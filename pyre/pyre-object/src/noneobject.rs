@@ -21,43 +21,6 @@ pub fn w_none() -> PyObjectRef {
     &NONE_SINGLETON as *const W_NoneObject as *mut PyObject
 }
 
-/// Python NotImplemented singleton.
-/// PyPy: space.w_NotImplemented
-#[repr(C)]
-pub struct W_NotImplementedObject {
-    pub ob_header: PyObject,
-}
-
-static NOT_IMPLEMENTED_SINGLETON: W_NotImplementedObject = W_NotImplementedObject {
-    ob_header: PyObject {
-        ob_type: &NOTIMPLEMENTED_TYPE as *const PyType,
-        w_class: std::ptr::null_mut(),
-    },
-};
-
-/// Get the NotImplemented singleton.
-pub fn w_not_implemented() -> PyObjectRef {
-    &NOT_IMPLEMENTED_SINGLETON as *const W_NotImplementedObject as *mut PyObject
-}
-
-/// Python Ellipsis singleton (`...`).
-#[repr(C)]
-pub struct W_EllipsisObject {
-    pub ob_header: PyObject,
-}
-
-static ELLIPSIS_SINGLETON: W_EllipsisObject = W_EllipsisObject {
-    ob_header: PyObject {
-        ob_type: &ELLIPSIS_TYPE as *const PyType,
-        w_class: std::ptr::null_mut(),
-    },
-};
-
-/// Get the Ellipsis singleton.
-pub fn w_ellipsis() -> PyObjectRef {
-    &ELLIPSIS_SINGLETON as *const W_EllipsisObject as *mut PyObject
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

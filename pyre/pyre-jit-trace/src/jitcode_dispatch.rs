@@ -504,7 +504,7 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     ///   token = sd.exit_frame_with_exception_descr_ref
     ///   self.history.record1(rop.FINISH, valuebox, None, descr=token)
     /// Production callers resolve via `MetaInterpStaticData`
-    /// (cf. `metainterp.rs:733`); tests use `make_fail_descr(1)`.
+    /// (cf. `pyjitpl.rs:733`); tests use `make_fail_descr(1)`.
     pub exit_frame_with_exception_descr_ref: DescrRef,
     /// Whether this `WalkContext` is the outermost trace frame
     /// (`true`) or a nested sub-jitcode frame entered through
@@ -1085,7 +1085,7 @@ pub enum DispatchError {
     /// iteration (and its short inner loops compile + deopt-storm), strictly
     /// slower than interpreting.  The trait tracer inlines such callees via
     /// `push_inline_frame` + the `recursive-call-assembler` loop back-edge
-    /// (`metainterp.rs` opimpl_recursive_call_assembler).  Surface a typed
+    /// (`pyjitpl.rs` opimpl_recursive_call_assembler).  Surface a typed
     /// abort so the key routes to the trait leg (`FBW_DECLINED_KEYS`) until
     /// the walker itself covers loop-callee inlining (task #62, the Phase-6
     /// convergence).
@@ -6201,7 +6201,7 @@ fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) 
 
 /// Forward-skip Python trivia (`Cache` / `ExtendedArg` / `Resume` / `Nop`
 /// / `NotTaken`) from `py_pc` to the next executable opcode.  Mirrors the
-/// forward trivia walk in [`crate::metainterp::semantic_fallthrough_pc`]
+/// forward trivia walk in [`crate::pyjitpl::semantic_fallthrough_pc`]
 /// but starts AT `py_pc` (not `py_pc + 1`) so a coordinate that already
 /// points at trivia is advanced.  A resume coordinate must be a real
 /// opcode boundary; the resume reader's own backtrack walks trivia
@@ -6663,7 +6663,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     // stack no longer holds those operands (which drops/dups
                     // the side effect, e.g. an in-place list swap store).
                     if after_residual_call {
-                        py = crate::metainterp::semantic_fallthrough_pc(code, py as usize) as u32;
+                        py = crate::pyjitpl::semantic_fallthrough_pc(code, py as usize) as u32;
                     }
                 }
                 (py, jc.index as u32, jc.payload.metadata.pc_map.len())
@@ -6948,7 +6948,7 @@ fn compute_inline_caller_frame(
             return None;
         }
         let code = &*jc.payload.code_ptr;
-        let fallthrough = crate::metainterp::semantic_fallthrough_pc(code, call_py) as u32;
+        let fallthrough = crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32;
         (jc.index as u32, fallthrough, jc.payload.code_ptr)
     };
     // The call result is the top operand-stack slot at the return point.
@@ -7030,7 +7030,7 @@ fn walker_capture_multi_frame_inline_snapshot(
         let mut py = python_pc_for_jitcode_pc(&callee_pjc.metadata, callee_op_pc);
         py = skip_python_trivia_forward(code, py as usize) as u32;
         if after_residual_call {
-            py = crate::metainterp::semantic_fallthrough_pc(code, py as usize) as u32;
+            py = crate::pyjitpl::semantic_fallthrough_pc(code, py as usize) as u32;
         }
         py
     };
@@ -7214,11 +7214,11 @@ fn walker_record_guard_exception(ctx: &mut WalkContext<'_, '_>, pc: usize) {
     };
     // `pyjitpl.py:3382-3384`: ALWAYS emit `GuardException` with a const
     // class pin (`class_of_last_exc_is_const = True` after the emit).
-    // Pyre's `W_ExceptionObject.ob_header.ob_type` is the per-`ExcKind`
-    // `PyType` static (`excobject.rs::exc_kind_to_pytype`), matching
+    // Pyre's `W_BaseException.ob_header.ob_type` is the per-`ExcKind`
+    // `PyType` static (`interp_exceptions.rs::exc_kind_to_pytype`), matching
     // upstream `OBJECT.typeptr = specific class` (`rclass.py:167-174`).
     let exc_type_ptr = unsafe {
-        (*(exc_obj as *const pyre_object::excobject::W_ExceptionObject))
+        (*(exc_obj as *const pyre_object::interp_exceptions::W_BaseException))
             .ob_header
             .ob_type as i64
     };
@@ -7763,14 +7763,14 @@ fn diagnose_inline_recognition(arg_concretes: &[ConcreteValue], op_pc: usize) {
 }
 
 /// Resolve a concrete callable pointer to `(w_code, arg_count, has_closure)`,
-/// validating the `Function -> W_CodeObject -> CodeObject` type chain at every
+/// validating the `Function -> PyCode -> CodeObject` type chain at every
 /// hop.  Returns `None` — decline to the orthodox residual call — when any link
 /// fails to type-check.
 ///
 /// The `callable` comes from `ctx.concrete_registers_r`, a best-effort shadow
 /// that is NOT a GC root: a collection during the walk can leave the shadow
 /// pointing at freed/relocated memory whose first word still happens to read
-/// `FUNCTION_TYPE`.  Reading `(*callable).code` then yields a non-`W_CodeObject`
+/// `FUNCTION_TYPE`.  Reading `(*callable).code` then yields a non-`PyCode`
 /// (a host-allocated code wrapper never lives in the GC heap), so the
 /// `CODE_TYPE` tag check rejects the stale shadow before `code_ptr` is read —
 /// degrading to a residual call instead of dereferencing garbage.  Both walker
@@ -10759,11 +10759,11 @@ fn try_walker_orthodox_list_append(
     // Recognition: bound builtin `list.append` + Integer-storage list +
     // plain-int value + spare capacity (mirror the fold's gate).
     let (inner_func, inner_self, len_before) = unsafe {
-        if !pyre_object::methodobject::is_method(callable) {
+        if !pyre_object::function::is_method(callable) {
             return Ok(None);
         }
-        let inner_func = pyre_object::methodobject::w_method_get_func(callable);
-        let inner_self = pyre_object::methodobject::w_method_get_self(callable);
+        let inner_func = pyre_object::function::w_method_get_func(callable);
+        let inner_self = pyre_object::function::w_method_get_self(callable);
         if inner_func.is_null() || inner_self.is_null() {
             return Ok(None);
         }
@@ -10807,7 +10807,7 @@ fn try_walker_orthodox_list_append(
     // Pin the callable to `list.append`: guard_class METHOD + guard_value on
     // the stable function slot (these guards resume via the full-body path at
     // `op.pc`, ignoring the call-site fields set below).
-    let method_type_addr = &pyre_object::methodobject::METHOD_TYPE as *const _ as i64;
+    let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
     if !callable_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(callable_op) {
         let type_const = ctx.trace_ctx.const_int(method_type_addr);
         ctx.trace_ctx
@@ -11002,11 +11002,11 @@ fn try_walker_specialize_list_append(
     // plain-int value + spare capacity.  Mirrors the trait recognition
     // (`trace_opcode.rs` is_method / canonical_list_method("append")).
     let (inner_func, inner_self, len_before, is_inline, elem) = unsafe {
-        if !pyre_object::methodobject::is_method(callable) {
+        if !pyre_object::function::is_method(callable) {
             return Ok(None);
         }
-        let inner_func = pyre_object::methodobject::w_method_get_func(callable);
-        let inner_self = pyre_object::methodobject::w_method_get_self(callable);
+        let inner_func = pyre_object::function::w_method_get_func(callable);
+        let inner_self = pyre_object::function::w_method_get_self(callable);
         if inner_func.is_null() || inner_self.is_null() {
             return Ok(None);
         }
@@ -11045,7 +11045,7 @@ fn try_walker_specialize_list_append(
     // `w_function` slot.  The bound method is freshly allocated each
     // iteration but its function pointer is stable, so the receiver alone
     // cannot tie the trace to `list.append` — guard the function.
-    let method_type_addr = &pyre_object::methodobject::METHOD_TYPE as *const _ as i64;
+    let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
     if !callable_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(callable_op) {
         let type_const = ctx.trace_ctx.const_int(method_type_addr);
         ctx.trace_ctx
@@ -13713,7 +13713,7 @@ fn handle(
             // Mirrors trait-side `seed_raised_exception` at
             // `trace_opcode.rs:seed_raised_exception`.  The read at
             // `ob_header.ob_type` resolves to the per-`ExcKind` `PyType`
-            // static (`excobject.rs::exc_kind_to_pytype`), so the
+            // static (`interp_exceptions.rs::exc_kind_to_pytype`), so the
             // emitted `GuardClass` discriminates the actual subclass.
             // Stashes the concrete into `ctx.last_exc_value_concrete`
             // so a downstream
@@ -13732,7 +13732,7 @@ fn handle(
                 if let ConcreteValue::Ref(exc_ptr) = concrete_exc {
                     if !exc_ptr.is_null() && !ctx.trace_ctx.heap_cache().is_class_known(exc) {
                         let exc_class_ptr = unsafe {
-                            (*(exc_ptr as *const pyre_object::excobject::W_ExceptionObject))
+                            (*(exc_ptr as *const pyre_object::interp_exceptions::W_BaseException))
                                 .ob_header
                                 .ob_type
                         };
@@ -13824,7 +13824,7 @@ fn handle(
             // The class pointer is the standing exception's `ob_type`.
             // `read_typeptr_from_exception` (`dispatch.rs:1117`) routes
             // through `cpu.cls_of_box`; the trait leg reads it directly off
-            // `W_ExceptionObject.ob_header.ob_type` (`trace_opcode.rs:7042`,
+            // `W_BaseException.ob_header.ob_type` (`trace_opcode.rs:7042`,
             // `seed_raised_exception` at `:7171`). Walker mirrors the
             // direct read from the live concrete exception. The result is
             // a `ConstInt(typeptr)` — no IR op recorded, matching
@@ -13842,7 +13842,7 @@ fn handle(
                 }
             };
             let typeptr = unsafe {
-                (*(exc_ptr as *const pyre_object::excobject::W_ExceptionObject))
+                (*(exc_ptr as *const pyre_object::interp_exceptions::W_BaseException))
                     .ob_header
                     .ob_type as i64
             };
@@ -13910,7 +13910,7 @@ fn handle(
             // `F`=rf). pyre's portal jitdriver greens =
             // `[next_instr, is_being_profiled, pycode]` (`eval.rs:1936`),
             // so gi[0]=next_instr (the Python pc) and gr[0]=pycode
-            // (W_CodeObject). The green key is derivable from the op's own
+            // (PyCode). The green key is derivable from the op's own
             // greens, and `next_instr` is the SAME Python-pc coordinate the
             // trace-start seed uses (`trace.rs add_merge_point(make_green_key(
             // w_code, start_pc))`) — no jitcode-pc/python-pc mismatch.
@@ -16637,13 +16637,13 @@ mod tests {
         // tracked by every `registers_r[dst]` write
         // ([`write_ref_reg`]), so a `raise/r` reading the shadow finds
         // a reliable concrete pointer.  Allocate a real
-        // `W_ExceptionObject` so the deref against
+        // `W_BaseException` so the deref against
         // `ob_header.ob_type` is sound; expect GuardClass + Finish
         // recorded and the heapcache class-known flag pinned.  Mirrors
         // trait-side `seed_raised_exception` at `trace_opcode.rs:
         // 6629-6643`.
-        let exc_ptr = pyre_object::excobject::w_exception_new(
-            pyre_object::excobject::ExcKind::ValueError,
+        let exc_ptr = pyre_object::interp_exceptions::w_exception_new(
+            pyre_object::interp_exceptions::ExcKind::ValueError,
             "shadow-walker probe",
         );
         let raise_byte = *insns_opname_to_byte()
@@ -22214,7 +22214,7 @@ mod tests {
         ];
         let mut tc = fresh_trace_ctx();
         let next_instr = tc.const_int(42); // gi[0] = Python pc
-        let pycode = tc.const_ref(0x1_0000); // gr[0] = W_CodeObject ptr
+        let pycode = tc.const_ref(0x1_0000); // gr[0] = PyCode ptr
         let red0 = tc.const_ref(0x2_0000); // rr[0]
         let red1 = tc.const_ref(0x3_0000); // rr[1]
         let mut regs_i = vec![next_instr];

@@ -247,7 +247,7 @@ pub fn exception_getclass(w_obj: PyObjectRef) -> PyObjectRef {
 /// elements).  Gates the `characters_written` reader and suppresses the
 /// `filename` derivation for that argument (`interp_exceptions.py` `_init_error`).
 fn exc_blocking_written(obj: PyObjectRef) -> bool {
-    let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+    let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
     let n = unsafe { pyre_object::w_tuple_len(args) };
     if n < 3 {
         return false;
@@ -280,7 +280,7 @@ fn syntax_error_attr(obj: PyObjectRef, name: &str) -> PyObjectRef {
             return v;
         }
     }
-    let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+    let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
     let n = unsafe { pyre_object::w_tuple_len(args) };
     if name == "msg" {
         if n >= 1 {
@@ -384,7 +384,7 @@ unsafe fn p_recursive_isinstance_type_w(
 }
 
 /// abstractinst.py:53-72 `p_recursive_isinstance_w`. The Py3 port drops
-/// the `W_ClassObject`/`W_InstanceObject` Py2 fast path. Validates
+/// the `W_ClassObject`/`W_ObjectObject` Py2 fast path. Validates
 /// `w_cls` via `check_class()` before falling back to the abstract
 /// `__class__` / `__bases__` walk.
 unsafe fn p_recursive_isinstance_w(
@@ -1308,7 +1308,7 @@ unsafe fn getitem_type(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     // descroperation.py:362 — `type[X]` (the operand is exactly `type`) builds
     // a GenericAlias even though `type` defines no `__class_getitem__`.
     if std::ptr::eq(obj, crate::typedef::w_type()) {
-        return crate::genericalias::generic_alias_class_getitem(&[obj, index]);
+        return crate::_pypy_generic_alias::generic_alias_class_getitem(&[obj, index]);
     }
     // Python 3.9+ generic subscript: cls[X] → cls.__class_getitem__(X)
     // (`descroperation.py:366` getattr lookup).
@@ -1337,7 +1337,7 @@ unsafe fn getitem_instance(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 }
 
 #[inline(never)]
-/// `rangeobject.py W_RangeObject.descr_getitem` — integer index returns
+/// `functional.py W_Range.descr_getitem` — integer index returns
 /// the member `start + i*step` (negative folded, bounds-checked); a slice
 /// returns a NEW `range` object, not a list.  Indices and members are
 /// kept in bignum so a range past a machine word is still subscriptable.
@@ -1357,7 +1357,7 @@ unsafe fn getitem_range(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     }
 }
 
-/// `rangeobject.py compute_slice_indices3` — resolve a slice's
+/// `functional.py compute_slice_indices3` — resolve a slice's
 /// (start, stop, step) against a wrapped `length`, in bignum.
 unsafe fn compute_slice_indices3_big(
     slice: PyObjectRef,
@@ -1443,7 +1443,7 @@ unsafe fn compute_slice_indices3_big(
     Ok((start, stop, step))
 }
 
-/// `rangeobject.py W_RangeObject._compute_slice` — build the NEW `range`
+/// `functional.py W_Range._compute_slice` — build the NEW `range`
 /// a slice of `obj` denotes.
 unsafe fn range_compute_slice(obj: PyObjectRef, slice: PyObjectRef) -> PyResult {
     use num_traits::Zero;
@@ -1471,14 +1471,14 @@ unsafe fn range_compute_slice(obj: PyObjectRef, slice: PyObjectRef) -> PyResult 
     Ok(pyre_object::w_range_new(w_substart, w_substop, w_substep))
 }
 
-/// `range.count(value)` — `rangeobject.py W_RangeObject.descr_count`.
+/// `range.count(value)` — `functional.py W_Range.descr_count`.
 fn range_count_method(args: &[PyObjectRef]) -> PyResult {
     let obj = args[0];
     let needle = args.get(1).copied().unwrap_or(PY_NULL);
     Ok(w_int_new(if contains(obj, needle)? { 1 } else { 0 }))
 }
 
-/// `range.index(value)` — `rangeobject.py W_RangeObject.descr_index`.
+/// `range.index(value)` — `functional.py W_Range.descr_index`.
 fn range_index_method(args: &[PyObjectRef]) -> PyResult {
     let obj = args[0];
     let needle = args.get(1).copied().unwrap_or(PY_NULL);
@@ -1521,7 +1521,7 @@ fn range_iter_method(args: &[PyObjectRef]) -> PyResult {
     iter(args[0])
 }
 
-/// `range.__reversed__()` — `rangeobject.py W_RangeObject.descr_reversed`.
+/// `range.__reversed__()` — `functional.py W_Range.descr_reversed`.
 fn range_reversed_method(args: &[PyObjectRef]) -> PyResult {
     unsafe { Ok(pyre_object::w_range_reversed(args[0])) }
 }
@@ -1571,7 +1571,7 @@ fn builtin_callable(name: &str) -> PyObjectRef {
     unsafe { (*ctx).lookup_builtin(name).unwrap_or(PY_NULL) }
 }
 
-/// `list_iterator.__reduce__()` — `iterobject.py
+/// `sequenceiterator.__reduce__()` — `iterobject.py
 /// W_AbstractSeqIterObject.descr_reduce`: `(iter, (seq,), index)`.
 fn seq_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
@@ -1586,7 +1586,7 @@ fn seq_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     }
 }
 
-/// `list_iterator.__setstate__(index)` — clamp the cursor into
+/// `sequenceiterator.__setstate__(index)` — clamp the cursor into
 /// `[0, length]` (`iterobject.py descr_setstate`).
 fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let mut index = int_w(args[1])?;
@@ -1602,7 +1602,7 @@ fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
     Ok(w_none())
 }
 
-/// `list_iterator.__length_hint__()` — elements not yet produced.
+/// `sequenceiterator.__length_hint__()` — elements not yet produced.
 fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let remaining =
@@ -1611,13 +1611,18 @@ fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     }
 }
 
-/// `range_iterator.__reduce__()` — `iterobject.py
-/// W_IntRangeIterator.descr_reduce`: rebuild a `range(current, stop,
-/// step)` covering the remaining span, `(iter, (range,), None)`.
+/// `range_iterator.__reduce__()` — `functional.py
+/// W_IntRangeIterator.descr_reduce`: pyre rebuilds a `range(current, stop,
+/// step)` covering the remaining span, then returns `(iter, (range,), None)`.
 fn range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
-        let (current, stop, step) = pyre_object::w_range_iter_fields(args[0]);
-        let w_range = pyre_object::w_range_new_i64(current, stop, step);
+        let (current, remaining, step) = pyre_object::w_range_iter_fields(args[0]);
+        let stop = BigInt::from(current) + BigInt::from(remaining) * step;
+        let w_range = pyre_object::w_range_new(
+            w_int_new(current),
+            pyre_object::range_bigint_to_obj(stop),
+            w_int_new(step),
+        );
         let state = w_tuple_new(vec![w_range]);
         Ok(w_tuple_new(vec![builtin_callable("iter"), state, w_none()]))
     }
@@ -1660,20 +1665,20 @@ fn long_range_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 /// `dict_keyiterator.__reduce__()` (and value/item siblings) —
-/// `dictmultiobject.py W_BaseDictIterator.descr_reduce`: the remaining
+/// `dictmultiobject.py W_BaseDictMultiIterObject.descr_reduce`: the remaining
 /// entries as a list, wrapped `(iter, (list,))`.  No third element.
 fn dict_view_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
-        let w_dict = pyre_object::dictviewobject::w_dict_view_iterator_get_dict(args[0]);
-        let kind = pyre_object::dictviewobject::w_dict_view_iterator_get_kind(args[0]);
-        let index = pyre_object::dictviewobject::w_dict_view_iterator_get_index(args[0]);
+        let w_dict = pyre_object::dictmultiobject::w_dict_view_iterator_get_dict(args[0]);
+        let kind = pyre_object::dictmultiobject::w_dict_view_iterator_get_kind(args[0]);
+        let index = pyre_object::dictmultiobject::w_dict_view_iterator_get_index(args[0]);
         let entries = pyre_object::w_dict_items(w_dict);
         let mut items = Vec::new();
         for (k, v) in entries.into_iter().skip(index) {
             let item = match kind {
-                pyre_object::dictviewobject::DictViewKind::Keys => k,
-                pyre_object::dictviewobject::DictViewKind::Values => v,
-                pyre_object::dictviewobject::DictViewKind::Items => w_tuple_new(vec![k, v]),
+                pyre_object::dictmultiobject::DictViewKind::Keys => k,
+                pyre_object::dictmultiobject::DictViewKind::Values => v,
+                pyre_object::dictmultiobject::DictViewKind::Items => w_tuple_new(vec![k, v]),
             };
             items.push(item);
         }
@@ -1685,8 +1690,8 @@ fn dict_view_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// `dict_keyiterator.__length_hint__()` — remaining entries.
 fn dict_view_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
-        let w_dict = pyre_object::dictviewobject::w_dict_view_iterator_get_dict(args[0]);
-        let index = pyre_object::dictviewobject::w_dict_view_iterator_get_index(args[0]);
+        let w_dict = pyre_object::dictmultiobject::w_dict_view_iterator_get_dict(args[0]);
+        let index = pyre_object::dictmultiobject::w_dict_view_iterator_get_index(args[0]);
         let remaining = (pyre_object::w_dict_len(w_dict) as i64) - (index as i64);
         Ok(w_int_new(remaining.max(0)))
     }
@@ -1696,8 +1701,8 @@ fn dict_view_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
 /// `(enumerate, (source_iter, index))`.
 fn enumerate_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
-        let i64_index = pyre_object::enumerateobject::w_enumerate_get_index(args[0]);
-        let raw = pyre_object::enumerateobject::w_enumerate_get_iter_or_list(args[0]);
+        let i64_index = pyre_object::functional::w_enumerate_get_index(args[0]);
+        let raw = pyre_object::functional::w_enumerate_get_iter_or_list(args[0]);
         let w_iter = if raw.is_null() {
             // Exhausted enumerate (`:294-295` set `w_iter_or_list` to
             // null); substitute an empty seq-iter so the reduce stays
@@ -1717,7 +1722,7 @@ fn enumerate_reduce_method(args: &[PyObjectRef]) -> PyResult {
         } else {
             raw
         };
-        let w_index_slot = pyre_object::enumerateobject::w_enumerate_get_w_index(args[0]);
+        let w_index_slot = pyre_object::functional::w_enumerate_get_w_index(args[0]);
         let index = if w_index_slot.is_null() {
             w_int_new(i64_index)
         } else {
@@ -1735,9 +1740,9 @@ fn enumerate_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// builtin so `pickle` recreates the iterator via `reversed(sequence)`.
 fn reversed_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
-        let seq = pyre_object::reversedobject::w_reversed_get_sequence(args[0]);
+        let seq = pyre_object::functional::w_reversed_get_sequence(args[0]);
         if !seq.is_null() {
-            let remaining = pyre_object::reversedobject::w_reversed_get_remaining(args[0]);
+            let remaining = pyre_object::functional::w_reversed_get_remaining(args[0]);
             let state = w_tuple_new(vec![seq]);
             Ok(w_tuple_new(vec![
                 builtin_callable("reversed"),
@@ -1757,14 +1762,14 @@ fn reversed_reduce_method(args: &[PyObjectRef]) -> PyResult {
 fn reversed_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let mut remaining = int_w(args[1])?;
     unsafe {
-        let seq = pyre_object::reversedobject::w_reversed_get_sequence(args[0]);
+        let seq = pyre_object::functional::w_reversed_get_sequence(args[0]);
         let n = if !seq.is_null() { len_w(seq)? } else { 0 };
         if remaining < -1 {
             remaining = -1;
         } else if remaining > n - 1 {
             remaining = n - 1;
         }
-        pyre_object::reversedobject::w_reversed_set_remaining(args[0], remaining);
+        pyre_object::functional::w_reversed_set_remaining(args[0], remaining);
     }
     Ok(w_none())
 }
@@ -1773,10 +1778,10 @@ fn reversed_setstate_method(args: &[PyObjectRef]) -> PyResult {
 /// descr_length_hint`: elements not yet produced, `0` once exhausted.
 fn reversed_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
-        let remaining = pyre_object::reversedobject::w_reversed_get_remaining(args[0]);
+        let remaining = pyre_object::functional::w_reversed_get_remaining(args[0]);
         let mut res = 0i64;
         if remaining >= 0 {
-            let seq = pyre_object::reversedobject::w_reversed_get_sequence(args[0]);
+            let seq = pyre_object::functional::w_reversed_get_sequence(args[0]);
             let total = if !seq.is_null() { len_w(seq)? } else { 0 };
             let rem_length = remaining + 1;
             if rem_length <= total {
@@ -1794,13 +1799,13 @@ fn reversed_length_hint_method(args: &[PyObjectRef]) -> PyResult {
 /// position.
 fn filter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
-        let w_predicate = pyre_object::filterobject::w_filter_get_predicate(args[0]);
+        let w_predicate = pyre_object::functional::w_filter_get_predicate(args[0]);
         let w_predicate = if w_predicate.is_null() {
             w_none()
         } else {
             w_predicate
         };
-        let w_iterable = pyre_object::filterobject::w_filter_get_iterable(args[0]);
+        let w_iterable = pyre_object::functional::w_filter_get_iterable(args[0]);
         let state = w_tuple_new(vec![w_predicate, w_iterable]);
         Ok(w_tuple_new(vec![builtin_callable("filter"), state]))
     }
@@ -1920,8 +1925,8 @@ unsafe fn pull_iterator_tuple(
 /// (CPython 3.14).  The captured iterators carry their positions.
 fn map_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
-        let w_fun = pyre_object::mapobject::w_map_get_fun(args[0]);
-        let w_iterators = pyre_object::mapobject::w_map_get_iterators(args[0]);
+        let w_fun = pyre_object::functional::w_map_get_fun(args[0]);
+        let w_iterators = pyre_object::functional::w_map_get_iterators(args[0]);
         let n = pyre_object::w_list_len(w_iterators);
         let mut state_items = Vec::with_capacity(n as usize + 1);
         state_items.push(w_fun);
@@ -1930,7 +1935,7 @@ fn map_reduce_method(args: &[PyObjectRef]) -> PyResult {
         }
         let state = w_tuple_new(state_items);
         let map_fn = builtin_callable("map");
-        if pyre_object::mapobject::w_map_get_strict(args[0]) {
+        if pyre_object::functional::w_map_get_strict(args[0]) {
             Ok(w_tuple_new(vec![map_fn, state, w_bool_from(true)]))
         } else {
             Ok(w_tuple_new(vec![map_fn, state]))
@@ -1943,7 +1948,7 @@ fn map_reduce_method(args: &[PyObjectRef]) -> PyResult {
 fn map_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let strict = is_true(args[1])?;
     unsafe {
-        pyre_object::mapobject::w_map_set_strict(args[0], strict);
+        pyre_object::functional::w_map_set_strict(args[0], strict);
     }
     Ok(w_none())
 }
@@ -1952,7 +1957,7 @@ fn map_setstate_method(args: &[PyObjectRef]) -> PyResult {
 /// `(zip, (*iterators))`, with a trailing `True` when `strict`.
 fn zip_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
-        let w_iterators = pyre_object::zipobject::w_zip_get_iterators(args[0]);
+        let w_iterators = pyre_object::functional::w_zip_get_iterators(args[0]);
         let n = pyre_object::w_list_len(w_iterators);
         let mut state_items = Vec::with_capacity(n as usize);
         for i in 0..n {
@@ -1960,7 +1965,7 @@ fn zip_reduce_method(args: &[PyObjectRef]) -> PyResult {
         }
         let state = w_tuple_new(state_items);
         let zip_fn = builtin_callable("zip");
-        if pyre_object::zipobject::w_zip_get_strict(args[0]) {
+        if pyre_object::functional::w_zip_get_strict(args[0]) {
             Ok(w_tuple_new(vec![zip_fn, state, w_bool_from(true)]))
         } else {
             Ok(w_tuple_new(vec![zip_fn, state]))
@@ -1973,20 +1978,14 @@ fn zip_reduce_method(args: &[PyObjectRef]) -> PyResult {
 fn zip_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let strict = is_true(args[1])?;
     unsafe {
-        pyre_object::zipobject::w_zip_set_strict(args[0], strict);
+        pyre_object::functional::w_zip_set_strict(args[0], strict);
     }
     Ok(w_none())
 }
 
 unsafe fn getitem_range_iter(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
-    let r = &*(obj as *const pyre_object::rangeobject::W_RangeIterator);
-    let len = if r.step > 0 {
-        (r.stop - r.current + r.step - 1) / r.step
-    } else if r.step < 0 {
-        (r.current - r.stop - r.step - 1) / (-r.step)
-    } else {
-        0
-    };
+    let r = &*(obj as *const pyre_object::functional::W_IntRangeIterator);
+    let len = r.remaining;
     if is_int(index) {
         // range[i]
         let i = w_int_get_value(index);
@@ -2382,13 +2381,14 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
             obj
         }
     };
-    // `pypy/objspace/std/dictmultiobject.py W_DictMultiViewKeysObject
-    // .descr_len` returns `space.len(self.w_dict)` for all three view
+    // `pypy/objspace/std/dictmultiobject.py`
+    // `W_DictViewKeysObject.descr_len` returns `space.len(self.w_dict)`
+    // for all three view
     // kinds.  Forward to the source dict so the view's len reflects
     // live mutations on the dict, matching PyPy's view semantics.
     unsafe {
-        if pyre_object::dictviewobject::is_dict_view(obj) {
-            let dict = pyre_object::dictviewobject::w_dict_view_get_dict(obj);
+        if pyre_object::dictmultiobject::is_dict_view(obj) {
+            let dict = pyre_object::dictmultiobject::w_dict_view_get_dict(obj);
             if dict.is_null() {
                 return Ok(w_int_new(0));
             }
@@ -2426,24 +2426,16 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
             };
         }
         if pyre_object::is_long_range_iter(obj) {
-            // `iterobject.py W_LongRangeIterator.descr_len → w_len - w_index`.
+            // `functional.py W_LongRangeIterator.descr_len → w_len - w_index`.
             return Ok(pyre_object::range_bigint_to_obj(
                 pyre_object::w_long_range_iter_len(obj),
             ));
         }
         if is_range_iter(obj) {
-            // `iterobject.py W_AbstractSeqIterObject.descr_length_hint`
-            // — the iterator reports its REMAINING count, derived from
-            // `(stop - current) / step`.
-            let r = &*(obj as *const pyre_object::rangeobject::W_RangeIterator);
-            let count = if r.step > 0 {
-                ((r.stop - r.current).max(0) + r.step - 1) / r.step
-            } else if r.step < 0 {
-                ((r.current - r.stop).max(0) + (-r.step) - 1) / (-r.step)
-            } else {
-                0
-            };
-            return Ok(w_int_new(count.max(0)));
+            // `functional.py W_IntRangeIterator.descr_len` reports the
+            // stored `remaining` count directly.
+            let r = &*(obj as *const pyre_object::functional::W_IntRangeIterator);
+            return Ok(w_int_new(r.remaining.max(0)));
         }
         // descroperation.py:294-298 `_len` — `space.lookup(w_obj, '__len__')`
         // then `space.get_and_call_function(w_descr, w_obj)`.  Routed through
@@ -2485,7 +2477,7 @@ pub fn getdict(obj: PyObjectRef) -> PyObjectRef {
     // exceptions/interp_exceptions.py:222-225 W_BaseException.getdict
     // override — lazily allocates the instance dict on the typed slot.
     if unsafe { pyre_object::is_exception(obj) } {
-        return unsafe { pyre_object::excobject::w_exception_getdict(obj) };
+        return unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) };
     }
     let w_type = match crate::typedef::r#type(obj) {
         Some(tp) => tp,
@@ -2502,7 +2494,7 @@ pub fn getdict(obj: PyObjectRef) -> PyObjectRef {
 /// `__slots__` storage fallback for a native-layout subclass instance.
 ///
 /// A `W_Member` slot normally reads/writes the receiver's mapdict slot
-/// storage (`MapdictSlotsSupport`), which only a `W_InstanceObject` carries.
+/// storage (`MapdictSlotsSupport`), which only a `W_ObjectObject` carries.
 /// A subclass of a builtin type with a fixed Rust payload (e.g. a subclass
 /// of `array.array`) keeps that native layout and has no mapdict, so the
 /// slot is instead backed by the instance `__dict__` — the same side table
@@ -2555,7 +2547,7 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
                 "setting exceptions's dictionary to a non-dict".to_string(),
             ));
         }
-        unsafe { pyre_object::excobject::w_exception_setdict(obj, w_dict) };
+        unsafe { pyre_object::interp_exceptions::w_exception_setdict(obj, w_dict) };
         return Ok(());
     }
     let w_type = match crate::typedef::r#type(obj) {
@@ -2581,7 +2573,7 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
 /// `getdict` result.  Upstream dict-subclass instances are dict-layout
 /// `W_DictMultiObject`, so `finditem_str`/`setitem_str` strategy
 /// dispatch works on them directly; pyre dict-subclass instances are
-/// `__dict_data__`-composed W_InstanceObject (typedef.rs
+/// `__dict_data__`-composed W_ObjectObject (typedef.rs
 /// dict_descr_new), so the `w_dict_*` layout accessors must target the
 /// backing dict.  Plain dicts, module dicts and mapdict views pass
 /// through unchanged.  The `__dict__` getter keeps returning the
@@ -2807,7 +2799,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
     // effect by forcing the receiver here. `force()` is a no-op for any
     // non-proxy operand, costing only one ptr-equality check on the hot
     // path.
-    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    let obj = crate::module::_weakref::interp__weakref::force(obj)?;
 
     // GenericAlias.__getattribute__ (`_pypy_generic_alias.py:52`) — every
     // attribute outside `_ATTR_EXCEPTIONS` delegates to `__origin__`.
@@ -2816,7 +2808,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
     // here; the exception names fall through to the normal lookup that
     // serves the `__origin__`/`__args__`/`__parameters__` getsets.
     if unsafe { pyre_object::is_generic_alias(obj) }
-        && !crate::genericalias::is_attr_exception(name)
+        && !crate::_pypy_generic_alias::is_attr_exception(name)
     {
         let origin = unsafe { pyre_object::w_generic_alias_get_origin(obj) };
         return getattr_str(origin, name);
@@ -2825,13 +2817,13 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
     // super proxy — PyPy: pypy/module/__builtin__/descriptor.py W_Super.getattribute
     // Looks up `name` in cls's MRO starting AFTER super_type.
     unsafe {
-        if pyre_object::superobject::is_super(obj) {
-            let super_type = pyre_object::superobject::w_super_get_type(obj);
-            let bound_obj = pyre_object::superobject::w_super_get_obj(obj);
+        if pyre_object::descriptor::is_super(obj) {
+            let super_type = pyre_object::descriptor::w_super_get_type(obj);
+            let bound_obj = pyre_object::descriptor::w_super_get_obj(obj);
 
             // Walk obj's type MRO, skip until we pass super_type.
             // Fall back to `crate::typedef::r#type(obj)` so non-INSTANCE
-            // built-in subclasses (W_ExceptionObject, etc.) resolve their
+            // built-in subclasses (W_BaseException, etc.) resolve their
             // class through the same path that powers `type(obj)` —
             // `pypy/objspace/std/typeobject.py:1083 type_get_mro`.
             // descriptor.py:127-149 _super_check: `su_obj` is itself a
@@ -2903,7 +2895,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
     //
     // Return W_Method(func, gen) so the generator is passed as args[0].
     unsafe {
-        if pyre_object::generatorobject::is_generator(obj) {
+        if pyre_object::generator::is_generator(obj) {
             let (sname, func, arity): (&str, fn(&[PyObjectRef]) -> PyResult, Option<u16>) =
                 match name {
                     "send" => ("send", generator_send_method, Some(2)),
@@ -2932,13 +2924,13 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
     // Expose `__next__` and `__iter__` so `_count(1).__next__` and
     // `iter(counter)` work.
     unsafe {
-        if pyre_object::itertoolsmodule::is_count(obj)
-            || pyre_object::itertoolsmodule::is_repeat(obj)
-            || pyre_object::itertoolsmodule::is_takewhile(obj)
-            || pyre_object::itertoolsmodule::is_dropwhile(obj)
-            || pyre_object::itertoolsmodule::is_filterfalse(obj)
-            || pyre_object::itertoolsmodule::is_pairwise(obj)
-            || pyre_object::itertoolsmodule::is_cycle(obj)
+        if pyre_object::interp_itertools::is_count(obj)
+            || pyre_object::interp_itertools::is_repeat(obj)
+            || pyre_object::interp_itertools::is_takewhile(obj)
+            || pyre_object::interp_itertools::is_dropwhile(obj)
+            || pyre_object::interp_itertools::is_filterfalse(obj)
+            || pyre_object::interp_itertools::is_pairwise(obj)
+            || pyre_object::interp_itertools::is_cycle(obj)
         {
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = match name {
                 "__next__" => Some((iter_next_method, "__next__", 1)),
@@ -2947,25 +2939,25 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                 // filterfalse `__reduce__` only (interp_itertools.py
                 // W_TakeWhile/W_DropWhile/W_FilterFalse typedefs); pairwise
                 // exposes neither.  cycle exposes both (W_Cycle typedef).
-                "__reduce__" if pyre_object::itertoolsmodule::is_cycle(obj) => {
+                "__reduce__" if pyre_object::interp_itertools::is_cycle(obj) => {
                     Some((cycle_reduce_method, "__reduce__", 1))
                 }
-                "__setstate__" if pyre_object::itertoolsmodule::is_cycle(obj) => {
+                "__setstate__" if pyre_object::interp_itertools::is_cycle(obj) => {
                     Some((cycle_setstate_method, "__setstate__", 2))
                 }
-                "__reduce__" if pyre_object::itertoolsmodule::is_takewhile(obj) => {
+                "__reduce__" if pyre_object::interp_itertools::is_takewhile(obj) => {
                     Some((takewhile_reduce_method, "__reduce__", 1))
                 }
-                "__setstate__" if pyre_object::itertoolsmodule::is_takewhile(obj) => {
+                "__setstate__" if pyre_object::interp_itertools::is_takewhile(obj) => {
                     Some((takewhile_setstate_method, "__setstate__", 2))
                 }
-                "__reduce__" if pyre_object::itertoolsmodule::is_dropwhile(obj) => {
+                "__reduce__" if pyre_object::interp_itertools::is_dropwhile(obj) => {
                     Some((dropwhile_reduce_method, "__reduce__", 1))
                 }
-                "__setstate__" if pyre_object::itertoolsmodule::is_dropwhile(obj) => {
+                "__setstate__" if pyre_object::interp_itertools::is_dropwhile(obj) => {
                     Some((dropwhile_setstate_method, "__setstate__", 2))
                 }
-                "__reduce__" if pyre_object::itertoolsmodule::is_filterfalse(obj) => {
+                "__reduce__" if pyre_object::interp_itertools::is_filterfalse(obj) => {
                     Some((filterfalse_reduce_method, "__reduce__", 1))
                 }
                 _ => None,
@@ -2981,7 +2973,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
         }
     }
 
-    // range attributes/methods — rangeobject.py W_RangeObject.
+    // range attributes/methods — functional.py W_Range.
     // `.start`/`.stop`/`.step` read-only ints; count/index/__iter__/
     // __reversed__ exposed as bound methods.
     unsafe {
@@ -3026,13 +3018,13 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
         if is_seq_iter(obj)
             || is_range_iter(obj)
             || pyre_object::is_long_range_iter(obj)
-            || pyre_object::dictviewobject::is_dict_view_iterator(obj)
-            || pyre_object::enumerateobject::is_enumerate(obj)
-            || pyre_object::reversedobject::is_reversed(obj)
-            || pyre_object::filterobject::is_filter(obj)
-            || pyre_object::mapobject::is_map(obj)
-            || pyre_object::zipobject::is_zip(obj)
-            || pyre_object::callableiteratorobject::is_callable_iterator(obj)
+            || pyre_object::dictmultiobject::is_dict_view_iterator(obj)
+            || pyre_object::functional::is_enumerate(obj)
+            || pyre_object::functional::is_reversed(obj)
+            || pyre_object::functional::is_filter(obj)
+            || pyre_object::functional::is_map(obj)
+            || pyre_object::functional::is_zip(obj)
+            || pyre_object::operation::is_callable_iterator(obj)
         {
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str)> = match name {
                 "__next__" => Some((iter_next_method, "__next__")),
@@ -3073,7 +3065,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                     }
                     _ => None,
                 }
-            } else if pyre_object::dictviewobject::is_dict_view_iterator(obj) {
+            } else if pyre_object::dictmultiobject::is_dict_view_iterator(obj) {
                 match name {
                     "__reduce__" => Some((dict_view_iter_reduce_method, "__reduce__", 1)),
                     "__length_hint__" => {
@@ -3081,30 +3073,30 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                     }
                     _ => None,
                 }
-            } else if pyre_object::enumerateobject::is_enumerate(obj) {
+            } else if pyre_object::functional::is_enumerate(obj) {
                 match name {
                     "__reduce__" => Some((enumerate_reduce_method, "__reduce__", 1)),
                     _ => None,
                 }
-            } else if pyre_object::reversedobject::is_reversed(obj) {
+            } else if pyre_object::functional::is_reversed(obj) {
                 match name {
                     "__reduce__" => Some((reversed_reduce_method, "__reduce__", 1)),
                     "__setstate__" => Some((reversed_setstate_method, "__setstate__", 2)),
                     "__length_hint__" => Some((reversed_length_hint_method, "__length_hint__", 1)),
                     _ => None,
                 }
-            } else if pyre_object::filterobject::is_filter(obj) {
+            } else if pyre_object::functional::is_filter(obj) {
                 match name {
                     "__reduce__" => Some((filter_reduce_method, "__reduce__", 1)),
                     _ => None,
                 }
-            } else if pyre_object::mapobject::is_map(obj) {
+            } else if pyre_object::functional::is_map(obj) {
                 match name {
                     "__reduce__" => Some((map_reduce_method, "__reduce__", 1)),
                     "__setstate__" => Some((map_setstate_method, "__setstate__", 2)),
                     _ => None,
                 }
-            } else if pyre_object::zipobject::is_zip(obj) {
+            } else if pyre_object::functional::is_zip(obj) {
                 match name {
                     "__reduce__" => Some((zip_reduce_method, "__reduce__", 1)),
                     "__setstate__" => Some((zip_setstate_method, "__setstate__", 2)),
@@ -3142,7 +3134,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             };
             if let Some((sname, func, arity)) = static_name {
                 let builtin = crate::make_builtin_function_with_arity(sname, func, arity);
-                return Ok(pyre_object::methodobject::w_method_new(
+                return Ok(pyre_object::function::w_method_new(
                     builtin,
                     obj,
                     pyre_object::PY_NULL,
@@ -3156,7 +3148,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                     // descriptor.py exposes the name set by `__set_name__`;
                     // an unset name falls through to the normal
                     // `'property' object has no attribute '__name__'`.
-                    let w_name = pyre_object::propertyobject::w_property_get_name(obj);
+                    let w_name = pyre_object::descriptor::w_property_get_name(obj);
                     if !w_name.is_null() {
                         return Ok(w_name);
                     }
@@ -3165,7 +3157,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                     // descriptor.py:316-318 `__doc__ = GetSetProperty(
                     // W_Property.get_doc, W_Property.set_doc)` → :249-250
                     // get_doc returns the `w_doc` slot.
-                    let stored = pyre_object::propertyobject::w_property_get_doc(obj);
+                    let stored = pyre_object::descriptor::w_property_get_doc(obj);
                     return Ok(if stored.is_null() { w_none() } else { stored });
                 }
                 _ => {}
@@ -3175,7 +3167,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
 
     // Member descriptor attributes — typedef.py:443 Member.__name__, __objclass__
     unsafe {
-        if pyre_object::memberobject::is_member(obj) {
+        if pyre_object::typedef::is_member(obj) {
             match name {
                 "__name__" => {
                     return Ok(pyre_object::w_str_new(pyre_object::w_member_get_name(obj)));
@@ -3246,13 +3238,13 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
         // so the type dispatch path matches PyPy's getset semantics.
         // PyPy3 exposes only the dunder names — `im_func` / `im_self`
         // were dropped in 3.x, so do not surface them here.
-        if pyre_object::methodobject::is_method(obj) {
+        if pyre_object::function::is_method(obj) {
             match name {
                 "__func__" => {
-                    return Ok(pyre_object::methodobject::w_method_get_func(obj));
+                    return Ok(pyre_object::function::w_method_get_func(obj));
                 }
                 "__self__" => {
-                    return Ok(pyre_object::methodobject::w_method_get_self(obj));
+                    return Ok(pyre_object::function::w_method_get_self(obj));
                 }
                 // `__class__` resolves to the `method` type itself (handled by
                 // the generic type dispatch below), never forwarded.
@@ -3267,7 +3259,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                         .map(|t| lookup_in_type_where(t, name).is_some())
                         .unwrap_or(false);
                     if !on_method_type {
-                        let func = pyre_object::methodobject::w_method_get_func(obj);
+                        let func = pyre_object::function::w_method_get_func(obj);
                         if !func.is_null() {
                             return getattr_str(func, name);
                         }
@@ -3632,7 +3624,7 @@ unsafe fn setattr_surrogate(
     value: PyObjectRef,
 ) -> PyResult {
     let value = unwrap_cell(value);
-    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     unsafe {
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
@@ -3658,7 +3650,7 @@ pub(crate) unsafe fn object_setattr_surrogate(
     value: PyObjectRef,
 ) -> PyResult {
     let value = unwrap_cell(value);
-    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     unsafe {
         // descroperation.py:114-123 — a data descriptor's `__set__` takes
         // priority over the dict store.  Walk `space.type(obj)` (the
@@ -3725,7 +3717,7 @@ pub(crate) unsafe fn object_setattr_surrogate(
 
 /// `space.delattr` for a lone-surrogate name — mirrors `delattr_str`.
 unsafe fn delattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) -> PyResult {
-    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     unsafe {
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
@@ -3744,7 +3736,7 @@ pub(crate) unsafe fn object_delattr_surrogate(
     w_name: PyObjectRef,
     name: &Wtf8,
 ) -> PyResult {
-    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     unsafe {
         // descroperation.py:131-137 — a data descriptor's `__delete__`
         // takes priority over the dict removal.  Mirror object_delattr,
@@ -4259,7 +4251,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
         }
     }
 
-    // Function object attributes — PyPy: funcobject.py W_Function
+    // Function object attributes — PyPy: function.py Function
     // Check the live W_DictObject (functions are hasdict per typedef.py:735
     // __dict__ = getset_func_dict).
     if unsafe { crate::is_function(obj) } {
@@ -4274,7 +4266,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
         if crate::is_function(obj) {
             match name {
                 "__code__" => {
-                    // function_get_code returns Code-level pointer (W_CodeObject or BuiltinCode)
+                    // function_get_code returns Code-level pointer (PyCode or BuiltinCode)
                     let code = crate::function_get_code(obj) as PyObjectRef;
                     if code.is_null() {
                         return Ok(w_none());
@@ -4475,17 +4467,19 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 // `descr_settraceback` and the `raise` machinery's
                 // `record_application_traceback`; `None` when none has
                 // been set.
-                let stored = unsafe { pyre_object::excobject::w_exception_get_traceback(obj) };
+                let stored =
+                    unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(obj) };
                 return Ok(if stored.is_null() { w_none() } else { stored });
             }
             "__cause__" => {
                 // `interp_exceptions.py:163-164 descr_getcause`.
-                let stored = unsafe { pyre_object::excobject::w_exception_get_cause(obj) };
+                let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_cause(obj) };
                 return Ok(if stored.is_null() { w_none() } else { stored });
             }
             "__context__" => {
                 // `interp_exceptions.py:180-181 descr_getcontext`.
-                let stored = unsafe { pyre_object::excobject::w_exception_get_context(obj) };
+                let stored =
+                    unsafe { pyre_object::interp_exceptions::w_exception_get_context(obj) };
                 return Ok(if stored.is_null() { w_none() } else { stored });
             }
             "__suppress_context__" => {
@@ -4493,7 +4487,9 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 // returns `space.newbool(self.suppress_context)`.
                 // Defaults to False per `:117 W_BaseException` class
                 // default; `descr_setcause` flips to True.
-                let b = unsafe { pyre_object::excobject::w_exception_get_suppress_context(obj) };
+                let b = unsafe {
+                    pyre_object::interp_exceptions::w_exception_get_suppress_context(obj)
+                };
                 return Ok(pyre_object::w_bool_from(b));
             }
             "args" => {
@@ -4504,7 +4500,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 // same: it walks the internal list slot and rebuilds
                 // a `W_TupleObject`, returning the empty tuple when
                 // the slot was never stamped.
-                return Ok(unsafe { pyre_object::excobject::w_exception_get_args(obj) });
+                return Ok(unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) });
             }
             "value" => {
                 // `pypy/module/exceptions/interp_exceptions.py
@@ -4516,8 +4512,9 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 // attribute — other exception kinds keep the regular
                 // attribute lookup fall-through.
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::excobject::ExcKind::StopIteration {
-                    let args_tuple = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+                if kind == pyre_object::interp_exceptions::ExcKind::StopIteration {
+                    let args_tuple =
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
                     // `w_exception_get_args` always returns a real
                     // tuple — empty tuple when `args_w` was never
                     // stamped — so the null-check above is unneeded.
@@ -4541,12 +4538,13 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 // (the internal-constructor path that bypasses the public
                 // setter), mirroring the OSError `errno` arm.
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::excobject::ExcKind::SystemExit {
-                    let stored = unsafe { pyre_object::excobject::w_exception_get_code(obj) };
+                if kind == pyre_object::interp_exceptions::ExcKind::SystemExit {
+                    let stored =
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_code(obj) };
                     if !stored.is_null() {
                         return Ok(stored);
                     }
-                    let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+                    let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
                     let len = unsafe { pyre_object::w_tuple_len(args) };
                     if len == 1 {
                         if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, 0) } {
@@ -4574,18 +4572,18 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::OSError
-                        | pyre_object::excobject::ExcKind::FileNotFoundError
+                    pyre_object::interp_exceptions::ExcKind::OSError
+                        | pyre_object::interp_exceptions::ExcKind::FileNotFoundError
                 ) {
                     let stored = if name == "errno" {
-                        unsafe { pyre_object::excobject::w_exception_get_errno(obj) }
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_errno(obj) }
                     } else {
-                        unsafe { pyre_object::excobject::w_exception_get_strerror(obj) }
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_strerror(obj) }
                     };
                     if !stored.is_null() {
                         return Ok(stored);
                     }
-                    let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+                    let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
                     let n = unsafe { pyre_object::w_tuple_len(args) };
                     if (2..=5).contains(&n) {
                         let idx = if name == "errno" { 0 } else { 1 };
@@ -4600,13 +4598,13 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::OSError
-                        | pyre_object::excobject::ExcKind::FileNotFoundError
+                    pyre_object::interp_exceptions::ExcKind::OSError
+                        | pyre_object::interp_exceptions::ExcKind::FileNotFoundError
                 ) {
                     let stored = if name == "filename" {
-                        unsafe { pyre_object::excobject::w_exception_get_filename(obj) }
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_filename(obj) }
                     } else {
-                        unsafe { pyre_object::excobject::w_exception_get_filename2(obj) }
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_filename2(obj) }
                     };
                     if !stored.is_null() {
                         return Ok(stored);
@@ -4616,7 +4614,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                     if name == "filename" && exc_blocking_written(obj) {
                         return Ok(w_none());
                     }
-                    let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+                    let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
                     let n = unsafe { pyre_object::w_tuple_len(args) };
                     let idx: usize = if name == "filename" { 2 } else { 4 };
                     if (3..=5).contains(&n) && idx < n {
@@ -4628,7 +4626,9 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 }
                 // `W_SyntaxError` also exposes `filename`, derived from its
                 // `(filename, lineno, ...)` details tuple (`filename2` is OSError-only).
-                if kind == pyre_object::excobject::ExcKind::SyntaxError && name == "filename" {
+                if kind == pyre_object::interp_exceptions::ExcKind::SyntaxError
+                    && name == "filename"
+                {
                     return Ok(syntax_error_attr(obj, name));
                 }
             }
@@ -4637,7 +4637,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             // it in `args_w[2]` as `characters_written`; otherwise the slot is
             // unset (`written == -1`) and the attribute raises `AttributeError`.
             "characters_written" if exc_blocking_written(obj) => {
-                let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+                let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
                 if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, 2) } {
                     return Ok(v);
                 }
@@ -4653,12 +4653,18 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             // AttributeError expose it too.
             "msg" | "path" | "name_from" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::excobject::ExcKind::ImportError {
+                if kind == pyre_object::interp_exceptions::ExcKind::ImportError {
                     let stored = unsafe {
                         match name {
-                            "msg" => pyre_object::excobject::w_exception_get_import_msg(obj),
-                            "path" => pyre_object::excobject::w_exception_get_import_path(obj),
-                            _ => pyre_object::excobject::w_exception_get_import_name_from(obj),
+                            "msg" => {
+                                pyre_object::interp_exceptions::w_exception_get_import_msg(obj)
+                            }
+                            "path" => {
+                                pyre_object::interp_exceptions::w_exception_get_import_path(obj)
+                            }
+                            _ => pyre_object::interp_exceptions::w_exception_get_import_name_from(
+                                obj,
+                            ),
                         }
                     };
                     if !stored.is_null() {
@@ -4667,7 +4673,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                     return Ok(w_none());
                 }
                 // `W_SyntaxError.msg` — the first constructor argument.
-                if kind == pyre_object::excobject::ExcKind::SyntaxError && name == "msg" {
+                if kind == pyre_object::interp_exceptions::ExcKind::SyntaxError && name == "msg" {
                     return Ok(syntax_error_attr(obj, name));
                 }
             }
@@ -4680,11 +4686,12 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::ImportError
-                        | pyre_object::excobject::ExcKind::NameError
-                        | pyre_object::excobject::ExcKind::AttributeError
+                    pyre_object::interp_exceptions::ExcKind::ImportError
+                        | pyre_object::interp_exceptions::ExcKind::NameError
+                        | pyre_object::interp_exceptions::ExcKind::AttributeError
                 ) {
-                    let stored = unsafe { pyre_object::excobject::w_exception_get_name(obj) };
+                    let stored =
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_name(obj) };
                     if !stored.is_null() {
                         return Ok(stored);
                     }
@@ -4695,8 +4702,9 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             // attribute lookup failed; default `None`.
             "obj" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::excobject::ExcKind::AttributeError {
-                    let stored = unsafe { pyre_object::excobject::w_exception_get_attr_obj(obj) };
+                if kind == pyre_object::interp_exceptions::ExcKind::AttributeError {
+                    let stored =
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_attr_obj(obj) };
                     if !stored.is_null() {
                         return Ok(stored);
                     }
@@ -4720,11 +4728,12 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::UnicodeTranslateError
-                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
-                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
                 ) {
-                    let stored = unsafe { pyre_object::excobject::w_exception_get_object(obj) };
+                    let stored =
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_object(obj) };
                     return Ok(if stored.is_null() { w_none() } else { stored });
                 }
             }
@@ -4732,11 +4741,12 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::UnicodeTranslateError
-                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
-                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
                 ) {
-                    let stored = unsafe { pyre_object::excobject::w_exception_get_start(obj) };
+                    let stored =
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_start(obj) };
                     return Ok(if stored.is_null() { w_none() } else { stored });
                 }
             }
@@ -4744,11 +4754,12 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::UnicodeTranslateError
-                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
-                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
                 ) {
-                    let stored = unsafe { pyre_object::excobject::w_exception_get_end(obj) };
+                    let stored =
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_end(obj) };
                     return Ok(if stored.is_null() { w_none() } else { stored });
                 }
             }
@@ -4756,11 +4767,12 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::UnicodeTranslateError
-                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
-                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
                 ) {
-                    let stored = unsafe { pyre_object::excobject::w_exception_get_reason(obj) };
+                    let stored =
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_reason(obj) };
                     return Ok(if stored.is_null() { w_none() } else { stored });
                 }
             }
@@ -4776,10 +4788,11 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::UnicodeDecodeError
-                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                    pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
                 ) {
-                    let stored = unsafe { pyre_object::excobject::w_exception_get_encoding(obj) };
+                    let stored =
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_encoding(obj) };
                     return Ok(if stored.is_null() { w_none() } else { stored });
                 }
             }
@@ -4789,7 +4802,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             // `filename` / `msg` are handled by the shared arms above.
             "lineno" | "offset" | "text" | "end_lineno" | "end_offset" | "print_file_and_line" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::excobject::ExcKind::SyntaxError {
+                if kind == pyre_object::interp_exceptions::ExcKind::SyntaxError {
                     return Ok(syntax_error_attr(obj, name));
                 }
             }
@@ -6165,10 +6178,10 @@ pub(crate) unsafe fn is_data_descr(descr: PyObjectRef) -> bool {
     // virtue of always exposing `__set__`/`__delete__` slots in its
     // typedef (regardless of whether `fset`/`fdel` are non-null —
     // `descr_property_set` raises `readonly_attribute` for the
-    // null-fset case).  Pyre's W_GetSetProperty no longer rides on
+    // null-fset case).  Pyre's GetSetProperty no longer rides on
     // INSTANCE_TYPE so the generic `is_instance + lookup_in_type`
     // branch below would miss it; short-circuit here.
-    if pyre_object::getsetproperty::is_getset_property(descr) {
+    if pyre_object::typedef::is_getset_property(descr) {
         return true;
     }
     // Check if the descriptor's class has __set__ or __delete__
@@ -6192,7 +6205,7 @@ unsafe fn descr_has_delete(descr: PyObjectRef) -> bool {
     }
     if is_property(descr)
         || pyre_object::is_member(descr)
-        || pyre_object::getsetproperty::is_getset_property(descr)
+        || pyre_object::typedef::is_getset_property(descr)
     {
         return true;
     }
@@ -6347,7 +6360,7 @@ unsafe fn set(
     // Read-only properties (no `fset` / `@x.setter` never registered)
     // raise AttributeError ("can't set attribute") rather than falling
     // through to the instance dict (`descrobject.c property_descr_set`,
-    // mirrored at `pypy/objspace/std/typeobject.py W_Property.descr_set`).
+    // mirrored at `pypy/module/__builtin__/descriptor.py W_Property.set`).
     if is_property(descr) {
         let fset = w_property_get_fset(descr);
         if fset.is_null() || is_none(fset) {
@@ -6398,10 +6411,10 @@ unsafe fn set(
 
     // General __set__: look up on descriptor's type MRO.  GetSetProperty
     // is no longer INSTANCE_TYPE-shaped (it carries `GETSET_DESCRIPTOR
-    // _TYPE` so its W_GetSetProperty payload is GC-traced), so resolve
+    // _TYPE` so its GetSetProperty payload is GC-traced), so resolve
     // the type through `crate::typedef::r#type` rather than the
     // `is_instance` branch.
-    let descr_type = if pyre_object::getsetproperty::is_getset_property(descr) {
+    let descr_type = if pyre_object::typedef::is_getset_property(descr) {
         crate::typedef::r#type(descr).unwrap_or(std::ptr::null_mut())
     } else if is_instance(descr) {
         w_instance_get_type(descr)
@@ -6463,8 +6476,8 @@ unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyEr
     }
     // General __delete__: look up on descriptor's type MRO — same
     // shape as `set` above (resolve type through `r#type` so non-
-    // INSTANCE_TYPE descriptors like `W_GetSetProperty` are reached).
-    let descr_type = if pyre_object::getsetproperty::is_getset_property(descr) {
+    // INSTANCE_TYPE descriptors like `GetSetProperty` are reached).
+    let descr_type = if pyre_object::typedef::is_getset_property(descr) {
         crate::typedef::r#type(descr).unwrap_or(std::ptr::null_mut())
     } else if is_instance(descr) {
         w_instance_get_type(descr)
@@ -6548,7 +6561,7 @@ fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> PyResult {
 
 pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
     let value = unwrap_cell(value);
-    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     // descroperation.py:247 — space.lookup for __setattr__ through MRO,
     // then get_and_call_function which applies descriptor binding.
     unsafe {
@@ -6590,11 +6603,11 @@ pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult
 /// `object.__setattr__` and as the default path in `setattr`.
 pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
     let value = unwrap_cell(value);
-    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     // Data descriptor __set__ takes priority (PyPy: descroperation.py
     // descr__setattr__ step 1). PyPy walks `space.type(obj)` regardless of
     // whether `obj` is a Python-level instance, so the lookup must run for
-    // every object whose type pyre can resolve — not just W_InstanceObject.
+    // every object whose type pyre can resolve — not just W_ObjectObject.
     unsafe {
         let w_type = if is_instance(obj) {
             w_instance_get_type(obj)
@@ -6700,11 +6713,11 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     unsafe {
         if is_property(obj) {
             if name == "__doc__" {
-                pyre_object::propertyobject::w_property_set_doc(obj, value);
+                pyre_object::descriptor::w_property_set_doc(obj, value);
                 return Ok(w_none());
             }
             if name == "__name__" {
-                pyre_object::propertyobject::w_property_set_name(obj, value);
+                pyre_object::descriptor::w_property_set_name(obj, value);
                 return Ok(w_none());
             }
         }
@@ -6715,7 +6728,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     // so user code routinely does `e.foo = bar` (e.g.
     // `argparse.ArgumentTypeError`'s `e.message = ...` pattern).
     // Non-special names land in the lazily allocated instance dict on
-    // `W_ExceptionObject.w_dict` (interp_exceptions.py:113, 222-225).
+    // `W_BaseException.w_dict` (interp_exceptions.py:113, 222-225).
     if unsafe { pyre_object::is_exception(obj) } {
         // `pypy/module/exceptions/interp_exceptions.py:156-157
         // W_BaseException.descr_setargs` →
@@ -6726,7 +6739,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
         // as-is, list wraps into tuple, anything else iterates).
         if name == "args" {
             let coerced = unsafe { coerce_to_list_for_args(value)? };
-            unsafe { pyre_object::excobject::w_exception_set_args(obj, coerced) };
+            unsafe { pyre_object::interp_exceptions::w_exception_set_args(obj, coerced) };
             return Ok(w_none());
         }
         // `interp_exceptions.py:165-219` — the four special exception
@@ -6735,7 +6748,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
         // setters on `W_BaseException.typedef` and each validates its
         // input before storing into the matching typed slot
         // (`w_cause`/`w_context`/`w_traceback`/`suppress_context`,
-        // line 113-117).  Storage lives on `W_ExceptionObject`
+        // line 113-117).  Storage lives on `W_BaseException`
         // directly — no side store for these four names.
         match name {
             "__dict__" => {
@@ -6759,8 +6772,8 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                     }
                 }
                 unsafe {
-                    pyre_object::excobject::w_exception_set_cause(obj, value);
-                    pyre_object::excobject::w_exception_set_suppress_context(obj, true);
+                    pyre_object::interp_exceptions::w_exception_set_cause(obj, value);
+                    pyre_object::interp_exceptions::w_exception_set_suppress_context(obj, true);
                 };
                 return Ok(w_none());
             }
@@ -6775,13 +6788,13 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                         ));
                     }
                 }
-                unsafe { pyre_object::excobject::w_exception_set_context(obj, value) };
+                unsafe { pyre_object::interp_exceptions::w_exception_set_context(obj, value) };
                 return Ok(w_none());
             }
             "__traceback__" => {
                 // `interp_exceptions.py:202-206 descr_settraceback` —
                 // accept None or PyTraceback only.  Now that real
-                // W_PyTraceback exists, narrow the type check to the
+                // PyTraceback exists, narrow the type check to the
                 // exact pair PyPy accepts; reject everything else as
                 // TypeError per PyPy.
                 let accept = unsafe {
@@ -6797,14 +6810,14 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                 } else {
                     value
                 };
-                unsafe { pyre_object::excobject::w_exception_set_traceback(obj, stored) };
+                unsafe { pyre_object::interp_exceptions::w_exception_set_traceback(obj, stored) };
                 return Ok(w_none());
             }
             "__suppress_context__" => {
                 // `interp_exceptions.py:215-216 descr_setsuppresscontext`
                 // — `space.bool_w(w_value)` coerces via `__bool__`.
                 let b = is_true(value)?;
-                unsafe { pyre_object::excobject::w_exception_set_suppress_context(obj, b) };
+                unsafe { pyre_object::interp_exceptions::w_exception_set_suppress_context(obj, b) };
                 return Ok(w_none());
             }
             // `interp_exceptions.py:468-471`
@@ -6819,11 +6832,11 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::UnicodeTranslateError
-                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
-                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
                 ) {
-                    unsafe { pyre_object::excobject::w_exception_set_object(obj, value) };
+                    unsafe { pyre_object::interp_exceptions::w_exception_set_object(obj, value) };
                     return Ok(w_none());
                 }
             }
@@ -6831,11 +6844,11 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::UnicodeTranslateError
-                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
-                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
                 ) {
-                    unsafe { pyre_object::excobject::w_exception_set_start(obj, value) };
+                    unsafe { pyre_object::interp_exceptions::w_exception_set_start(obj, value) };
                     return Ok(w_none());
                 }
             }
@@ -6843,11 +6856,11 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::UnicodeTranslateError
-                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
-                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
                 ) {
-                    unsafe { pyre_object::excobject::w_exception_set_end(obj, value) };
+                    unsafe { pyre_object::interp_exceptions::w_exception_set_end(obj, value) };
                     return Ok(w_none());
                 }
             }
@@ -6855,11 +6868,11 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::UnicodeTranslateError
-                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
-                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
                 ) {
-                    unsafe { pyre_object::excobject::w_exception_set_reason(obj, value) };
+                    unsafe { pyre_object::interp_exceptions::w_exception_set_reason(obj, value) };
                     return Ok(w_none());
                 }
             }
@@ -6870,10 +6883,10 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::UnicodeDecodeError
-                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                    pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
                 ) {
-                    unsafe { pyre_object::excobject::w_exception_set_encoding(obj, value) };
+                    unsafe { pyre_object::interp_exceptions::w_exception_set_encoding(obj, value) };
                     return Ok(w_none());
                 }
             }
@@ -6889,19 +6902,23 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::OSError
-                        | pyre_object::excobject::ExcKind::FileNotFoundError
+                    pyre_object::interp_exceptions::ExcKind::OSError
+                        | pyre_object::interp_exceptions::ExcKind::FileNotFoundError
                 ) {
                     unsafe {
                         match name {
-                            "errno" => pyre_object::excobject::w_exception_set_errno(obj, value),
+                            "errno" => {
+                                pyre_object::interp_exceptions::w_exception_set_errno(obj, value)
+                            }
                             "strerror" => {
-                                pyre_object::excobject::w_exception_set_strerror(obj, value)
+                                pyre_object::interp_exceptions::w_exception_set_strerror(obj, value)
                             }
                             "filename" => {
-                                pyre_object::excobject::w_exception_set_filename(obj, value)
+                                pyre_object::interp_exceptions::w_exception_set_filename(obj, value)
                             }
-                            _ => pyre_object::excobject::w_exception_set_filename2(obj, value),
+                            _ => pyre_object::interp_exceptions::w_exception_set_filename2(
+                                obj, value,
+                            ),
                         }
                     };
                     return Ok(w_none());
@@ -6915,8 +6932,8 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
             // descriptor only on `W_SystemExit.typedef`.
             "code" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::excobject::ExcKind::SystemExit {
-                    unsafe { pyre_object::excobject::w_exception_set_code(obj, value) };
+                if kind == pyre_object::interp_exceptions::ExcKind::SystemExit {
+                    unsafe { pyre_object::interp_exceptions::w_exception_set_code(obj, value) };
                     return Ok(w_none());
                 }
             }
@@ -6927,16 +6944,18 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
             // handled by the shared arm below.
             "msg" | "path" | "name_from" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::excobject::ExcKind::ImportError {
+                if kind == pyre_object::interp_exceptions::ExcKind::ImportError {
                     unsafe {
                         match name {
-                            "msg" => pyre_object::excobject::w_exception_set_import_msg(obj, value),
-                            "path" => {
-                                pyre_object::excobject::w_exception_set_import_path(obj, value)
-                            }
-                            _ => {
-                                pyre_object::excobject::w_exception_set_import_name_from(obj, value)
-                            }
+                            "msg" => pyre_object::interp_exceptions::w_exception_set_import_msg(
+                                obj, value,
+                            ),
+                            "path" => pyre_object::interp_exceptions::w_exception_set_import_path(
+                                obj, value,
+                            ),
+                            _ => pyre_object::interp_exceptions::w_exception_set_import_name_from(
+                                obj, value,
+                            ),
                         }
                     };
                     return Ok(w_none());
@@ -6948,19 +6967,19 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::ImportError
-                        | pyre_object::excobject::ExcKind::NameError
-                        | pyre_object::excobject::ExcKind::AttributeError
+                    pyre_object::interp_exceptions::ExcKind::ImportError
+                        | pyre_object::interp_exceptions::ExcKind::NameError
+                        | pyre_object::interp_exceptions::ExcKind::AttributeError
                 ) {
-                    unsafe { pyre_object::excobject::w_exception_set_name(obj, value) };
+                    unsafe { pyre_object::interp_exceptions::w_exception_set_name(obj, value) };
                     return Ok(w_none());
                 }
             }
             // Writable `obj` slot (W_AttributeError).
             "obj" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::excobject::ExcKind::AttributeError {
-                    unsafe { pyre_object::excobject::w_exception_set_attr_obj(obj, value) };
+                if kind == pyre_object::interp_exceptions::ExcKind::AttributeError {
+                    unsafe { pyre_object::interp_exceptions::w_exception_set_attr_obj(obj, value) };
                     return Ok(w_none());
                 }
             }
@@ -6969,7 +6988,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     }
     // descroperation.py:121-122 `if w_obj.setdictvalue(space, name, w_value):
     // return` — exception extras land in the lazily allocated
-    // `W_ExceptionObject.w_dict` (interp_exceptions.py:113, 222-225) via
+    // `W_BaseException.w_dict` (interp_exceptions.py:113, 222-225) via
     // the `getdict` exception arm.
     if setdictvalue(obj, name, value) {
         return Ok(w_none());
@@ -7058,7 +7077,7 @@ fn raiseattrerror(obj: PyObjectRef, name: &str) -> PyError {
 ///
 /// PyPy: descroperation.py descr__delattr__
 pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
-    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     // descroperation.py:254 — space.lookup for __delattr__ through MRO
     unsafe {
         if is_instance(obj) {
@@ -7075,26 +7094,26 @@ pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
 
 /// Terminal `object.__delattr__` — bypasses user override.
 pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
-    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     // `property.__name__` is a writable/deletable slot; deleting clears
     // the name recorded by `__set_name__`, and deleting when unset
     // raises like a missing attribute.
     unsafe {
         if is_property(obj) && name == "__name__" {
-            let w_name = pyre_object::propertyobject::w_property_get_name(obj);
+            let w_name = pyre_object::descriptor::w_property_get_name(obj);
             if w_name.is_null() {
                 return Err(crate::PyError::attribute_error(
                     "'property' object has no attribute '__name__'",
                 ));
             }
-            pyre_object::propertyobject::w_property_set_name(obj, pyre_object::PY_NULL);
+            pyre_object::descriptor::w_property_set_name(obj, pyre_object::PY_NULL);
             return Ok(w_none());
         }
     }
     // descroperation.py:131-140 descr__delattr__: a data descriptor's
     // `__delete__` takes priority over the namespace delete. PyPy walks
     // `space.type(obj)`, so the lookup must run for any object whose type
-    // pyre can resolve — not just W_InstanceObject — and before the
+    // pyre can resolve — not just W_ObjectObject — and before the
     // module/type/instance dict removal below.
     unsafe {
         let w_type = if is_instance(obj) {
@@ -7439,8 +7458,8 @@ pub fn callable_w(obj: PyObjectRef) -> bool {
         is_function(obj)
             || is_type(obj)
             || pyre_object::is_method(obj)
-            || pyre_object::propertyobject::is_staticmethod(obj)
-            || pyre_object::propertyobject::is_classmethod(obj)
+            || pyre_object::function::is_staticmethod(obj)
+            || pyre_object::function::is_classmethod(obj)
             || crate::typedef::r#type(obj)
                 .and_then(|t| lookup_in_type(t, "__call__"))
                 .is_some()
@@ -7528,7 +7547,7 @@ pub fn unpackiterable(
         // PyTypeObject/__next__ slot lookup, and uses a private
         // `_invoke_execute_frame(space.w_None)` instead of `space.next`.
         // Port both branches.
-        if unsafe { pyre_object::generatorobject::is_generator(w_iterator) } {
+        if unsafe { pyre_object::generator::is_generator(w_iterator) } {
             let mut lst_w: Vec<PyObjectRef> = Vec::new();
             generator_unpack_into(w_iterator, &mut lst_w)?;
             return Ok(lst_w);
@@ -7609,7 +7628,7 @@ fn unpackiterable_driver_jit_merge_point(_greenkey: PyObjectRef) {
 ///         results.append(w_result)     # YIELDed
 /// ```
 ///
-/// Pyre stores the suspended PyFrame on the W_GeneratorObject as
+/// Pyre stores the suspended PyFrame on the GeneratorIterator as
 /// `frame_ptr`; an exhausted generator has either `exhausted=true` or a
 /// null frame_ptr.  `_invoke_execute_frame(space.w_None)` corresponds to
 /// the frame's own `execute_frame(None, None)` resume — same routing as
@@ -7618,7 +7637,7 @@ fn generator_unpack_into(
     gen_obj: PyObjectRef,
     results: &mut Vec<PyObjectRef>,
 ) -> Result<(), crate::PyError> {
-    use pyre_object::generatorobject::*;
+    use pyre_object::generator::*;
     unsafe {
         // generator.py:325-327 — `frame is None: return`.
         if w_generator_is_running(gen_obj) {
@@ -7778,7 +7797,7 @@ pub fn length_hint(w_obj: PyObjectRef, default: i64) -> Result<i64, crate::PyErr
             return Err(err);
         }
     };
-    if is_w(w_hint, pyre_object::noneobject::w_not_implemented()) {
+    if is_w(w_hint, pyre_object::special::w_not_implemented()) {
         return Ok(default);
     }
     let hint = int_w(w_hint)?;
@@ -8256,7 +8275,7 @@ fn _unpackiterable_known_length_jitlook(
 ///
 /// `user_overridden_class` (typeobject.py term for "type is exact
 /// dict, not a subclass") corresponds to pyre's `is_dict(w_dict)` —
-/// pyre dict subclasses live as `W_InstanceObject` with a backing
+/// pyre dict subclasses live as `W_ObjectObject` with a backing
 /// dict (`typedef.rs:820 dict_descr_new`), so an exact-type check on
 /// the wrapper rules out user subclasses.  Both tuple slots are
 /// `Option` so callers distinguish "no fast path" (None) from "fast
@@ -8366,8 +8385,8 @@ pub fn object_functionstr(w_function: PyObjectRef) -> Result<String, crate::PyEr
     }
     // baseobjspace.py:2121-2122 — `_Method` recursive fast path:
     // unwrap to `w_function.w_function` and recurse.
-    if !w_function.is_null() && unsafe { pyre_object::methodobject::is_method(w_function) } {
-        let inner = unsafe { pyre_object::methodobject::w_method_get_func(w_function) };
+    if !w_function.is_null() && unsafe { pyre_object::function::is_method(w_function) } {
+        let inner = unsafe { pyre_object::function::w_method_get_func(w_function) };
         return object_functionstr(inner);
     }
     // baseobjspace.py:2123 — `w_qualname = self.findattr(...)`.  This
@@ -8605,14 +8624,14 @@ pub fn is_iterable(w_obj: PyObjectRef) -> bool {
             || is_range_iter(obj)
             || pyre_object::is_long_range_iter(obj)
             || is_seq_iter(obj)
-            || pyre_object::generatorobject::is_generator(obj)
-            || pyre_object::itertoolsmodule::is_count(obj)
-            || pyre_object::itertoolsmodule::is_repeat(obj)
-            || pyre_object::itertoolsmodule::is_takewhile(obj)
-            || pyre_object::itertoolsmodule::is_dropwhile(obj)
-            || pyre_object::itertoolsmodule::is_filterfalse(obj)
-            || pyre_object::itertoolsmodule::is_pairwise(obj)
-            || pyre_object::itertoolsmodule::is_cycle(obj)
+            || pyre_object::generator::is_generator(obj)
+            || pyre_object::interp_itertools::is_count(obj)
+            || pyre_object::interp_itertools::is_repeat(obj)
+            || pyre_object::interp_itertools::is_takewhile(obj)
+            || pyre_object::interp_itertools::is_dropwhile(obj)
+            || pyre_object::interp_itertools::is_filterfalse(obj)
+            || pyre_object::interp_itertools::is_pairwise(obj)
+            || pyre_object::interp_itertools::is_cycle(obj)
         {
             return true;
         }
@@ -8676,24 +8695,25 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             obj
         }
     };
-    // `pypy/objspace/std/dictmultiobject.py:1701-1741
-    // W_BaseDictIterator` line-by-line port — pyre's `W_DictViewIterator`
+    // `pypy/objspace/std/dictmultiobject.py`
+    // `W_BaseDictMultiIterObject` line-by-line port — pyre's
+    // `W_BaseDictMultiIterObject`
     // captures the source dict + the version counter seen at iter()
     // time, then on each `next()` step compares against `w_dict.version`
     // and raises `RuntimeError("dictionary changed size during
     // iteration")` if the dict was mutated mid-iteration.
     unsafe {
-        if pyre_object::dictviewobject::is_dict_view(obj) {
-            let kind = pyre_object::dictviewobject::w_dict_view_get_kind(obj);
-            let w_dict = pyre_object::dictviewobject::w_dict_view_get_dict(obj);
-            return Ok(pyre_object::dictviewobject::w_dict_view_iterator_new(
+        if pyre_object::dictmultiobject::is_dict_view(obj) {
+            let kind = pyre_object::dictmultiobject::w_dict_view_get_kind(obj);
+            let w_dict = pyre_object::dictmultiobject::w_dict_view_get_dict(obj);
+            return Ok(pyre_object::dictmultiobject::w_dict_view_iterator_new(
                 w_dict, kind,
             ));
         }
         // `dict_keyiterator` / `dict_valueiterator` / `dict_itemiterator`
         // — `__iter__` returns self per `dictmultiobject.py:1716-1717
-        // W_BaseDictIterator.iter_w`.
-        if pyre_object::dictviewobject::is_dict_view_iterator(obj) {
+        // `W_BaseDictMultiIterObject.descr_iter`.
+        if pyre_object::dictmultiobject::is_dict_view_iterator(obj) {
             return Ok(obj);
         }
     }
@@ -8730,7 +8750,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if pyre_object::is_generic_alias(obj) {
             // GenericAlias.__iter__ (`_pypy_generic_alias.py:108`) — `yield
             // _make_starred(self)`, a one-shot iterator over the starred copy.
-            let starred = crate::genericalias::make_starred(obj)?;
+            let starred = crate::_pypy_generic_alias::make_starred(obj)?;
             let list = w_list_new(vec![starred]);
             return Ok(pyre_object::w_seq_iter_new(list, 1));
         }
@@ -8756,15 +8776,15 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // W_DictMultiObject.descr_iter` → `W_DictMultiIterKeysObject`).
         // For W_ModuleDictObject this dispatches through
         // `ModuleDictStrategy.getiterkeys` (`celldict.py:188-189`);
-        // pyre's W_DictViewIterator captures `startlen` at iter()
+        // pyre's W_BaseDictMultiIterObject captures `startlen` at iter()
         // time and raises `RuntimeError("dictionary changed size
         // during iteration")` mid-iteration — matches PyPy's
         // `_check_modified` (`dictmultiobject.py:1716+`) without the
         // snapshot list materialisation.
         if is_dict(obj) {
-            return Ok(pyre_object::dictviewobject::w_dict_view_iterator_new(
+            return Ok(pyre_object::dictmultiobject::w_dict_view_iterator_new(
                 obj,
-                pyre_object::dictviewobject::DictViewKind::Keys,
+                pyre_object::dictmultiobject::DictViewKind::Keys,
             ));
         }
         // set / frozenset → iterate via stable insertion order (PyPy:
@@ -8784,56 +8804,56 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if is_range_iter(obj)
             || pyre_object::is_long_range_iter(obj)
             || is_seq_iter(obj)
-            || pyre_object::generatorobject::is_generator(obj)
+            || pyre_object::generator::is_generator(obj)
         {
             return Ok(obj);
         }
         // itertools native iterators — iter_w returns self.
         // PyPy: W_Count.iter_w / W_Repeat.iter_w / W_TakeWhile.iter_w /
         // W_DropWhile.iter_w / W_Filter.iter_w / W_Pairwise.iter_w
-        if pyre_object::itertoolsmodule::is_count(obj)
-            || pyre_object::itertoolsmodule::is_repeat(obj)
-            || pyre_object::itertoolsmodule::is_takewhile(obj)
-            || pyre_object::itertoolsmodule::is_dropwhile(obj)
-            || pyre_object::itertoolsmodule::is_filterfalse(obj)
-            || pyre_object::itertoolsmodule::is_pairwise(obj)
-            || pyre_object::itertoolsmodule::is_cycle(obj)
+        if pyre_object::interp_itertools::is_count(obj)
+            || pyre_object::interp_itertools::is_repeat(obj)
+            || pyre_object::interp_itertools::is_takewhile(obj)
+            || pyre_object::interp_itertools::is_dropwhile(obj)
+            || pyre_object::interp_itertools::is_filterfalse(obj)
+            || pyre_object::interp_itertools::is_pairwise(obj)
+            || pyre_object::interp_itertools::is_cycle(obj)
         {
             return Ok(obj);
         }
         // `pypy/module/__builtin__/functional.py:277-278
         // W_Enumerate.descr___iter__` — `return self`.
-        if pyre_object::enumerateobject::is_enumerate(obj) {
+        if pyre_object::functional::is_enumerate(obj) {
             return Ok(obj);
         }
         // `pypy/module/__builtin__/functional.py:371-372
         // W_ReversedIterator.descr___iter__` — `return self`.
-        if pyre_object::reversedobject::is_reversed(obj) {
+        if pyre_object::functional::is_reversed(obj) {
             return Ok(obj);
         }
         // `pypy/module/__builtin__/functional.py:927-928 W_Filter.iter_w` —
         // `return self`.
-        if pyre_object::filterobject::is_filter(obj) {
+        if pyre_object::functional::is_filter(obj) {
             return Ok(obj);
         }
         // `functional.py:846-847 W_Map.iter_w` / `:1019-1020 W_Zip.iter_w` —
         // `return self`.
-        if pyre_object::mapobject::is_map(obj) || pyre_object::zipobject::is_zip(obj) {
+        if pyre_object::functional::is_map(obj) || pyre_object::functional::is_zip(obj) {
             return Ok(obj);
         }
         // `pypy/module/_sre/interp_sre.py:915 W_SRE_Scanner.iter_w` —
         // `return self` (the finditer/scanner iterator).
-        if pyre_object::sreobject::is_sre_scanner(obj) {
+        if pyre_object::interp_sre::is_sre_scanner(obj) {
             return Ok(obj);
         }
         // `iter(callable, sentinel)` product — its own iterator.
-        if pyre_object::callableiteratorobject::is_callable_iterator(obj) {
+        if pyre_object::operation::is_callable_iterator(obj) {
             return Ok(obj);
         }
         // `array.array` — `interp_array.py descr_iter` returns
         // `space.newseqiter(self)` (a fresh index cursor, not self).
-        if pyre_object::array_object::is_array(obj) {
-            let len = pyre_object::array_object::w_array_len(obj);
+        if pyre_object::interp_array::is_array(obj) {
+            let len = pyre_object::interp_array::w_array_len(obj);
             return Ok(pyre_object::w_seq_iter_new(obj, len));
         }
         // pypy/objspace/descroperation.py:330-346 `def iter(space, w_obj)`
@@ -8955,7 +8975,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
     unsafe {
         // Seq iterator
         if is_seq_iter(obj) {
-            let iter = &mut *(obj as *mut pyre_object::W_SeqIterator);
+            let iter = &mut *(obj as *mut pyre_object::W_SeqIterObject);
             let seq = iter.seq;
             let idx = iter.index;
             let item = if is_list(seq) {
@@ -8979,9 +8999,9 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     n += 1;
                 }
                 found
-            } else if pyre_object::array_object::is_array(seq) {
-                if (idx as usize) < pyre_object::array_object::w_array_len(seq) {
-                    Some(pyre_object::array_object::w_array_unpack_item(
+            } else if pyre_object::interp_array::is_array(seq) {
+                if (idx as usize) < pyre_object::interp_array::w_array_len(seq) {
+                    Some(pyre_object::interp_array::w_array_unpack_item(
                         seq,
                         idx as usize,
                     ))
@@ -8999,22 +9019,16 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         }
         // Range iterator
         if is_range_iter(obj) {
-            let iter = &mut *(obj as *mut pyre_object::rangeobject::W_RangeIterator);
-            let has_next = if iter.step > 0 {
-                iter.current < iter.stop
-            } else if iter.step < 0 {
-                iter.current > iter.stop
-            } else {
-                false
-            };
-            if has_next {
+            let iter = &mut *(obj as *mut pyre_object::functional::W_IntRangeIterator);
+            if iter.remaining > 0 {
                 let val = w_int_new(iter.current);
                 iter.current += iter.step;
+                iter.remaining -= 1;
                 return Ok(val);
             }
             return Err(PyError::stop_iteration());
         }
-        // `iterobject.py W_LongRangeIterator.descr_next` — bignum-bound
+        // `functional.py W_LongRangeIterator.descr_next` — bignum-bound
         // range cursor (`start + index*step`).
         if pyre_object::is_long_range_iter(obj) {
             return match pyre_object::w_long_range_iter_next(obj) {
@@ -9023,7 +9037,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             };
         }
         // Generator __next__ — PyPy: generator.py GeneratorIterator.next
-        if pyre_object::generatorobject::is_generator(obj) {
+        if pyre_object::generator::is_generator(obj) {
             return generator_next(obj);
         }
         // itertools.count.next_w — PyPy interp_itertools.py W_Count.next_w
@@ -9032,11 +9046,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //         w_c = self.w_c
         //         self.w_c = self.space.add(w_c, self.w_step)
         //         return w_c
-        if pyre_object::itertoolsmodule::is_count(obj) {
-            let w_c = pyre_object::itertoolsmodule::w_count_get_c(obj);
-            let w_step = pyre_object::itertoolsmodule::w_count_get_step(obj);
+        if pyre_object::interp_itertools::is_count(obj) {
+            let w_c = pyre_object::interp_itertools::w_count_get_c(obj);
+            let w_step = pyre_object::interp_itertools::w_count_get_step(obj);
             let new_c = add(w_c, w_step)?;
-            pyre_object::itertoolsmodule::w_count_set_c(obj, new_c);
+            pyre_object::interp_itertools::w_count_set_c(obj, new_c);
             return Ok(w_c);
         }
         // itertools.repeat.next_w — PyPy interp_itertools.py W_Repeat.next_w
@@ -9047,14 +9061,14 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //                 raise OperationError(self.space.w_StopIteration, self.space.w_None)
         //             self.count -= 1
         //         return self.w_obj
-        if pyre_object::itertoolsmodule::is_repeat(obj) {
-            if pyre_object::itertoolsmodule::w_repeat_get_counting(obj) {
-                if pyre_object::itertoolsmodule::w_repeat_get_count(obj) <= 0 {
+        if pyre_object::interp_itertools::is_repeat(obj) {
+            if pyre_object::interp_itertools::w_repeat_get_counting(obj) {
+                if pyre_object::interp_itertools::w_repeat_get_count(obj) <= 0 {
                     return Err(PyError::stop_iteration());
                 }
-                pyre_object::itertoolsmodule::w_repeat_dec_count(obj);
+                pyre_object::interp_itertools::w_repeat_dec_count(obj);
             }
-            return Ok(pyre_object::itertoolsmodule::w_repeat_get_obj(obj));
+            return Ok(pyre_object::interp_itertools::w_repeat_get_obj(obj));
         }
         // itertools.takewhile — interp_itertools.py W_TakeWhile.next_w
         //
@@ -9067,8 +9081,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //             self.stopped = True
         //             raise OperationError(self.space.w_StopIteration, self.space.w_None)
         //         return w_obj
-        if pyre_object::itertoolsmodule::is_takewhile(obj) {
-            let it = &mut *(obj as *mut pyre_object::itertoolsmodule::W_TakeWhile);
+        if pyre_object::interp_itertools::is_takewhile(obj) {
+            let it = &mut *(obj as *mut pyre_object::interp_itertools::W_TakeWhile);
             if it.stopped {
                 return Err(PyError::stop_iteration());
             }
@@ -9093,8 +9107,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //                     self.started = True
         //                     break
         //         return w_obj
-        if pyre_object::itertoolsmodule::is_dropwhile(obj) {
-            let it = &mut *(obj as *mut pyre_object::itertoolsmodule::W_DropWhile);
+        if pyre_object::interp_itertools::is_dropwhile(obj) {
+            let it = &mut *(obj as *mut pyre_object::interp_itertools::W_DropWhile);
             let w_obj = if it.started {
                 next(it.w_iterable)?
             } else {
@@ -9122,8 +9136,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //             pred = self.space.is_true(w_pred)
         //         if pred ^ self.reverse:
         //             return w_obj
-        if pyre_object::itertoolsmodule::is_filterfalse(obj) {
-            let it = &mut *(obj as *mut pyre_object::itertoolsmodule::W_FilterFalse);
+        if pyre_object::interp_itertools::is_filterfalse(obj) {
+            let it = &mut *(obj as *mut pyre_object::interp_itertools::W_FilterFalse);
             loop {
                 let w_obj = next(it.w_iterable)?;
                 let pred = if it.w_predicate.is_null() {
@@ -9150,7 +9164,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //             pred = self.space.is_true(w_pred)
         //         if pred ^ self.reverse:
         //             return w_obj
-        if pyre_object::filterobject::is_filter(obj) {
+        if pyre_object::functional::is_filter(obj) {
             // `next`, the predicate, and `is_true`/`__bool__` all run Python and
             // can move the filter and the yielded item; pin the filter and re-read
             // its fields after each call, and pin the item across the predicate.
@@ -9159,14 +9173,14 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             loop {
                 let w_iterable = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
-                    as *const pyre_object::filterobject::W_Filter))
+                    as *const pyre_object::functional::W_Filter))
                     .w_iterable;
                 let w_obj = next(w_iterable)?;
                 let _r = pyre_object::gc_roots::push_roots();
                 pyre_object::gc_roots::pin_root(w_obj);
                 let w_obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 let w_predicate = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
-                    as *const pyre_object::filterobject::W_Filter))
+                    as *const pyre_object::functional::W_Filter))
                     .w_predicate;
                 let pred = if w_predicate.is_null() {
                     is_true(pyre_object::gc_roots::shadow_stack_get(w_obj_slot))?
@@ -9185,8 +9199,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         // `functional.py:849-863 W_Map.next_w` — pull one item from each
         // sub-iterator, then `call(w_fun, *items)`; stop at the shortest
         // (strict raises on mismatch).
-        if pyre_object::mapobject::is_map(obj) {
-            use pyre_object::mapobject as mo;
+        if pyre_object::functional::is_map(obj) {
+            use pyre_object::functional as mo;
             let w_iterators = mo::w_map_get_iterators(obj);
             let strict = mo::w_map_get_strict(obj);
             return match pull_iterator_tuple(w_iterators, strict, "map")? {
@@ -9200,8 +9214,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         // `functional.py:1022-1057 W_Zip.next_w` — pull one item from each
         // sub-iterator into a tuple; stop at the shortest (strict raises on
         // mismatch).
-        if pyre_object::zipobject::is_zip(obj) {
-            use pyre_object::zipobject as zo;
+        if pyre_object::functional::is_zip(obj) {
+            use pyre_object::functional as zo;
             let w_iterators = zo::w_zip_get_iterators(obj);
             let strict = zo::w_zip_get_strict(obj);
             return match pull_iterator_tuple(w_iterators, strict, "zip")? {
@@ -9220,8 +9234,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //         w_next = space.next(self.w_iterator)
         //         self.w_prev = w_next
         //         return space.newtuple2(w_prev, w_next)
-        if pyre_object::itertoolsmodule::is_pairwise(obj) {
-            let it = &mut *(obj as *mut pyre_object::itertoolsmodule::W_Pairwise);
+        if pyre_object::interp_itertools::is_pairwise(obj) {
+            let it = &mut *(obj as *mut pyre_object::interp_itertools::W_Pairwise);
             let mut w_prev = it.w_prev;
             if w_prev.is_null() {
                 w_prev = next(it.w_iterator)?;
@@ -9256,8 +9270,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //             else:
         //                 self.saved_w.append(w_obj)
         //         return w_obj
-        if pyre_object::itertoolsmodule::is_cycle(obj) {
-            let it = &mut *(obj as *mut pyre_object::itertoolsmodule::W_Cycle);
+        if pyre_object::interp_itertools::is_cycle(obj) {
+            let it = &mut *(obj as *mut pyre_object::interp_itertools::W_Cycle);
             // Cycling pass (index > 0): replay `saved` after the source ended.
             if it.index > 0 {
                 let n = pyre_object::w_list_len(it.saved) as i64;
@@ -9311,8 +9325,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //         if w_value is None:
         //             raise "dictionary changed during iteration"
         //         return (w_key, w_value)
-        if pyre_object::dictviewobject::is_dict_view_iterator(obj) {
-            use pyre_object::dictviewobject as dv;
+        if pyre_object::dictmultiobject::is_dict_view_iterator(obj) {
+            use pyre_object::dictmultiobject as dv;
             let dict = dv::w_dict_view_iterator_get_dict(obj);
             let startlen = dv::w_dict_view_iterator_get_startlen(obj);
             let current_len = pyre_object::dictmultiobject::w_dict_len(dict);
@@ -9334,7 +9348,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let current_strategy_id = pyre_object::dictmultiobject::w_dict_strategy_id(dict);
             let kind = dv::w_dict_view_iterator_get_kind(obj);
             if start_strategy_id != current_strategy_id {
-                if matches!(kind, pyre_object::dictviewobject::DictViewKind::Items) {
+                if matches!(kind, pyre_object::dictmultiobject::DictViewKind::Items) {
                     // `:837-841`: re-look-up the key on the new strategy;
                     // raise if it was removed during the transition.
                     match pyre_object::dictmultiobject::w_dict_lookup(dict, k) {
@@ -9351,9 +9365,9 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 // (`:836 if TP == 'key' or TP == 'value': return result`).
             }
             return Ok(match kind {
-                pyre_object::dictviewobject::DictViewKind::Keys => k,
-                pyre_object::dictviewobject::DictViewKind::Values => v,
-                pyre_object::dictviewobject::DictViewKind::Items => {
+                pyre_object::dictmultiobject::DictViewKind::Keys => k,
+                pyre_object::dictmultiobject::DictViewKind::Values => v,
+                pyre_object::dictmultiobject::DictViewKind::Items => {
                     pyre_object::w_tuple_new(vec![k, v])
                 }
             });
@@ -9399,8 +9413,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         // the callable itself raises `StopIteration`, and a re-entrant
         // call that exhausts the iterator during `callable()` discards
         // this call's result.
-        if pyre_object::callableiteratorobject::is_callable_iterator(obj) {
-            use pyre_object::callableiteratorobject as ci;
+        if pyre_object::operation::is_callable_iterator(obj) {
+            use pyre_object::operation as ci;
             let callable = ci::w_callable_iterator_get_callable(obj);
             if callable.is_null() {
                 return Err(PyError::stop_iteration());
@@ -9430,8 +9444,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             }
             return Ok(result);
         }
-        if pyre_object::enumerateobject::is_enumerate(obj) {
-            use pyre_object::enumerateobject as eo;
+        if pyre_object::functional::is_enumerate(obj) {
+            use pyre_object::functional as eo;
             let w_index_slot = eo::w_enumerate_get_w_index(obj);
             let mut w_iter_or_list = eo::w_enumerate_get_iter_or_list(obj);
             let mut w_item: PyObjectRef = pyre_object::PY_NULL;
@@ -9493,8 +9507,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         // W_ReversedIterator.descr_next` — `getitem(sequence, remaining)`
         // then decrement; IndexError / StopIteration ends the walk and
         // clears the slot.
-        if pyre_object::reversedobject::is_reversed(obj) {
-            use pyre_object::reversedobject as ro;
+        if pyre_object::functional::is_reversed(obj) {
+            use pyre_object::functional as ro;
             let remaining = ro::w_reversed_get_remaining(obj);
             if remaining >= 0 {
                 // `getitem` runs `__getitem__` (Python) and can move the reversed
@@ -9529,7 +9543,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         }
         // `pypy/module/_sre/interp_sre.py:918 W_SRE_Scanner.next_w` —
         // search from the current position, yielding the match object.
-        if pyre_object::sreobject::is_sre_scanner(obj) {
+        if pyre_object::interp_sre::is_sre_scanner(obj) {
             return crate::module::_sre::interp_sre::sre_scanner_next(obj);
         }
         // Instance __next__
@@ -9561,7 +9575,7 @@ unsafe fn property_copy(
     let getter = resolve(w_getter, w_property_get_fget);
     let setter = resolve(w_setter, w_property_get_fset);
     let deleter = resolve(w_deleter, w_property_get_fdel);
-    let getter_doc = (*(prop as *const pyre_object::propertyobject::W_PropertyObject)).getter_doc;
+    let getter_doc = (*(prop as *const pyre_object::descriptor::W_Property)).getter_doc;
     // descriptor.py:263-264 `if self.getter_doc and w_getter is not None`
     // — judged on the getter AFTER defaulting from `w_fget`, so
     // `.setter(s)` on a getter_doc property still passes doc=None and
@@ -9569,23 +9583,22 @@ unsafe fn property_copy(
     let w_doc = if getter_doc && !is_none(getter) {
         w_none
     } else {
-        let d = pyre_object::propertyobject::w_property_get_doc(prop);
+        let d = pyre_object::descriptor::w_property_get_doc(prop);
         if d.is_null() { w_none } else { d }
     };
     // descriptor.py:267-269 `w_type = self.getclass(space); space.call_function(
     // w_type, w_getter, w_setter, w_deleter, w_doc)` — construct through the
     // instance's own type so a `property` subclass is preserved; the
     // constructor re-runs the doc capture.
-    let w_type = crate::typedef::r#type(prop).unwrap_or_else(|| {
-        crate::typedef::gettypeobject(&pyre_object::propertyobject::PROPERTY_TYPE)
-    });
+    let w_type = crate::typedef::r#type(prop)
+        .unwrap_or_else(|| crate::typedef::gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE));
     let w_res = crate::call::call_function_impl_result(w_type, &[getter, setter, deleter, w_doc])?;
     // descriptor.py:270-271 `if isinstance(w_res, W_Property): w_res.w_name
     // = self.w_name` — the copy keeps the source's name.
     if is_property(w_res) {
-        let w_name = pyre_object::propertyobject::w_property_get_name(prop);
+        let w_name = pyre_object::descriptor::w_property_get_name(prop);
         if !w_name.is_null() {
-            pyre_object::propertyobject::w_property_set_name(w_res, w_name);
+            pyre_object::descriptor::w_property_set_name(w_res, w_name);
         }
     }
     Ok(w_res)
@@ -9601,7 +9614,7 @@ unsafe fn property_no_accessor(prop: PyObjectRef, obj: PyObjectRef, kind: &str) 
         },
         None => (*(*obj).ob_type).name.to_string(),
     };
-    let w_name = pyre_object::propertyobject::w_property_get_name(prop);
+    let w_name = pyre_object::descriptor::w_property_get_name(prop);
     let msg = if !w_name.is_null() {
         let name_repr = crate::display::py_repr(w_name).unwrap_or_else(|_| "<name>".to_string());
         format!("property {name_repr} of '{qualname}' object has no {kind}")
@@ -9615,7 +9628,7 @@ fn property_set_name_impl(args: &[PyObjectRef]) -> PyResult {
     // descriptor.py:274-276 `set_name(self, w_type, w_name)` — the bound
     // method receives `[property, owner, name]`.
     if let Some(&w_name) = args.get(2) {
-        unsafe { pyre_object::propertyobject::w_property_set_name(args[0], w_name) };
+        unsafe { pyre_object::descriptor::w_property_set_name(args[0], w_name) };
     }
     Ok(pyre_object::w_none())
 }
@@ -9700,7 +9713,7 @@ pub(crate) fn property_descr_delete_impl(args: &[PyObjectRef]) -> PyResult {
 /// Resume a generator frame: push w_arg (for send/next) or inject operr
 /// (for throw), then run the frame until YIELD_VALUE or RETURN_VALUE.
 fn generator_send_ex(gen_obj: PyObjectRef, w_arg: PyObjectRef, operr: Option<PyError>) -> PyResult {
-    use pyre_object::generatorobject::*;
+    use pyre_object::generator::*;
     unsafe {
         if w_generator_is_running(gen_obj) {
             return Err(PyError::value_error("generator already executing"));
@@ -9774,7 +9787,7 @@ fn generator_send_ex(gen_obj: PyObjectRef, w_arg: PyObjectRef, operr: Option<PyE
 /// `next(g)` outside a generator-return context still surfaces a bare
 /// `StopIteration()`.
 fn stop_iteration_with_value(value: PyObjectRef) -> PyError {
-    use pyre_object::excobject::*;
+    use pyre_object::interp_exceptions::*;
     let exc = w_exception_new(ExcKind::StopIteration, "");
     if !value.is_null() && unsafe { !is_none(value) } {
         // `interp_exceptions.py:121-124 W_BaseException.descr_init`
@@ -9814,7 +9827,7 @@ fn iter_self_method(args: &[PyObjectRef]) -> PyResult {
 /// `takewhile.__reduce__` — `interp_itertools.py W_TakeWhile.descr_reduce`:
 /// `(type(self), (predicate, iterable), stopped)`.
 fn takewhile_reduce_method(args: &[PyObjectRef]) -> PyResult {
-    let it = unsafe { &*(args[0] as *const pyre_object::itertoolsmodule::W_TakeWhile) };
+    let it = unsafe { &*(args[0] as *const pyre_object::interp_itertools::W_TakeWhile) };
     let w_type = crate::typedef::r#type(args[0]).unwrap_or(PY_NULL);
     let state = w_tuple_new(vec![it.w_predicate, it.w_iterable]);
     Ok(w_tuple_new(vec![w_type, state, w_bool_from(it.stopped)]))
@@ -9827,7 +9840,7 @@ fn takewhile_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// `int_w(...)? != 0` is the exact equivalent (raises on a non-int
 /// state just as `bool_w` does).
 fn takewhile_setstate_method(args: &[PyObjectRef]) -> PyResult {
-    let it = unsafe { &mut *(args[0] as *mut pyre_object::itertoolsmodule::W_TakeWhile) };
+    let it = unsafe { &mut *(args[0] as *mut pyre_object::interp_itertools::W_TakeWhile) };
     it.stopped = int_w(args.get(1).copied().unwrap_or(w_none()))? != 0;
     Ok(w_none())
 }
@@ -9835,7 +9848,7 @@ fn takewhile_setstate_method(args: &[PyObjectRef]) -> PyResult {
 /// `dropwhile.__reduce__` — `interp_itertools.py W_DropWhile.descr_reduce`:
 /// `(type(self), (predicate, iterable), started)`.
 fn dropwhile_reduce_method(args: &[PyObjectRef]) -> PyResult {
-    let it = unsafe { &*(args[0] as *const pyre_object::itertoolsmodule::W_DropWhile) };
+    let it = unsafe { &*(args[0] as *const pyre_object::interp_itertools::W_DropWhile) };
     let w_type = crate::typedef::r#type(args[0]).unwrap_or(PY_NULL);
     let state = w_tuple_new(vec![it.w_predicate, it.w_iterable]);
     Ok(w_tuple_new(vec![w_type, state, w_bool_from(it.started)]))
@@ -9845,7 +9858,7 @@ fn dropwhile_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// `self.started = space.bool_w(w_state)` (= `bool(int_w(w))`; see
 /// `takewhile_setstate_method` for the `int_w(...)? != 0` equivalence).
 fn dropwhile_setstate_method(args: &[PyObjectRef]) -> PyResult {
-    let it = unsafe { &mut *(args[0] as *mut pyre_object::itertoolsmodule::W_DropWhile) };
+    let it = unsafe { &mut *(args[0] as *mut pyre_object::interp_itertools::W_DropWhile) };
     it.started = int_w(args.get(1).copied().unwrap_or(w_none()))? != 0;
     Ok(w_none())
 }
@@ -9853,7 +9866,7 @@ fn dropwhile_setstate_method(args: &[PyObjectRef]) -> PyResult {
 /// `filterfalse.__reduce__` — `interp_itertools.py W_FilterFalse.descr_reduce`:
 /// `(type(self), (None-or-predicate, iterable))` — no state element.
 fn filterfalse_reduce_method(args: &[PyObjectRef]) -> PyResult {
-    let it = unsafe { &*(args[0] as *const pyre_object::itertoolsmodule::W_FilterFalse) };
+    let it = unsafe { &*(args[0] as *const pyre_object::interp_itertools::W_FilterFalse) };
     let w_type = crate::typedef::r#type(args[0]).unwrap_or(PY_NULL);
     let w_pred = if it.w_predicate.is_null() {
         w_none()
@@ -9874,7 +9887,7 @@ fn cycle_reduce_method(args: &[PyObjectRef]) -> PyResult {
     // that `w_list_new` pins, and `w_iterable` / `index` are read up
     // front rather than across an allocation.
     let w_type = crate::typedef::r#type(args[0]).unwrap_or(PY_NULL);
-    let it = unsafe { &*(args[0] as *const pyre_object::itertoolsmodule::W_Cycle) };
+    let it = unsafe { &*(args[0] as *const pyre_object::interp_itertools::W_Cycle) };
     let w_iterable = it.w_iterable;
     let index = it.index;
     let n = unsafe { pyre_object::w_list_len(it.saved) };
@@ -9911,7 +9924,7 @@ fn cycle_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let saved_w = unpackiterable(state_w[0], -1)?;
     let w_saved = w_list_new(saved_w);
     let index = int_w(state_w[1])?;
-    let it = unsafe { &mut *(w_self as *mut pyre_object::itertoolsmodule::W_Cycle) };
+    let it = unsafe { &mut *(w_self as *mut pyre_object::interp_itertools::W_Cycle) };
     it.saved = w_saved;
     pyre_object::gc_hook::try_gc_write_barrier(w_self as *mut u8);
     it.index = index;
@@ -9940,7 +9953,7 @@ fn generator_throw_method(args: &[PyObjectRef]) -> PyResult {
 fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
     let gen_obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     unsafe {
-        use pyre_object::generatorobject::*;
+        use pyre_object::generator::*;
         if w_generator_is_exhausted(gen_obj) {
             return Ok(w_none());
         }
@@ -9973,14 +9986,14 @@ fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
 fn normalize_throw_args(w_type: PyObjectRef, w_val: PyObjectRef) -> PyError {
     unsafe {
         // If w_type is an exception instance, use it directly
-        if !w_type.is_null() && pyre_object::excobject::is_exception(w_type) {
+        if !w_type.is_null() && pyre_object::interp_exceptions::is_exception(w_type) {
             return PyError::from_exc_object(w_type);
         }
 
         // If w_type is a type (class), try to create exception from it
         if !w_type.is_null() && pyre_object::is_type(w_type) {
             let type_name = pyre_object::w_type_get_name(w_type);
-            if let Some(kind) = pyre_object::excobject::exc_kind_from_name(type_name) {
+            if let Some(kind) = pyre_object::interp_exceptions::exc_kind_from_name(type_name) {
                 let msg = if w_val.is_null() || pyre_object::is_none(w_val) {
                     String::new()
                 } else if pyre_object::is_str(w_val) {
@@ -10004,7 +10017,7 @@ mod tests {
     #[test]
     fn test_setattr_getattr() {
         // PyPy raises AttributeError when setattr targets a non-hasdict
-        // type. Use a hasdict instance: a W_InstanceObject of a fresh
+        // type. Use a hasdict instance: a W_ObjectObject of a fresh
         // user class created via type().
         let obj = make_user_instance();
         setattr_str(obj, "name", w_int_new(100)).unwrap();
@@ -10033,7 +10046,7 @@ mod tests {
     /// (analogous to PyPy's `_getusercls` instances).
     fn make_user_instance() -> PyObjectRef {
         crate::typedef::init_typeobjects();
-        use pyre_object::instanceobject::w_instance_new;
+        use pyre_object::objectobject::w_instance_new;
         let cls = crate::typedef::make_builtin_type("TestUserClass", |_| {});
         unsafe { pyre_object::w_type_set_hasdict(cls, true) };
         w_instance_new(cls)
@@ -10081,10 +10094,8 @@ mod tests {
     fn test_module_setattr_getattr() {
         let mut namespace = Box::new(crate::DictStorage::default());
         namespace.fix_ptr();
-        let module = pyre_object::moduleobject::w_module_new(
-            "test_module",
-            Box::into_raw(namespace) as *mut u8,
-        );
+        let module =
+            pyre_object::module::w_module_new("test_module", Box::into_raw(namespace) as *mut u8);
 
         setattr_str(module, "ps1", w_str_new("py> ")).unwrap();
         let result = getattr_str(module, "ps1").unwrap();
@@ -10095,10 +10106,8 @@ mod tests {
     fn test_module_delattr() {
         let mut namespace = Box::new(crate::DictStorage::default());
         namespace.fix_ptr();
-        let module = pyre_object::moduleobject::w_module_new(
-            "test_module",
-            Box::into_raw(namespace) as *mut u8,
-        );
+        let module =
+            pyre_object::module::w_module_new("test_module", Box::into_raw(namespace) as *mut u8);
 
         setattr_str(module, "ps1", w_str_new("py> ")).unwrap();
         delattr_str(module, "ps1").unwrap();
@@ -10160,7 +10169,7 @@ mod tests {
         // (executioncontext::get_builtin / importing::init_builtin_module
         //  / pyrex::run_source __main__).
         let canonical = super::dict_storage_to_dict(ns_ptr);
-        let module = pyre_object::moduleobject::w_module_new_aliasing_dict(
+        let module = pyre_object::module::w_module_new_aliasing_dict(
             "test_canonical",
             ns_ptr as *mut u8,
             canonical,
@@ -10264,7 +10273,7 @@ mod tests {
         let inner_type = crate::typedef::make_builtin_type("PseudoInner", |ns| {
             crate::dict_storage_store(ns, "__bases__", w_tuple_new(vec![]));
         });
-        let inner = pyre_object::instanceobject::w_instance_new(inner_type);
+        let inner = pyre_object::objectobject::w_instance_new(inner_type);
         let outer_type = crate::typedef::make_builtin_type("PseudoOuter", |_ns| {
             // closure capture is fine — make_builtin_type runs init eagerly.
         });
@@ -10276,7 +10285,7 @@ mod tests {
             "__bases__",
             w_tuple_new(vec![inner]),
         );
-        let outer = pyre_object::instanceobject::w_instance_new(outer_type);
+        let outer = pyre_object::objectobject::w_instance_new(outer_type);
         let yes = super::issubclass(outer, inner).expect("issubclass should succeed");
         assert!(yes);
     }
@@ -10449,23 +10458,24 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
             haystack
         }
     };
-    // `pypy/objspace/std/dictmultiobject.py W_DictMultiViewKeysObject
-    // .descr_contains` → `space.contains(self.w_dict, w_key)`.
-    // `W_DictMultiViewItemsObject.descr_contains` matches a (k, v)
-    // tuple via dict lookup + value equality.  `W_DictMultiViewValues
-    // Object` has no `__contains__` slot in PyPy — pyre delegates the
+    // `pypy/objspace/std/dictmultiobject.py`
+    // `W_DictViewKeysObject.descr_contains` →
+    // `space.contains(self.w_dict, w_key)`.
+    // `W_DictViewItemsObject.descr_contains` matches a (k, v)
+    // tuple via dict lookup + value equality.  `W_DictViewValuesObject`
+    // has no `__contains__` slot in PyPy — pyre delegates the
     // fall-through to the standard `iter`-based scan further down so
     // `v in d.values()` still works (as in PyPy where the missing
     // slot triggers the iter fallback).
     unsafe {
-        if pyre_object::dictviewobject::is_dict_view(haystack) {
-            let kind = pyre_object::dictviewobject::w_dict_view_get_kind(haystack);
-            let dict = pyre_object::dictviewobject::w_dict_view_get_dict(haystack);
+        if pyre_object::dictmultiobject::is_dict_view(haystack) {
+            let kind = pyre_object::dictmultiobject::w_dict_view_get_kind(haystack);
+            let dict = pyre_object::dictmultiobject::w_dict_view_get_dict(haystack);
             if dict.is_null() {
                 return Ok(false);
             }
             match kind {
-                pyre_object::dictviewobject::DictViewKind::Keys => {
+                pyre_object::dictmultiobject::DictViewKind::Keys => {
                     return match unsafe {
                         pyre_object::dictmultiobject::w_dict_lookup_checked(dict, needle)
                     } {
@@ -10473,7 +10483,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                         Err(_) => Err(take_pending_hash_error()),
                     };
                 }
-                pyre_object::dictviewobject::DictViewKind::Items => {
+                pyre_object::dictmultiobject::DictViewKind::Items => {
                     if !is_tuple(needle) || w_tuple_len(needle) != 2 {
                         return Ok(false);
                     }
@@ -10493,7 +10503,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                         Err(_) => Err(take_pending_hash_error()),
                     };
                 }
-                pyre_object::dictviewobject::DictViewKind::Values => {
+                pyre_object::dictmultiobject::DictViewKind::Values => {
                     // values view: PyPy uses iter-based scan.
                     for (_, v) in pyre_object::w_dict_items(dict) {
                         if eq_w(v, needle)? {
@@ -10505,7 +10515,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
             }
         }
     }
-    // `rangeobject.py W_RangeObject.descr_contains` — O(1) membership for
+    // `functional.py W_Range.descr_contains` — O(1) membership for
     // an int/long needle; any other type falls back to an elementwise scan.
     unsafe {
         if pyre_object::is_w_range(haystack) {
@@ -10686,7 +10696,7 @@ pub fn hash_w_strict(obj: PyObjectRef) -> Result<i64, PyError> {
             Some("set")
         } else if pyre_object::is_bytearray(obj) {
             Some("bytearray")
-        } else if pyre_object::dictviewobject::is_dict_view(obj) {
+        } else if pyre_object::dictmultiobject::is_dict_view(obj) {
             Some("dict view")
         } else if pyre_object::sliceobject::is_slice(obj) {
             Some("slice")
