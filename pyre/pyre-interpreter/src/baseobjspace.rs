@@ -3319,15 +3319,17 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             }
 
             // Step 3: instance dict — the mapdict map+storage is the sole
-            // authority for instance attributes.  `getdict` returns the
-            // MapDictStrategy view whose getitem_str reads the map
-            // (getdictvalue, mapdict.py:846-847; MapDictStrategy.getitem_str
-            // delegates there, mapdict.py:1168-1175).
-            let w_dict = getdict_backing(obj);
-            if !w_dict.is_null() {
-                if let Some(value) = pyre_object::w_dict_getitem_str(w_dict, name) {
-                    return Ok(value);
-                }
+            // authority for instance attributes.  Read the node directly
+            // (getdictvalue, mapdict.py:846-847) rather than materialising the
+            // MapDictStrategy `__dict__` view through `getdict_backing`;
+            // MapDictStrategy.getitem_str (mapdict.py:1168-1175) delegates to the
+            // same `instance_node_getdictvalue`, so the value is identical and the
+            // `__dict__` wrapper is built only on explicit `__dict__` access.
+            let value = unsafe {
+                crate::objspace::std::mapdict::instance_node_getdictvalue(obj, Wtf8::new(name))
+            };
+            if let Some(value) = value {
+                return Ok(value);
             }
 
             // Step 4: non-data descriptor
@@ -3827,14 +3829,15 @@ pub fn object_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
                     }
                 }
             }
-            // Instance dict is the sole authority for instance attributes
-            // (mapdict map+storage via the MapDictStrategy view); no
-            // side-table fallback (mapdict.py:846-847, 1168-1175).
-            let w_dict = getdict_backing(obj);
-            if !w_dict.is_null() {
-                if let Some(value) = pyre_object::w_dict_getitem_str(w_dict, name) {
-                    return Ok(value);
-                }
+            // Instance dict is the sole authority for instance attributes:
+            // read the mapdict node directly (getdictvalue, mapdict.py:846-847)
+            // rather than materialising the MapDictStrategy `__dict__` view, which
+            // MapDictStrategy.getitem_str (mapdict.py:1168-1175) delegates to
+            // anyway.  No side-table fallback.
+            let value =
+                crate::objspace::std::mapdict::instance_node_getdictvalue(obj, Wtf8::new(name));
+            if let Some(value) = value {
+                return Ok(value);
             }
             if let Some(descr) = w_descr {
                 if let Some(result) = get(descr, obj, w_type)? {
@@ -10574,8 +10577,8 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
         // `_op_val(allow_char=True)` — an int needle is a single byte value
         // (range-checked), a bytes-like needle is matched as a substring (an
         // empty needle is always present), and any other type is a TypeError.
-        // The upstream buffer-protocol fallback that also accepts a memoryview
-        // is not implemented for bytes methods here.
+        // `_op_val` falls back to `buffer_w(BUF_SIMPLE)`, so any buffer-protocol
+        // object (e.g. a memoryview) is also accepted as the needle.
         if pyre_object::bytesobject::is_bytes_like(haystack) {
             let hay = pyre_object::bytesobject::bytes_like_data(haystack);
             if is_int(needle) || is_long(needle) {

@@ -2983,6 +2983,19 @@ fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitS
     // region boundary; callees are allowed to enter the JIT. This keeps
     // module-level driver loops such as fannkuch's `for range(3, 10)`
     // from disabling the hot function they call.
+    //
+    // The entry-hook in `trace_opcode.rs` (delegating `FOR_ITER` to
+    // `execute_for_iter`, binding `concrete_iter` from the stack) makes the
+    // loop traceable, so the auto-gen operand gap (`ResidualCallArgUnbound`) is
+    // resolved. The remaining defect keeps the gate up: the FBW walk-end-flush
+    // commits `while`/JUMP_BACKWARD loops (advancing the live frame past the
+    // recorded iteration) but does not commit `FOR_ITER` loops, so the recorded
+    // iteration's body is replayed once (extra iteration on a `list.append`
+    // body; SIGBUS on a nested loop). This is `FOR_ITER`-general (a `range`
+    // loop double-applies too), not a resume or `space.next` bug. The gate
+    // stays until the FBW commit path covers `FOR_ITER`; the residual emit path
+    // (`MIFrame::iter_next` -> `trace_next` -> `jit_next`) and the entry-hook
+    // are in place behind it.
     let mut arg_state = pyre_interpreter::OpArgState::default();
     let mut has_for_iter = false;
     for unit in code.instructions.iter().copied() {
@@ -2995,10 +3008,16 @@ fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitS
         }
     }
     if has_for_iter {
-        UnsupportedJitShape::CurrentFrameOnly
-    } else {
-        UnsupportedJitShape::None
+        // Opt-in `PYRE_57_INLINE_NEXT=1` lets a FOR_ITER frame enter the JIT for
+        // flag-gated validation; the firewall stays UP by default.
+        static FOR_ITER_JIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *FOR_ITER_JIT
+            .get_or_init(|| std::env::var("PYRE_57_INLINE_NEXT").as_deref() == Ok("1"));
+        if !enabled {
+            return UnsupportedJitShape::CurrentFrameOnly;
+        }
     }
+    UnsupportedJitShape::None
 }
 
 fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
@@ -8971,8 +8990,9 @@ mod tests {
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
         let next = state
-            .capture_iter_next_value(iter, range_iter)
-            .expect("range iterator fast path should trace");
+            .capture_iter_next(iter, range_iter)
+            .expect("range iterator fast path should trace")
+            .expect("two-element range iterator should yield a value");
         assert_eq!(state.capture_value_type(next.opref), Type::Int);
         <MIFrame as IterOpcodeHandler>::guard_optional_value(&mut state, next, true)
             .expect("typed range next should not need optional guard");
