@@ -45,8 +45,8 @@ on:
       - 'release-pyre**[0-9]+.[0-9]+.[0-9]+*'
 
 concurrency:
-  group: release-pyre-release-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: release-pyre-release-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do

@@ -10,8 +10,8 @@ on:
     branches: [ "main", "py3.[0-9]+" ]
 
 concurrency:
-  group: pre-commit-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  group: pre-commit-${{ github.ref == 'refs/heads/main' && github.run_id || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
