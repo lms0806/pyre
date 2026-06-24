@@ -154,8 +154,18 @@ fn wasm_alloc_oldgen_typed(type_id: u32, size: usize) -> GcRef {
 /// lands in the table) and invokes it with `(type_id, size)`. Returns the new
 /// object pointer, or 0 when no GC is installed. The `ob_type` field for
 /// `NewWithVtable` is written inline by codegen at `vtable_offset`.
+///
+/// Unlike the general [`wasm_alloc_nursery_typed`] host hook (which must not
+/// collect — its callers hold unrooted raw pointers), this JIT-trace path is
+/// safe to collect: the trace registers every live Ref's frame home slot as a
+/// GC root and reloads its locals from the (forwarded) homes after each
+/// allocation. So it uses the *collecting* `alloc_nursery_typed`, which
+/// triggers a minor collection on nursery-full instead of leaking to old-gen.
 pub extern "C" fn wasm_jit_alloc(type_id: i64, size: i64) -> i64 {
-    wasm_alloc_nursery_typed(type_id as u32, size as usize).0 as i64
+    WASM_ACTIVE_GC.with(|cell| match cell.borrow_mut().as_deref_mut() {
+        Some(gc) => gc.alloc_nursery_typed(type_id as u32, size as usize).0 as i64,
+        None => 0,
+    })
 }
 
 /// JIT-trace variable-size allocation trampoline target for `NewArray` /
@@ -192,6 +202,22 @@ pub extern "C" fn wasm_jit_alloc_array(
     })
 }
 
+/// JIT-trace write-barrier trampoline target for ref-storing `SetfieldGc` /
+/// `SetarrayitemGc` / `SetinteriorfieldGc`. Routes through the host `jit_call`
+/// trampoline; invokes the active GC's `write_barrier`, which adds an old
+/// object that may now hold a young reference to the remembered set (and clears
+/// TRACK_YOUNG_PTRS). A young base (no flag) or a null base is a no-op. wasm
+/// skips the native GC rewrite pass, so the trace emits this barrier directly
+/// instead of `COND_CALL_GC_WB`. Returns 0 — the store codegen ignores it.
+pub extern "C" fn wasm_jit_write_barrier(obj: i64) -> i64 {
+    WASM_ACTIVE_GC.with(|cell| {
+        if let Some(gc) = cell.borrow_mut().as_deref_mut() {
+            gc.write_barrier(GcRef(obj as usize));
+        }
+    });
+    0
+}
+
 /// Host-side root-register trampoline.
 ///
 /// # Safety
@@ -212,6 +238,19 @@ fn wasm_gc_remove_root(slot: *mut GcRef) {
         let mut guard = cell.borrow_mut();
         if let Some(gc) = guard.as_deref_mut() {
             gc.remove_root(slot);
+        }
+    });
+}
+
+/// Host-side write-barrier trampoline for the interpreter (mapdict / list /
+/// set / dict stores route through `majit_gc::gc_write_barrier`). Mirrors
+/// `dynasm_gc_write_barrier`; without it every interpreter ref-store is a
+/// silent no-op, so a collecting nursery loses old→young pointers.
+fn wasm_active_gc_write_barrier(obj: GcRef) {
+    WASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if let Some(gc) = guard.as_deref_mut() {
+            gc.write_barrier(obj);
         }
     });
 }
@@ -301,6 +340,7 @@ impl WasmBackend {
         majit_gc::set_active_alloc_oldgen_typed(Some(wasm_alloc_oldgen_typed));
         majit_gc::set_active_root_hooks(Some(wasm_gc_add_root), Some(wasm_gc_remove_root));
         majit_gc::set_active_gc_owns_object(Some(wasm_gc_owns_object));
+        majit_gc::set_active_write_barrier(Some(wasm_active_gc_write_barrier));
     }
 
     /// llmodel.py:64-69 self.vtable_offset configuration.
@@ -447,8 +487,6 @@ unsafe impl Send for WasmBackend {}
 fn wasm_unsupported_trace_reason(ops: &[Op]) -> Option<String> {
     let mut has_label = false;
     let mut has_jump = false;
-    let mut has_new = false;
-    let mut has_call = false;
     for op in ops {
         if op.opcode.is_call_assembler() {
             // CALL_ASSEMBLER enters another trace's compiled token; the wasm
@@ -461,11 +499,6 @@ fn wasm_unsupported_trace_reason(ops: &[Op]) -> Option<String> {
         match op.opcode {
             majit_ir::OpCode::Label => has_label = true,
             majit_ir::OpCode::Jump => has_jump = true,
-            majit_ir::OpCode::New
-            | majit_ir::OpCode::NewWithVtable
-            | majit_ir::OpCode::NewArray
-            | majit_ir::OpCode::NewArrayClear => has_new = true,
-            opcode if opcode.is_call() => has_call = true,
             _ => {}
         }
     }
@@ -473,17 +506,6 @@ fn wasm_unsupported_trace_reason(ops: &[Op]) -> Option<String> {
     // no enclosing loop block, yielding invalid wasm.
     if has_jump && !has_label {
         return Some("wasm backend: JUMP to external loop (no local LABEL)".into());
-    }
-    // A loop that BOTH allocates and makes residual calls every iteration grows
-    // the heap without bound (the wasm backend has no GC malloc-nursery rewrite,
-    // so wasm_jit_alloc never collects) while the host-trampoline calls keep it
-    // running long enough to exhaust memory. Decline so the interpreter (with
-    // its GC) runs the loop. An all-inline allocating loop (no residual call)
-    // stays compiled: it is fast and its bounded run does not exhaust memory.
-    if has_label && has_new && has_call {
-        return Some(
-            "wasm backend: allocation + residual call in loop trace (no GC nursery)".into(),
-        );
     }
     None
 }
@@ -612,7 +634,8 @@ impl majit_backend::Backend for WasmBackend {
         // index on wasm32; taking it here keeps the function in the table.
         let alloc_fn_ptr = wasm_jit_alloc as *const () as usize as i64;
         let alloc_array_fn_ptr = wasm_jit_alloc_array as *const () as usize as i64;
-        let (wasm_bytes, guard_exits) = codegen::build_wasm_module(
+        let wb_fn_ptr = wasm_jit_write_barrier as *const () as usize as i64;
+        let (wasm_bytes, guard_exits, num_ref_homes) = codegen::build_wasm_module(
             inputargs,
             ops,
             &self.constants,
@@ -621,6 +644,7 @@ impl majit_backend::Backend for WasmBackend {
             &guard_gc_type_info,
             alloc_fn_ptr,
             alloc_array_fn_ptr,
+            wb_fn_ptr,
         )?;
 
         // Build fail descriptors
@@ -658,6 +682,7 @@ impl majit_backend::Backend for WasmBackend {
             fail_descrs,
             num_inputs: inputargs.len(),
             max_output_slots,
+            num_ref_homes,
         };
 
         token.compiled = Some(Box::new(compiled));
@@ -704,10 +729,13 @@ impl majit_backend::Backend for WasmBackend {
             .downcast_ref::<CompiledWasmLoop>()
             .expect("not CompiledWasmLoop");
 
-        // Allocate frame area large enough for slots + call trampoline area.
-        // MIN_FRAME_BYTES accommodates the call area at offset 2000+.
+        // Allocate frame area large enough for slots + call trampoline area +
+        // the Ref-home region. MIN_FRAME_BYTES accommodates the call area at
+        // offset 2000+; the Ref-home region (`codegen::HOME_SLOT_BASE`) follows
+        // it, one slot per Ref-typed value (`num_ref_homes`).
         let min_slots = codegen::MIN_FRAME_BYTES / 8;
-        let frame_size = min_slots.max(1 + compiled.max_output_slots.max(compiled.num_inputs));
+        let base_slots = min_slots.max(1 + compiled.max_output_slots.max(compiled.num_inputs));
+        let frame_size = base_slots + compiled.num_ref_homes;
         let mut frame = vec![0i64; frame_size];
 
         // Write inputs to frame[1..]
@@ -729,6 +757,23 @@ impl majit_backend::Backend for WasmBackend {
         }
         #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
         {
+            // Register each Ref-home slot (codegen::HOME_SLOT_BASE region) as a
+            // GC root so a collecting allocation inside the trace (epic B)
+            // forwards the live refs. A home slot only ever holds null (its
+            // entry init) or a valid GcRef (store-on-def), so forwarding is
+            // always safe without precise liveness.
+            //
+            // No RAII guard is needed for the removal below: the path from here
+            // to `wasm_gc_remove_root` is straight-line (no `?`/early return),
+            // and the wasm32 build is `panic=abort`, so `glue::execute` cannot
+            // unwind past this frame — a trap aborts the process rather than
+            // leaking the roots.
+            let home_base = codegen::HOME_SLOT_BASE as usize / 8;
+            for h in 0..compiled.num_ref_homes {
+                let slot = unsafe { frame.as_mut_ptr().add(home_base + h) } as *mut GcRef;
+                unsafe { wasm_gc_add_root(slot) };
+            }
+
             // The pending-exception cell is global, unlike the native
             // per-jitframe `jf_guard_exc`. A residual raise on a blackhole
             // resume path (publish_residual_call_exception) writes it outside
@@ -737,6 +782,13 @@ impl majit_backend::Backend for WasmBackend {
             // exception from a previous frame's resume as this trace's.
             jit_exc_clear();
             glue::execute(compiled.func_handle, _frame_ptr);
+
+            // Companion to the add_root loop above: drop the home-slot roots
+            // now the trace has returned (the host frame is freed on return).
+            for h in 0..compiled.num_ref_homes {
+                let slot = unsafe { frame.as_mut_ptr().add(home_base + h) } as *mut GcRef;
+                wasm_gc_remove_root(slot);
+            }
 
             // A GuardNoException / GuardException exit leaves the pending
             // exception in the global slot; capture and clear it here so

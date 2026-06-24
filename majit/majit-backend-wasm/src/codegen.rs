@@ -21,7 +21,8 @@ use majit_gc::header::{GcHeader, TYPE_ID_MASK};
 use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
 use wasm_encoder::{
     BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
-    ImportSection, InstructionSink, MemArg, MemoryType, Module, TypeSection, ValType,
+    ImportSection, InstructionSink, MemArg, MemoryType, Module, RefType, TableType, TypeSection,
+    ValType,
 };
 
 /// Frame slot byte offset: slot[i] is at frame_ptr + 8 + i * 8.
@@ -34,12 +35,32 @@ const UMULHI_SCRATCH: u32 = 5;
 
 /// Call area layout (fixed offsets from frame_ptr).
 const CALL_RESULT_OFS: u64 = 2000;
+/// First frame *slot* index occupied by the fixed call area. Frame value slots
+/// (inputs at entry, fail-arg spills at guard exit) occupy `[1, 1 + max(num
+/// inputs, max fail args))`; they must stay below this index, or they clobber
+/// the call area and — past `HOME_SLOT_BASE` — the Ref-home region. A trace that
+/// would exceed it is declined in `build_wasm_module`.
+pub const CALL_AREA_FIRST_SLOT: u64 = CALL_RESULT_OFS / SLOT_SIZE;
 const CALL_FUNC_OFS: u64 = 2008;
 const CALL_NARGS_OFS: u64 = 2016;
 const CALL_ARGS_OFS: u64 = 2024;
 
 /// Minimum frame allocation size in bytes to accommodate the call area.
 pub const MIN_FRAME_BYTES: usize = 2024 + 16 * 8; // 16 max call args
+
+/// Byte offset of the Ref-home region within the frame. Each Ref-typed value
+/// (input arg or op result) is given a dedicated home slot here: it is
+/// null-initialized at trace entry and written on every definition
+/// (store-on-def), so a home slot only ever holds null or a valid GcRef.
+/// A (future) collecting allocation registers these slots as GC roots and
+/// forwards them, then the trace reloads the live Ref locals from their homes
+/// — making object movement transparent without precise liveness.
+///
+/// Placed past the call area so it never overlaps the fail-index / input /
+/// output slots (which sit below the call area at offset 2000) or the call
+/// trampoline area. Inert while `wasm_jit_alloc` is no-collect (epic B): the
+/// extra stores write a region nothing reads until the allocator collects.
+pub const HOME_SLOT_BASE: u64 = MIN_FRAME_BYTES as u64;
 
 fn mem64(offset: u64) -> MemArg {
     MemArg {
@@ -156,6 +177,176 @@ fn setfield_store_size_from_descr(op: &Op) -> usize {
 fn array_item_size_sign_from_descr(op: &Op) -> (usize, bool) {
     op.with_array_descr(|ad| (ad.item_size(), ad.is_item_signed()))
         .unwrap_or((8, true))
+}
+
+/// Maps each Ref-typed value (input arg / op result) to a compact home-slot
+/// index `0..len`, where its current `GcRef` is mirrored into the frame's
+/// GC-root region (`HOME_SLOT_BASE + home * 8`) so a collecting allocation
+/// inside the trace can forward it.
+///
+/// Keyed by value id (`OpRef::raw()` / input `index`), which is the dense
+/// `[0, num_vars)` space the wasm value locals already use (`1 + raw`); a flat
+/// vector indexed by that id is the natural fit — no hashing, and iteration is
+/// in id order, so the emitted module stays deterministic without sorting. The
+/// `is_constant` guard lives in one place (`home`): a constant `raw()` is a
+/// distinct namespace that must never alias a value's home.
+struct RefHomes {
+    /// `by_id[raw] = home index`, or `NONE` where the value is not a Ref home.
+    /// Sized to the last Ref id; queries for higher ids miss via `get`.
+    by_id: Vec<u32>,
+    len: usize,
+}
+
+impl RefHomes {
+    const NONE: u32 = u32::MAX;
+
+    fn assign(by_id: &mut Vec<u32>, next: &mut u32, id: u32) {
+        let i = id as usize;
+        if i >= by_id.len() {
+            by_id.resize(i + 1, Self::NONE);
+        }
+        if by_id[i] == Self::NONE {
+            by_id[i] = *next;
+            *next += 1;
+        }
+    }
+
+    fn collect(inputargs: &[InputArg], ops: &[Op]) -> Self {
+        let mut by_id = Vec::new();
+        let mut next = 0u32;
+        for ia in inputargs {
+            if ia.tp == Type::Ref {
+                Self::assign(&mut by_id, &mut next, ia.index);
+            }
+        }
+        for op in ops {
+            let r = op.pos.get();
+            if r != OpRef::NONE && !r.is_constant() && op.result_type() == Type::Ref {
+                Self::assign(&mut by_id, &mut next, r.raw());
+            }
+        }
+        RefHomes {
+            by_id,
+            len: next as usize,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Home index of value id `id` (caller guarantees it is a value, not a
+    /// constant — e.g. an input-arg index).
+    fn home_id(&self, id: u32) -> Option<u32> {
+        match self.by_id.get(id as usize) {
+            Some(&h) if h != Self::NONE => Some(h),
+            _ => None,
+        }
+    }
+
+    /// Home index of `v`, or `None` if it is a constant or not a Ref home.
+    fn home(&self, v: OpRef) -> Option<u32> {
+        if v.is_constant() {
+            return None;
+        }
+        self.home_id(v.raw())
+    }
+
+    /// `(value id, home index)` pairs in id order (deterministic).
+    fn iter(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.by_id
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|&(_, h)| h != Self::NONE)
+            .map(|(id, h)| (id as u32, h))
+    }
+}
+
+/// Argument index of the stored value for a GC ref-storing op. `SetfieldRaw` /
+/// `SetarrayitemRaw` store into non-GC memory and never need a write barrier,
+/// so only the `*Gc` variants are listed (rewrite.py only routes `SETFIELD_GC`
+/// / `SETARRAYITEM_GC` / `SETINTERIORFIELD_GC` through the barrier).
+fn ref_store_value_arg(op: &Op) -> Option<usize> {
+    match op.opcode {
+        OpCode::SetfieldGc => Some(1),
+        OpCode::SetarrayitemGc | OpCode::SetinteriorfieldGc => Some(2),
+        _ => None,
+    }
+}
+
+/// If `op` stores a (non-constant) reference into a GC object, return the base
+/// object operand that must be passed through the write barrier; otherwise
+/// `None`. A value is a reference exactly when it has a Ref home slot
+/// (`ref_homes` keys every Ref-typed input/result). This mirrors the native
+/// `handle_write_barrier_setfield` gate `v.type == 'r' and not ConstPtr`: a
+/// constant reference is an immortal/old object whose store never makes the base
+/// point to young, so it needs no barrier (rewrite.py:930-931).
+fn write_barrier_base(op: &Op, ref_homes: &RefHomes) -> Option<OpRef> {
+    let val = op.arg(ref_store_value_arg(op)?).to_opref();
+    // `home` returns `None` for a constant value, matching the gate's
+    // `not ConstPtr`.
+    ref_homes.home(val).map(|_| op.arg(0).to_opref())
+}
+
+/// Whether any op in the trace needs a write-barrier trampoline call, which
+/// requires the `jit_call` import to be present.
+fn has_ref_store_op(ops: &[Op], ref_homes: &RefHomes) -> bool {
+    ops.iter()
+        .any(|op| write_barrier_base(op, ref_homes).is_some())
+}
+
+/// Emit a write-barrier trampoline call on `base_ref` before a ref-storing
+/// field/array store. The host helper `wasm_jit_write_barrier` checks
+/// TRACK_YOUNG_PTRS and remembers an old→young store, standing in for the
+/// `COND_CALL_GC_WB` the native GC rewrite pass inserts. Operand-stack-neutral:
+/// every push is consumed by a store or the call.
+fn emit_write_barrier(
+    sink: &mut InstructionSink<'_>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
+    jit_call: u32,
+    wb_fn_ptr: i64,
+    base_ref: OpRef,
+) {
+    // func_ptr = wasm_jit_write_barrier
+    sink.local_get(0);
+    sink.i64_const(wb_fn_ptr);
+    sink.i64_store(mem64(CALL_FUNC_OFS));
+    // num_args = 1 (the trampoline reflects arity from the wasm signature;
+    // written for protocol symmetry with the alloc/call paths)
+    sink.local_get(0);
+    sink.i64_const(1);
+    sink.i64_store(mem64(CALL_NARGS_OFS));
+    // arg0 = base object pointer
+    sink.local_get(0);
+    emit_resolve(sink, constants, base_ref);
+    sink.i64_store(mem64(CALL_ARGS_OFS));
+    // call trampoline; void result ignored
+    sink.local_get(0);
+    sink.call(jit_call);
+}
+
+/// Reload every live Ref local from its home slot, optionally skipping one
+/// value id (`skip_raw` — the freshly-allocated result, whose home is not yet
+/// written). Emitted after a collecting allocation: the collection forwarded
+/// the home slots (registered as GC roots), so reloading the locals makes
+/// object movement transparent to the trace without precise per-safepoint
+/// liveness. Over-reloading a dead Ref is harmless (it is never read again).
+fn emit_reload_refs_from_homes(
+    sink: &mut InstructionSink<'_>,
+    ref_homes: &RefHomes,
+    skip_raw: Option<u32>,
+) {
+    // `iter` yields id order, so the emitted module is reproducible without a
+    // sort; each reload is independent (home and local storage are disjoint).
+    for (raw, h) in ref_homes.iter() {
+        if Some(raw) == skip_raw {
+            continue;
+        }
+        sink.local_get(0);
+        sink.i64_load(mem64(HOME_SLOT_BASE + h as u64 * SLOT_SIZE));
+        sink.local_set(1 + raw);
+    }
 }
 
 /// llsupport/gc.py:563 GcLLDescr_framework
@@ -288,6 +479,11 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
     (guards, max_var)
 }
 
+/// Assign each Ref-typed value (input arg or op result) a dense home-slot
+/// index, keyed by its value id (`raw()`), the same id its wasm local uses
+/// (`1 + raw`). Input args and op results share one value-id space (see
+/// `collect_guards_and_vars`), so a single map covers both. Int / Float /
+/// Void values are skipped — only GC references need a forwarding home.
 /// Build a wasm module from majit IR.
 pub fn build_wasm_module(
     inputargs: &[InputArg],
@@ -298,9 +494,34 @@ pub fn build_wasm_module(
     guard_gc_type_info: &GuardGcTypeInfo,
     alloc_fn_ptr: i64,
     alloc_array_fn_ptr: i64,
-) -> Result<(Vec<u8>, Vec<GuardExit>), BackendError> {
+    wb_fn_ptr: i64,
+) -> Result<(Vec<u8>, Vec<GuardExit>, usize), BackendError> {
     let (guards, num_vars) = collect_guards_and_vars(inputargs, ops);
-    let needs_call = has_call_ops(ops);
+
+    // Frame value slots (inputs at entry, fail-arg spills at guard exit) occupy
+    // `[1, 1 + max(num inputs, max fail args))`. They sit below the fixed call
+    // area and the Ref-home region, which are at constant offsets; a trace whose
+    // value slots would reach the call area must be declined, or those stores
+    // silently clobber the call trampoline / home roots. (Pre-existing for the
+    // call area; the home region inherits the same bound.)
+    let max_fail_args = guards
+        .iter()
+        .map(|g| g.fail_arg_refs.len())
+        .max()
+        .unwrap_or(0);
+    let max_value_slots = 1 + max_fail_args.max(inputargs.len());
+    if max_value_slots as u64 > CALL_AREA_FIRST_SLOT {
+        return Err(BackendError::Unsupported(format!(
+            "wasm backend: {max_value_slots} frame value slots reach the call area \
+             (limit {CALL_AREA_FIRST_SLOT})"
+        )));
+    }
+
+    let ref_homes = RefHomes::collect(inputargs, ops);
+    let num_ref_homes = ref_homes.len();
+    // A ref-storing store needs the `jit_call` import for its write barrier,
+    // even when the trace has no `New*`/CALL of its own.
+    let needs_call = has_call_ops(ops) || has_ref_store_op(ops, &ref_homes);
 
     let mut module = Module::new();
 
@@ -330,6 +551,21 @@ pub fn build_wasm_module(
     if needs_call {
         // Import jit_call trampoline as function index 0
         imports.import("env", "jit_call", EntityType::Function(1));
+        // Import the host's shared indirect function table as table index 0.
+        // Inert for now: reserved for inter-trace `call_indirect` chaining;
+        // nothing in the trace body references it yet, so behavior is
+        // unchanged. The host registers each compiled trace into this table.
+        imports.import(
+            "env",
+            "__indirect_function_table",
+            EntityType::Table(TableType {
+                element_type: RefType::FUNCREF,
+                table64: false,
+                minimum: 0,
+                maximum: None,
+                shared: false,
+            }),
+        );
     }
     module.section(&imports);
 
@@ -358,11 +594,13 @@ pub fn build_wasm_module(
         guard_gc_type_info,
         alloc_fn_ptr,
         alloc_array_fn_ptr,
+        wb_fn_ptr,
+        &ref_homes,
     )?;
     codes.function(&func);
     module.section(&codes);
 
-    Ok((module.finish(), guards))
+    Ok((module.finish(), guards, num_ref_homes))
 }
 
 fn build_function(
@@ -376,6 +614,8 @@ fn build_function(
     guard_gc_type_info: &GuardGcTypeInfo,
     alloc_fn_ptr: i64,
     alloc_array_fn_ptr: i64,
+    wb_fn_ptr: i64,
+    ref_homes: &RefHomes,
 ) -> Result<Function, BackendError> {
     // Value locals occupy `1 ..= num_vars`; reserve `UMULHI_SCRATCH` extra i64
     // locals past them (`num_vars+1 ..= num_vars+UMULHI_SCRATCH`) as scratch for
@@ -383,13 +623,26 @@ fn build_function(
     let mut func = Function::new(vec![(num_vars + UMULHI_SCRATCH, ValType::I64)]);
     let mut sink = func.instructions();
 
-    // Load inputs from frame into locals
+    // Null-init every Ref-home slot so a slot read before its value is defined
+    // is null (forwarding-safe), not a stale word from the reused host frame.
+    for h in 0..ref_homes.len() as u64 {
+        sink.local_get(0);
+        sink.i64_const(0);
+        sink.i64_store(mem64(HOME_SLOT_BASE + h * SLOT_SIZE));
+    }
+
+    // Load inputs from frame into locals, and store Ref inputs to their homes.
     for ia in inputargs {
         let local_idx = 1 + ia.index;
         let offset = FRAME_SLOT_BASE + ia.index as u64 * SLOT_SIZE;
         sink.local_get(0)
             .i64_load(mem64(offset))
             .local_set(local_idx);
+        if let Some(h) = ref_homes.home_id(ia.index) {
+            sink.local_get(0);
+            sink.local_get(local_idx);
+            sink.i64_store(mem64(HOME_SLOT_BASE + h as u64 * SLOT_SIZE));
+        }
     }
 
     // A peeled loop arrives as `[preamble..][LABEL][body..][JUMP]`: the
@@ -440,6 +693,18 @@ fn build_function(
                 }
                 for i in (0..n).rev() {
                     sink.local_set(1 + label_args[i].raw());
+                }
+                // The parallel move rebinds loop-carried locals without going
+                // through store-on-def, so any Ref label arg's home slot is now
+                // stale. Refresh it before branching back, so the next
+                // iteration's reload-after-allocation sees the current value
+                // (not the previous iteration's).
+                for la in label_args.iter().take(n) {
+                    if let Some(h) = ref_homes.home(*la) {
+                        sink.local_get(0);
+                        sink.local_get(1 + la.raw());
+                        sink.i64_store(mem64(HOME_SLOT_BASE + h as u64 * SLOT_SIZE));
+                    }
                 }
                 sink.br(0);
             }
@@ -833,6 +1098,11 @@ fn build_function(
                 }
             }
             OpCode::SetfieldGc | OpCode::SetfieldRaw => {
+                if let (Some(jit_call), Some(base)) =
+                    (jit_call_idx, write_barrier_base(op, ref_homes))
+                {
+                    emit_write_barrier(&mut sink, constants, jit_call, wb_fn_ptr, base);
+                }
                 emit_resolve(&mut sink, constants, op.arg(0).to_opref()); // struct ptr
                 sink.i32_wrap_i64();
                 let field_offset = field_offset_from_descr(op);
@@ -912,6 +1182,11 @@ fn build_function(
                 }
             }
             OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
+                if let (Some(jit_call), Some(base)) =
+                    (jit_call_idx, write_barrier_base(op, ref_homes))
+                {
+                    emit_write_barrier(&mut sink, constants, jit_call, wb_fn_ptr, base);
+                }
                 emit_array_addr(&mut sink, constants, op);
                 emit_resolve(&mut sink, constants, op.arg(2).to_opref()); // value
                 // A Ref item is pointer-width (4 bytes on wasm32). Storing a
@@ -952,6 +1227,11 @@ fn build_function(
                 }
             }
             OpCode::SetinteriorfieldGc => {
+                if let (Some(jit_call), Some(base)) =
+                    (jit_call_idx, write_barrier_base(op, ref_homes))
+                {
+                    emit_write_barrier(&mut sink, constants, jit_call, wb_fn_ptr, base);
+                }
                 emit_resolve(&mut sink, constants, op.arg(0).to_opref());
                 sink.i32_wrap_i64();
                 let field_offset = field_offset_from_descr(op);
@@ -1414,6 +1694,11 @@ fn build_function(
                     sink.i64_load(mem64(CALL_RESULT_OFS));
                     sink.local_set(1 + vi);
                 }
+                // No reload after a residual call: the interpreter's host-side
+                // allocations use the *no-collect* nursery hook (their callers
+                // hold unrooted raw pointers), so a residual callee never moves
+                // objects. Only `New*` (which uses the collecting allocator)
+                // needs a reload.
             }
 
             // ── Allocation (via trampoline — treated as CALL) ──
@@ -1478,6 +1763,12 @@ fn build_function(
                         });
                     }
                 }
+                // The collecting allocation may have moved every other live
+                // Ref; reload them from their (forwarded) homes. Skip the fresh
+                // result — it was allocated after the collection and its home is
+                // written by store-on-def below.
+                let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
+                emit_reload_refs_from_homes(&mut sink, ref_homes, skip);
             }
             OpCode::NewArray | OpCode::NewArrayClear => {
                 let jit_call = jit_call_idx.expect("NewArray op present but jit_call not imported");
@@ -1529,6 +1820,9 @@ fn build_function(
                     sink.i64_load(mem64(CALL_RESULT_OFS));
                     sink.local_set(1 + vi);
                 }
+                // `wasm_jit_alloc_array` collects; reload other live Refs.
+                let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
+                emit_reload_refs_from_homes(&mut sink, ref_homes, skip);
             }
 
             // ── Misc ──
@@ -1613,6 +1907,19 @@ fn build_function(
                     )));
                 }
             }
+        }
+
+        // store-on-def: mirror a freshly-defined Ref result into its home slot
+        // so a (future) collecting allocation can forward it. The local
+        // `1 + raw` holds the value the matched arm just set; `ref_homes` only
+        // keys Ref-typed value ids, so non-Ref / void / constant ops are
+        // skipped. Each value-producing arm is operand-stack-neutral, so this
+        // appended store is balanced.
+        let result = op.pos.get();
+        if let Some(h) = ref_homes.home(result) {
+            sink.local_get(0);
+            sink.local_get(1 + result.raw());
+            sink.i64_store(mem64(HOME_SLOT_BASE + h as u64 * SLOT_SIZE));
         }
     }
 
