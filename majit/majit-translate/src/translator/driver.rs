@@ -218,13 +218,13 @@ impl LibDef {
 }
 
 // Upstream `CStandaloneBuilder` / `CLibraryBuilder` / `LowLevelDatabase`
-// types live in `crate::translator::c::{genc, dlltool}` matching upstream
+// types live in `crate::translator::backend::{genc, dlltool}` matching upstream
 // module paths (`rpython/translator/c/genc.py` /
 // `rpython/translator/c/dlltool.py`). The `CBuilderRef` sum type below
 // stitches the two subclasses into the single `self.cbuilder` slot the
 // driver tasks read at `:435`, `:444`, `:531-541`.
-pub use crate::translator::c::CBuilderRef;
-pub use crate::translator::c::database::LowLevelDatabase as DatabaseState;
+pub use crate::translator::backend::CBuilderRef;
+pub use crate::translator::backend::database::LowLevelDatabase as DatabaseState;
 
 // Upstream `entrypoint.py:1`: `secondary_entrypoints = {"main": []}`.
 // Stored thread-local because `Rc<dyn Any>` is not `Sync`.
@@ -1510,9 +1510,8 @@ impl TranslationDriver {
         // else: self.jitpolicy = get_policy(self)`.
         let get_policy = self.extra.borrow().get("jitpolicy").cloned();
         if get_policy.is_none() {
-            *self.jitpolicy.borrow_mut() = Some(Rc::new(
-                crate::jit_codewriter::policy::DefaultJitPolicy::new(),
-            ));
+            *self.jitpolicy.borrow_mut() =
+                Some(Rc::new(crate::codewriter::policy::DefaultJitPolicy::new()));
         } else {
             return Err(self.missing_task_leaf(
                 352,
@@ -1659,7 +1658,7 @@ impl TranslationDriver {
             //         secondary_entrypoints=
             //             self.secondary_entrypoints +
             //             annotated_jit_entrypoints)
-            CBuilderRef::Standalone(crate::translator::c::genc::CStandaloneBuilder::new(
+            CBuilderRef::Standalone(crate::translator::backend::genc::CStandaloneBuilder::new(
                 translator,
                 entry_point,
                 config,
@@ -1691,7 +1690,7 @@ impl TranslationDriver {
             functions.extend(annotated);
             // Upstream `:430`: `name='libtesting'` literal. The
             // `extmod_name` override happens post-construction at `:434`.
-            CBuilderRef::Library(crate::translator::c::dlltool::CLibraryBuilder::new(
+            CBuilderRef::Library(crate::translator::backend::dlltool::CLibraryBuilder::new(
                 translator,
                 entry_point,
                 config,
@@ -1738,7 +1737,7 @@ impl TranslationDriver {
             self._backend_extra_options.borrow().get("c_debug_defines"),
             Some(OptionValue::Bool(true))
         ) {
-            crate::translator::c::genc::CBuilder::debug_defines()
+            crate::translator::backend::genc::CBuilder::debug_defines()
         } else {
             HashMap::new()
         };
@@ -1905,7 +1904,7 @@ impl TranslationDriver {
         // `getuniquegraph` is ported on
         // [`crate::annotator::description::FunctionDesc::getuniquegraph`]
         // and the c-backend driver already calls it
-        // (`translator/c/genc.rs:453`). The placeholder below remains
+        // (`translator/backend/genc.rs:453`). The placeholder below remains
         // because the `LLInterpreter::eval_graph` consumer surface
         // expects an `Rc<dyn Any>` opaque graph handle until the
         // llinterp port narrows it to `Rc<PyGraph>`.
@@ -2564,8 +2563,8 @@ mod tests {
             .task_backendopt_lltype()
             .expect_err("backendopt leaf should report the missing upstream leaf");
         assert!(
-            err.message.contains("all.py:"),
-            "expected `all.py:` citation, got: {}",
+            err.message.contains("malloc.py:553"),
+            "expected `malloc.py:553` citation, got: {}",
             err.message
         );
 
@@ -2581,8 +2580,9 @@ mod tests {
         // `rpython.translator.backendopt.all.backend_optimizations(
         // self.translator, replace_we_are_jitted=True)`. The local port
         // dispatches into `crate::translator::backendopt::all`; default
-        // backendopt config has `inline=True`, so the first unported
-        // subpass to fire is `all.py:148 inline.auto_inline_graphs`.
+        // backendopt config has `mallocs=True`, so the first unported
+        // subpass to fire after the implemented `all.py` scaffolding is
+        // `malloc.py:553 remove_mallocs`.
         let td = TranslationDriver::new_default().expect("driver");
         td.setup(None, None, None, HashMap::new(), None)
             .expect("setup");
@@ -2590,8 +2590,8 @@ mod tests {
             .task_backendopt_lltype()
             .expect_err("backendopt leaf is still missing");
         assert!(
-            err.message.contains("all.py:"),
-            "task_backendopt_lltype must dispatch to `all.py backend_optimizations`, got: {}",
+            err.message.contains("malloc.py:553"),
+            "task_backendopt_lltype must reach `malloc.py remove_mallocs`, got: {}",
             err.message
         );
     }

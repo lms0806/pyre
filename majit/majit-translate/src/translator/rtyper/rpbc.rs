@@ -17,6 +17,8 @@
 //! After this pass, no `CallTarget::Indirect` survives in the graph;
 //! `jtransform` only sees `OpKind::IndirectCall` for indirect dispatch.
 
+#![allow(private_interfaces)]
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -277,7 +279,7 @@ pub struct SelectedCallFamilyRow {
 /// * `shape, index = self.callfamily.find_row(...)`
 /// * `row_of_graphs = self.callfamily.calltables[shape][index]`
 /// * `anygraph = row_of_graphs.itervalues().next()`
-pub fn select_call_family_row(
+pub(crate) fn select_call_family_row(
     bookkeeper: &Rc<Bookkeeper>,
     callfamily: &Rc<RefCell<CallFamily>>,
     s_pbc: &SomePBC,
@@ -1290,7 +1292,8 @@ impl FunctionRepr {
     /// `op` is upstream's SpaceOperation identity key; the Rust port
     /// threads it as `Option<PositionKey>` to match
     /// [`FunctionDesc::get_graph`](crate::annotator::description::FunctionDesc::get_graph).
-    pub fn get_concrete_llfn(
+    #[allow(dead_code)]
+    pub(crate) fn get_concrete_llfn(
         &self,
         s_pbc: &SomePBC,
         args_s: Vec<crate::annotator::model::SomeValue>,

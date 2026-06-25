@@ -1254,7 +1254,7 @@ pub struct SomePBC {
     /// `BTreeMap<DescKey, DescEntry>` — keyed by pointer identity to
     /// mirror `set(descriptions)` membership while keeping iteration
     /// deterministic.
-    pub descriptions:
+    pub(crate) descriptions:
         std::collections::BTreeMap<super::description::DescKey, super::description::DescEntry>,
     pub can_be_none: bool,
     /// RPython `self.subset_of` — pointer to a wider PBC; `None` for
@@ -1265,14 +1265,14 @@ pub struct SomePBC {
 impl SomePBC {
     /// RPython `SomePBC.__init__(descriptions, can_be_None=False,
     /// subset_of=None)` (model.py:519-553).
-    pub fn new(
+    pub(crate) fn new(
         descriptions: impl IntoIterator<Item = super::description::DescEntry>,
         can_be_none: bool,
     ) -> Self {
         Self::with_subset(descriptions, can_be_none, None)
     }
 
-    pub fn with_subset(
+    pub(crate) fn with_subset(
         descriptions: impl IntoIterator<Item = super::description::DescEntry>,
         can_be_none: bool,
         subset_of: Option<Box<SomePBC>>,
@@ -1366,7 +1366,7 @@ impl SomePBC {
     }
 
     /// RPython `SomePBC.any_description()` (model.py:555-556).
-    pub fn any_description(&self) -> Option<&super::description::DescEntry> {
+    pub(crate) fn any_description(&self) -> Option<&super::description::DescEntry> {
         self.descriptions.values().next()
     }
 
@@ -1439,7 +1439,7 @@ impl SomePBC {
     /// Method / Class / Frozen / MethodOfFrozen keep structural
     /// no-op bodies until their own `consider_call_site` methods
     /// land.
-    pub fn consider_call_site(
+    pub(crate) fn consider_call_site(
         &self,
         args: &super::argument::ArgumentsForTranslation,
         s_result: &SomeValue,
@@ -2535,7 +2535,7 @@ impl SomeObjectTrait for SomeValue {
 /// def bind_callables_under(self, classdef, name):
 ///     return self
 /// ```
-pub fn bind_callables_under(
+pub(crate) fn bind_callables_under(
     s_value: &SomeValue,
     classdef: &Rc<std::cell::RefCell<super::classdesc::ClassDef>>,
     name: &str,
@@ -2588,51 +2588,28 @@ impl std::error::Error for UnionError {}
 // ---------------------------------------------------------------------------
 
 /// RPython `s_None = SomeNone()` (model.py:685).
-pub fn s_none() -> SomeValue {
+pub(crate) fn s_none() -> SomeValue {
     SomeValue::None_(SomeNone::new())
 }
 
 /// RPython `s_ImpossibleValue = SomeImpossibleValue()` (model.py:692).
-pub fn s_impossible_value() -> SomeValue {
+pub(crate) fn s_impossible_value() -> SomeValue {
     SomeValue::Impossible
 }
 
 /// RPython `s_Bool = SomeBool()` (model.py:686).
-pub fn s_bool() -> SomeValue {
+pub(crate) fn s_bool() -> SomeValue {
     SomeValue::Bool(SomeBool::new())
 }
 
-/// RPython `s_True = SomeBool(); s_True.const = True` (model.py:687-688).
-pub fn s_true() -> SomeValue {
-    let mut b = SomeBool::new();
-    b.base.const_box = Some(Constant::new(
-        super::super::flowspace::model::ConstValue::Bool(true),
-    ));
-    SomeValue::Bool(b)
-}
-
-/// RPython `s_False = SomeBool(); s_False.const = False` (model.py:689-690).
-pub fn s_false() -> SomeValue {
-    let mut b = SomeBool::new();
-    b.base.const_box = Some(Constant::new(
-        super::super::flowspace::model::ConstValue::Bool(false),
-    ));
-    SomeValue::Bool(b)
-}
-
 /// RPython `s_Int = SomeInteger()` (model.py:691).
-pub fn s_int() -> SomeValue {
+pub(crate) fn s_int() -> SomeValue {
     SomeValue::Integer(SomeInteger::default())
 }
 
 /// RPython `s_Str0 = SomeString(no_nul=True)` (model.py:693).
-pub fn s_str0() -> SomeValue {
+pub(crate) fn s_str0() -> SomeValue {
     SomeValue::String(SomeString::new(false, true))
-}
-
-/// RPython `s_Unicode0 = SomeUnicodeString(no_nul=True)` (model.py:694).
-pub fn s_unicode0() -> SomeValue {
-    SomeValue::UnicodeString(SomeUnicodeString::new(false, true))
 }
 
 // ---------------------------------------------------------------------------
@@ -3254,7 +3231,7 @@ pub fn unionof<'a, I: IntoIterator<Item = &'a SomeValue>>(
 
 /// RPython `SomeObject.contains(other)` now that `union` exists
 /// (model.py:94-100). Supersedes the A4.1 equality-only fallback.
-pub fn contains(a: &SomeValue, b: &SomeValue) -> bool {
+pub(crate) fn contains(a: &SomeValue, b: &SomeValue) -> bool {
     if a == b {
         return true;
     }
@@ -3557,7 +3534,7 @@ pub fn merge_knowntypedata(ktd1: &KnownTypeData, ktd2: &KnownTypeData) -> KnownT
 /// Builds a [`SomeTypeOf`] carrying the provided variables, with a
 /// fast path that pins `.const` when the single argument is a
 /// `SomeException` whose classdefs singleton identifies the type.
-pub fn typeof_vars(args_v: &[Rc<Variable>]) -> SomeValue {
+pub(crate) fn typeof_vars(args_v: &[Rc<Variable>]) -> SomeValue {
     if args_v.is_empty() {
         return SomeValue::Type(SomeType::new());
     }
@@ -4453,12 +4430,9 @@ mod tests {
     #[test]
     fn singleton_helpers_match_upstream_definitions() {
         assert_eq!(s_int().knowntype(), KnownType::Int);
-        assert!(s_true().is_constant());
-        assert!(s_false().is_constant());
-        assert_ne!(s_true(), s_false());
         assert!(matches!(s_impossible_value(), SomeValue::Impossible));
         assert!(matches!(s_none(), SomeValue::None_(_)));
-        // s_Str0 / s_Unicode0 carry no_nul = True.
+        // s_Str0 carries no_nul = True.
         let SomeValue::String(s) = s_str0() else {
             panic!("s_str0 must be SomeString");
         };

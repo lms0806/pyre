@@ -44,7 +44,7 @@
 //! The anchor corpus will surface which
 //! followup is the next priority. `Ref`-typed operands now route
 //! through `valuetype_to_someshell(Ref) → SomeInstance(classdef=None)`
-//! (`jit_codewriter/annotation_state.rs:69`), so the rtyper picks
+//! (`codewriter/annotation_state.rs:69`), so the rtyper picks
 //! `getinstancerepr(rtyper, None, Gc) → InstanceRepr::new_rootinstance
 //! → Ptr(GcStruct(OBJECT))` and the projection collapses to
 //! `ConcreteType::GcRef` matching the legacy resolver — the previous
@@ -54,12 +54,12 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use crate::codewriter::type_state::ConcreteType;
 use crate::flowspace::argument::Signature;
 use crate::flowspace::model::{
     Block, BlockRefExt, ConstValue, Constant, GraphFunc, Hlvalue, Link, Variable,
 };
 use crate::flowspace::pygraph::PyGraph;
-use crate::jit_codewriter::type_state::ConcreteType;
 use crate::model::FunctionGraph as LegacyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::flowspace_adapter::{FlowspaceAdapterOutput, LegacyToTyped};
@@ -181,9 +181,9 @@ impl Drop for LegacyAnnotationGuard {
 /// Skip arm.  The legacy-baseline diff stays here so
 /// anchor tests can keep validating the LL→Concrete projection.
 ///
-/// Both `dual_gate_check` and `dual_gate_check_with_registry` wrap
-/// the baseline in a [`LegacyAnnotationGuard`] so the dual-gate
-/// comparison is side-effect-free on `legacy_graph.variable.annotation`.
+/// `dual_gate_check_with_registry` wraps the baseline in a
+/// [`LegacyAnnotationGuard`] so the dual-gate comparison is
+/// side-effect-free on `legacy_graph.variable.annotation`.
 /// Without the guard the baseline's `legacy_annotator::annotate` would
 /// publish the wider legacy lift onto the graph's annotation cells
 /// (annotate-write contract); a subsequent real-path pass over the same
@@ -195,89 +195,6 @@ impl Drop for LegacyAnnotationGuard {
 /// later gets narrowed.  The guard's `Drop` restores the pre-baseline
 /// `.annotation` slot contents on every exit path (success, panic,
 /// or early `Err` return).
-#[cfg(test)]
-pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> {
-    // The real path goes through `RPythonTyper::specialize`, which
-    // asserts internal invariants (e.g. `genop`'s "wrong level!"
-    // contract that every operand carry `concretetype`). Followups
-    // occasionally surface those asserts on graphs whose
-    // shape exposes an unported pyre-front idiom — those panics are
-    // diagnostic for "next blocker", not crashes the dual-gate
-    // should propagate. Catch the unwind so the gate uniformly
-    // returns a stringified error.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        specialize_legacy_graph(legacy_graph)
-    }));
-    let (value_to_var, constants) = match result {
-        Ok(Ok(pair)) => pair,
-        Ok(Err(e)) => return Err(format!("real path failed: {e}")),
-        Err(payload) => {
-            let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-                (*s).to_string()
-            } else if let Some(s) = payload.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "<unrecognised panic payload>".to_string()
-            };
-            return Err(format!("real path panicked: {msg}"));
-        }
-    };
-
-    // Defensive baseline diff against the legacy walker.  Mirrors the
-    // `_with_registry` variant (cutover.rs:370-373): runs after the
-    // real path's flowin so `Variable.annotation` is
-    // not pre-populated with the legacy walker's wider lift before
-    // `seed_variable` runs (orthodox `_setbinding` monotonicity).
-    // `legacy_resolve::resolve_types` writes `graph.concretetype` from
-    // the post-publish `graph.variable.annotation` cells; the
-    // comparison loop below reads `graph.concretetype` directly.
-    //
-    // The annotation guard snapshots every live
-    // `Variable.annotation` cell before the
-    // baseline and restores the snapshot on `Drop` (end of this
-    // function's scope, including early returns and panic unwinds).
-    // Without it
-    // the wider legacy lift would persist as residue on the graph
-    // (`annotate` writes directly to
-    // `Variable.annotation`); a subsequent dual-gate pass over the
-    // same `legacy_graph` would then trip the orthodox
-    // `_setbinding` monotonicity check in flowin.
-    let _annotation_guard = LegacyAnnotationGuard::snapshot(legacy_graph);
-    let baseline = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        super::legacy_annotator::annotate(legacy_graph);
-        super::legacy_resolve::resolve_types(legacy_graph);
-    }));
-    if let Err(payload) = baseline {
-        let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-            (*s).to_string()
-        } else if let Some(s) = payload.downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "<unrecognised panic payload>".to_string()
-        };
-        return Err(format!(
-            "dual-gate baseline panicked (legacy walker crashed before \
-             comparison could run): {msg}"
-        ));
-    }
-
-    // Diff every legacy-resolved value against the real path. Once this
-    // gate is used to prove cutover parity, real-path `Unknown` for a
-    // legacy-known value (and the reverse asymmetry — a real kind for a
-    // value the legacy walker left Unknown) is a coverage bug, not
-    // success.  The legacy walker's kinds are read off each Variable's
-    // `concretetype` cell, which `resolve_types` populated through
-    // `FunctionGraph::set_concretetype_of_inline`.
-    let real_state = project_value_to_var(&value_to_var, &constants);
-    let divergences = collect_divergences(&real_state, legacy_graph);
-
-    if divergences.is_empty() {
-        Ok(())
-    } else {
-        Err(divergences.join("; "))
-    }
-}
-
 /// Outcome of a dual-gate run.  Distinguishes a real-path success
 /// (`Match` — production consumes `real_state` authoritatively) from
 /// a known-unported feature (`Skip(reason)` — production falls back
@@ -290,12 +207,10 @@ pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> 
 /// Skip-classified graphs.  The legacy-baseline diff inside
 /// `dual_gate_check_with_registry` still runs while the transition is
 /// active; `Match` means the real path succeeded and matched the legacy
-/// baseline when that baseline could be produced.  Test-time anchor
-/// invariants also run [`dual_gate_check`] for legacy-baseline
-/// regression checks against hand-built fixtures.  PyPy
-/// `codewriter.py:33` consumes the rtyper-produced graph directly,
-/// with no dual-gate equivalent; pyre's `Skip` arm is transitional
-/// scaffolding that retires once every category in
+/// baseline when that baseline could be produced. PyPy `codewriter.py:33`
+/// consumes the rtyper-produced graph directly, with no dual-gate
+/// equivalent; pyre's `Skip` arm is transitional scaffolding that
+/// retires once every category in
 /// `is_known_unported`'s table is implemented.
 #[derive(Debug)]
 pub(crate) enum DualGateOutcome {
@@ -319,7 +234,7 @@ pub(crate) enum DualGateOutcome {
         /// `RPythonTyper`-set `concretetype` inline (`flowspace/
         /// model.py:280`), so codewriter callers copy that lltype onto
         /// the matching legacy Variable via
-        /// [`crate::jit_codewriter::type_state::apply_from_flowspace_variables`];
+        /// [`crate::codewriter::type_state::apply_from_flowspace_variables`];
         /// `FunctionGraph::concretetype_of(&v)` then reads the legacy
         /// Variable's `concretetype` cell directly.
         real_value_to_var: LegacyToTyped,
@@ -375,7 +290,7 @@ pub(crate) enum DualGateOutcome {
 pub(crate) fn dual_gate_check_with_registry(
     legacy_graph: &LegacyGraph,
     call_registry: &PyreCallRegistry,
-    lift_sources: &crate::jit_codewriter::call::GraphStore,
+    lift_sources: &crate::codewriter::call::GraphStore,
 ) -> Result<DualGateOutcome, String> {
     // Same panic-catch contract as `dual_gate_check` — the rtyper's
     // internal `genop`/`level` asserts surface as diagnostic panics
@@ -481,7 +396,7 @@ pub(crate) fn dual_gate_check_with_registry(
 fn unpoison_failed_subject_callees(
     call_registry: &PyreCallRegistry,
     fixed_at_entry: &HashSet<crate::flowspace::model::GraphKey>,
-    lift_sources: &crate::jit_codewriter::call::GraphStore,
+    lift_sources: &crate::codewriter::call::GraphStore,
 ) {
     let Some((annotator, rtyper)) = call_registry.session_if_started() else {
         return;
@@ -1040,7 +955,7 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
 ///    so `cachedgraph` (`description.rs:1037-1039`) hits at the
 ///    rtyper's `direct_call`.
 pub(crate) fn populate_call_registry_from_call_graphs(
-    function_graphs: &crate::jit_codewriter::call::GraphStore,
+    function_graphs: &crate::codewriter::call::GraphStore,
     registry: &PyreCallRegistry,
 ) -> Result<(), TyperError> {
     // Dedupe by canonical path — RPython `Bookkeeper.getdesc(pyobj)`
@@ -1487,7 +1402,7 @@ pub(crate) fn default_someshell_for_lltype(
 /// is never present in `function_graphs`.  `CallControl::
 /// find_all_graphs` walks `function_graphs.keys()` only and resolves
 /// each call target via `target_to_path_and_graph`
-/// (`jit_codewriter/call.rs:2601`) which returns `None` for any
+/// (`codewriter/call.rs:2601`) which returns `None` for any
 /// path absent from `function_graphs` — so an unsafe-stub target
 /// triggers `continue` and is never added to `candidate_graphs`,
 /// never reaches `transform_graph_to_jitcode`, and never compiles
@@ -1519,7 +1434,7 @@ pub(crate) fn register_unsafe_fn_stubs(
     }
 }
 
-/// Restricted entry: only graphs without `OpKind::Call::FunctionPath`
+/// Test-only restricted entry: only graphs without `OpKind::Call::FunctionPath`
 /// ops resolve through this path.  An empty `PyreCallRegistry` is
 /// constructed internally and shared with the annotator; any
 /// `simple_call` op the adapter emits would surface a fail-loud
@@ -1538,6 +1453,7 @@ pub(crate) fn register_unsafe_fn_stubs(
 /// production walker that traverses `SemanticProgram.functions`
 /// lands, this entry remains in-place for anchor tests and
 /// dual-gate validation against graphs that have no `Call` ops.
+#[cfg(test)]
 pub fn specialize_legacy_graph(
     legacy: &LegacyGraph,
 ) -> Result<(LegacyToTyped, HashMap<Variable, LowLevelType>), TyperError> {
@@ -1553,7 +1469,7 @@ pub fn specialize_legacy_graph(
 /// Codewriter callers consume `value_to_var` directly: the rtyper's
 /// typed `Variable.concretetype` writes are copied onto the matching
 /// legacy Variables by
-/// [`crate::jit_codewriter::type_state::apply_from_flowspace_variables`].
+/// [`crate::codewriter::type_state::apply_from_flowspace_variables`].
 /// `constants` feeds [`project_value_to_var`] for the
 /// dual-gate baseline comparison.
 ///
@@ -1615,7 +1531,7 @@ fn drive_subject(
         graph,
         value_to_var,
         constant_concretetypes,
-        block_map: _,
+        ..
     } = crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace(
         legacy,
         call_registry,
@@ -1851,8 +1767,8 @@ fn drive_subject(
     // placement note targets.  Gated on `PYRE_JTRANSFORM_SHADOW` so the
     // default build neither borrows nor walks the graph; the gauge never
     // mutates it.
-    if crate::jit_codewriter::jtransform_shadow::is_enabled() {
-        crate::jit_codewriter::jtransform_shadow::report_if_enabled(&graph.borrow());
+    if crate::codewriter::jtransform_shadow::is_enabled() {
+        crate::codewriter::jtransform_shadow::report_if_enabled(&graph.borrow());
     }
 
     Ok((graph, value_to_var, constant_concretetypes))
@@ -1878,10 +1794,10 @@ fn drive_subject(
 /// walker, never the flowspace session — so a partial cache from an aborted
 /// prepass still yields Match for the graphs that completed and a safe
 /// legacy-walker Skip for the rest (zero regression, never the poisoned session).
-pub fn run_two_phase_prepass(
+pub(crate) fn run_two_phase_prepass(
     call_registry: &PyreCallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
-    function_graphs: &crate::jit_codewriter::call::GraphStore,
+    function_graphs: &crate::codewriter::call::GraphStore,
 ) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_two_phase_prepass_inner(call_registry, candidate_graphs, function_graphs)
@@ -2022,7 +1938,7 @@ fn emit_disposition_histogram(phase: &str, reasons: &[String]) {
 fn run_two_phase_prepass_inner(
     call_registry: &PyreCallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
-    function_graphs: &crate::jit_codewriter::call::GraphStore,
+    function_graphs: &crate::codewriter::call::GraphStore,
 ) {
     // Deterministic order (R3): candidate_graphs is a HashSet; iterating it
     // directly would make classdef numbering (and thus Match/Skip
@@ -2119,7 +2035,7 @@ fn run_two_phase_prepass_inner(
 /// incrementally so partial progress survives a cut-short call.
 fn run_phase_b_rtype_isolated(
     call_registry: &PyreCallRegistry,
-    lift_sources: &crate::jit_codewriter::call::GraphStore,
+    lift_sources: &crate::codewriter::call::GraphStore,
 ) {
     use crate::flowspace::model::{BlockRef, GraphKey, GraphRef};
     let Ok((annotator, rtyper)) = call_registry.ensure_session() else {
@@ -2530,7 +2446,7 @@ mod tests {
     /// The rtyper's lattice has process-global singletons that mutate
     /// during `setup()`; cargo's parallel test runner can interleave
     /// two specialize-driving tests so one observes the other's
-    /// `Setupstate::InProgress` and panics with "recursive invocation
+    /// `setupstate::InProgress` and panics with "recursive invocation
     /// of Repr setup()".  Holding this `Mutex` serialises the runs.
     fn anchor_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -3005,7 +2921,7 @@ mod tests {
     #[test]
     fn register_unsafe_fn_stubs_does_not_populate_callcontrol_function_graphs() {
         use crate::annotator::bookkeeper::Bookkeeper;
-        use crate::jit_codewriter::call::CallControl;
+        use crate::codewriter::call::CallControl;
         use crate::translator::rtyper::pyre_call_registry::PyreCallRegistry;
         let mut callcontrol = CallControl::new();
         callcontrol.unsafe_fn_stubs = vec![(

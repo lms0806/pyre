@@ -84,7 +84,7 @@ use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 /// the legacy Variable they already hold, with no slot-index round-trip.
 pub type LegacyToTyped = HashMap<Variable, Variable>;
 
-pub use crate::jit_codewriter::annotation_state::valuetype_to_someshell;
+pub use crate::codewriter::annotation_state::valuetype_to_someshell;
 
 /// Allocate a fresh `flowspace::Variable` and attach the projected
 /// `SomeValue` shell to its `annotation` slot.
@@ -670,18 +670,18 @@ fn is_slice_reverse_segments(segments: &[String]) -> bool {
         && segments[3] == "reverse"
 }
 
-/// `true` iff the flowspace op(s) this `OpKind` lowers to carry a
-/// non-empty `canraise` (`operation.py`).
+/// Test-only mirror of whether the flowspace op(s) this `OpKind`
+/// lowers to carry a non-empty `canraise` (`operation.py`).
 ///
-/// The frontend's `?` handling in `front::mir` consults this to decide
-/// whether a `?`-operand's recorded tail op closes the block with
-/// `exitswitch = c_last_exception`: `flowcontext.py:379-393 do_op` runs
-/// `guessexception(op.canraise)`, which installs the exception edge only
-/// when `op.canraise` is non-empty.  A non-raising tail op (a transparent
-/// ctor, `same_as`, a pure cast / binop, getattr / setattr, a const) must
-/// NOT close the block as canraise.
+/// The production path is `translate_op`, which emits real flowspace
+/// operations and lets their upstream-modeled `canraise` metadata drive
+/// exception edges.  This predicate is retained only for tests that keep
+/// the local lowering table honest: a non-raising tail op (a transparent
+/// ctor, `same_as`, a pure cast / binop, getattr / setattr, a const)
+/// must not be classified as canraise.
 ///
 /// KEEP IN SYNC with [`translate_op`]'s `OpKind` -> flowspace-opname arms.
+#[cfg(test)]
 pub(crate) fn op_canraise(kind: &OpKind) -> bool {
     match kind {
         // getitem / setitem -> `[IndexError, KeyError, Exception]`
@@ -1374,7 +1374,7 @@ pub fn translate_op(
                     // (`StringRepr.rtype_len` → `ll_strlen`).  The helper
                     // is registered as an opname graph and lowered to the
                     // `strlen`/`arraylen_gc` blackhole op
-                    // (`jit_codewriter::jtransform_opname::lower_graph`), so
+                    // (`codewriter::jtransform_opname::lower_graph`), so
                     // these are real `len` ops, not symbolic residuals.
                     let is_len_op = (segments.len() == 1 && segments[0] == "__len")
                         || (segments.len() == 4
@@ -1595,7 +1595,7 @@ pub fn translate_op(
                     // resulting `SomeInstance(classdef)` projects to
                     // `ConcreteType::GcRef`, matching legacy
                     // `resolve_types(Unknown) → GcRef`.  Post-jtransform
-                    // [`crate::jit_codewriter::jtransform`] still unwraps
+                    // [`crate::codewriter::jtransform`] still unwraps
                     // the simple_call to its inner value (the transparent
                     // semantics survive at the codewriter layer).
                     //
@@ -1973,6 +1973,7 @@ pub struct FlowspaceAdapterOutput {
     /// `returnblock` and `exceptblock` (mapped to the
     /// `FunctionGraph::with_return_var`-allocated final blocks) so any
     /// legacy Link targeting them resolves correctly.
+    #[cfg(test)]
     pub block_map: HashMap<BlockId, BlockRef>,
 }
 
@@ -2870,6 +2871,7 @@ pub fn function_graph_to_flowspace(
         graph: graph_ref,
         value_to_var,
         constant_concretetypes,
+        #[cfg(test)]
         block_map,
     })
 }

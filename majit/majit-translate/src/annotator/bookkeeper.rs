@@ -78,22 +78,22 @@ use crate::tool::algo::unionfind::UnionFind;
 /// indistinguishable (mirroring upstream's Python tuple equality via
 /// `id()`).
 #[derive(Clone, Debug)]
-pub struct PositionKey {
+pub(crate) struct PositionKey {
     /// Identity hash of the enclosing `FunctionGraph` — upstream
     /// `position_key[0]`.
-    pub graph_id: usize,
+    pub(crate) graph_id: usize,
     /// Identity hash of the enclosing `Block` — upstream
     /// `position_key[1]`.
-    pub block_id: usize,
+    pub(crate) block_id: usize,
     /// Operation index inside the block — upstream `position_key[2]`.
-    pub op_index: usize,
+    pub(crate) op_index: usize,
     /// Weak reference to the enclosing `FunctionGraph`. Populated by
     /// [`Self::from_refs`]; `None` for test-only synthetic keys.
-    pub graph_ref:
+    pub(crate) graph_ref:
         Option<std::rc::Weak<std::cell::RefCell<crate::flowspace::model::FunctionGraph>>>,
     /// Weak reference to the enclosing `Block`. Populated by
     /// [`Self::from_refs`]; `None` for test-only synthetic keys.
-    pub block_ref: Option<std::rc::Weak<std::cell::RefCell<crate::flowspace::model::Block>>>,
+    pub(crate) block_ref: Option<std::rc::Weak<std::cell::RefCell<crate::flowspace::model::Block>>>,
 }
 
 impl PartialEq for PositionKey {
@@ -114,10 +114,22 @@ impl std::hash::Hash for PositionKey {
     }
 }
 
+/// Upstream `analyzer_for(func)` decorator (bookkeeper.py:34-38).
+pub(crate) fn analyzer_for(
+    reg: &mut HashMap<String, super::builtin::BuiltinAnalyzer>,
+    qualname: &str,
+    analyser: super::builtin::BuiltinAnalyzer,
+) {
+    if reg.insert(qualname.to_string(), analyser).is_some() {
+        panic!("bookkeeper.rs: duplicate BUILTIN_ANALYZERS entry for {qualname}");
+    }
+}
+
 impl PositionKey {
     /// Synthetic constructor — test-only. Fills the identity triple
     /// directly and leaves the Weak refs empty.
-    pub fn new(graph_id: usize, block_id: usize, op_index: usize) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(graph_id: usize, block_id: usize, op_index: usize) -> Self {
         PositionKey {
             graph_id,
             block_id,
@@ -132,7 +144,7 @@ impl PositionKey {
     /// `id()`), and retains `Weak` refs so consumers like
     /// `reflowfromposition` can upgrade back to the live
     /// `FunctionGraph` / `Block`.
-    pub fn from_refs(graph: &GraphRef, block: &BlockRef, op_index: usize) -> Self {
+    pub(crate) fn from_refs(graph: &GraphRef, block: &BlockRef, op_index: usize) -> Self {
         PositionKey {
             graph_id: Rc::as_ptr(graph) as usize,
             block_id: Rc::as_ptr(block) as usize,
@@ -145,13 +157,13 @@ impl PositionKey {
     /// Upgrade the weak graph reference, if the key carries one and
     /// the target is still alive. Mirrors upstream's `graph, _, _ =
     /// position_key` tuple unpack.
-    pub fn graph(&self) -> Option<GraphRef> {
+    pub(crate) fn graph(&self) -> Option<GraphRef> {
         self.graph_ref.as_ref().and_then(|w| w.upgrade())
     }
 
     /// Upgrade the weak block reference. Mirrors upstream's `_, block,
     /// _ = position_key` unpack.
-    pub fn block(&self) -> Option<BlockRef> {
+    pub(crate) fn block(&self) -> Option<BlockRef> {
         self.block_ref.as_ref().and_then(|w| w.upgrade())
     }
 }
@@ -174,7 +186,7 @@ pub struct Bookkeeper {
     /// this slot around each reflow block so `read_item` / `agree`
     /// pick it up. Interior mutability because callers hold
     /// `Rc<Bookkeeper>` sharers.
-    pub position_key: RefCell<Option<PositionKey>>,
+    pub(crate) position_key: RefCell<Option<PositionKey>>,
     /// RPython `self.listdefs = {}` (bookkeeper.py:59). Keyed by
     /// position — callers hitting the same position twice share the
     /// ListDef so merging re-entries stay identity-equal. The key is
@@ -184,16 +196,16 @@ pub struct Bookkeeper {
     /// `None`, upstream still caches under the `None` key — so we do
     /// the same rather than building a fresh ListDef per call outside
     /// a reflow frame.
-    pub listdefs: RefCell<HashMap<Option<PositionKey>, ListDef>>,
+    pub(crate) listdefs: RefCell<HashMap<Option<PositionKey>, ListDef>>,
     /// RPython `self.dictdefs = {}` (bookkeeper.py:60). Same
     /// `Option<PositionKey>` key semantics as `listdefs`.
-    pub dictdefs: RefCell<HashMap<Option<PositionKey>, DictDef>>,
+    pub(crate) dictdefs: RefCell<HashMap<Option<PositionKey>, DictDef>>,
     /// RPython `self.descs = {}` (bookkeeper.py:67). Maps
     /// `Constant(pyobj)` to a FunctionDesc / ClassDesc / FrozenDesc /
     /// MethodDesc / MethodOfFrozenDesc per bookkeeper.py:353-409. The
     /// Rust port keys directly on [`HostObject`] (which already has
     /// `Arc::ptr_eq` identity) via [`DescEntry`].
-    pub descs: RefCell<HashMap<HostObject, DescEntry>>,
+    pub(crate) descs: RefCell<HashMap<HostObject, DescEntry>>,
     /// RPython `self.classdefs = []` (bookkeeper.py:68). Populated by
     /// `ClassDesc._init_classdef` (classdesc.py:672-697). ClassDef
     /// identity is Rc pointer equality — matches upstream's Python
@@ -203,20 +215,20 @@ pub struct Bookkeeper {
     /// `(funcdesc, originclassdef, selfclassdef, name, flags)` tuple
     /// so repeated `getmethoddesc(...)` calls with the same inputs
     /// share identity, per bookkeeper.py:431-442.
-    pub methoddescs: RefCell<HashMap<MethodDescKey, Rc<RefCell<MethodDesc>>>>,
+    pub(crate) methoddescs: RefCell<HashMap<MethodDescKey, Rc<RefCell<MethodDesc>>>>,
     /// RPython `self.frozenpbc_attr_families = UnionFind(FrozenAttrFamily)`
     /// (bookkeeper.py:63).
-    pub frozenpbc_attr_families: RefCell<UnionFind<DescKey, Rc<RefCell<FrozenAttrFamily>>>>,
+    pub(crate) frozenpbc_attr_families: RefCell<UnionFind<DescKey, Rc<RefCell<FrozenAttrFamily>>>>,
     /// RPython `self.classpbc_attr_families = {}` (bookkeeper.py:62) —
     /// lazy `attrname -> UnionFind(ClassAttrFamily)` map materialised by
     /// `get_classpbc_attr_families(attrname)` (bookkeeper.py:447-456).
-    pub classpbc_attr_families:
+    pub(crate) classpbc_attr_families:
         RefCell<HashMap<String, UnionFind<DescKey, Rc<RefCell<ClassAttrFamily>>>>>,
     /// RPython `self.pbc_maximal_call_families = UnionFind(CallFamily)`
     /// (bookkeeper.py:64).
-    pub pbc_maximal_call_families: RefCell<UnionFind<DescKey, Rc<RefCell<CallFamily>>>>,
+    pub(crate) pbc_maximal_call_families: RefCell<UnionFind<DescKey, Rc<RefCell<CallFamily>>>>,
     /// RPython `self.emulated_pbc_calls = {}` (bookkeeper.py:66).
-    pub emulated_pbc_calls: RefCell<HashMap<EmulatedPbcCallKey, (SomePBC, Vec<SomeValue>)>>,
+    pub(crate) emulated_pbc_calls: RefCell<HashMap<EmulatedPbcCallKey, (SomePBC, Vec<SomeValue>)>>,
     /// RPython `bookkeeper._jit_annotation_cache = {}`
     /// (rlib/jit.py:903-914), populated lazily by
     /// `ExtEnterLeaveMarker.compute_result_annotation`.
@@ -296,7 +308,7 @@ pub struct Bookkeeper {
     /// ([`crate::translator::rtyper::normalizecalls::create_instantiate_functions`])
     /// processes each classdef independently so iteration order is not
     /// observable.
-    pub needs_generic_instantiate:
+    pub(crate) needs_generic_instantiate:
         RefCell<std::collections::BTreeMap<ClassDefKey, Rc<RefCell<ClassDef>>>>,
     /// TODO: no upstream equivalent.  Pyre-only struct-field
     /// metadata snapshot (`struct_name -> [(field_name, type_string)]`)
@@ -371,19 +383,19 @@ impl std::fmt::Debug for Bookkeeper {
 /// pointer identity of the two descriptor Rcs plus the stringified
 /// name + flags.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct MethodDescKey {
+pub(crate) struct MethodDescKey {
     /// RPython `funcdesc` — pointer identity via [`DescKey::from_rc`].
-    pub funcdesc_id: DescKey,
+    pub(crate) funcdesc_id: DescKey,
     /// RPython `originclassdef` — `ClassDefKey` already carries the
     /// pointer identity.
-    pub originclassdef: ClassDefKey,
+    pub(crate) originclassdef: ClassDefKey,
     /// RPython `selfclassdef` — `None` for unbound methods.
-    pub selfclassdef: Option<ClassDefKey>,
+    pub(crate) selfclassdef: Option<ClassDefKey>,
     /// RPython `name`.
-    pub name: String,
+    pub(crate) name: String,
     /// RPython `tuple(flags.items())` — flattened sort-stable flag
     /// entries.
-    pub flags: Vec<(String, bool)>,
+    pub(crate) flags: Vec<(String, bool)>,
 }
 
 /// Hashable identity for `Bookkeeper.emulated_pbc_calls`.
@@ -392,7 +404,8 @@ pub struct MethodDescKey {
 /// callers need a stable position key plus the r_dict eq/hash
 /// pseudo-call identities.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum EmulatedPbcCallKey {
+pub(crate) enum EmulatedPbcCallKey {
+    #[allow(dead_code)]
     Position(PositionKey),
     Graph(GraphKey),
     ClassDef(ClassDefKey),
@@ -420,7 +433,7 @@ pub enum EmulatedPbcCallKey {
 /// * `Callback(position)` — callback-style: `whence=position`, same
 ///   `op=None` / `s_previous_result=s_ImpossibleValue` as `True`.
 #[derive(Clone, Debug)]
-pub enum PbcCallEmulated {
+pub(crate) enum PbcCallEmulated {
     None,
     True,
     Callback(PositionKey),
@@ -429,7 +442,7 @@ pub enum PbcCallEmulated {
 impl EmulatedPbcCallKey {
     /// Build the sandbox-trampoline key used by
     /// `AnnotatorPolicy::no_more_blocks_to_annotate` (policy.py:87).
-    pub fn sandboxing(func_const: &crate::flowspace::model::ConstValue) -> Self {
+    pub(crate) fn sandboxing(func_const: &crate::flowspace::model::ConstValue) -> Self {
         use crate::flowspace::model::ConstValue;
         let callable_id = match func_const {
             ConstValue::HostObject(obj) => obj.identity_id(),
@@ -748,14 +761,15 @@ impl Bookkeeper {
     /// previous value so callers can restore it around a nested reflow
     /// (matches upstream bookkeeper.py:278 `@contextmanager
     /// position()`).
-    pub fn set_position_key(&self, pk: Option<PositionKey>) -> Option<PositionKey> {
+    #[cfg(test)]
+    pub(crate) fn set_position_key(&self, pk: Option<PositionKey>) -> Option<PositionKey> {
         self.position_key.replace(pk)
     }
 
     /// Current `bookkeeper.position_key`. Returns `None` when no
     /// reflow frame is active (upstream's initial
     /// `self.position_key = None`).
-    pub fn current_position_key(&self) -> Option<PositionKey> {
+    pub(crate) fn current_position_key(&self) -> Option<PositionKey> {
         self.position_key.borrow().clone()
     }
 
@@ -765,7 +779,7 @@ impl Bookkeeper {
     /// bookkeeper so [`getbookkeeper`] returns it. Asserts that no
     /// `enter` is currently active — matches upstream's `not hasattr`
     /// check.
-    pub fn enter(self: &Rc<Self>, position_key: Option<PositionKey>) {
+    pub(crate) fn enter(self: &Rc<Self>, position_key: Option<PositionKey>) {
         assert!(!self.position_entered.get(), "don't call enter() nestedly");
         self.position_entered.set(true);
         self.position_key.replace(position_key);
@@ -777,7 +791,7 @@ impl Bookkeeper {
     ///
     /// Clears both the position slot and the thread-local bookkeeper
     /// hook. Safe to call only after a matching [`Self::enter`].
-    pub fn leave(&self) {
+    pub(crate) fn leave(&self) {
         self.position_entered.set(false);
         self.position_key.replace(None);
         // Upstream: `del TLS.bookkeeper` (bookkeeper.py:93).
@@ -791,7 +805,7 @@ impl Bookkeeper {
     /// the bookkeeper is already inside a reflow frame — used by
     /// `compute_at_fixpoint` to let nested callers reuse the ambient
     /// position.
-    pub fn at_position(self: &Rc<Self>, pos: Option<PositionKey>) -> PositionGuard {
+    pub(crate) fn at_position(self: &Rc<Self>, pos: Option<PositionKey>) -> PositionGuard {
         if self.position_entered.get() && pos.is_none() {
             // Upstream: `if hasattr(self, 'position_key') and pos is None: yield; return`
             PositionGuard {
@@ -928,7 +942,7 @@ impl Bookkeeper {
     /// is opname-sensitive (`simple_call` →
     /// `ArgumentsForTranslation(list(args_s))`, `call_args` →
     /// `fromshape`); the simple_call path uses [`simple_args`].
-    pub fn consider_call_site(
+    pub(crate) fn consider_call_site(
         self: &Rc<Self>,
         call_op: &crate::flowspace::model::SpaceOperation,
         op_key: Option<PositionKey>,
@@ -990,7 +1004,7 @@ impl Bookkeeper {
     /// Returns a snapshot of the attribute's read locations — callers
     /// iterate + reflow outside the borrow so [`ClassDef::find_attribute`]
     /// can reacquire the RefCell if it generalizes the attribute.
-    pub fn getattr_locations(
+    pub(crate) fn getattr_locations(
         &self,
         classdesc: &Rc<RefCell<ClassDesc>>,
         attrname: &str,
@@ -1216,7 +1230,10 @@ impl Bookkeeper {
     ///   * `BoundMethod` → `MethodDesc` / `MethodOfFrozenDesc`
     ///   * `Instance` / `BuiltinCallable` / `Module` / `Opaque` →
     ///     [`Self::getfrozen`] (upstream's `_freeze_` fallback)
-    pub fn getdesc(self: &Rc<Self>, pyobj: &HostObject) -> Result<DescEntry, AnnotatorError> {
+    pub(crate) fn getdesc(
+        self: &Rc<Self>,
+        pyobj: &HostObject,
+    ) -> Result<DescEntry, AnnotatorError> {
         if let Some(existing) = self.descs.borrow().get(pyobj) {
             return Ok(existing.clone());
         }
@@ -1269,11 +1286,7 @@ impl Bookkeeper {
                     super::description::MethodOfFrozenDesc::new(self.clone(), funcdesc, frozendesc),
                 )))
             } else {
-                let origin_class = pyobj.bound_method_origin_class().ok_or_else(|| {
-                    AnnotatorError::new(
-                        "Bookkeeper.getdesc(bound method): missing origin class from descriptor lookup",
-                    )
-                })?;
+                let (origin_class, name) = origin_of_meth(pyobj)?;
                 let self_class = if self_obj.is_class() {
                     self_obj.clone()
                 } else {
@@ -1287,15 +1300,12 @@ impl Bookkeeper {
                 if self_obj.is_instance() {
                     super::classdesc::ClassDef::see_instance(&classdef, self_obj)?;
                 }
-                let name = pyobj.bound_method_name().ok_or_else(|| {
-                    AnnotatorError::new("Bookkeeper.getdesc(bound method): missing method name")
-                })?;
-                let _ = super::classdesc::ClassDef::find_attribute(&classdef, name)?;
+                let _ = super::classdesc::ClassDef::find_attribute(&classdef, &name)?;
                 DescEntry::Method(self.getmethoddesc(
                     &funcdesc,
                     ClassDefKey::from_classdef(&self.getuniqueclassdef(origin_class)?),
                     Some(ClassDefKey::from_classdef(&classdef)),
-                    name,
+                    &name,
                     std::collections::BTreeMap::new(),
                 ))
             }
@@ -1323,7 +1333,10 @@ impl Bookkeeper {
     /// specializer is `memo`, return a [`DescEntry::Memo`] wrapping the
     /// `FunctionDesc` (upstream `if specializer is memo: return MemoDesc(
     /// ...)`, bookkeeper.py:419-425); otherwise a [`DescEntry::Function`].
-    pub fn newfuncdesc(self: &Rc<Self>, pyfunc: &HostObject) -> Result<DescEntry, AnnotatorError> {
+    pub(crate) fn newfuncdesc(
+        self: &Rc<Self>,
+        pyfunc: &HostObject,
+    ) -> Result<DescEntry, AnnotatorError> {
         let gf = pyfunc.user_function().ok_or_else(|| {
             AnnotatorError::new(format!(
                 "newfuncdesc({:?}) called on non-user-function HostObject",
@@ -1397,7 +1410,7 @@ impl Bookkeeper {
     /// Caches MethodDescs by the `(funcdesc-id, origindef-id,
     /// selfdef-id, name, flags)` tuple — upstream's Python tuple hash
     /// keyed on identity for the descriptor / classdef entries.
-    pub fn getmethoddesc(
+    pub(crate) fn getmethoddesc(
         self: &Rc<Self>,
         funcdesc: &super::description::FuncDescEntry,
         originclassdef: ClassDefKey,
@@ -1565,7 +1578,7 @@ impl Bookkeeper {
     /// handle doesn't escape the `RefCell::borrow_mut()` borrow. The
     /// attrname's UnionFind is materialised on first access with the
     /// `ClassAttrFamily`-factory, matching upstream's lazy creation.
-    pub fn with_classpbc_attr_families<T>(
+    pub(crate) fn with_classpbc_attr_families<T>(
         &self,
         attrname: &str,
         f: impl FnOnce(&mut UnionFind<DescKey, Rc<RefCell<ClassAttrFamily>>>) -> T,
@@ -1585,7 +1598,7 @@ impl Bookkeeper {
         self.classdefs.borrow_mut().push(classdef);
     }
 
-    pub fn lookup_classdef(&self, key: ClassDefKey) -> Option<Rc<RefCell<ClassDef>>> {
+    pub(crate) fn lookup_classdef(&self, key: ClassDefKey) -> Option<Rc<RefCell<ClassDef>>> {
         self.classdefs
             .borrow()
             .iter()
@@ -2512,7 +2525,7 @@ impl Bookkeeper {
 
     /// Python's three-state `emulated` parameter (`None` / `True` /
     /// `<position_key>`) maps onto [`PbcCallEmulated`] in Rust.
-    pub fn pbc_call(
+    pub(crate) fn pbc_call(
         self: &Rc<Self>,
         pbc: &SomePBC,
         args: &super::argument::ArgumentsForTranslation,
@@ -2689,7 +2702,7 @@ impl Bookkeeper {
     ///             emulated = callback
     ///         return self.pbc_call(pbc, args, emulated=emulated)
     /// ```
-    pub fn emulate_pbc_call(
+    pub(crate) fn emulate_pbc_call(
         self: &Rc<Self>,
         unique_key: EmulatedPbcCallKey,
         pbc: &SomeValue,
@@ -3003,7 +3016,7 @@ impl Bookkeeper {
         }
         // upstream bookkeeper.py:309-311 — `elif ishashable(x) and x
         // in BUILTIN_ANALYZERS: result = SomeBuiltin(...)`.
-        if super::builtin::is_registered(obj.qualname()) {
+        if ishashable(obj) && super::builtin::is_registered(obj.qualname()) {
             let module_name = match crate::flowspace::model::host_getattr(obj, "__module__") {
                 Ok(value) => value.into_text().unwrap_or_else(|| "unknown".to_string()),
                 Err(crate::flowspace::model::HostGetAttrError::Missing) => "unknown".to_string(),
@@ -3576,11 +3589,31 @@ pub fn immutablevalue(x: &ConstValue) -> Result<SomeValue, AnnotatorError> {
     bk.immutablevalue(x)
 }
 
+/// RPython `origin_of_meth(boundmeth)` (bookkeeper.py:583-593).
+fn origin_of_meth(boundmeth: &HostObject) -> Result<(&HostObject, String), AnnotatorError> {
+    let origin_class = boundmeth.bound_method_origin_class().ok_or_else(|| {
+        AnnotatorError::new(format!(
+            "could not match bound-method to attribute name: {boundmeth:?}"
+        ))
+    })?;
+    let name = boundmeth.bound_method_name().ok_or_else(|| {
+        AnnotatorError::new(format!(
+            "could not match bound-method to attribute name: {boundmeth:?}"
+        ))
+    })?;
+    Ok((origin_class, name.to_string()))
+}
+
+/// RPython `ishashable(x)` (bookkeeper.py:595-601).
+fn ishashable(_x: &HostObject) -> bool {
+    true
+}
+
 /// RAII guard returned by [`Bookkeeper::at_position`]. Mirrors the
 /// upstream `@contextmanager` exit — calls [`Bookkeeper::leave`] on
 /// drop unless the fast-path at bookkeeper.py:99-101 skipped the
 /// initial enter.
-pub struct PositionGuard {
+pub(crate) struct PositionGuard {
     bk: Rc<Bookkeeper>,
     skip_leave: bool,
 }
@@ -5046,7 +5079,7 @@ mod tests {
         let gf = GraphFunc::new("f", Constant::new(ConstValue::Dict(Default::default())));
         let host = HostObject::new_user_function(gf);
         let entry = bk.getdesc(&host).unwrap();
-        assert!(entry.is_function());
+        assert!(matches!(entry, DescEntry::Func(_)));
         let fd = entry.as_function().unwrap();
         assert_eq!(fd.borrow().name, "f");
     }
@@ -5072,7 +5105,7 @@ mod tests {
         let bk = bk();
         let cls = HostObject::new_class("pkg.Foo", vec![]);
         let entry = bk.getdesc(&cls).unwrap();
-        assert!(entry.is_class());
+        assert!(matches!(entry, DescEntry::Class(_)));
         let cd = entry.as_class().unwrap();
         assert_eq!(cd.borrow().name, "pkg.Foo");
     }
@@ -5083,7 +5116,7 @@ mod tests {
         let cls = HostObject::new_class("pkg.Foo", vec![]);
         let inst = HostObject::new_instance(cls, vec![]);
         let entry = bk.getdesc(&inst).unwrap();
-        assert!(entry.is_frozen());
+        assert!(matches!(entry, DescEntry::Frozen(_)));
     }
 
     #[test]
@@ -5093,7 +5126,7 @@ mod tests {
         let bk = bk();
         let obj = HostObject::new_builtin_callable("len");
         let entry = bk.getdesc(&obj).unwrap();
-        assert!(entry.is_frozen());
+        assert!(matches!(entry, DescEntry::Frozen(_)));
     }
 
     #[test]

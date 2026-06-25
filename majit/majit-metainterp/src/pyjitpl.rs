@@ -2208,8 +2208,8 @@ impl<M: Clone> MetaInterp<M> {
     /// staticdata method.
     pub fn finish_setup(
         &mut self,
-        codewriter: &majit_translate::jit_codewriter::codewriter::CodeWriter,
-        callcontrol: &majit_translate::jit_codewriter::call::CallControl,
+        codewriter: &majit_translate::codewriter::codewriter::CodeWriter,
+        callcontrol: &majit_translate::codewriter::call::CallControl,
     ) {
         let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
             "MetaInterp::finish_setup called after `staticdata` was cloned; \
@@ -2281,7 +2281,7 @@ impl<M: Clone> MetaInterp<M> {
     /// — call before any tracing path clones `staticdata`.
     pub fn install_canonical_liveness(
         &mut self,
-        asm: &majit_translate::jit_codewriter::assembler::Assembler,
+        asm: &majit_translate::codewriter::assembler::Assembler,
     ) {
         let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
             "MetaInterp::install_canonical_liveness called after `staticdata` was cloned; \
@@ -2832,11 +2832,6 @@ impl<M: Clone> MetaInterp<M> {
         ctx.get_merge_point_at(inner_key, ctx.header_pc)
             .filter(|mp| mp.position._pos > 0)
             .map(|mp| (mp.header_pc, mp.green_boxes.clone()))
-    }
-
-    /// Compat alias: delegates to set_trace_eagerness.
-    pub fn set_bridge_threshold(&mut self, threshold: u32) {
-        self.set_trace_eagerness(threshold);
     }
 
     /// Set the main compilation threshold.
@@ -8426,7 +8421,7 @@ impl<M: Clone> MetaInterp<M> {
             //                  original_jitcell_token`. pyre stores the
             // owner's `number` in `LoopTargetDescr.original_jitcell_token_number`
             // (set by `compile.py:237` / `compile.py:289` counterparts at
-            // `pyjitpl/mod.rs:3886`/`5518`).  Empirically (probe
+            // `pyjitpl.rs:3886`/`5518`).  Empirically (probe
             // `MAJIT_PROBE_TARGETTOKEN_NONE` against the full pyre/check.py
             // suite, dynasm 14/14) every JUMP TargetToken reaching the
             // walker has the owner number backfilled, so the
@@ -8489,7 +8484,7 @@ impl<M: Clone> MetaInterp<M> {
         // that the registration walker can execute here without the
         // pyre-interpreter import.  `last_quasi_immutable_deps` (the
         // pyre-side analog of `loop.quasi_immutable_deps`) is populated
-        // by the optimizer (`pyjitpl/mod.rs:5407` / `:5774`) and drained
+        // by the optimizer (`pyjitpl.rs:5407` / `:5774`) and drained
         // by the eval.rs walker at the same call-graph depth as
         // `compile.py:204-207`.
 
@@ -11357,7 +11352,7 @@ impl<M: Clone> MetaInterp<M> {
                             .get(unique_id_idx)
                             .and_then(|v| *v)
                             .unwrap_or(0);
-                        crate::rvmprof::cintf::jit_rvmprof_code(leaving, unique_id);
+                        majit_translate::rlib::rvmprof::cintf::jit_rvmprof_code(leaving, unique_id);
                     }
                 }
             }
@@ -14309,7 +14304,7 @@ impl MetaInterpStaticData {
     /// ```
     ///
     /// TODO: pyre's `CodeWriter`
-    /// (`majit-translate/src/jit_codewriter/codewriter.rs:64-77`) does
+    /// (`majit-translate/src/codewriter/codewriter.rs:64-77`) does
     /// **not** own `callcontrol` — RPython's does
     /// (`codewriter.py:CodeWriter.__init__` keeps both).  The Rust
     /// borrow-checker constraint is documented at the CodeWriter
@@ -14327,8 +14322,8 @@ impl MetaInterpStaticData {
     /// payload types still diverge.
     pub fn finish_setup(
         &mut self,
-        codewriter: &majit_translate::jit_codewriter::codewriter::CodeWriter,
-        callcontrol: &majit_translate::jit_codewriter::call::CallControl,
+        codewriter: &majit_translate::codewriter::codewriter::CodeWriter,
+        callcontrol: &majit_translate::codewriter::call::CallControl,
     ) {
         // pyjitpl.py:2257-2258
         //     self.blackholeinterpbuilder = BlackholeInterpBuilder(codewriter, self)
@@ -14380,7 +14375,7 @@ impl MetaInterpStaticData {
         // pyjitpl.py:2267 `self.virtualref_info = codewriter.callcontrol.virtualref_info`
         //
         // `callcontrol.virtualref_info` carries the codewriter-time
-        // [`majit_translate::jit_codewriter::call::VirtualRefInfoHandle`]
+        // [`majit_translate::codewriter::call::VirtualRefInfoHandle`]
         // (u32 descr indices for the dispatch encoder); the metainterp-side
         // `VirtualRefInfo` carries the process-singleton `DescrRef` Arcs
         // produced by `vref_size_descr()` +
@@ -14469,7 +14464,7 @@ impl MetaInterpStaticData {
     /// → finish_setup(codewriter)` warmspot lifecycle.
     pub fn install_canonical_liveness(
         &mut self,
-        asm: &majit_translate::jit_codewriter::assembler::Assembler,
+        asm: &majit_translate::codewriter::assembler::Assembler,
     ) {
         // Mirrors the asm-derived parts of `finish_setup(codewriter,
         // callcontrol)` (this file, `pyjitpl.py:2255-2285`):
@@ -14552,11 +14547,10 @@ impl MetaInterpStaticData {
     ///     effectinfo.compute_bitstrings(self.all_descrs)
     /// ```
     ///
-    /// Pyre lift: concatenates every cached descr from
-    /// `descr_registry` (size, field, array, arraylen, interiorfield)
-    /// + `gc_cache._cache_call_order` (call) in PyPy's `descr.py:25-47
-    /// setup_descrs` group order, runs `effectinfo::compute_bitstrings`
-    /// over the population, and writes the new bitstrings back through
+    /// Pyre lift: snapshots `GcCache` in PyPy's `descr.py:25-47
+    /// setup_descrs` group order (size, field, array, arraylen, call,
+    /// interiorfield), runs `effectinfo::compute_bitstrings` over the
+    /// population, and writes the new bitstrings back through
     /// `Descr::set_effect_bitstrings` onto each call descr's interior
     /// `effect_info` cell.  `effectinfo.py:523-526 descr.ei_index = …`
     /// is the single writer of `ei_index` on every read/write set
@@ -14570,42 +14564,10 @@ impl MetaInterpStaticData {
         // PyPy `backend/llsupport/descr.py:25-47 setup_descrs` walks
         // `gc_cache` per-category in this fixed order: size, field,
         // array, arraylen, call, interiorfield.  Each visit assigns
-        // the next sequential `descr_index`.  Pyre's lift threads the
-        // same group order through two side caches:
-        //
-        // - `descr_registry::DESCR_REGISTRY`: size, field, array,
-        //   arraylen, interiorfield — five of the six PyPy gc_cache
-        //   slots.  Mint sites push their freshly-created descrs in via
-        //   `register_size` / `register_field` / etc.; the
-        //   `make_simple_descr_group` helper threads size + field
-        //   registration; `pyre-jit-trace::descr` plus the
-        //   `jit_struct!` macro feed the same path.
-        // - `crate::call_descr::cached_call_descrs`: the `_cache_call`
-        //   slot for `MetaCallDescr` instances minted via
-        //   `make_call_descr_with_effect`.
-        //
-        // Concat order: sizes → fields → arrays → array_lens →
-        // call_descrs → interior_fields, mirroring `descr.py:25-47`
-        // verbatim.  This preserves PyPy's `descr_index` parity for
-        // serialised streams (used by `bridgeopt.serialize` /
-        // `opencoder.encode_descr`).  Categories that pyre doesn't
-        // register today (`array_lens` is populated only via
-        // `register_array_len` on `ArrayDescr.lendescr` mint sites — a
-        // narrow set since pyre's array descrs don't always carry a
-        // separate length descr) snapshot to empty Vec, leaving the
-        // sequential index domain compact but ordered correctly.
-        // call_descrs now write through to
-        // `gc_cache._cache_call_order` via `descr_registry::register_call`
-        // at `make_call_descr_with_effect` mint time, so `snapshot_calls()`
-        // returns the same population that `cached_call_descrs()` would.
-        // Concat order matches PyPy `descr.py:25-47` group order verbatim.
-        let mut all_descrs: Vec<DescrRef> = Vec::new();
-        all_descrs.extend(majit_ir::descr_registry::snapshot_sizes());
-        all_descrs.extend(majit_ir::descr_registry::snapshot_fields());
-        all_descrs.extend(majit_ir::descr_registry::snapshot_arrays());
-        all_descrs.extend(majit_ir::descr_registry::snapshot_array_lens());
-        all_descrs.extend(majit_ir::descr::gc_cache().lock().unwrap().snapshot_calls());
-        all_descrs.extend(majit_ir::descr_registry::snapshot_interior_fields());
+        // the next sequential `descr_index`.  Pyre's descriptor mint
+        // sites publish into the same `GcCache` owner, including
+        // metainterp call descrs via `GcCache._cache_call`.
+        let all_descrs = majit_ir::descr_registry::snapshot_all();
 
         // `descr.py:25-47 setup_descrs` assigns sequential `descr_index`
         // to every cached descr in fixed group order (size, field, array,
@@ -14684,7 +14646,7 @@ impl MetaInterpStaticData {
     /// `ll_portal_runner` address (`warmspot.py:1010-1012`) **before**
     /// passing the driver to this function. `compile_tmp_callback`
     /// (`compile.rs::compile_tmp_callback`) and
-    /// `MIFrame::do_recursive_call` (`pyjitpl/mod.rs::do_recursive_call`)
+    /// `MIFrame::do_recursive_call` (`pyjitpl.rs::do_recursive_call`)
     /// both `debug_assert!(jd.portal_runner_adr != 0)` at their entry
     /// points; a `0`-address registration silently broke the trampoline
     /// in earlier iterations because the assertion fired only at the
@@ -15938,7 +15900,7 @@ mod metainterp_static_data_tests {
         // and never reaches this arm.  The executor routes through
         // `call_int_function` (i64-bits ABI), and callers recover the
         // f64 via `f64::from_bits` when the slot needs to be interpreted
-        // as a float (pyjitpl/mod.rs:8901-8902).  This test pins that
+        // as a float (pyjitpl.rs:8901-8902).  This test pins that
         // contract so a regression that re-introduces the f64-ABI
         // transmute path is caught.
         use crate::executor;
@@ -17675,8 +17637,8 @@ mod metainterp_static_data_tests {
         // mirror.  Build a small CodeWriter, register two liveness
         // entries on its assembler, and make sure finish_setup mirrors
         // both halves.
-        use majit_translate::jit_codewriter::call::CallControl;
-        use majit_translate::jit_codewriter::codewriter::CodeWriter;
+        use majit_translate::codewriter::call::CallControl;
+        use majit_translate::codewriter::codewriter::CodeWriter;
 
         let mut codewriter = CodeWriter::new();
         let mut scratch = Vec::<u8>::new();
@@ -17719,8 +17681,8 @@ mod metainterp_static_data_tests {
         // staticdata Arc still has refcount 1 (immediately after
         // `MetaInterp::new`).  Verify the wrapper drives the bytes all
         // the way to `staticdata.liveness_info` without panicking.
-        use majit_translate::jit_codewriter::call::CallControl;
-        use majit_translate::jit_codewriter::codewriter::CodeWriter;
+        use majit_translate::codewriter::call::CallControl;
+        use majit_translate::codewriter::codewriter::CodeWriter;
 
         let mut codewriter = CodeWriter::new();
         let mut scratch = Vec::<u8>::new();
@@ -17745,8 +17707,8 @@ mod metainterp_static_data_tests {
         // anything has cloned `self.staticdata`, the wrapper must fail
         // loudly so the convergence violation surfaces at the call
         // site.
-        use majit_translate::jit_codewriter::call::CallControl;
-        use majit_translate::jit_codewriter::codewriter::CodeWriter;
+        use majit_translate::codewriter::call::CallControl;
+        use majit_translate::codewriter::codewriter::CodeWriter;
 
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
@@ -17764,7 +17726,7 @@ mod metainterp_static_data_tests {
         // without going through `CodeWriter` / `CallControl`.
         // pyjitpl.py:2236-2243 — also seed the cached opcode-id fields
         // (`op_live` etc.) from pyre's static `BC_*` constants.
-        use majit_translate::jit_codewriter::assembler::Assembler;
+        use majit_translate::codewriter::assembler::Assembler;
 
         let mut asm = Assembler::new();
         let mut scratch = Vec::<u8>::new();
@@ -17832,7 +17794,7 @@ mod metainterp_static_data_tests {
         // Same single-owner invariant as `finish_setup`: once
         // `staticdata` is shared, the hook must fail loudly rather
         // than silently no-op or clobber a shared snapshot.
-        use majit_translate::jit_codewriter::assembler::Assembler;
+        use majit_translate::codewriter::assembler::Assembler;
 
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();

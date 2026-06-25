@@ -2309,7 +2309,7 @@ impl TraceCtx {
     // `_cache[v]`, and `_cache` is indexed by `_index`, so callers that
     // store an OpRef and later pass it as an arg must have stored an
     // `_index`-based value. Across pyre, `op.pos.raw()` is used as a HashMap
-    // key (compile.rs, blackhole.rs, optimizeopt/*, pyjitpl/mod.rs) under
+    // key (compile.rs, blackhole.rs, optimizeopt/*, pyjitpl.rs) under
     // the pyre-legacy "all ops unique" invariant; a straight swap would
     // corrupt those maps. The swap therefore has to land together with
     // caller-side OpRef convention migration.
@@ -2592,7 +2592,7 @@ impl TraceCtx {
     /// Convergence (task #208): the only callers of this path are the
     /// interpreter-side vable promotes — `get_arrayitem_vable_index`
     /// (`trace_ctx.rs`) and the `is_nonstandard_virtualizable` `isstandard`
-    /// PTR_EQ (`trace_ctx.rs`, `pyjitpl/mod.rs`). Both emit a `GUARD_VALUE`
+    /// PTR_EQ (`trace_ctx.rs`, `pyjitpl.rs`). Both emit a `GUARD_VALUE`
     /// whose argument is constant-narrowed at optimization time — the array
     /// index is a function of the already-promoted-constant `stackpos`, and
     /// `isstandard` folds to `1` under pyre's single standard virtualizable —
@@ -2801,7 +2801,7 @@ impl TraceCtx {
     /// have no per-callee analysis available — equivalent to PyPy's
     /// `effectinfo.MOST_GENERAL` fallback for unanalyzed callees.
     /// The codewriter's `CallControl::getcalldescr`
-    /// (`majit-translate/src/jit_codewriter/call.rs`) does port
+    /// (`majit-translate/src/codewriter/call.rs`) does port
     /// call.py:210-335 in full (raise / random-effects / write /
     /// collect / virtualizable / quasi-immut analyzers); the remaining
     /// gap is plumbing the per-callsite EI it produces back to runtime
@@ -3155,10 +3155,10 @@ impl TraceCtx {
     /// accesses": the calldescr's result type follows the known-result
     /// box's concretetype (int or ref), even though the recorded
     /// `record_known_result_*_ir_v` op itself produces no result
-    /// register.  `CallDescrKey` (`call_descr.rs:54`) hashes
+    /// register.  The `GcCache._cache_call` key (`LLType::Func`) hashes
     /// `result_type` into the descr identity, so passing `Type::Void`
     /// here would never match the `Type::Int` / `Type::Ref` descr that
-    /// `getcalldescr` (`jit_codewriter/call.rs:2799+`) builds for the
+    /// `getcalldescr` (`codewriter/call.rs:2799+`) builds for the
     /// matching `CALL_PURE_*` op.
     ///
     /// `slot` is the per-callee classification chosen at producer time

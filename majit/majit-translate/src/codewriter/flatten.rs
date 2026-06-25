@@ -426,13 +426,6 @@ pub fn enforce_input_args(graph: &FunctionGraph, regallocs: &mut HashMap<RegKind
     }
 }
 
-/// Backward-compatible alias for [`flatten_graph`].  Older callers still
-/// reach for `flatten()`; new code should use `flatten_graph` to match
-/// `flatten.py`.
-pub fn flatten(graph: &FunctionGraph, regallocs: &mut HashMap<RegKind, RegAllocResult>) -> SSARepr {
-    flatten_graph(graph, regallocs)
-}
-
 /// `flatten.py:73-86 class GraphFlattener`.
 ///
 /// Holds the per-flatten state (graph, regalloc result, the SSARepr
@@ -671,7 +664,7 @@ impl<'a> GraphFlattener<'a> {
     /// `(opname, *args[, '->', result])` tuple.  Pyre's [`SpaceOperation`]
     /// already carries typed args + result on the variant, so the
     /// per-op rewriting happens in [`format_assembler`] /
-    /// [`crate::jit_codewriter::assembler`] instead and the flatten
+    /// [`crate::codewriter::assembler`] instead and the flatten
     /// step just appends the `FlatOp::Op` variant.
     pub fn serialize_op(&mut self, op: &SpaceOperation) {
         match &op.kind {
@@ -1330,11 +1323,11 @@ fn value_kind(var: &Variable, regallocs: &HashMap<RegKind, RegAllocResult>) -> c
 pub(crate) fn constant_kind(c: &Constant) -> char {
     if let Some(ty) = c.concretetype.as_ref() {
         return match crate::model::getkind(ty) {
-            crate::jit_codewriter::type_state::ConcreteType::Signed => 'i',
-            crate::jit_codewriter::type_state::ConcreteType::GcRef => 'r',
-            crate::jit_codewriter::type_state::ConcreteType::Float => 'f',
-            crate::jit_codewriter::type_state::ConcreteType::Void => 'v',
-            crate::jit_codewriter::type_state::ConcreteType::Unknown => constvalue_kind(&c.value),
+            crate::codewriter::type_state::ConcreteType::Signed => 'i',
+            crate::codewriter::type_state::ConcreteType::GcRef => 'r',
+            crate::codewriter::type_state::ConcreteType::Float => 'f',
+            crate::codewriter::type_state::ConcreteType::Void => 'v',
+            crate::codewriter::type_state::ConcreteType::Unknown => constvalue_kind(&c.value),
         };
     }
     constvalue_kind(&c.value)
@@ -1563,7 +1556,7 @@ mod tests {
         graph.set_return(entry, Some(v));
 
         let mut regallocs = identity_regallocs(&graph, 8);
-        let flat = flatten(&graph, &mut regallocs);
+        let flat = flatten_graph(&graph, &mut regallocs);
         assert_eq!(flat.name, "simple");
         // Label + ConstInt op = 2 flat ops
         assert!(flat.insns.len() >= 2);
@@ -1585,7 +1578,7 @@ mod tests {
         graph.set_return(merge, None);
 
         let mut regallocs = identity_regallocs(&graph, 8);
-        let flat = flatten(&graph, &mut regallocs);
+        let flat = flatten_graph(&graph, &mut regallocs);
         // Should have labels + jumps
         let has_jump = flat
             .insns
@@ -1696,7 +1689,7 @@ mod tests {
         );
 
         let mut regallocs = identity_regallocs(&graph, 8);
-        let flat = flatten(&graph, &mut regallocs);
+        let flat = flatten_graph(&graph, &mut regallocs);
         let expected_value = var_reg(&regallocs, &cond_handle);
         assert!(
             flat.insns.iter().any(|op| matches!(
@@ -1739,7 +1732,7 @@ mod tests {
         );
 
         let mut regallocs = identity_regallocs(&graph, 8);
-        let flat = flatten(&graph, &mut regallocs);
+        let flat = flatten_graph(&graph, &mut regallocs);
         assert!(
             flat.insns.iter().any(|op| matches!(
                 op,
@@ -1772,7 +1765,7 @@ mod tests {
         );
 
         let mut regallocs = identity_regallocs(&graph, 8);
-        let flat = flatten(&graph, &mut regallocs);
+        let flat = flatten_graph(&graph, &mut regallocs);
         assert!(
             flat.insns
                 .iter()
@@ -1866,7 +1859,7 @@ mod tests {
         graph.set_goto(entry, target, vec![val_var]);
 
         let mut regallocs = identity_regallocs(&graph, 8);
-        let flat = flatten(&graph, &mut regallocs);
+        let flat = flatten_graph(&graph, &mut regallocs);
         let moves: Vec<_> = flat
             .insns
             .iter()
@@ -1908,7 +1901,7 @@ mod tests {
         graph.set_return(entry, Some(sum_var));
 
         let mut regallocs = identity_regallocs(&graph, 8);
-        let flat = flatten(&graph, &mut regallocs);
+        let flat = flatten_graph(&graph, &mut regallocs);
         assert!(
             !flat.insns.iter().any(|op| matches!(
                 op,
@@ -1954,7 +1947,7 @@ mod tests {
         );
 
         let mut regallocs = identity_regallocs(&graph, 16);
-        let flat = flatten(&graph, &mut regallocs);
+        let flat = flatten_graph(&graph, &mut regallocs);
         assert!(
             flat.insns
                 .iter()
@@ -2026,7 +2019,7 @@ mod tests {
         );
 
         let mut regallocs = identity_regallocs(&graph, 16);
-        let flat = flatten(&graph, &mut regallocs);
+        let flat = flatten_graph(&graph, &mut regallocs);
         assert!(
             flat.insns.iter().any(|op| matches!(
                 op,
@@ -2072,7 +2065,7 @@ mod tests {
         );
 
         let mut regallocs = identity_regallocs(&graph, 16);
-        let flat = flatten(&graph, &mut regallocs);
+        let flat = flatten_graph(&graph, &mut regallocs);
         // Raise carries the exception value's Register; the fixture's
         // identity coloring puts it on the value's assigned Int register.
         let expected_raise_reg = var_reg(&regallocs, &last_exc_value_handle);
@@ -2111,7 +2104,7 @@ mod tests {
         );
 
         let mut regallocs = identity_regallocs(&graph, 16);
-        let flat = flatten(&graph, &mut regallocs);
+        let flat = flatten_graph(&graph, &mut regallocs);
         assert!(
             flat.insns.iter().any(|op| matches!(
                 op,
@@ -2177,7 +2170,7 @@ mod tests {
         );
 
         let mut regallocs = identity_regallocs(&graph, 16);
-        let flat = flatten(&graph, &mut regallocs);
+        let flat = flatten_graph(&graph, &mut regallocs);
         let expected_lhs = var_reg(&regallocs, &lhs_handle);
         let expected_rhs = var_reg(&regallocs, &rhs_handle);
         let expected_dst = var_reg(&regallocs, &sum_handle);
@@ -2246,7 +2239,7 @@ mod tests {
         );
 
         let mut regallocs = identity_regallocs(&graph, 16);
-        let flat = flatten(&graph, &mut regallocs);
+        let flat = flatten_graph(&graph, &mut regallocs);
         let standard_overflow = crate::flowspace::model::HOST_ENV
             .lookup_standard_exception_instance("OverflowError")
             .expect("missing standard OverflowError instance");
@@ -2600,7 +2593,7 @@ mod tests {
     // opname tokens.
     // ────────────────────────────────────────────────────────────────────
 
-    use crate::jit_codewriter::format::format_assembler;
+    use crate::codewriter::format::format_assembler;
 
     fn flat_to_text(graph: &FunctionGraph) -> String {
         let mut regallocs = identity_regallocs(graph, 16);

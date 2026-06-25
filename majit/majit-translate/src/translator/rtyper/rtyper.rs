@@ -17,6 +17,8 @@
 //! Deferred methods are documented inline with their upstream line
 //! reference.
 
+#![allow(private_interfaces)]
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
@@ -2415,7 +2417,7 @@ pub struct HighLevelOp {
     /// directly via [`Self::set_position_key`]. `None` is the
     /// test-fixture default; production [`RPythonTyper::specialize_block`]
     /// fills it via [`RPythonTyper::highlevelops_with_graph`].
-    pub position_key: RefCell<Option<PositionKey>>,
+    pub(crate) position_key: RefCell<Option<PositionKey>>,
 }
 
 impl HighLevelOp {
@@ -2444,7 +2446,7 @@ impl HighLevelOp {
     /// Stamp the (graph, block, op_index) position key onto this hop.
     /// Mirrors upstream's reliance on `hop.spaceop` to recover the
     /// op-site identity for `desc.specialize(inputs, op)` lookups.
-    pub fn set_position_key(&self, position_key: Option<PositionKey>) {
+    pub(crate) fn set_position_key(&self, position_key: Option<PositionKey>) {
         *self.position_key.borrow_mut() = position_key;
     }
 

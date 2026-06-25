@@ -19,7 +19,7 @@ use std::rc::Rc;
 use super::super::flowspace::model::{
     BlockKey, BlockRef, GraphKey, GraphRef, Hlvalue, LinkKey, LinkRef, Variable, checkgraph,
 };
-use super::bookkeeper::Bookkeeper;
+use super::bookkeeper::{Bookkeeper, PositionKey};
 use super::model::{SomeValue, TLS, UnionError, unionof};
 use super::policy::{AnnotatorPolicy, PolicyHandle};
 use crate::tool::ansi_print::AnsiLogger;
@@ -84,7 +84,7 @@ pub struct RPythonAnnotator {
     /// RPython `self.links_followed = {}` (annrpython.py:39).
     pub links_followed: RefCell<HashSet<LinkKey>>,
     /// RPython `self.notify = {}` (annrpython.py:40).
-    pub notify: RefCell<IndexMap<BlockKey, HashSet<PositionKey>>>,
+    pub(crate) notify: RefCell<IndexMap<BlockKey, HashSet<PositionKey>>>,
     /// RPython `self.fixed_graphs = {}` (annrpython.py:41). Graphs
     /// that have already been rtyped — `addpendingblock` rejects new
     /// pending entries against these.
@@ -111,10 +111,6 @@ pub struct RPythonAnnotator {
     pub errors: RefCell<Vec<String>>,
 }
 
-/// Placeholder position key — mirrors the tuple upstream uses as the
-/// `position_key` payload passed to `Bookkeeper.at_position`.
-pub type PositionKey = super::bookkeeper::PositionKey;
-
 /// RPython `class BlockedInference(Exception)` (annrpython.py:673-693).
 ///
 /// Thrown from `consider_op` / `flowin` to signal "the situation is
@@ -139,7 +135,7 @@ pub struct BlockedInference {
     pub opindex: Option<usize>,
     /// RPython `self.break_at` — the bookkeeper's position at the
     /// moment of the block, or `None` if no reflow frame is active.
-    pub break_at: Option<PositionKey>,
+    pub(crate) break_at: Option<PositionKey>,
 }
 
 impl BlockedInference {
@@ -219,7 +215,7 @@ enum OpLoopOutcome {
 ///         return
 ///     raise
 /// ```
-pub enum FlowinError {
+enum FlowinError {
     /// upstream `BlockedInference` — transient block, retry later.
     Blocked(BlockedInference),
     /// upstream `annmodel.HarmlesslyBlocked` — swallow, return.
@@ -263,12 +259,7 @@ impl From<crate::annotator::model::AnnotatorException> for FlowinError {
 /// call shape. The operindex is `Option<usize>` upstream (`None`
 /// means "no op, block-level"); callers passing a concrete index wrap
 /// it in `Some`.
-pub fn gather_error(
-    ann: &RPythonAnnotator,
-    graph: &GraphRef,
-    block: &BlockRef,
-    i: usize,
-) -> String {
+fn gather_error(ann: &RPythonAnnotator, graph: &GraphRef, block: &BlockRef, i: usize) -> String {
     crate::tool::error::gather_error(ann, graph, block, Some(i))
 }
 
@@ -276,7 +267,7 @@ pub fn gather_error(
 /// upstream's `@contextmanager` so callers use `let _g =
 /// ann.using_policy(...);` in the same shape as `with
 /// self.using_policy(policy):`.
-pub struct PolicyGuard<'a> {
+pub(crate) struct PolicyGuard<'a> {
     ann: &'a RPythonAnnotator,
     saved: Option<PolicyHandle>,
 }
@@ -875,7 +866,7 @@ impl RPythonAnnotator {
     /// A context manager that temporarily swaps `self.policy`. The
     /// Rust port returns a RAII guard that restores the saved policy
     /// on drop, matching the upstream `try ... finally` contract.
-    pub fn using_policy<P>(&self, policy: P) -> PolicyGuard<'_>
+    pub(crate) fn using_policy<P>(&self, policy: P) -> PolicyGuard<'_>
     where
         P: Into<PolicyHandle>,
     {
@@ -989,7 +980,7 @@ impl RPythonAnnotator {
     /// Internal helper behind [`Self::call_sites`] that also preserves
     /// the upstream `(graph, block, opindex)` identity as a
     /// [`PositionKey`].
-    pub fn call_sites_with_positions(
+    pub(crate) fn call_sites_with_positions(
         &self,
     ) -> Vec<(
         super::super::flowspace::model::SpaceOperation,
@@ -1234,7 +1225,8 @@ impl RPythonAnnotator {
     ///
     /// Rust `PositionKey` carries the u64-encoded (graph, block, index)
     /// tuple. For log messages we stringify each component.
-    pub fn whereami(&self, pk: PositionKey) -> String {
+    #[cfg(test)]
+    pub(crate) fn whereami(&self, pk: PositionKey) -> String {
         let opid = if pk.op_index > 0 {
             format!(" op={}", pk.op_index)
         } else {
@@ -1979,7 +1971,7 @@ impl RPythonAnnotator {
     /// evicts a Skipped subject's blocks from `annotated` without pruning
     /// the shared `notify` map, leaving a position whose `Weak<Block>`
     /// still upgrades against a session-retained `Rc`.
-    pub fn reflowfromposition(&self, position_key: &PositionKey) {
+    pub(crate) fn reflowfromposition(&self, position_key: &PositionKey) {
         // upstream: `graph, block, index = position_key`
         let Some(graph) = position_key.graph() else {
             return;
@@ -2166,7 +2158,7 @@ impl RPythonAnnotator {
     /// harmless swallow / annotator error). The caller owns the block
     /// borrow and is responsible for writing the binding into
     /// `op.result` (which lives behind a `RefCell` on the block).
-    pub fn consider_op(
+    fn consider_op(
         &self,
         hlop: &super::super::flowspace::operation::HLOperation,
     ) -> Result<SomeValue, FlowinError> {
@@ -3122,8 +3114,8 @@ mod tests {
         // constraint map says "if this link is taken, a0 is True".
         // improve(SomeBool, s_True) returns s_True (contained). Target
         // inputarg receives the refined SomeBool(const=True) binding.
-        use super::super::super::flowspace::model::{Block, Link};
-        use super::super::model::{SomeBool, s_true};
+        use super::super::super::flowspace::model::{Block, ConstValue, Constant, Link};
+        use super::super::model::SomeBool;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let graph = mk_graph("bool_cstrt", 1);
         let u0 = Hlvalue::Variable(Variable::named("u0"));
@@ -3145,7 +3137,9 @@ mod tests {
 
         let mut constraints: HashMap<Rc<Variable>, SomeValue> = HashMap::new();
         if let Hlvalue::Variable(v) = &source_a0 {
-            constraints.insert(Rc::new(v.clone()), s_true());
+            let mut s_true = SomeBool::new();
+            s_true.base.const_box = Some(Constant::new(ConstValue::Bool(true)));
+            constraints.insert(Rc::new(v.clone()), SomeValue::Bool(s_true));
         }
         ann.follow_link(&graph, &link, &constraints);
 

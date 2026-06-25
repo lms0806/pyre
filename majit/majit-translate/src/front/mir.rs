@@ -494,7 +494,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // return_type is intentionally `None` until the Charon
         // dedup-table resolution can map a `TyRef::Deduplicated{id}` to
         // its primitive name. The codewriter's call-signature validator
-        // at `jit_codewriter/call.rs:4234` skips the check when declared
+        // at `codewriter/call.rs:4234` skips the check when declared
         // type is None, which is the right behaviour while the
         // resolution gap is open — TyRef labels (`ty#170`) would
         // otherwise be classified as `Type::Ref` and trip a spurious
@@ -1258,7 +1258,7 @@ pub fn lower_fun_decl_with_static_addrs(
         // blocks here — before `prune_dead_phis`, which would otherwise
         // treat a no-predecessor block as an extra root
         // (`transform_dead_op_vars`'s start set), and before the
-        // `jit_codewriter` consumers that scan `graph.blocks` directly.
+        // `codewriter` consumers that scan `graph.blocks` directly.
         // The `next`-diamond rewrite (`front::iter_next`) runs on the same
         // simplified graph: the Option discriminant switch's default→Abort
         // arm must be pruned first, identically to the `?` diamond.  It is
@@ -1600,8 +1600,8 @@ impl<'a> Lowering<'a> {
         // ty }` op into the startblock.  Downstream consumers
         // — `flowspace_adapter::derive_subject_inputcells`
         // (`translator/rtyper/flowspace_adapter.rs:1464+`),
-        // `graph_non_void_arg_types` (`jit_codewriter/call.rs:2748+`),
-        // `type_state` (`jit_codewriter/type_state.rs:131`) — locate
+        // `graph_non_void_arg_types` (`codewriter/call.rs:2748+`),
+        // `type_state` (`codewriter/type_state.rs:131`) — locate
         // each inputarg's declared `ValueType` by scanning the leading
         // `OpKind::Input` ops with `op.result == &arg`.  Without the
         // Input op, `derive_subject_inputcells` fails-loud at
@@ -5041,7 +5041,7 @@ impl<'a> Lowering<'a> {
                     // `hint_promote*` marker so the residual `OpKind::Call`
                     // reaches `jtransform::rewrite_op_hint`, which emits
                     // `[-live-, <kind>_guard_value(x)]`
-                    // (`jit_codewriter/jtransform.py:608-614`).  The rtyper
+                    // (`codewriter/jtransform.py:608-614`).  The rtyper
                     // lowers the marker to `same_as` for the dual-gate type
                     // projection (`flowspace_adapter`), and jtransform aliases
                     // the result back to `x`.  Same single-segment marker
@@ -5193,7 +5193,7 @@ impl<'a> Lowering<'a> {
         // SUCCESS edge as a `Result::Err` value, matched downstream as
         // ordinary control flow, not this unwind edge. The residual-call
         // `guard_no_exception` is re-derived op-locally from the callee
-        // graph (`jit_codewriter/call.rs` `_canraise`), so dropping the
+        // graph (`codewriter/call.rs` `_canraise`), so dropping the
         // front-graph unwind edge keeps the can-raise signal. A real
         // try/except handler would need a `LastException` edge here; the
         // interpreter expresses exceptions as `Result`, so none arises.
@@ -7092,7 +7092,7 @@ impl<'a> Lowering<'a> {
                 // `Variable.bool().eval(self)`).  Necessary because the
                 // MIR discriminant for an `If` target can be a Ref
                 // (e.g. a SyntheticTransparentCtor result) whereas
-                // jit_codewriter/assembler.rs::FlatOp::GotoIfNot expects
+                // codewriter/assembler.rs::FlatOp::GotoIfNot expects
                 // `cond.kind == RegKind::Int`.  `true_args` / `false_args`
                 // carry each target block's input arguments; `set_branch`
                 // asserts their arity against the block's `inputargs`.
@@ -8423,7 +8423,7 @@ fn canonical_binop_label(tag: &str, subkind: Option<&str>) -> String {
         ("Div", _) => "floordiv".into(),
         ("Rem", _) => "mod".into(),
         // Bitwise.  The canonical pyre labels carry the `bit` prefix so
-        // `jit_codewriter::jtransform` (`bitand`/`bitor`/`bitxor` arm) and
+        // `codewriter::jtransform` (`bitand`/`bitor`/`bitxor` arm) and
         // the rtyper adapter `normalize_binop_name` (`bitand`->`and_`,
         // `bitor`->`or_`, `bitxor`->`xor`) recognise them.  Bare `and`/`or`
         // are reserved for short-circuit control flow, which never reaches
@@ -8962,9 +8962,7 @@ fn adt_node_def_id(node: &serde_json::Value) -> Option<u64> {
 }
 
 /// The monomorphic-ADT class root of an (already wrapper-stripped)
-/// type node, or `None` for non-ADTs and generic instantiations —
-/// the shared tail of [`tyref_class_root`] /
-/// [`cast_ptr_target_class_root`].
+/// type node, or `None` for non-ADTs and generic instantiations.
 fn adt_node_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> {
     let adt = node.as_object()?.get("Adt")?.as_object()?;
     let def_id = adt_node_def_id(node)?;
@@ -9006,20 +9004,9 @@ fn adt_node_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> 
     Some(leaf)
 }
 
-/// The pointee's monomorphic-ADT class root for a `*const T` /
-/// `*mut T` cast-target type, or `None` when the target is not a raw
-/// pointer onto a plain ADT.  `expr as *const W_Foo` is pyre's surface
-/// spelling of the upstream instance downcast `cast_pointer(PTRTYPE,
-/// p)` (lltype.py:964-968): the pointee root names the classdef the
-/// `lltype.cast_pointer` annotation rule resolves the result to.
-fn cast_ptr_target_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
-    raw_ptr_pointee_class_root(strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?, llbc)
-}
-
 /// The pointee's monomorphic-ADT class root of an (already
 /// wrapper-stripped) `RawPtr` type node, or `None` when the node is
-/// not a raw pointer onto a plain ADT — the shared tail of
-/// [`tyref_class_root`] / [`cast_ptr_target_class_root`].
+/// not a raw pointer onto a plain ADT.
 fn raw_ptr_pointee_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> {
     let raw = node.as_object()?.get("RawPtr")?.as_array()?;
     adt_node_class_root(strip_ty_wrappers(raw.first()?, llbc)?, llbc)

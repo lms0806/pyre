@@ -91,12 +91,12 @@ thread_local! {
 /// because `finally` does not exist as a language construct. The guard
 /// is `!Send` / `!Sync` so the increment never escapes the thread that
 /// took it.
-pub struct SideEffectFreeGuard {
+pub(crate) struct SideEffectFreeGuard {
     _not_send: std::marker::PhantomData<*mut ()>,
 }
 
 impl SideEffectFreeGuard {
-    pub fn enter() -> Self {
+    pub(crate) fn enter() -> Self {
         NO_SIDE_EFFECTS_IN_UNION.with(|c| c.set(c.get() + 1));
         SideEffectFreeGuard {
             _not_send: std::marker::PhantomData,
@@ -112,7 +112,7 @@ impl Drop for SideEffectFreeGuard {
 
 /// Mirror of upstream `getattr(TLS, 'no_side_effects_in_union', 0)`
 /// (listdef.py:60) — True when the counter is non-zero.
-pub fn in_side_effect_free_union() -> bool {
+pub(crate) fn in_side_effect_free_union() -> bool {
     NO_SIDE_EFFECTS_IN_UNION.with(|c| c.get() > 0)
 }
 
@@ -185,7 +185,7 @@ pub struct ListItem {
     /// every owner currently using this `ListItem`.
     pub(crate) itemof: Vec<ItemOwner>,
     /// RPython `self.read_locations = set()` (listdef.py:33).
-    pub read_locations: HashSet<PositionKey>,
+    pub(crate) read_locations: HashSet<PositionKey>,
     /// Flattened `DictKey.custom_eq_hash` (dictdef.py:13). `false` for
     /// every non-DictKey ListItem.
     pub custom_eq_hash: bool,
@@ -507,7 +507,7 @@ fn merge_range_step(self_step: Option<i64>, other_step: Option<i64>) -> Option<i
 /// `listitem` lives inside an interior-mutable slot so
 /// [`ListItem::merge`] can retarget it through an [`ItemOwner`].
 #[derive(Debug)]
-pub struct ListDefInner {
+pub(crate) struct ListDefInner {
     pub(crate) listitem: RefCell<Rc<RefCell<ListItem>>>,
 }
 
@@ -605,7 +605,7 @@ impl ListDef {
     /// `Some` values, so `None` is dropped from the read-locations set
     /// — the subsequent `s_value.clone()` return still matches
     /// upstream behaviour.
-    pub fn read_item(&self, position_key: Option<PositionKey>) -> SomeValue {
+    pub(crate) fn read_item(&self, position_key: Option<PositionKey>) -> SomeValue {
         let li = self.inner.listitem.borrow().clone();
         let mut li_mut = li.borrow_mut();
         if let Some(pk) = position_key {
@@ -775,7 +775,7 @@ impl std::hash::Hash for ListDef {
 
 /// RPython `s_list_of_strings = SomeList(ListDef(None,
 /// SomeString(no_nul=True), resized=True))` (listdef.py:206-207).
-pub fn s_list_of_strings() -> super::model::SomeList {
+pub(crate) fn s_list_of_strings() -> super::model::SomeList {
     super::model::SomeList::new(ListDef::new(
         None,
         super::model::SomeValue::String(super::model::SomeString::new(false, true)),

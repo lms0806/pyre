@@ -19,7 +19,7 @@
 use std::rc::Rc;
 
 use majit_ir::Descr;
-use majit_translate::jit_codewriter::flatten::reorder_renaming_list;
+use majit_translate::codewriter::flatten::reorder_renaming_list;
 use majit_translate::jitcode::BhDescr;
 
 use super::flow::{
@@ -544,7 +544,7 @@ pub fn intern_call_descr_stub(
 /// | `can_collect`                  | `collect_analyzer.analyze(op)`        |
 ///
 /// All six analyzers + the public `getcalldescr` are ported in
-/// `majit-translate/src/jit_codewriter/call.rs`:
+/// `majit-translate/src/codewriter/call.rs`:
 ///
 /// | Analyzer                | Pyre site                              |
 /// |-------------------------|----------------------------------------|
@@ -889,7 +889,7 @@ pub enum CallFlavor {
     /// `PlainCannotRaiseNoHeap` (`can_collect=false`) instead.
     PlainCannotRaise,
     /// `EF_CANNOT_RAISE` + analyzer-confirmed "no heap touched". Maps
-    /// to `CANNOT_RAISE_NO_HEAP_EFFECT_INFO` (`call_descr.rs:317-329`):
+    /// to `CANNOT_RAISE_NO_HEAP_EFFECT_INFO` (`majit_metainterp::call_descr`):
     /// `extraeffect=CannotRaise`, every six raw set `Some(empty Vec)`,
     /// every six bitstring `Some(empty Vec)`, `can_collect=false`.
     /// PyPy `effectinfo.py:281-283` produces the same shape when the

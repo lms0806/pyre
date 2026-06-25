@@ -12,16 +12,32 @@
 //!
 //! Everything else (constant management, FailDescr/CallDescr creation,
 //! optimizer invocation, backend compilation, I/O buffering) is automated.
+//!
+//! Most modules below mirror `rpython/jit/metainterp/*.py` by file stem.
+//! Local Rust boundaries are kept only where the upstream structure is
+//! split across crates or Python runtime machinery:
+//!
+//! * `jit` is the user-facing half of `rpython/rlib/jit.py`; the
+//!   translator half lives in `majit_translate::rlib::jit`.
+//! * `call_descr` holds runtime call-descr constructors for the
+//!   `call.py` / backend `calldescrof` surface.
+//! * `cpu` re-exports the backend `model.py::AbstractCPU` surface
+//!   threaded through metainterp optimizers.
+//! * `io_buffer`, `jit_state`, `trace_ctx`, and `parity` are pyre
+//!   runtime/test boundaries with no same-named upstream file.
+//! * `jitcode` and `recorder` are transitional runtime ABI boundaries
+//!   around canonical translate-side `jitcode.py` / `opencoder.py`
+//!   ports; their module docs describe the remaining migration path.
 
 extern crate self as majit_metainterp;
 
 use majit_ir::{OpRef, Type};
 
 pub mod blackhole;
-pub mod call_descr;
+pub(crate) mod call_descr;
 pub(crate) mod compile;
 pub mod counter;
-pub mod cpu;
+pub use majit_backend::model as cpu;
 pub use majit_ir::debug;
 pub mod executor;
 pub mod gc;
@@ -29,7 +45,7 @@ pub mod graphpage;
 pub mod greenfield;
 pub mod heapcache;
 pub mod history;
-pub mod io_buffer;
+pub(crate) mod io_buffer;
 pub mod jit;
 mod jit_state;
 pub mod jitcode;
@@ -41,14 +57,13 @@ pub mod memmgr;
 pub mod opencoder;
 pub mod optimize;
 pub mod optimizeopt;
-pub mod parity;
+pub(crate) mod parity;
 mod pyjitpl;
 pub mod quasiimmut;
 pub mod recorder;
 pub mod resoperation;
 pub mod resume;
-pub mod ruleopt;
-pub mod rvmprof;
+pub(crate) mod ruleopt;
 pub mod support;
 mod trace_ctx;
 pub mod virtualizable;
@@ -90,7 +105,7 @@ pub use pyjitpl::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval
 // can build a fresh Assembler without forcing each user crate to
 // declare a `majit-translate` dependency.  The same pattern is used
 // for `JitCode` / `BhDescr` re-exports above (`jitcode/mod.rs:4`).
-pub use majit_translate::jit_codewriter::assembler::Assembler;
+pub use majit_translate::codewriter::assembler::Assembler;
 pub use parity::{TraceParityCase, assert_trace_parity, normalize_ops, normalize_trace};
 pub use pyjitpl::{
     BackEdgeAction, BridgeRetraceResult, ClosureRuntime, ClosureRuntimeWithResolver,
@@ -490,4 +505,4 @@ mod tests {
         assert_eq!(hash, gk.hash_u64());
     }
 }
-pub mod resumecode;
+pub(crate) mod resumecode;

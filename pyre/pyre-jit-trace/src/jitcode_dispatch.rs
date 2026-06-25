@@ -108,11 +108,11 @@
 //!       `OopSpecIndex::JitForceVirtual` is set only by
 //!       `jtransform.rs:1903 jit.force_virtual` lowering, which our
 //!       benchmarks don't reach. Metainterp orthodox port at
-//!       `majit-metainterp/src/pyjitpl/mod.rs:11828` is tests-only.
+//!       `majit-metainterp/src/pyjitpl.rs:11828` is tests-only.
 //!    d. **Not yet implemented**: `direct_libffi_call`
 //!       (`pyjitpl.py:3622-3667`) needs `CIF_DESCRIPTION_P` parser +
 //!       dynamic calldescr builder; live tracer also returns None
-//!       universally (`pyjitpl/mod.rs:11487-11491`). Production reach
+//!       universally (`pyjitpl.rs:11487-11491`). Production reach
 //!       0 — pyre interpreter doesn't expose libffi calls.
 //!    e. Guard recording uses `ctx.trace_ctx.record_guard(..., 0)`
 //!       followed by `walker_capture_snapshot_for_last_guard`
@@ -4388,7 +4388,7 @@ fn try_fold_pure_call_via_executor(
     // Cap at MAX_HOST_CALL_ARITY (`call_int_function` / `call_void_function`
     // panic on excess arity).  `allboxes.len() - 1` is the arg count
     // (funcbox doesn't pass through).
-    if allboxes.len() - 1 > majit_translate::jit_codewriter::insns::MAX_HOST_CALL_ARITY {
+    if allboxes.len() - 1 > majit_translate::codewriter::insns::MAX_HOST_CALL_ARITY {
         return;
     }
     let mut args = Vec::with_capacity(allboxes.len() - 1);
@@ -4773,7 +4773,7 @@ fn try_execute_residual_call_via_executor(
     // placeholder values that escaped runtime patching.  Pyre's
     // codewriter mints a 64-bit hash of the helper's `CallPath` when
     // the build-time `pyre_interpreter::jit_trace_fnaddrs()` snapshot
-    // has no entry for it (`majit-translate/src/jit_codewriter/call.rs:
+    // has no entry for it (`majit-translate/src/codewriter/call.rs:
     // 4926 symbolic_fnaddr_for_path`).  `runtime_fnaddr_patch` rewrites
     // these to real runtime addresses only when the path appears in
     // both the build-time and runtime registries; helpers absent from
@@ -4802,7 +4802,7 @@ fn try_execute_residual_call_via_executor(
     if pyre_interpreter::is_pyframe_operand_stack_accessor(func_ptr as usize) {
         return Ok(None);
     }
-    if allboxes.len() - 1 > majit_translate::jit_codewriter::insns::MAX_HOST_CALL_ARITY {
+    if allboxes.len() - 1 > majit_translate::codewriter::insns::MAX_HOST_CALL_ARITY {
         return Ok(None);
     }
     let mut args = Vec::with_capacity(allboxes.len() - 1);
@@ -5031,7 +5031,7 @@ fn try_execute_residual_call_via_executor(
 /// upstream's `argboxes[0] = funcbox` convention, so the slice rebuild
 /// is `[savebox, funcbox_real] + allboxes[1..]`.
 ///
-/// Mirror of `majit-metainterp/src/pyjitpl/mod.rs:10437-10477
+/// Mirror of `majit-metainterp/src/pyjitpl.rs:10437-10477
 /// direct_call_release_gil` for the pyre-jit-trace dispatcher layer.
 /// The two-frame-layer parity (majit `do_residual_call` and
 /// pyre-jit-trace `dispatch_residual_call_*`) both implement the same
@@ -5090,7 +5090,7 @@ fn try_execute_residual_call_via_executor(
 ///
 /// The pyre trace-walker has no concrete-execution callback for
 /// jitcode-walked residual_call bytecodes yet — concrete execution
-/// happens in the metainterp layer (`pyjitpl/mod.rs:9631-9659
+/// happens in the metainterp layer (`pyjitpl.rs:9631-9659
 /// do_not_in_trace_call`) which dispatches `BC_CALL_*` not
 /// `BC_RESIDUAL_CALL_*`. Therefore an `OS_NOT_IN_TRACE` callee that
 /// reached this dispatcher cannot be safely treated as a regular
@@ -6098,7 +6098,7 @@ pub(crate) fn fbw_no_replay_exit_enabled() -> bool {
 /// prints the structured reason (the `DispatchError` variant or the
 /// non-loop-closing `DispatchOutcome`) for every walk that maps to
 /// `TraceAction::Abort` / `AbortPermanent`.  The metainterp's own
-/// "abort trace at key={} (permanent={})" log (`pyjitpl/mod.rs:6348`) only
+/// "abort trace at key={} (permanent={})" log (`pyjitpl.rs:6348`) only
 /// reports the key and permanence; the walker-side reason is otherwise
 /// swallowed.  Default OFF → no output, zero production effect.
 pub(crate) fn fbw_debug_abort_enabled() -> bool {
@@ -8430,7 +8430,7 @@ fn direct_call_release_gil(
 ///     way to retire the fail-loud guard) is not yet implemented and
 ///     would land on both legs together; metainterp has a tests-only
 ///     orthodox port at
-///     `majit-metainterp/src/pyjitpl/mod.rs:11828 _do_jit_force_virtual`
+///     `majit-metainterp/src/pyjitpl.rs:11828 _do_jit_force_virtual`
 ///     that the converged walker would route through. Production reach
 ///     today is zero — `jtransform.rs:1903 jit.force_virtual` is the only
 ///     producer and pyre's interpreter does not emit it.
@@ -8444,7 +8444,7 @@ fn direct_call_release_gil(
 ///   - `direct_libffi_call` (`pyjitpl.py:3622-3667`) — pyre's live
 ///     tracer also returns `None` from this helper unless a
 ///     `CIF_DESCRIPTION_P` parser + dynamic `calldescr` builder lands
-///     (`majit-metainterp/src/pyjitpl/mod.rs:11487-11491` defers to
+///     (`majit-metainterp/src/pyjitpl.rs:11487-11491` defers to
 ///     direct_call_release_gil/may_force, which is the same fall-through
 ///     the walker already takes).
 ///   - `direct_assembler_call` (`pyjitpl.py:3589-3609`) + KEEPALIVE
@@ -14115,7 +14115,7 @@ fn handle(
         // exec-generated opimpl loop. Codewriter today emits only
         // float_add/float_sub/float_truediv (float_mul absent —
         // generated only when an explicit `*` operand reaches the
-        // jit_codewriter; pyre's bench set has no float_mul yet)
+        // codewriter; pyre's bench set has no float_mul yet)
         // plus the unary float_neg.
         "float_add/ff>f" => binop_float_record(code, op, ctx, OpCode::FloatAdd),
         "float_sub/ff>f" => binop_float_record(code, op, ctx, OpCode::FloatSub),
@@ -15252,7 +15252,7 @@ mod tests {
     }
 
     /// Build a `done_with_this_frame_descr_ref` for tests. Mirrors the
-    /// production fallback at `pyjitpl/mod.rs:4733` (`make_fail_descr_typed`)
+    /// production fallback at `pyjitpl.rs:4733` (`make_fail_descr_typed`)
     /// when the staticdata singleton was never attached.
     fn done_descr_ref_for_tests() -> DescrRef {
         make_fail_descr(1)
@@ -21852,7 +21852,7 @@ mod tests {
         // jtransform `Ok` / `Err` / `Some` identity rewrite stripped
         // the trailing `int_copy + residual_call_r_r/iRd>r` wrapper
         // for the `Ok(StepResult::Continue)` return value
-        // (`majit/majit-translate/src/jit_codewriter/jtransform.rs
+        // (`majit/majit-translate/src/codewriter/jtransform.rs
         //  ::rewrite_op_direct_call`).  The current sequence is:
         //
         //     inline_call_r_r/dR>r ; live/ ; catch_exception/L ;
