@@ -872,8 +872,8 @@ impl OptVirtualize {
                         .and_then(|widx| get_field(&vinfo.fields, widx));
                     if let Some(val_ref) = stored {
                         let b_old = Operand::from_bound_op(op_rc);
-                        let b_val = ctx.get_box_replacement(val_ref);
-                        ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_val));
+                        let b_val = ctx.get_box_replacement_operand(val_ref);
+                        ctx.make_equal_to(&b_old, &b_val);
                         return OptimizationResult::Remove;
                     }
                     if let Some(w_class) = vinfo
@@ -1511,8 +1511,8 @@ impl OptVirtualize {
                             if let Ok(val_ref) = vinfo.read_value(lookup_offset, itemsize_u, &descr)
                             {
                                 let b_old = Operand::from_bound_op(op_rc);
-                                let b_val = ctx.get_box_replacement(val_ref);
-                                ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_val));
+                                let b_val = ctx.get_box_replacement_operand(val_ref);
+                                ctx.make_equal_to(&b_old, &b_val);
                                 return OptimizationResult::Remove;
                             }
                         }
@@ -3093,9 +3093,9 @@ mod tests {
         // result box (oparser object-identity); GetfieldRawI (ops[0]) is
         // Int-typed so its result position is `OpRef::int_op(0)`.
         let array_ptr_box =
-            crate::history::test_support::rooted_resop_box(Type::Int, ops[0].pos.get().raw());
-        ops[1].setarg(0, Operand::from_boxref(&array_ptr_box));
-        ops[2].setarg(0, Operand::from_boxref(&array_ptr_box));
+            crate::history::test_support::rooted_resop_operand(Type::Int, ops[0].pos.get().raw());
+        ops[1].setarg(0, array_ptr_box.clone());
+        ops[2].setarg(0, array_ptr_box);
 
         for op in &ops {
             let mut resolved = op.clone();
@@ -3446,9 +3446,9 @@ mod tests {
         // vable inputarg. GetfieldRawI (ops[0]) is Int-typed so its result
         // position is `OpRef::int_op(0)`.
         let array_ptr_box =
-            crate::history::test_support::rooted_resop_box(Type::Int, ops[0].pos.get().raw());
-        ops[1].setarg(0, Operand::from_boxref(&array_ptr_box));
-        ops[2].setarg(0, Operand::from_boxref(&array_ptr_box));
+            crate::history::test_support::rooted_resop_operand(Type::Int, ops[0].pos.get().raw());
+        ops[1].setarg(0, array_ptr_box.clone());
+        ops[2].setarg(0, array_ptr_box);
 
         for op in &ops {
             let mut resolved = op.clone();
@@ -3567,10 +3567,10 @@ mod tests {
         // GetfieldRawI (ops[0]) is Int-typed so its result position is
         // `OpRef::int_op(0)`; bind the element ops to its result box.
         let array_ptr_box =
-            crate::history::test_support::rooted_resop_box(Type::Int, ops[0].pos.get().raw());
-        ops[1].setarg(0, Operand::from_boxref(&array_ptr_box));
-        ops[2].setarg(0, Operand::from_boxref(&array_ptr_box));
-        ops[3].setarg(0, Operand::from_boxref(&array_ptr_box));
+            crate::history::test_support::rooted_resop_operand(Type::Int, ops[0].pos.get().raw());
+        ops[1].setarg(0, array_ptr_box.clone());
+        ops[2].setarg(0, array_ptr_box.clone());
+        ops[3].setarg(0, array_ptr_box);
 
         for op in &ops {
             let mut resolved = op.clone();

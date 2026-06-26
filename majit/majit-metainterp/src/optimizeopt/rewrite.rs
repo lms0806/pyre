@@ -187,8 +187,8 @@ impl OptRewrite {
                 let arg_shift = ctx.materialize_operand_at(shift_ref);
                 let result_ref = ctx.emit(Op::new(OpCode::IntRshift, &[arg0, arg_shift.clone()]));
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_res = ctx.get_box_replacement(result_ref);
-                ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_res));
+                let b_res = ctx.get_box_replacement_operand(result_ref);
+                ctx.make_equal_to(&b_old, &b_res);
                 return OptimizationResult::Remove;
             }
 
@@ -208,8 +208,8 @@ impl OptRewrite {
                     ctx,
                 );
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_res = ctx.get_box_replacement(result);
-                ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_res));
+                let b_res = ctx.get_box_replacement_operand(result);
+                ctx.make_equal_to(&b_old, &b_res);
                 return OptimizationResult::Remove;
             }
         }
@@ -303,8 +303,8 @@ impl OptRewrite {
                     ctx,
                 );
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_res = ctx.get_box_replacement(result);
-                ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_res));
+                let b_res = ctx.get_box_replacement_operand(result);
+                ctx.make_equal_to(&b_old, &b_res);
                 return OptimizationResult::Remove;
             }
         }
@@ -1078,8 +1078,8 @@ impl OptRewrite {
             ctx,
         );
         let b_old = Operand::from_bound_op(op_rc);
-        let b_res = ctx.get_box_replacement(result_ref);
-        ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_res));
+        let b_res = ctx.get_box_replacement_operand(result_ref);
+        ctx.make_equal_to(&b_old, &b_res);
         ctx.last_op_removed = true;
         Some(OptimizationResult::Remove)
     }
@@ -1126,10 +1126,8 @@ impl OptRewrite {
                 {
                     let shiftvar = ctx.resolve_operand_box(&shift_op.arg(1)).to_opref();
                     let shiftbound = {
-                        let b = ctx.get_box_replacement(shiftvar);
-                        ctx.getintbound_handle(&Operand::from_boxref(&b))
-                            .borrow()
-                            .clone()
+                        let b = ctx.get_box_replacement_operand(shiftvar);
+                        ctx.getintbound_handle(&b).borrow().clone()
                     };
                     if shiftbound.known_nonnegative() && shiftbound.known_lt_const(63) {
                         let arg_shift = ctx.materialize_operand_at(shiftvar);
@@ -1187,8 +1185,8 @@ impl OptRewrite {
             ctx,
         );
         let b_old = Operand::from_bound_op(op_rc);
-        let b_res = ctx.get_box_replacement(result_ref);
-        ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_res));
+        let b_res = ctx.get_box_replacement_operand(result_ref);
+        ctx.make_equal_to(&b_old, &b_res);
         ctx.last_op_removed = true;
         Some(OptimizationResult::Remove)
     }
@@ -1521,8 +1519,8 @@ impl OptRewrite {
             let key = (reflex_opcode, arg1.to_opref(), arg0.to_opref());
             if let Some(&cached_ref) = self.bool_result_cache.get(&key) {
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_cached = ctx.get_box_replacement(cached_ref);
-                ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
+                let b_cached = ctx.get_box_replacement_operand(cached_ref);
+                ctx.make_equal_to(&b_old, &b_cached);
                 return Some(OptimizationResult::Remove);
             }
 
@@ -1852,10 +1850,7 @@ impl Optimization for OptRewrite {
                     if c != 0 {
                         let mut call_op = Op::new(
                             OpCode::CallN,
-                            &op.getarglist()[1..]
-                                .iter()
-                                .map(Operand::from_boxref)
-                                .collect::<Vec<_>>(),
+                            &(1..op.num_args()).map(|i| op.arg(i)).collect::<Vec<_>>(),
                         );
                         call_op.pos.set(op.pos.get());
                         if let Some(d) = op.getdescr() {
@@ -1888,10 +1883,7 @@ impl Optimization for OptRewrite {
                     };
                     let mut call_op = Op::new(
                         call_opcode,
-                        &op.getarglist()[1..]
-                            .iter()
-                            .map(Operand::from_boxref)
-                            .collect::<Vec<_>>(),
+                        &(1..op.num_args()).map(|i| op.arg(i)).collect::<Vec<_>>(),
                     );
                     call_op.pos.set(op.pos.get());
                     if let Some(d) = op.getdescr() {
@@ -2109,8 +2101,8 @@ impl Optimization for OptRewrite {
                             LoopInvariantEntry::Direct(r) => r,
                         };
                         let b_old = Operand::from_bound_op(op_rc);
-                        let b_cached = ctx.get_box_replacement(cached_result);
-                        ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
+                        let b_cached = ctx.get_box_replacement_operand(cached_result);
+                        ctx.make_equal_to(&b_old, &b_cached);
                         ctx.last_op_removed = true;
                         return OptimizationResult::Remove;
                     }
@@ -2375,12 +2367,11 @@ mod tests {
     fn build_specs(specs: &[OpSpec]) -> Vec<majit_ir::OpRc> {
         let mut ops: Vec<majit_ir::OpRc> = Vec::new();
         for (pos, spec) in specs.iter().enumerate() {
-            let args: Vec<BoxRef> = spec
+            let arg_ops: Vec<Operand> = spec
                 .args
                 .iter()
-                .map(|&p| BoxRef::from_bound_op(&ops[p as usize]))
+                .map(|&p| Operand::from_bound_op(&ops[p as usize]))
                 .collect();
-            let arg_ops: Vec<Operand> = args.iter().map(Operand::from_boxref).collect();
             let op = std::rc::Rc::new(Op::new(spec.opcode, &arg_ops));
             op.pos
                 .set(OpRef::op_typed(pos as u32, spec.opcode.result_type()));
@@ -3494,20 +3485,24 @@ mod tests {
         // a live producer, and GUARD_VALUE's expected operand is the literal
         // ConstInt(0) — so every arg sheds to Operand::{InputArg,Op,Const}.
         use crate::history::test_support::bound_inputarg_box;
-        let (i0, _i0_rc) = bound_inputarg_box(majit_ir::Type::Int, 0);
-        let (i1, _i1_rc) = bound_inputarg_box(majit_ir::Type::Int, 1);
+        let (_i0, i0_rc) = bound_inputarg_box(majit_ir::Type::Int, 0);
+        let (_i1, i1_rc) = bound_inputarg_box(majit_ir::Type::Int, 1);
         // A live producer for v (IntGt result) at int_op(2); the OpRc is held
         // in `int_gt` so the from_bound_op box's Weak upgrade stays live.
         let int_gt = std::rc::Rc::new(Op::new(
             OpCode::IntGt,
-            &[Operand::from_boxref(&i0), Operand::from_boxref(&i1)],
+            &[
+                Operand::from_bound_inputarg(&i0_rc),
+                Operand::from_bound_inputarg(&i1_rc),
+            ],
         ));
         int_gt.pos.set(OpRef::int_op(2));
-        let v = BoxRef::from_bound_op(&int_gt);
-        let zero = BoxRef::new_const(Value::Int(0));
         let guard_value = Op::new(
             OpCode::GuardValue,
-            &[Operand::from_boxref(&v), Operand::from_boxref(&zero)],
+            &[
+                Operand::from_bound_op(&int_gt),
+                Operand::const_from_value(Value::Int(0)),
+            ],
         );
         let finish = Op::new(OpCode::Finish, &[]);
         let ops = {

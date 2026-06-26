@@ -694,7 +694,7 @@ impl Optimizer {
                 &format!("import_virtual_state_value {opref:?} <= {info:?}"),
             );
         }
-        Self::apply_imported_virtual_state(info, &Operand::from_boxref(&box_), ctx);
+        Self::apply_imported_virtual_state(info, &box_, ctx);
         opref
     }
 
@@ -980,17 +980,14 @@ impl Optimizer {
                         .get_box_replacement_operand_opt(field_ref)
                         .as_ref()
                         .map_or(false, |b| ctx.is_virtual(b));
+                    let field_is_const = ctx
+                        .get_box_replacement_operand_opt(field_ref)
+                        .and_then(|cb| cb.const_value())
+                        .is_some();
                     if ctx.skip_flush_mode
                         && !field_ref.is_none()
-                        && !ctx
-                            .get_box_replacement_operand_opt(field_ref)
-                            .and_then(|cb| cb.const_value())
-                            .is_some()
+                        && !field_is_const
                         && !field_is_virtual
-                        && ctx
-                            .get_box_replacement_operand_opt(field_ref)
-                            .and_then(|cb| cb.const_value())
-                            .is_none()
                     {
                         same_as_targets.push((field_ref, entries.len(), field_idx));
                     }
@@ -1074,9 +1071,9 @@ impl Optimizer {
         let mut installed_heads: majit_ir::vec_set::VecSet<majit_ir::operand::Operand> =
             majit_ir::vec_set::VecSet::new();
         for entry in entries {
-            let head_box = ctx.get_box_replacement_box(entry.head);
+            let head_box = ctx.get_box_replacement_operand_opt(entry.head);
             if let Some(hk) = &head_box {
-                let head_key = majit_ir::operand::Operand::from_boxref(hk);
+                let head_key = hk.clone();
                 if installed_heads.contains(&head_key) {
                     continue;
                 }
@@ -1097,7 +1094,7 @@ impl Optimizer {
                             .map(|(i, r)| (*i, ctx.materialize_operand_at(*r)))
                             .collect();
                         ctx.set_ptr_info(
-                            &Operand::from_boxref(b),
+                            b,
                             crate::optimizeopt::info::PtrInfo::Virtual(
                                 crate::optimizeopt::info::VirtualInfo {
                                     descr: entry.size_descr,
@@ -1119,7 +1116,7 @@ impl Optimizer {
                             .map(|(i, r)| (*i, ctx.materialize_operand_at(*r)))
                             .collect();
                         ctx.set_ptr_info(
-                            &Operand::from_boxref(b),
+                            b,
                             crate::optimizeopt::info::PtrInfo::VirtualStruct(
                                 crate::optimizeopt::info::VirtualStructInfo {
                                     descr: entry.size_descr,
@@ -1219,7 +1216,7 @@ impl Optimizer {
                     .collect();
                 let _ = field_descrs; // descr.all_fielddescrs() is authoritative
                 ctx.set_ptr_info(
-                    &Operand::from_boxref(&head_box),
+                    &head_box,
                     crate::optimizeopt::info::PtrInfo::Virtual(
                         crate::optimizeopt::info::VirtualInfo {
                             descr: descr.clone(),
@@ -1252,7 +1249,7 @@ impl Optimizer {
                     })
                     .collect();
                 ctx.set_ptr_info(
-                    &Operand::from_boxref(&head_box),
+                    &head_box,
                     crate::optimizeopt::info::PtrInfo::VirtualArray(
                         crate::optimizeopt::info::VirtualArrayInfo {
                             descr: descr.clone(),
@@ -1289,7 +1286,7 @@ impl Optimizer {
                     .collect();
                 let _ = field_descrs; // descr.all_fielddescrs() is authoritative
                 ctx.set_ptr_info(
-                    &Operand::from_boxref(&head_box),
+                    &head_box,
                     crate::optimizeopt::info::PtrInfo::VirtualStruct(
                         crate::optimizeopt::info::VirtualStructInfo {
                             descr: descr.clone(),
@@ -1329,7 +1326,7 @@ impl Optimizer {
                     })
                     .collect();
                 ctx.set_ptr_info(
-                    &Operand::from_boxref(&head_box),
+                    &head_box,
                     crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(
                         crate::optimizeopt::info::ArrayStructInfo {
                             descr: descr.clone(),
@@ -1851,31 +1848,26 @@ impl Optimizer {
                 }
             }
         }
-        let resolved_box = ctx.get_box_replacement_box(opref);
-        if resolved_box
-            .as_ref()
-            .map_or(false, |b| ctx.is_virtual(&Operand::from_boxref(b)))
-        {
+        let resolved_op = ctx.get_box_replacement_operand_opt(opref);
+        if resolved_op.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
             // Virtualizable represents an existing heap object with tracked
             // fields — not a deferred allocation. force_box must not take
             // its PtrInfo. RPython parity: Virtualizable is never a "true"
             // virtual (no allocation to emit); it just tracks field state
             // for the standard frame. Calling force_box on it would destroy
             // the tracked state via take_ptr_info.
-            if resolved_box
+            if resolved_op
                 .as_ref()
-                .map_or(false, |b| ctx.is_virtualizable(&Operand::from_boxref(b)))
+                .map_or(false, |b| ctx.is_virtualizable(b))
             {
                 return resolved;
             }
             // RPython: info.force_box() sets _is_virtual=False in-place.
             // Take ownership so the Virtual PtrInfo is removed. force_box_impl
             // installs a non-virtual (Instance/Struct) at the alloc_ref.
-            let resolved_box = resolved_box.expect("recorder-populated");
-            let mut info = ctx
-                .take_ptr_info(&Operand::from_boxref(&resolved_box))
-                .unwrap();
-            let forced = info.force_box(resolved_box, ctx);
+            let resolved_op = resolved_op.expect("recorder-populated");
+            let mut info = ctx.take_ptr_info(&resolved_op).unwrap();
+            let forced = info.force_box(&resolved_op, ctx);
             return ctx.get_replacement_opref(forced);
         }
         resolved
@@ -2696,7 +2688,7 @@ impl Optimizer {
                         let b_source = ctx
                             .get_box_replacement_operand_opt(source)
                             .expect("Phase 2 source inputarg must have a materialized BoxRef slot");
-                        ctx.make_equal_to(&b_source, &Operand::from_boxref(&b_fresh));
+                        ctx.make_equal_to(&b_source, &b_fresh);
                         fresh
                     } else {
                         source
@@ -2886,8 +2878,8 @@ impl Optimizer {
                         // allowing Ref -> Float/Int type substitution at the JUMP.
                     }
                 } else {
-                    let arg = ctx.materialize_box_at(resolved);
-                    terminal_op.setarg(i, majit_ir::operand::Operand::from_boxref(&arg));
+                    let arg = ctx.materialize_operand_at(resolved);
+                    terminal_op.setarg(i, arg);
                 }
             }
             for i in force_needed {
@@ -2897,11 +2889,11 @@ impl Optimizer {
                 // terminal, materializing the host when the forced position
                 // has no producer yet (mirrors the materialize_box_at arm
                 // above; never a position-only fabrication).
-                let b_forced = match ctx.get_box_replacement_box(forced) {
+                let b_forced = match ctx.get_box_replacement_operand_opt(forced) {
                     Some(b) => b,
-                    None => ctx.materialize_box_at(forced),
+                    None => ctx.materialize_operand_at(forced),
                 };
-                terminal_op.setarg(i, majit_ir::operand::Operand::from_boxref(&b_forced));
+                terminal_op.setarg(i, b_forced);
             }
             if self.skip_flush {
                 // flush=False: store for caller to consume.
@@ -3123,13 +3115,10 @@ impl Optimizer {
                                         // bound box up front and forward it to the
                                         // original field box.
                                         let (ff, b_ff) = ctx.reserve_virtual_box(tp);
-                                        let b_orig = ctx.get_box_replacement(orig_field);
-                                        ctx.make_equal_to(
-                                            &Operand::from_boxref(&b_ff),
-                                            &Operand::from_boxref(&b_orig),
-                                        );
+                                        let b_orig = ctx.get_box_replacement_operand(orig_field);
+                                        ctx.make_equal_to(&b_ff, &b_orig);
                                         let _ = ff;
-                                        field.1 = Operand::from_boxref(&b_ff);
+                                        field.1 = b_ff;
                                     }
                                     crate::optimizeopt::info::PtrInfo::Virtual(vinfo)
                                 }
@@ -4440,9 +4429,9 @@ impl Optimizer {
             OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
         ) {
             let new = current_op.arg(0).to_opref();
-            let b_old = BoxRef::from_bound_op(op_rc);
-            let b_new = ctx.get_box_replacement(new);
-            ctx.make_equal_to(&Operand::from_boxref(&b_old), &Operand::from_boxref(&b_new));
+            let b_old = Operand::from_bound_op(op_rc);
+            let b_new = ctx.get_box_replacement_operand(new);
+            ctx.make_equal_to(&b_old, &b_new);
             return Ok(());
         }
 
@@ -5441,9 +5430,9 @@ mod tests {
                     // Replace with first arg
                     let old = op.pos.get();
                     let new = op.arg(0).to_opref();
-                    let b_old = ctx.materialize_box_at(old);
-                    let b_new = ctx.materialize_box_at(new);
-                    ctx.make_equal_to(&Operand::from_boxref(&b_old), &Operand::from_boxref(&b_new));
+                    let b_old = ctx.materialize_operand_at(old);
+                    let b_new = ctx.materialize_operand_at(new);
+                    ctx.make_equal_to(&b_old, &b_new);
                     return OptimizationResult::Remove;
                 }
             }
@@ -5695,15 +5684,9 @@ mod tests {
                 self.queued = true;
 
                 let alloc = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
-                let alloc_box = ctx.materialize_box_at(alloc);
-                let value = ctx.materialize_box_at(OpRef::int_op(0));
-                let mut set = Op::new(
-                    OpCode::SetfieldGc,
-                    &[
-                        Operand::from_boxref(&alloc_box),
-                        Operand::from_boxref(&value),
-                    ],
-                );
+                let alloc_box = ctx.materialize_operand_at(alloc);
+                let value = ctx.materialize_operand_at(OpRef::int_op(0));
+                let mut set = Op::new(OpCode::SetfieldGc, &[alloc_box, value]);
                 set.setdescr(self.field_descr.clone());
                 ctx.emit_extra(ctx.current_pass_idx, set);
             }
@@ -6421,28 +6404,16 @@ mod tests {
                 self.queued = true;
 
                 let alloc_a = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
-                let alloc_a_box = ctx.materialize_box_at(alloc_a);
-                let value_a = ctx.materialize_box_at(OpRef::int_op(0));
-                let mut set_a = Op::new(
-                    OpCode::SetfieldGc,
-                    &[
-                        Operand::from_boxref(&alloc_a_box),
-                        Operand::from_boxref(&value_a),
-                    ],
-                );
+                let alloc_a_box = ctx.materialize_operand_at(alloc_a);
+                let value_a = ctx.materialize_operand_at(OpRef::int_op(0));
+                let mut set_a = Op::new(OpCode::SetfieldGc, &[alloc_a_box, value_a]);
                 set_a.setdescr(self.field_descr.clone());
                 ctx.emit_extra(ctx.current_pass_idx, set_a);
 
                 let alloc_b = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
-                let alloc_b_box = ctx.materialize_box_at(alloc_b);
-                let value_b = ctx.materialize_box_at(OpRef::int_op(1));
-                let mut set_b = Op::new(
-                    OpCode::SetfieldGc,
-                    &[
-                        Operand::from_boxref(&alloc_b_box),
-                        Operand::from_boxref(&value_b),
-                    ],
-                );
+                let alloc_b_box = ctx.materialize_operand_at(alloc_b);
+                let value_b = ctx.materialize_operand_at(OpRef::int_op(1));
+                let mut set_b = Op::new(OpCode::SetfieldGc, &[alloc_b_box, value_b]);
                 set_b.setdescr(self.field_descr.clone());
                 ctx.emit_extra(ctx.current_pass_idx, set_b);
             }
@@ -6851,22 +6822,22 @@ mod tests {
         // for the test, every slot uses Ref to match the producer-side shape
         // (`inputarg_from_tp` per opencoder.py:259 with all Ref args).
         let mut ctx = OptContext::with_inputarg_types(32, &vec![Type::Ref; 1024]);
-        let b10 = ctx.materialize_box_at(OpRef::int_op(10));
+        let b10 = ctx.materialize_operand_at(OpRef::int_op(10));
         ctx.set_ptr_info(
-            &Operand::from_boxref(&b10),
+            &b10,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
-                fields: vec![(1, Operand::from_boxref(&rooted_resop_box(Type::Int, 11)))],
+                fields: vec![(1, rooted_resop_operand(Type::Int, 11))],
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
-        let b11 = ctx.materialize_box_at(OpRef::int_op(11));
-        let b20 = ctx.materialize_box_at(OpRef::int_op(20));
-        ctx.make_equal_to(&Operand::from_boxref(&b11), &Operand::from_boxref(&b20));
-        let b20 = ctx.materialize_box_at(OpRef::int_op(20));
+        let b11 = ctx.materialize_operand_at(OpRef::int_op(11));
+        let b20 = ctx.materialize_operand_at(OpRef::int_op(20));
+        ctx.make_equal_to(&b11, &b20);
+        let b20 = ctx.materialize_operand_at(OpRef::int_op(20));
         ctx.set_ptr_info(
-            &Operand::from_boxref(&b20),
+            &b20,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: Vec::new(),
@@ -6911,17 +6882,17 @@ mod tests {
                 .with_all_fielddescrs(vec![field_descr_typed]),
         );
         let mut ctx = OptContext::with_inputarg_types(16, &[Type::Ref]);
-        let b10 = ctx.materialize_box_at(OpRef::ref_op(10));
+        let b10 = ctx.materialize_operand_at(OpRef::ref_op(10));
         // The field value box is materialized THROUGH the context so it binds
         // to the context's producer host; force_box's `resolve_box_box` then
         // resolves it to a bound box (sheds to Operand::Op), not a fresh
         // position-only `from_opref` box.
-        let field_value = ctx.materialize_box_at(OpRef::int_op(11));
+        let field_value = ctx.materialize_operand_at(OpRef::int_op(11));
         ctx.set_ptr_info(
-            &Operand::from_boxref(&b10),
+            &b10,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
-                fields: vec![(0, Operand::from_boxref(&field_value))],
+                fields: vec![(0, field_value)],
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -6930,9 +6901,7 @@ mod tests {
         let mut opt = Optimizer::new();
         let op = Op::new(
             OpCode::GuardNonnull,
-            &[Operand::from_boxref(
-                &ctx.materialize_box_at(OpRef::ref_op(10)),
-            )],
+            &[ctx.materialize_operand_at(OpRef::ref_op(10))],
         );
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&op));
