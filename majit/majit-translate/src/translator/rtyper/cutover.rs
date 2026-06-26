@@ -656,8 +656,18 @@ fn compare_real_against_legacy(
 /// envelope — closed only by giving slices a class root plus an
 /// iterator Repr (the rlist iterator Repr extended past `SomeList`).
 /// The sibling classdef-less hitters
-/// (`getattr("deref"/"__len__"/"as_str"/"__getitem__")`) close
-/// instead via typed-Ref ClassDef projection.
+/// (`getattr("deref"/"__len__"/"as_str"/"__getitem__")`) close via
+/// foreign-value-type modeling, NOT ClassDef projection: the
+/// receivers are foreign value types (a `Deref` wrapper / `Vec` /
+/// `Wtf8` / a slice), and `deref`/`__len__`/`as_str`/`__getitem__`
+/// are Rust trait methods, not `ClassDef.attrs` field rows.
+/// `ClassDef::find_attribute` (`classdesc.rs`) reads only `attrs[..]`
+/// field rows, so attaching a ClassDef to the receiver cannot
+/// resolve a trait method.  Every classdef-less-instance hitter in
+/// the prepass histogram accesses a foreign-value method
+/// (`to_f64`/`deref`/`__iter__`/`len`/`as_str`/`to_i64`/`index`); none
+/// reads an object struct field, so typed-Ref ClassDef projection
+/// (the object-pointer epic) moves none of them.
 ///
 /// PyPy `bookkeeper.py:108-127` propagates fixpoint failures uncaught;
 /// pyre's dual-gate Skip defers exactly the categories enumerated
@@ -956,6 +966,8 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
 ///    rtyper's `direct_call`.
 pub(crate) fn populate_call_registry_from_call_graphs(
     function_graphs: &crate::codewriter::call::GraphStore,
+    unsafe_fn_stubs: &[(Vec<String>, Signature, LowLevelType)],
+    foreign_opaque_method_externals: &[(Vec<String>, Signature, crate::model::ValueType)],
     registry: &PyreCallRegistry,
 ) -> Result<(), TyperError> {
     // Dedupe by canonical path — RPython `Bookkeeper.getdesc(pyobj)`
@@ -1023,6 +1035,18 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         if canonical_strip == ["lltype", "malloc_typed"] {
             continue;
         }
+        // `pyre_object::lltype::malloc_raw` is the raw (non-GC) allocation
+        // intrinsic (`lltype.malloc(T, flavor='raw')` parity), recognised as
+        // a host builtin (annotator `malloc_raw_alloc`, HOST_ENV
+        // `pyre_object.lltype` module).  Its body calls the analyser-less
+        // `Box::new` / `Box::into_raw`, so lifting it records a poison
+        // lift-error that surfaces on the first raw-allocating caller.  Skip
+        // registering it as a user function for the same reason as
+        // `malloc_typed`: callsites resolve to the HOST_ENV builtin
+        // (translate_op Layer-3b) instead of this failed user-graph entry.
+        if canonical_strip == ["lltype", "malloc_raw"] {
+            continue;
+        }
         let entry = if let Some(canonical_key) = by_canonical_path.get(&canonical_strip) {
             if canonical_key != &key {
                 registry.alias(key.clone(), canonical_key);
@@ -1038,6 +1062,33 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         };
         pending.push((key, graph, entry));
     }
+    // Register `unsafe fn` stubs between Pass 1 (alias explosion) and
+    // Pass 2 (callee lift).  `build_flow.rs:215` rejects unsafe bodies so
+    // they never enter `function_graphs`; without a stub a safe-fn body
+    // lifted in Pass 2 that calls an unsafe callee (`is_cell`,
+    // `is_exception`, …) records a "not registered" lift error and the
+    // caller Skips.  Seeding here — not before Pass 1 — keeps Pass 1's
+    // `registry.alias()` invariant ("alias key already a canonical entry")
+    // intact: the alias explosion has already landed, and neither Pass 2
+    // (lift) nor Pass 3 (class-member binding) calls `alias()`, so a
+    // verbatim single-key stub cannot collide.  `register_unsafe_fn_stubs`
+    // is non-overwriting (skips keys the `function_graphs` pass already
+    // registered) and idempotent.
+    register_unsafe_fn_stubs(registry, unsafe_fn_stubs);
+    // Foreign Rust-stdlib externals (`core::*` / `std::*` / `fmt::*`)
+    // the interpreter calls inline.  Declared opaque here — the rtyper
+    // residualizes them rather than tracing into low-level plumbing, the
+    // `register_external` / `@jit.dont_look_inside` analog.  Same
+    // non-overwriting, between-passes seeding contract as the unsafe-fn
+    // stubs above.
+    register_foreign_stdlib_externals(registry);
+    // Foreign opaque-ADT method externals (`<BigInt as Add>::add`, …) the
+    // LLBC collected.  `impl_method_owner` declines the Method hint for an
+    // opaque owner, so these residualize as `FunctionPath` calls; declare
+    // each external here with its faithful result shell.  Same
+    // non-overwriting, between-passes seeding contract as the foreign-stdlib
+    // and unsafe-fn stubs above.
+    register_foreign_opaque_method_externals(registry, foreign_opaque_method_externals);
     // Pass 2 — prefill the default-cache once per *unique* registry
     // entry.  Aliases already point at the same `Rc<PyreFunctionEntry>`
     // so their `prefill_default_cache` would be redundant; identify
@@ -1315,6 +1366,27 @@ pub(crate) fn build_stub_pygraph_for_unsafe_fn(
     return_lltype: LowLevelType,
 ) -> Option<Rc<PyGraph>> {
     let return_someval = default_someshell_for_lltype(&return_lltype)?;
+    Some(build_stub_pygraph_with_result_shell(
+        name,
+        signature,
+        return_someval,
+    ))
+}
+
+/// Build an annotator-only stub PyGraph whose return Variable carries
+/// `return_someval` directly.  Shared core of
+/// [`build_stub_pygraph_for_unsafe_fn`] (which projects an lltype through
+/// [`default_someshell_for_lltype`]) and the foreign-opaque-method
+/// registration (which carries a `SomeValue` shell built from the
+/// method's faithful result `ValueType` — including the classdef-less
+/// `SomeInstance` that an lltype cannot express).  See
+/// [`build_stub_pygraph_for_unsafe_fn`] for the annotator-only carrier
+/// contract.
+fn build_stub_pygraph_with_result_shell(
+    name: String,
+    signature: Signature,
+    return_someval: crate::annotator::model::SomeValue,
+) -> Rc<PyGraph> {
     let inputargs: Vec<Hlvalue> = signature
         .argnames
         .iter()
@@ -1336,13 +1408,13 @@ pub(crate) fn build_stub_pygraph_for_unsafe_fn(
         None,
     )));
     startblock.closeblock(vec![link]);
-    Some(Rc::new(PyGraph {
+    Rc::new(PyGraph {
         graph: Rc::new(RefCell::new(graph_inner)),
         func,
         signature: RefCell::new(signature),
         defaults: RefCell::new(Some(Vec::new())),
         access_directly: Cell::new(false),
-    }))
+    })
 }
 
 /// Project a `LowLevelType` to a `SomeValue` shell suitable for
@@ -1441,6 +1513,139 @@ pub(crate) fn register_unsafe_fn_stubs(
             // safe fn with the same path).  Don't overwrite.
             continue;
         }
+        registry.register_callee(key, signature.clone(), stub_pygraph);
+    }
+}
+
+/// Foreign Rust-stdlib helper paths the interpreter source calls inline
+/// (`core::*` / `std::*` / `alloc::*` / `fmt::*`) that the rtyper must
+/// treat as opaque externals rather than trace into.
+///
+/// RPython's interpreter never traces into its low-level plumbing — C
+/// helpers are declared with `register_external` / `rffi.llexternal`
+/// (`extfunc.py` / `rffi.py`) so the annotator sees a
+/// `SomeExternalFunction` with a *declared* result annotation and the
+/// JIT residualizes the call (the same effect `@jit.dont_look_inside`
+/// has on a graph).  pyre's interpreter is written in Rust, so the Rust
+/// stdlib is pulled into the lifted call tree; the analog is to declare
+/// these foreign paths external here.  Each entry mirrors a
+/// `register_external(function, args, result)` declaration: a callee
+/// path, the call-site arity, and the result lltype the residual call
+/// produces.
+///
+/// The entries are recurring foreign paths the prepass reaches on cold /
+/// opaque plumbing branches whose declared result lltype is faithful to
+/// the Rust signature (the residual call really does produce that type):
+///
+/// - `core::mem::swap(&mut T, &mut T)` returns `()` — an in-place swap,
+///   `Void` result.
+/// - `core::f64::<Impl>::is_infinite` / `core::slice::<Impl>::is_empty`
+///   return `bool` — `Bool` result.
+/// - `std::f64::<Impl>::floor` returns `f64` — `Float` result.
+///
+/// Paths whose faithful result is a non-scalar value the stub carrier
+/// cannot express (`alloc::fmt::format` → `String`,
+/// `core::array::iter::<Impl>::into_iter` → an iterator with no Repr,
+/// `core::slice::<Impl>::as_ptr` → a raw `*const T`, `core::num::<Impl>::
+/// checked_*` → `Option<i64>`) are intentionally absent: registering
+/// them with a placeholder `Void`/`Signed` result mis-models the value
+/// and only migrates the failure to a deeper annotation wall (union
+/// pollution / raw-pointer modeling), so they stay residual at the
+/// "not registered" Skip until their result type can be modeled.
+const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
+    (&["core", "mem", "swap"], &["x", "y"], LowLevelType::Void),
+    (
+        &["core", "f64", "<Impl>", "is_infinite"],
+        &["self"],
+        LowLevelType::Bool,
+    ),
+    (
+        &["core", "slice", "<Impl>", "is_empty"],
+        &["self"],
+        LowLevelType::Bool,
+    ),
+    (
+        &["std", "f64", "<Impl>", "floor"],
+        &["self"],
+        LowLevelType::Float,
+    ),
+];
+
+/// Register the [`FOREIGN_STDLIB_EXTERNALS`] table into `registry`.
+///
+/// Faithful analog of `extfuncregistry.py`'s `_register` table being
+/// walked into the annotator's external registry: each foreign path is
+/// declared as an opaque external with a fixed signature, registered
+/// through the same opaque stub-pygraph carrier
+/// [`register_unsafe_fn_stubs`] uses, so subsequent
+/// `flowspace_adapter::translate_op` `FunctionPath` lookups resolve the
+/// callee instead of raising "not registered in PyreCallRegistry".  Like
+/// `register_unsafe_fn_stubs` the registration is annotator-only and
+/// non-overwriting: a path already registered by the `function_graphs`
+/// or unsafe-fn pass wins, and the codewriter residualizes the call
+/// through its fnaddr lowering (these foreign stubs are never present in
+/// `CallControl::function_graphs`, so they never compile into JITCode).
+pub(crate) fn register_foreign_stdlib_externals(registry: &PyreCallRegistry) {
+    for (segments, argnames, return_lltype) in FOREIGN_STDLIB_EXTERNALS {
+        let signature = Signature::new(
+            argnames.iter().map(|n| (*n).to_string()).collect(),
+            None,
+            None,
+        );
+        let Some(stub_pygraph) = build_stub_pygraph_for_unsafe_fn(
+            segments.last().copied().unwrap_or_default().to_string(),
+            signature.clone(),
+            return_lltype.clone(),
+        ) else {
+            continue;
+        };
+        let key = FunctionPathKey::from_segments(segments.iter().map(|s| s.to_string()));
+        if registry.lookup(&key).is_some() {
+            continue;
+        }
+        registry.register_callee(key, signature, stub_pygraph);
+    }
+}
+
+/// Register the foreign opaque-ADT method externals
+/// [`crate::front::mir::collect_foreign_opaque_method_externals`] harvested
+/// from the LLBC.
+///
+/// Faithful analog of `register_external` for a method on a foreign opaque
+/// type: the JIT does not trace into `<BigInt as Add>::add` (the
+/// interpreter's cold `@jit.dont_look_inside` overflow→long arm), it emits
+/// a residual call.  [`crate::front::mir::Lowering::impl_method_owner`]
+/// declines the `CallTarget::Method` hint for an opaque owner so the call
+/// lowers as `CallTarget::FunctionPath`; registering each path here lets
+/// the residual lookup resolve instead of raising "not registered in
+/// PyreCallRegistry" (and avoids the classdef-less `SomeInstance.getattr`
+/// panic the Method form would surface).
+///
+/// The result shell comes from the per-method faithful `ValueType` the
+/// collector read off the LLBC output signature — a `Ref(None)`
+/// classdef-less `SomeInstance` for a `BigInt`-returning method (matching
+/// `bigint_from`), or a scalar shell for an integer/float/bool return.
+/// Same non-overwriting, annotator-only-carrier contract as
+/// [`register_foreign_stdlib_externals`].
+pub(crate) fn register_foreign_opaque_method_externals(
+    registry: &PyreCallRegistry,
+    externals: &[(Vec<String>, Signature, crate::model::ValueType)],
+) {
+    for (segments, signature, result_ty) in externals {
+        let Some(return_someval) =
+            crate::codewriter::annotation_state::valuetype_to_someshell(result_ty)
+        else {
+            continue;
+        };
+        let key = FunctionPathKey::from_segments(segments.iter().cloned());
+        if registry.lookup(&key).is_some() {
+            continue;
+        }
+        let stub_pygraph = build_stub_pygraph_with_result_shell(
+            segments.last().cloned().unwrap_or_default(),
+            signature.clone(),
+            return_someval,
+        );
         registry.register_callee(key, signature.clone(), stub_pygraph);
     }
 }

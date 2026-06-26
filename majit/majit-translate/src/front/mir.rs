@@ -267,6 +267,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
             exact_layouts: std::collections::HashMap::new(),
             struct_ids: std::collections::HashMap::new(),
             unsafe_fn_stubs: Vec::new(),
+            foreign_opaque_method_externals: Vec::new(),
         }),
     )
 }
@@ -597,6 +598,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // Populated post-build in `build_semantic_program_via_active_frontend`
         // (it iterates the full LLBC set), mirroring `merge_hints_from_llbcs`.
         unsafe_fn_stubs: Vec::new(),
+        foreign_opaque_method_externals: Vec::new(),
     })
 }
 
@@ -1219,6 +1221,7 @@ pub fn lower_fun_decl_with_static_addrs(
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
             || !lo.next_call_results.is_empty()
+            || !lo.checked_arith_call_results.is_empty()
         {
             // The exception-link transforms run on a simplified graph,
             // as exceptiontransform.py does (graphs reach it after
@@ -1283,7 +1286,27 @@ pub fn lower_fun_decl_with_static_addrs(
         } else {
             crate::front::iter_next::rewire_next_call_sites(&mut lo.graph, &lo.next_call_results)
         };
-        if !lo.result_exc_call_results.is_empty() || result_exc_callee || next_rewritten > 0 {
+        // The checked-arith rewrite (`front::checked_arith`) runs on the
+        // same simplified graph as the `next`-diamond rewrite: the Option
+        // discriminant switch's default→Abort arm must be pruned first,
+        // identically.  It is fail-safe — a non-overflow-fallback `Option`
+        // match is left as the residual call — so it runs over every
+        // recorded site and reports how many it actually rewrote.  Only an
+        // actual rewrite detaches the discriminant switch's block, so the
+        // unreachable-block sweep is gated on that count.
+        let checked_arith_rewritten = if lo.checked_arith_call_results.is_empty() {
+            0
+        } else {
+            crate::front::checked_arith::rewire_checked_arith_call_sites(
+                &mut lo.graph,
+                &lo.checked_arith_call_results,
+            )
+        };
+        if !lo.result_exc_call_results.is_empty()
+            || result_exc_callee
+            || next_rewritten > 0
+            || checked_arith_rewritten > 0
+        {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
         simplify_lowered_graph(&mut lo.graph);
@@ -1600,6 +1623,11 @@ struct Lowering<'a> {
     /// the `next`-diamond rewiring pass (`front::iter_next`) that runs
     /// after the body lowering completes.
     next_call_results: Vec<Variable>,
+    /// `i64::checked_{add,sub,mul}()` call results (`Option<i64>`-typed)
+    /// recorded for the checked-arith rewiring pass
+    /// (`front::checked_arith`) that runs after the body lowering
+    /// completes, rewriting each into an `*_ovf` op + OverflowError edge.
+    checked_arith_call_results: Vec<Variable>,
 }
 
 impl<'a> Lowering<'a> {
@@ -1661,7 +1689,21 @@ impl<'a> Lowering<'a> {
                     // then rtypes as `pair(StringRepr, StringRepr)` rather
                     // than walling at `pair(InstanceRepr, StringRepr)`.
                     .or_else(|| tyref_strips_to_str(&local.ty, llbc).then(|| "str".to_string()))
-                    .or_else(|| tyref_generic_trait_bound_root(&local.ty, llbc, generics)),
+                    .or_else(|| tyref_generic_trait_bound_root(&local.ty, llbc, generics))
+                    // A list-typed param (`Vec<T>`, `&[T]`, …) has no
+                    // named-ADT leaf — `tyref_class_root` answers `None`
+                    // because `adt_node_class_root` excludes the
+                    // core/std/alloc container family from classdef
+                    // minting.  Carry its full monomorphic spelling so
+                    // `derive_subject_inputcells` projects it through the
+                    // annotator's list model (`project_pyre_field_type`)
+                    // instead of the classdef-less `SomeInstance(None)`
+                    // shell, on which a `len()` / iteration would wall at
+                    // `getattr` over a classdef-less instance.
+                    .or_else(|| {
+                        let spelling = tyref_to_ast_string(&local.ty, llbc);
+                        majit_ir::descr::is_list_container_spelling(&spelling).then_some(spelling)
+                    }),
                 _ => None,
             };
             input_ops.push(SpaceOperation {
@@ -1740,6 +1782,7 @@ impl<'a> Lowering<'a> {
             multi_assigned_locals: compute_multi_assigned_locals(body),
             result_exc_call_results: Vec::new(),
             next_call_results: Vec::new(),
+            checked_arith_call_results: Vec::new(),
         })
     }
 
@@ -4525,6 +4568,14 @@ impl<'a> Lowering<'a> {
         }
 
         let class = call.func.classify();
+        // Full `name_path()` of a `CallKind::Fun` callee, captured for the
+        // `Result<T, PyError>` scope decision at the `?`-diamond capture
+        // site below: the built `CallTarget::Method` keeps only the leaf,
+        // losing the module path the scope predicate keys on.  It is the
+        // same string the callee-side gate sees (`fd.item_meta.name_path()`,
+        // `lower_fun_decl_with_static_addrs`), so caller and callee agree on
+        // whether a given callee is scoped.
+        let mut callee_name_path: Option<String> = None;
         let op_kind = match (class, call.func) {
             (CallClass::Direct, CallFunc::Regular(reg))
             | (CallClass::Trait, CallFunc::Regular(reg)) => {
@@ -4936,6 +4987,51 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `<[T]>::len` / `Vec::len` returns the container element
+                // count.  Emit the `__len` operation on the receiver — the
+                // rtyper routes it through the `len` op
+                // (`flowspace_adapter`), which on a `SomeList` receiver
+                // lowers to `AbstractBaseListRepr.rtype_len` — instead of
+                // the `getattr("len")` the generic method fallback emits,
+                // which dead-ends at `Cannot find attribute "len"` on the
+                // list annotation.  Same routing
+                // [`is_concrete_iter_constructor`] gives the container
+                // `iter`.
+                if args.len() == 1 && self.is_container_len(&reg) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__len".to_string()],
+                            },
+                            args: vec![args[0].clone()],
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `Vec::as_slice` / `<[T]>::as_slice` borrows the same
+                // elements as a slice — identity on the list model.  Alias
+                // the result to the receiver so the slice consumer reads
+                // the list directly, instead of the `getattr("as_slice")`
+                // the generic method fallback emits, which dead-ends at
+                // `Cannot find attribute "as_slice"` on the list
+                // annotation.  Same shape as the reflexive identity
+                // aliases below.
+                if args.len() == 1 && self.is_container_as_slice(&reg) {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `alloc::fmt::format` of a no-placeholder constant
                 // message — `format!("literal")`, whose `format_args!`
                 // lowered to `Arguments::from_str` (aliased to its
@@ -4970,6 +5066,10 @@ impl<'a> Lowering<'a> {
                 // `unaryop.rs:3587` (lib test
                 // `generic_handler_graphs_keep_symbolic_fnaddr_surface`).
                 let (segments, method_hint) = self.call_target_segments(mir_bb, &reg)?;
+                // For a method/direct callee this equals the callee's
+                // `name_path()`; the scope predicate keys on the module
+                // path, which the built `CallTarget::Method` drops.
+                callee_name_path = Some(segments.join("::"));
                 if self.try_lower_checked_neg(
                     mir_bb,
                     &reg.kind,
@@ -5259,8 +5359,10 @@ impl<'a> Lowering<'a> {
         // Capture scoped `Result<T, PyError>` call results for the
         // `?`-diamond rewiring pass (`front::result_exc`) that runs
         // after the body lowering completes.
-        if let OpKind::Call { target, .. } = &op_kind
-            && crate::front::result_exc::call_target_in_scope(target)
+        if let OpKind::Call { .. } = &op_kind
+            && callee_name_path
+                .as_deref()
+                .is_some_and(crate::front::result_exc::in_result_exc_scope)
             && crate::front::result_exc::tyref_is_result_of_pyerror(&call.dest.ty, self.llbc)
         {
             // The per-instantiation suffix of the callee's `Result<T,
@@ -5284,6 +5386,20 @@ impl<'a> Lowering<'a> {
             && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
         {
             self.next_call_results.push(result_var.clone());
+        }
+        // Capture `i64::checked_{add,sub,mul}()` results (`Option<i64>`-
+        // typed) for the checked-arith rewiring pass
+        // (`front::checked_arith`), which rewrites each into the native
+        // `*_ovf` op + OverflowError edge.  Recognition is liberal — any
+        // `core::num::<Impl>::checked_*` call returning `Option` — because
+        // the rewrite itself validates the surrounding overflow-fallback
+        // match and declines (leaving the residual call) on any other
+        // shape.
+        if let OpKind::Call { target, .. } = &op_kind
+            && crate::front::checked_arith::is_checked_arith_target(target)
+            && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
+        {
+            self.checked_arith_call_results.push(result_var.clone());
         }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var),
@@ -5481,6 +5597,24 @@ impl<'a> Lowering<'a> {
                     return None;
                 }
                 let td = self.llbc.type_by_id(adt_def_id)?;
+                // A foreign opaque owner (`malachite_bigint::BigInt`,
+                // `Sign`, …) has no extracted body, so the annotator never
+                // mints a `ClassDef` for it — the receiver lands as a
+                // classdef-less `SomeInstance` and a `CallTarget::Method`
+                // getattr panics ("SomeInstance.getattr on classdef-less
+                // instance").  The interpreter's overflow→long arms are the
+                // cold `@jit.dont_look_inside` bailouts that operate on this
+                // opaque value (`bigint_add`/`bigint_sub`/… call
+                // `<BigInt as Add>::add` etc.), so the faithful treatment is
+                // to residualize the call, not trace into the foreign body —
+                // the `register_external` analog.  Declining the Method hint
+                // routes the call through the `FunctionPath` form, which the
+                // call registry resolves to an opaque external
+                // (`register_foreign_opaque_method_externals`) and the
+                // codewriter emits as a residual fnaddr call.
+                if matches!(td.kind, TypeDeclKind::Opaque) {
+                    return None;
+                }
                 let owner = td
                     .item_meta
                     .name_path()
@@ -5976,6 +6110,38 @@ impl<'a> Lowering<'a> {
                 "core::slice::iter::<Impl>::into_iter"
                     | "alloc::vec::<Impl>::into_iter"
                     | "core::array::<Impl>::into_iter"
+            )
+        })
+    }
+
+    /// `<[T]>::len` / `Vec::len` — the container element count.  Lowered
+    /// to the `__len` operation so the receiver's list annotation
+    /// supplies the length through the rtyper's `len` op, the same
+    /// routing [`is_concrete_iter_constructor`] gives the container
+    /// `iter`.
+    fn is_container_len(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "core::slice::<Impl>::len" | "alloc::vec::<Impl>::len"
+            )
+        })
+    }
+
+    /// `Vec::as_slice` / `<[T]>::as_slice` — a borrowed slice view of the
+    /// same elements.  Identity on the list model, so the callsite aliases
+    /// its receiver instead of leaving the unregistered method callee.
+    fn is_container_as_slice(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "core::slice::<Impl>::as_slice" | "alloc::vec::<Impl>::as_slice"
             )
         })
     }
@@ -8247,6 +8413,171 @@ pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
         out.push((segments, Signature::new(argnames, None, None), lltype));
     }
     out
+}
+
+/// Collect, from the lowered MIR, `(path-segments, Signature, result
+/// ValueType)` for every method whose impl-owner is a **foreign opaque**
+/// ADT (`malachite_bigint::bigint::BigInt`, …) and whose result type can
+/// be modeled faithfully.
+///
+/// An opaque owner has no extracted body, so the annotator never mints a
+/// `ClassDef` for it; the receiver lands as a classdef-less
+/// `SomeInstance` and a `CallTarget::Method` getattr panics.  These
+/// methods are the foreign helpers the interpreter's cold
+/// `@jit.dont_look_inside` overflow→long arms operate on
+/// (`<BigInt as Add>::add`, `…::clone`, …), so the faithful treatment is
+/// the `register_external` analog: residualize the call rather than trace
+/// into the foreign body.  [`Lowering::impl_method_owner`] already
+/// declines the `CallTarget::Method` hint for an opaque owner (routing the
+/// call through `CallTarget::FunctionPath`); this collection feeds the
+/// matching registry entries so the `FunctionPath` lookup resolves instead
+/// of raising "not registered in PyreCallRegistry".
+///
+/// The registration key is derived through the SAME
+/// [`impl_method_owner_for_fundecl`] the declined-Method
+/// `call_target_segments` arm uses, so the key equals the call-site
+/// lookup (`[strip_crate(owner.name_path).split("::"), leaf]` —
+/// e.g. `["bigint", "BigInt", "add"]`).
+///
+/// **Faithful result shell — no blanket Ref.**  The result `ValueType` is
+/// read from the method's LLBC output signature:
+///
+/// - output is a scalar literal (`i64` / `f64` / `bool`) → that
+///   `ValueType` (the residual really produces an integer / float / bool);
+/// - output is itself a foreign **opaque** ADT (`BigInt` → `BigInt`,
+///   the `Add`/`Sub`/`Mul`/`clone` cluster) → `Ref(None)`, the
+///   classdef-less `SomeInstance` shell `bigint_from` produces;
+/// - anything else — an `Option<i64>` (`to_i64`), an enum (`sign`), a
+///   tuple, a reference, a non-opaque ADT — is **declined** (no entry),
+///   leaving the method at the original "not registered" Skip.  Modeling
+///   an `Option<i64>` return as a bare integer or as `Ref(None)` would
+///   mis-type the value and only migrate the failure to a deeper wall, so
+///   those methods stay residual until their result type can be modeled.
+pub(crate) fn collect_foreign_opaque_method_externals(
+    llbc: &Llbc,
+) -> Vec<(
+    Vec<String>,
+    crate::flowspace::argument::Signature,
+    ValueType,
+)> {
+    use crate::flowspace::argument::Signature;
+    let mut out = Vec::new();
+    for fd in llbc.iter_local_fns() {
+        if fd.is_global_initializer.is_some() {
+            continue;
+        }
+        // Owner must be an impl-block method on an opaque ADT, with the
+        // owner ADT as the first (`self`) input.  `impl_method_owner_for_fundecl`
+        // resolves the owner's qualified name; the explicit opaque-kind +
+        // self-receiver checks here mirror the gate `impl_method_owner`
+        // applies before declining the Method hint.
+        let Some((owner_qualified, leaf)) = impl_method_owner_for_fundecl(llbc, fd) else {
+            continue;
+        };
+        let Some(owner_def_id) = impl_owner_adt_def_id_for_fundecl(llbc, fd) else {
+            continue;
+        };
+        let Some(owner_td) = llbc.type_by_id(owner_def_id) else {
+            continue;
+        };
+        if !matches!(owner_td.kind, TypeDeclKind::Opaque) {
+            continue;
+        }
+        if !first_input_is_adt_free(llbc, fd, owner_def_id) {
+            continue;
+        }
+        // Faithful result shell read from the LLBC output signature; a
+        // result type that cannot be modeled (Option / enum / tuple /
+        // reference / non-opaque ADT) declines the method.
+        let Some(result_ty) = foreign_opaque_method_result_valuetype(&fd.signature.output, llbc)
+        else {
+            continue;
+        };
+        let mut segments: Vec<String> = owner_qualified.split("::").map(str::to_string).collect();
+        segments.push(leaf);
+        let body = fd.unstructured();
+        let argnames: Vec<String> = (0..fd.signature.inputs.len())
+            .map(|i| {
+                body.as_ref()
+                    .and_then(|u| u.locals.locals.get(i + 1))
+                    .and_then(|l| l.name.clone())
+                    .unwrap_or_else(|| format!("arg{i}"))
+            })
+            .collect();
+        out.push((segments, Signature::new(argnames, None, None), result_ty));
+    }
+    out
+}
+
+/// Resolve the impl-owner ADT `def_id` of an impl-block method `fd`
+/// directly from its `<Impl>` NameSeg, the free-function twin of
+/// [`Lowering::resolve_impl_owner_adt_def_id`] over the `<Impl>` segment.
+fn impl_owner_adt_def_id_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<u64> {
+    let segs = &fd.item_meta.name;
+    let last_idx = segs
+        .iter()
+        .rposition(|s| matches!(s, NameSeg::Ident { .. }))?;
+    if last_idx == 0 {
+        return None;
+    }
+    let impl_payload = match &segs[last_idx - 1] {
+        NameSeg::Other(v) => v.as_object()?.get("Impl")?,
+        _ => return None,
+    };
+    resolve_impl_owner_adt_def_id_free(llbc, impl_payload)
+}
+
+/// Free-function twin of [`Lowering::first_input_is_adt`]: true when the
+/// method's first input (`self`, possibly behind `&`/`&mut`/`*`) is the
+/// owner ADT.
+fn first_input_is_adt_free(llbc: &Llbc, fd: &FunDecl, adt_def_id: u64) -> bool {
+    fd.signature
+        .inputs
+        .first()
+        .and_then(|t| tyref_node(t, llbc))
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+        .and_then(adt_node_def_id)
+        .is_some_and(|id| id == adt_def_id)
+}
+
+/// Faithful result `ValueType` for a residualized foreign-opaque method,
+/// or `None` to decline (see [`collect_foreign_opaque_method_externals`]).
+/// A scalar literal output keeps its `ValueType`; an opaque-ADT output
+/// projects to `Ref(None)`; every other shape (`Option`, enum, tuple,
+/// reference, non-opaque ADT) is declined.
+fn foreign_opaque_method_result_valuetype(output: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    // A reference return (`&T`) is not the owned residual result the
+    // stub models; decline.
+    if output_type_is_ref(output, llbc) {
+        return None;
+    }
+    match tyref_to_value_type(output, llbc) {
+        // Scalar literal results are produced directly by the residual.
+        vt @ (ValueType::Int | ValueType::Unsigned | ValueType::Float | ValueType::Bool) => {
+            Some(vt)
+        }
+        // A `Ref` projection covers every non-scalar ADT shape (`BigInt`,
+        // `Option<i64>`, tuples, …).  Accept it ONLY when the result ADT
+        // is itself a foreign opaque type (the `BigInt`-returning
+        // arithmetic cluster), which the classdef-less `SomeInstance`
+        // shell models faithfully.  A non-opaque ADT (`Option`, an enum)
+        // would be mis-typed as an opaque GcRef, so decline it.
+        ValueType::Ref(_) => {
+            let def_id = output_adt_def_id_free(output, llbc)?;
+            let td = llbc.type_by_id(def_id)?;
+            matches!(td.kind, TypeDeclKind::Opaque).then_some(ValueType::Ref(None))
+        }
+        _ => None,
+    }
+}
+
+/// Free-function twin of [`Lowering::tyref_adt_def_id`]: resolve a
+/// `TyRef`'s ADT `def_id`, following the dedup index for a `Dedup` shape.
+fn output_adt_def_id_free(ty: &TyRef, llbc: &Llbc) -> Option<u64> {
+    match ty {
+        TyRef::Inline { value: (_, v) } | TyRef::Other(v) => inline_adt_def_id(v),
+        TyRef::Dedup { id } => llbc.dedup_to_adt_def_id(*id),
+    }
 }
 
 /// Free-function version of [`Lowering::resolve_impl_owner_adt_def_id`].

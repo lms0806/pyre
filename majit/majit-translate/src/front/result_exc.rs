@@ -86,6 +86,20 @@ const RESULT_EXC_LOWERING_SCOPE: &[&str] = &[
     "store_fast_store_fast",
     "close_loop_args",
     "null_value",
+    // Read/load checked-value cluster — the symmetric read counterpart
+    // of the store cluster above.  Each `*_checked_value` is a sink
+    // (`load_*_value()?; guard_nonnull_value()?; Ok(value)`) whose two
+    // `?`-diamonds lower over the residual `load_*_value` /
+    // `guard_nonnull_value` leaves; `load_global_value` tail-forwards
+    // `load_name_value`.  None reach `push_value`, so the cluster is a
+    // self-contained connected component.
+    "load_local_value",
+    "load_name_value",
+    "load_global_value",
+    "guard_nonnull_value",
+    "load_local_checked_value",
+    "load_name_checked_value",
+    "load_global_checked_value",
 ];
 
 /// Dispatch-wrapper family rule: every `pyopcode::execute_*` wrapper —
@@ -109,19 +123,6 @@ pub(crate) fn in_result_exc_scope(name_path: &str) -> bool {
         .iter()
         .any(|scoped| name_path == *scoped || leaf == *scoped)
         || in_execute_wrapper_family(name_path, leaf)
-}
-
-/// True when a call target's leaf names a scoped callee.
-pub(crate) fn call_target_in_scope(target: &CallTarget) -> bool {
-    match target {
-        CallTarget::Method { name, .. } => RESULT_EXC_LOWERING_SCOPE.contains(&name.as_str()),
-        CallTarget::FunctionPath { segments } => {
-            let leaf = segments.last().map(String::as_str).unwrap_or("");
-            RESULT_EXC_LOWERING_SCOPE.contains(&leaf)
-                || (segments.iter().any(|s| s == "pyopcode") && leaf.starts_with("execute_"))
-        }
-        _ => false,
-    }
 }
 
 /// Resolve the JSON body behind a generics slot — `{"Deduplicated":
@@ -549,7 +550,7 @@ fn count_var_uses(graph: &FunctionGraph, var: &Variable) -> UseCounts {
 /// a new `OpKind` variant is a compile error here until its operands are
 /// declared, keeping the pass fail-closed.  Producer / constant / marker
 /// kinds carry no operand `Variable` and return empty.
-fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
+pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
     let extend_all = |dst: &mut Vec<Variable>, lists: &[&Vec<Variable>]| {
         for list in lists {
             dst.extend(list.iter().cloned());

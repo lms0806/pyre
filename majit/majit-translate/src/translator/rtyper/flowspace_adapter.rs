@@ -784,6 +784,15 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
                 | "pow"
                 | "lshift"
                 | "rshift"
+                // The `_ovf` arithmetic twins carry `[OverflowError]`
+                // (operation.py:760-761 `_add_except_ovf`;
+                // `OpKind::{Add,Sub,Mul}Ovf.canraise()`).  The front-end
+                // emits them only at a `LastException` block whose
+                // `raising_op` is the `_ovf` op (`front::checked_arith`),
+                // so they must classify as raising.
+                | "add_ovf"
+                | "sub_ovf"
+                | "mul_ovf"
                 | "add_assign"
                 | "sub_assign"
                 | "mul_assign"
@@ -2315,6 +2324,21 @@ pub(crate) fn derive_subject_inputcells(
             // classdef-less shell, narrowed by call-propagation as before
             // (`description.py:283-305 FunctionDesc.pycall`).
             if matches!(ty, crate::model::ValueType::Ref(_)) {
+                // A list-typed param (`Vec<T>`, `&[T]`, …) carries its
+                // full monomorphic spelling as `class_root` (the named-ADT
+                // root resolver excludes the core/std/alloc container
+                // family precisely so the receiver projects to the
+                // annotator's list model here, not a minted classdef).
+                // `project_pyre_field_type` maps the spelling to
+                // `SomeList(elem)` so a `len()` / iteration on the receiver
+                // resolves as a list op instead of `getattr` over the
+                // classdef-less `SomeInstance(None)` shell.
+                if let (Some(bk), Some(root)) = (bookkeeper, class_root.as_deref()) {
+                    if majit_ir::descr::is_list_container_spelling(root) {
+                        cells.push(bk.project_pyre_field_type(root));
+                        continue;
+                    }
+                }
                 // String-typed params are string values, not class
                 // instances: `String` and `str` both map to the byte
                 // string type (`s_str0` = `SomeString(no_nul=True)`,
@@ -2355,6 +2379,17 @@ pub(crate) fn derive_subject_inputcells(
                         .as_ref()
                         .is_some_and(|reg| reg.fields.contains_key(root));
                     if known {
+                        // A `&FixedObjectArray` receiver models as its
+                        // `_items` element list, not the wrapping struct
+                        // (project_pyre_field_type), so an `arr[idx]` access
+                        // resolves as a list `getitem` rather than rewriting
+                        // to `getattr("__getitem__")`.
+                        if majit_ir::descr::canonical_struct_name(root)
+                            == "object_array::FixedObjectArray"
+                        {
+                            cells.push(bk.project_pyre_field_type(root));
+                            continue;
+                        }
                         let cd = bk.getuniqueclassdef_for_struct_root(root).map_err(|e| {
                             TyperError::message(format!(
                                 "derive_subject_inputcells: startblock.inputargs[{idx}] \

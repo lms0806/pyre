@@ -300,6 +300,12 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "pyre_object.lltype.malloc_typed",
         malloc_typed_alloc,
     );
+    // `pyre_object::lltype::malloc_raw` — the raw (non-GC) allocation
+    // intrinsic (`lltype.malloc(T, flavor='raw')` parity).  Recognising it
+    // as a builtin keeps its `Box::new` / `Box::into_raw` body out of the
+    // looked-inside set (neither has an analyser), the same boundary the
+    // `malloc_typed` registration draws around `GcType::type_id`.
+    analyzer_for(&mut reg, "pyre_object.lltype.malloc_raw", malloc_raw_alloc);
     // Rust `std::ptr::eq(p, q) -> bool` — registered under the dotted
     // qualname that `HostEnv::bootstrap` assigns to the HOST_ENV stub
     // (`flowspace/model.rs:1910`).  Lowers identity checks in
@@ -354,6 +360,9 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     analyzer_for(&mut reg, "i64.from", primitive_integer_conversion);
     analyzer_for(&mut reg, "i64.try_from", primitive_integer_conversion);
     analyzer_for(&mut reg, "usize.try_from", primitive_integer_conversion);
+    // `BigInt::from(i64)` — boxes a machine int into the foreign opaque
+    // `BigInt` (Python `long`); returns the classdef-less GcRef shell.
+    analyzer_for(&mut reg, "BigInt.from", bigint_from);
     // `rarithmetic.r_uint` is routed via
     // `ExtRegistryEntry::ForType` (rarithmetic.py:572-582 `ForTypeEntry`):
     // bookkeeper's BUILTIN_ANALYZERS miss falls through to
@@ -1368,6 +1377,38 @@ fn string_constructor(
     Ok(SomeValue::String(SomeString::new(false, false)))
 }
 
+/// Analyzer for `BigInt::from(i64)` — the `From<i64>` impl that boxes a
+/// machine integer into the arbitrary-precision `BigInt` the interpreter
+/// uses for Python `long`.  `BigInt` is a foreign Rust value with no
+/// Repr: in the JIT the overflow→long arm is the cold `guard_no_overflow`
+/// bailout (`@jit.dont_look_inside` in `rbigint`), never traced inline,
+/// so the value stays opaque.  Model the result as a classdef-less
+/// `SomeInstance` — the same foreign-opaque GcRef shell
+/// `annotation_state::ref_fallback_instance` gives an unregistered
+/// host-struct pointee.  It projects to `ValueType::Ref(None)`
+/// (`somevalue_to_valuetype`), matching the `result_kind = 'r'` the
+/// `bigint_add`/`bigint_sub`/`bigint_mul` residuals produce.
+///
+/// This retires the `SomeBuiltin.call(): no analyser registered for
+/// BigInt.from` wall.  It does not by itself carry the cold long arm to
+/// Match: the next operation on the boxed value (the `+`/`-`/`*` operator
+/// → a `<BigInt as Add>::add` method call, or `as_bigint`/`bigint_result`'s
+/// `.to_i64()`/`.div_floor()`/`.sign()` …) is a method/operator call on
+/// the opaque shell that `SomeInstance.getattr` rejects as classdef-less.
+/// Residualizing those foreign-method calls on an opaque instance is a
+/// separate port.
+fn bigint_from(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(SomeValue::Instance(SomeInstance::new(
+        None,
+        false,
+        std::collections::BTreeMap::new(),
+    )))
+}
+
 /// Analyzer for the `majit_metainterp` crate's `pub fn -> bool` flag
 /// helpers.  Single implementation covers both `majit_log_enabled()`
 /// (logging gate) and `jit::we_are_jitted()` (JIT-context probe);
@@ -1606,6 +1647,49 @@ pub fn malloc_typed_alloc(
         other => Err(AnnotatorError::new(format!(
             "malloc_typed(): expected a struct value to box, got {other:?}"
         ))),
+    }
+}
+
+/// Analyzer for `pyre_object::lltype::malloc_raw::<T>(value: T) -> *mut T`
+/// — the raw (`lltype.malloc(T, flavor='raw')` parity) heap allocation.
+/// Registered as a builtin so the body is NEVER looked-inside: it calls
+/// `Box::new` / `Box::into_raw`, neither of which carries an analyser (the
+/// `Box.*` HOST_ENV stubs have no analyzer wired), so a body lift would
+/// poison every raw-allocating caller with "no analyser registered for
+/// Box.new".  Unlike `malloc_typed` (struct-only, `flavor='gc'`), the raw
+/// flavor allocates ANY `T` — an opaque foreign payload (`*mut BigInt`, the
+/// `int` overflow path), a `*mut String`, a `*mut Vec`, or a pyre struct
+/// (`DictStorage`, `FrameBlock`, …) — so the `*mut T` result carries the
+/// same value identity as the argument and the arg shape is passed through
+/// unchanged.  A successful raw malloc returns a non-null pointer to that
+/// payload, so an `Instance` result drops its `can_be_none` (OOM takes the
+/// MemoryError edge, not a null result).
+///
+/// Like [`malloc_typed_alloc`], the result models the freshly-allocated
+/// object by its value/instance shape, not `ann_malloc`'s `SomePtr(Ptr(T))`
+/// (lltype.py:2242): the allocation feeds the boxing / `NewWithVtable` path
+/// that consumes the object directly, so a `SomePtr` wrapper here would
+/// diverge from the established `malloc_typed` result modeling.
+pub fn malloc_raw_alloc(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 1 {
+        return Err(AnnotatorError::new(
+            "malloc_raw() expects a single (value) positional argument",
+        ));
+    }
+    match arg_at(args_s, 0, "malloc_raw") {
+        SomeValue::Instance(inst) => Ok(SomeValue::Instance(SomeInstance::new(
+            inst.classdef.clone(),
+            false,
+            Default::default(),
+        ))),
+        // Any other payload shape (`SomeString`, `SomeList`, …) round-trips
+        // through the `*mut T` pointer unchanged — the raw flavor does not
+        // narrow the pointee.
+        other => Ok(other.clone()),
     }
 }
 
