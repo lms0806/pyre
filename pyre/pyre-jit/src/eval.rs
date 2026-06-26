@@ -381,15 +381,24 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
 /// elements and rewrites the block. The block is exact-size for tuples
 /// (`capacity == len`, every slot written by `alloc_tuple_items_block`).
 unsafe fn tuple_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    let tuple = unsafe { &*(obj_addr as *const pyre_object::tupleobject::W_TupleObject) };
+    let tuple_ptr = obj_addr as *mut pyre_object::tupleobject::W_TupleObject;
+    let tuple = unsafe { &*tuple_ptr };
     let block = tuple.wrappeditems;
     if block.is_null() {
         return;
     }
-    let cap = unsafe { pyre_object::object_array::items_block_capacity(block) };
-    let base = unsafe { pyre_object::object_array::items_block_items_base(block) };
-    for i in 0..cap {
-        f(unsafe { base.add(i) } as *mut majit_ir::GcRef);
+    if pyre_object::gc_hook::try_gc_owns_object(block as *mut u8) {
+        // Phase L2: forward the `wrappeditems` field slot; the type-9 varsize
+        // walker forwards items[0..capacity] (tuples are exact-size).
+        let items_slot = unsafe { std::ptr::addr_of_mut!((*tuple_ptr).wrappeditems) };
+        f(items_slot as *mut majit_ir::GcRef);
+    } else {
+        // std::alloc stationary block: forward each element in place.
+        let cap = unsafe { pyre_object::object_array::items_block_capacity(block) };
+        let base = unsafe { pyre_object::object_array::items_block_items_base(block) };
+        for i in 0..cap {
+            f(unsafe { base.add(i) } as *mut majit_ir::GcRef);
+        }
     }
 }
 
@@ -407,13 +416,25 @@ unsafe fn tuple_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maji
 /// spare tail past the live length may hold stale pointers a shrink left
 /// behind.
 unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    let list = unsafe { &*(obj_addr as *const pyre_object::listobject::W_ListObject) };
+    let list_ptr = obj_addr as *mut pyre_object::listobject::W_ListObject;
+    let list = unsafe { &*list_ptr };
     if list.strategy != pyre_object::listobject::ListStrategy::Object || list.items.is_null() {
         return;
     }
-    let base = unsafe { pyre_object::object_array::items_block_items_base(list.items) };
-    for i in 0..list.length {
-        f(unsafe { base.add(i) } as *mut majit_ir::GcRef);
+    if pyre_object::gc_hook::try_gc_owns_object(list.items as *mut u8) {
+        // Phase L2: a GC-managed (moving) block is forwarded by handing the
+        // collector the `items` field slot itself; the type-9 varsize walker
+        // then forwards items[0..capacity] (spare slots are NULL). This is
+        // the `gc_ptr_offsets = [offset_of!(items)]` edge that collector.rs:377
+        // declines while the block stays std::alloc.
+        let items_slot = unsafe { std::ptr::addr_of_mut!((*list_ptr).items) };
+        f(items_slot as *mut majit_ir::GcRef);
+    } else {
+        // std::alloc stationary block: forward each live element in place.
+        let base = unsafe { pyre_object::object_array::items_block_items_base(list.items) };
+        for i in 0..list.length {
+            f(unsafe { base.add(i) } as *mut majit_ir::GcRef);
+        }
     }
 }
 
@@ -1367,14 +1388,16 @@ thread_local! {
         // guard below.  This keeps the net register-call count up to
         // `W_MODULE_DICT_GC_TYPE_ID = 48` unchanged (one explicit
         // registration here, one fewer from the loop), so no downstream
-        // hardcoded tid shifts.  `PyCode` carries only raw /
-        // non-GC pointers today (`code_ptr`, `w_globals`,
-        // `globals_caches`), so it registers with empty gc_ptr offsets;
-        // it has no `w_globals` PyObjectRef slot to trace.
-        // Allocation still routes through `Box::into_raw`
-        // (`w_code_new` → `malloc_typed`), so this registration is inert
-        // — the collector never reaches a code object until `w_code_new`
-        // is switched to `try_gc_alloc_stable`.
+        // hardcoded tid shifts.  Allocation routes through `Box::into_raw`
+        // (`w_code_new`), so this TypeInfo trace never fires and it registers
+        // with empty gc_ptr offsets.  Its one movable GCREF slot, `w_globals`
+        // (the cached globals dict object — movable for `exec`/custom-globals
+        // dicts), is instead forwarded as a root by
+        // `pyre_interpreter::eval::walk_raw_code_roots`, reached through
+        // `walk_raw_function_roots` (`func.code`) and the frame root walk
+        // (`frame.pycode`); a Box-immortal code object is never reachable by
+        // tracing into it.  This registration stays inert until `w_code_new`
+        // switches to `try_gc_alloc_stable`.
         let w_code_tid = gc.register_type(TypeInfo::object_subclass(
             std::mem::size_of::<pyre_interpreter::pycode::PyCode>(),
             object_tid,
@@ -7409,11 +7432,10 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
 mod tests {
     use super::*;
 
-    /// The frame's globals `DictStorage`, resolved through the canonical
-    /// `w_globals`'s `dict_storage_proxy`.
-    unsafe fn frame_globals_storage(frame: &PyFrame) -> *const pyre_interpreter::DictStorage {
-        pyre_object::dictmultiobject::w_dict_get_dict_storage_proxy(frame.w_globals)
-            as *const pyre_interpreter::DictStorage
+    /// Read a global by name from the frame's canonical `w_globals` object.
+    fn frame_global(frame: &PyFrame, name: &str) -> pyre_object::PyObjectRef {
+        unsafe { pyre_object::w_dict_getitem_str(frame.get_w_globals(), name) }
+            .unwrap_or_else(|| panic!("namespace should contain {name}"))
     }
 
     struct TestJitParamsGuard;
@@ -9083,7 +9105,7 @@ mod tests {
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let x = *(*frame_globals_storage(&frame)).get("x").unwrap();
+            let x = frame_global(&frame, "x");
             assert_eq!(pyre_object::intobject::w_int_get_value(x), 3);
         }
     }
@@ -9101,7 +9123,7 @@ while i < 20:
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let s = *(*frame_globals_storage(&frame)).get("s").unwrap();
+            let s = frame_global(&frame, "s");
             assert_eq!(pyre_object::intobject::w_int_get_value(s), 190);
         }
     }
@@ -9165,18 +9187,17 @@ r = acc",
         let mut frame = PyFrame::new(code);
         let result = eval_with_jit(&mut frame);
         if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
-            let mut keys: Vec<String> = unsafe {
-                (*frame_globals_storage(&frame))
-                    .keys()
-                    .map(|k| k.to_string())
-                    .collect()
-            };
+            let mut keys: Vec<String> =
+                unsafe { pyre_object::w_dict_str_entries(frame.get_w_globals()) }
+                    .into_iter()
+                    .map(|(k, _)| k)
+                    .collect();
             keys.sort();
             eprintln!("module result: {:?}", result);
             eprintln!("module namespace keys: {:?}", keys);
         }
         unsafe {
-            let r = *(*frame_globals_storage(&frame)).get("r").unwrap();
+            let r = frame_global(&frame, "r");
             assert_eq!(pyre_object::intobject::w_int_get_value(r), 6);
         }
     }
@@ -9204,7 +9225,7 @@ result = fib(12)
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let result = *(*frame_globals_storage(&frame)).get("result").unwrap();
+            let result = frame_global(&frame, "result");
             assert_eq!(
                 pyre_object::intobject::w_int_get_value(result),
                 144,
@@ -9253,8 +9274,8 @@ second = g(9)";
                 .expect("frame construction failed");
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let first = *(*frame_globals_storage(&frame)).get("first").unwrap();
-            let second = *(*frame_globals_storage(&frame)).get("second").unwrap();
+            let first = frame_global(&frame, "first");
+            let second = frame_global(&frame, "second");
             assert_eq!(pyre_object::intobject::w_int_get_value(first), 88);
             assert_eq!(pyre_object::intobject::w_int_get_value(second), 176);
         }
@@ -9289,7 +9310,7 @@ while i < 40:
                 .expect("frame construction failed");
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let s = *(*frame_globals_storage(&frame)).get("s").unwrap();
+            let s = frame_global(&frame, "s");
             assert_eq!(pyre_object::intobject::w_int_get_value(s), 3_900);
         }
     }
@@ -9330,7 +9351,7 @@ while i < 40:
                 .expect("frame construction failed");
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let s = *(*frame_globals_storage(&frame)).get("s").unwrap();
+            let s = frame_global(&frame, "s");
             assert_eq!(pyre_object::intobject::w_int_get_value(s), 21_320);
         }
     }
@@ -9456,8 +9477,8 @@ while i < 40:
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let s = *(*frame_globals_storage(&frame)).get("s").unwrap();
-            let q = *(*frame_globals_storage(&frame)).get("q").unwrap();
+            let s = frame_global(&frame, "s");
+            let q = frame_global(&frame, "q");
             assert_eq!(pyre_object::intobject::w_int_get_value(s), 220);
             assert_eq!(
                 pyre_object::intobject::w_int_get_value(

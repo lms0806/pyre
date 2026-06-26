@@ -4481,7 +4481,7 @@ fn exec_or_eval(
     // pypy/interpreter/pyopcode.py:771-776 — `code.exec_code(space,
     // w_globals, w_locals, outer_func)` runs the frame on the
     // user-supplied dict directly.  Pyre routes locals through
-    // `frame.setdictscope_object(w_locals)` so STORE_NAME / LOAD_NAME /
+    // `frame.setdictscope(w_locals)` so STORE_NAME / LOAD_NAME /
     // DELETE_NAME dispatch via `space.setitem` / `space.getitem` /
     // `space.delitem` on the live mapping (dict subclass `__getitem__`
     // overrides win, alias mutations are visible immediately, and
@@ -4506,7 +4506,7 @@ fn exec_or_eval(
         // pyframe.py:540 getdictscope returns the caller's
         // w_locals (PyObjectRef) — same dict-or-mapping the
         // interpreter sees inside the calling function body.
-        implicit_caller_locals = unsafe { (*caller_frame).getdictscope_w()? };
+        implicit_caller_locals = unsafe { (*caller_frame).getdictscope()? };
     }
     let mut locals_object_arg: pyre_object::PyObjectRef = std::ptr::null_mut();
     if !is_none_or_null(locals_arg) {
@@ -4514,14 +4514,14 @@ fn exec_or_eval(
             !is_none_or_null(globals_arg) && std::ptr::eq(locals_arg, globals_arg);
         if !same_as_globals {
             // Dict and non-dict mapping arms share the
-            // setdictscope_object path — for exact dict locals this
+            // setdictscope path — for exact dict locals this
             // matches PyPy's `code.exec_code(space, w_globals,
             // w_locals)` chain (pyopcode.py:776) which feeds
             // `space.setitem(w_locals, name, value)` to STORE_NAME.
             // Pyre's earlier `is_dict_w` arm built a storage copy and
             // drained it back through a `Vec<String>` snapshot to
             // mirror DELETE_GLOBAL while preserving alias mutations;
-            // routing through `setdictscope_object` retires the copy +
+            // routing through `setdictscope` retires the copy +
             // snapshot entirely.
             locals_object_arg = locals_arg;
         }
@@ -4545,7 +4545,7 @@ fn exec_or_eval(
     // module-code arm has already bound w_locals = w_globals, matching
     // PyPy's `exec(src, g)` (and `exec(src, g, l)` where `l is g`).
     if !locals_object_arg.is_null() {
-        frame.setdictscope_object(locals_object_arg)?;
+        frame.setdictscope(locals_object_arg)?;
     } else if !implicit_caller_locals.is_null() {
         // pyopcode.py:2015 — `exec(src)` with no globals/locals uses
         // the caller's `getdictscope()` as locals.  Skip when the
@@ -4556,7 +4556,7 @@ fn exec_or_eval(
         let same_as_globals = !caller_globals_obj.is_null()
             && std::ptr::eq(implicit_caller_locals, caller_globals_obj);
         if !same_as_globals {
-            frame.setdictscope_object(implicit_caller_locals)?;
+            frame.setdictscope(implicit_caller_locals)?;
         }
     }
     // run_with_jit rather than execute_frame so that
@@ -4622,40 +4622,19 @@ fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 "locals() requires an active frame",
             ));
         }
-        // pyframe.py:540 getdictscope: non-dict mapping locals are
-        // returned to caller as the live `w_locals_object` so
-        // `locals()['x'] = ...` goes through the mapping's
-        // `__setitem__` and reads observe the same object the
-        // exec/eval caller passed in.
+        // `interp_inspect.py:7-11 locals` returns
+        // `ec.gettopframe_nohidden().getdictscope()` unconditionally.
+        // `getdictscope` (`pyframe.py:525-530`) always runs `fast2locals()`
+        // before returning `debugdata.w_locals`, so a second `locals()`
+        // re-syncs the mapping with the current fast locals —
+        // `x = 1; locals(); x = 2; locals()["x"]` reads `2`.  `fast2locals`
+        // lazily allocates and caches the mapping on first call, so identity
+        // holds (`locals() is locals()`, and `locals() is globals()` at
+        // module scope where `debugdata.w_locals is w_globals`); for a
+        // non-dict exec/eval mapping it returns that live object and writes
+        // through its `__setitem__`.
         let frame_mut = unsafe { &mut *frame };
-        let w_locals_object = frame_mut.get_w_locals_object();
-        if !w_locals_object.is_null() {
-            return Ok(w_locals_object);
-        }
-        // `pypy/interpreter/pyframe.py:540 getdictscope` runs
-        // `fast2locals()` then returns `self.debugdata.w_locals`.
-        // `fast2locals` (`pyframe.py:557-562`) lazily allocates the
-        // backing dict on first call and stamps it into
-        // `debugdata.w_locals`, so subsequent calls reuse the same
-        // storage — `locals() is locals()` (function scope) and
-        // `locals() is globals()` (module scope, where
-        // `debugdata.w_locals is w_globals`) both hold.  Pyre's
-        // `frame.fast2locals()` follows the same shape; the canonical
-        // W_DictObject for that storage is then resolved via
-        // `dict_storage_to_dict` (mirror_target invariant).
-        frame_mut.fast2locals()?;
-        let w_locals = frame_mut.get_w_locals();
-        if !w_locals.is_null() {
-            return Ok(crate::baseobjspace::dict_storage_to_dict(
-                w_locals as *const _,
-            ));
-        }
-        // Fallback only fires when `fast2locals` neither found a
-        // mapping nor materialised a storage (no fast locals, no
-        // module-level w_globals shadow).  Build a plain dict so
-        // `locals()` still returns *something* in that degenerate
-        // case rather than `None`.
-        Ok(pyre_object::w_dict_new())
+        frame_mut.getdictscope()
     })
 }
 
@@ -4751,19 +4730,10 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 return Ok(w_list_new(vec![]));
             }
             let frame_mut = unsafe { &mut *frame };
-            let w_locals_dict = {
-                let w_locals_object = frame_mut.get_w_locals_object();
-                if !w_locals_object.is_null() {
-                    w_locals_object
-                } else {
-                    frame_mut.fast2locals()?;
-                    let w_locals = frame_mut.get_w_locals();
-                    if w_locals.is_null() {
-                        return Ok(w_list_new(vec![]));
-                    }
-                    crate::baseobjspace::dict_storage_to_dict(w_locals as *const _)
-                }
-            };
+            let w_locals_dict = frame_mut.getdictscope()?;
+            if w_locals_dict.is_null() {
+                return Ok(w_list_new(vec![]));
+            }
             let keys_iter = crate::baseobjspace::iter(w_locals_dict)?;
             let keys = collect_iterable(keys_iter)?;
             builtin_sorted(&[w_list_new(keys)])

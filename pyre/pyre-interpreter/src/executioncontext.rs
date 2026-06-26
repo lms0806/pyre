@@ -166,16 +166,13 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
         let _ = crate::baseobjspace::setattr_str(
             w_frame,
             "f_locals",
+            // pyframe.py:546 fast2locals (run by the trace gate before this
+            // callback) caches the locals mapping in `w_locals`; expose
+            // it directly.  A frame with no locals bound surfaces as None.
             if w_locals.is_null() {
                 pyre_object::w_none()
             } else {
-                // `pypy/interpreter/pyframe.py:546 fast2locals` builds a
-                // regular dict, not a module-strategy dict; function
-                // locals don't need GlobalCache machinery.
-                crate::baseobjspace::dict_storage_to_dict_kind(
-                    w_locals as *const DictStorage,
-                    crate::baseobjspace::DictWrapKind::Instance,
-                )
+                w_locals
             },
         );
         let _ = crate::baseobjspace::setattr_str(
@@ -1635,6 +1632,40 @@ impl ExecutionContext {
             crate::dict_storage_store(&mut ns, "__builtins__", w_builtin);
         }
         ns
+    }
+
+    /// Proxy-less celldict globals for a fresh module (`__main__`, imported
+    /// source modules) — the `dict_storage_proxy`-free analog of
+    /// `fresh_dict_storage`.  Seeds the builtins + `__builtins__` directly into
+    /// the `W_ModuleDictObject`'s authoritative cell storage so the JIT sees a
+    /// stable globals shape up front (same seed-vs-fallback rationale as
+    /// `fresh_dict_storage`), and module `STORE_NAME` / `STORE_GLOBAL` skip the
+    /// legacy proxy fan-out — `maybe_sync_dict_storage_store` no-ops on a null
+    /// proxy, so the per-store `w_str_new` + `DictStorage::insert` +
+    /// back-mirror disappear (the `IntMutableCell` in-place write stands alone,
+    /// matching pypy's `ModuleDictStrategy`).
+    pub fn fresh_module_globals(&self) -> PyObjectRef {
+        let dict = pyre_object::dictmultiobject::w_module_dict_new();
+        // Root the fresh dict across the seeding loop: each
+        // `w_dict_setitem_str_no_proxy` allocates a cell and may trigger a
+        // minor collection that would otherwise reclaim the not-yet-referenced
+        // dict.
+        let _root = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(dict);
+        unsafe {
+            for (k, v) in pyre_object::w_dict_str_entries(self.builtins_module) {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(dict, &k, v);
+            }
+            let w_builtin = self.get_builtin();
+            if !w_builtin.is_null() {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    dict,
+                    "__builtins__",
+                    w_builtin,
+                );
+            }
+        }
+        dict
     }
 
     /// `pypy/module/__builtin__/moduledef.py:Module.__init__` — `space.builtin`

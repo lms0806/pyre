@@ -170,6 +170,10 @@ unsafe fn walk_raw_function_roots(
         }
         let func = &mut *(value as *mut crate::function::Function);
         visitor(&mut *(&mut func.code as *mut *const () as *mut majit_ir::GcRef));
+        // The code object caches its own globals dict (`PyCode.w_globals`),
+        // a movable dict for custom-globals functions; the code is Box-immortal
+        // so the standard tracer never recurses into it.
+        walk_raw_code_roots(func.code as PyObjectRef, visitor);
         visitor(&mut *(&mut func.closure as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.defs_w as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_kw_defs as *mut PyObjectRef as *mut majit_ir::GcRef));
@@ -181,6 +185,24 @@ unsafe fn walk_raw_function_roots(
         visitor(&mut *(&mut func.w_qualname as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_objclass as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_text_signature as *mut PyObjectRef as *mut majit_ir::GcRef));
+    }
+}
+
+/// Forward a Box-immortal `PyCode`'s cached globals dict object
+/// (`pycode.py:105 "w_globals?"`).  Module globals are `malloc_typed`-immortal,
+/// but `exec`/`eval` with a plain dict (or a function built with custom
+/// globals) caches a `try_gc_alloc` movable dict here, which a minor collection
+/// relocates.  The code object itself is Box-immortal, so the standard tracer
+/// never recurses into it; visit the slot as a root the same way
+/// `walk_raw_function_roots` forwards `w_func_globals_obj`.  No-op for non-code
+/// values and inert when the cached dict is non-moving.
+unsafe fn walk_raw_code_roots(value: PyObjectRef, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    unsafe {
+        if value.is_null() || !crate::pycode::is_code(value) {
+            return;
+        }
+        let code = &mut *(value as *mut crate::pycode::PyCode);
+        visitor(&mut *(&mut code.w_globals as *mut PyObjectRef as *mut majit_ir::GcRef));
     }
 }
 
@@ -428,6 +450,10 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                 // inert today.
                 let pycode_slot = &mut (*(frame)).pycode as *mut *const ();
                 visitor(&mut *(pycode_slot as *mut majit_ir::GcRef));
+                // Forward the running code object's cached globals dict.  For
+                // `exec`'d code with a movable (non-module) globals dict and no
+                // owning Function, this frame is the only root that reaches it.
+                walk_raw_code_roots((*(frame)).pycode as PyObjectRef, visitor);
 
                 // PyFrame is normally a GC object in PyPy, so its GCREF
                 // fields are traced before consumers dereference them.
@@ -460,60 +486,18 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                 // globals and was walked earlier in this collection.
                 let w_globals_obj_slot = &mut (*frame).w_globals as *mut PyObjectRef;
                 visitor(&mut *(w_globals_obj_slot as *mut majit_ir::GcRef));
-                // pyframe.py:147 `debugdata.w_locals` (and the pyre-only
-                // `w_locals_object` companion for non-dict mapping
-                // locals) carry GCREFs that survive the frame.
+                // pyframe.py:147 `debugdata.w_locals` (the frame's locals
+                // mapping object) and `w_f_trace` carry GCREFs that survive
+                // the frame; forward both slots.  The locals mapping holds its
+                // own bindings (module globals, class namespace, function
+                // `locals()` dict, or an `exec` mapping), so forwarding the
+                // object pointer keeps the whole namespace reachable.
                 if !(*frame).debugdata.is_null() {
                     let d = &mut *(*frame).debugdata;
-                    let w_locals_object_slot = &mut d.w_locals_object as *mut PyObjectRef;
-                    visitor(&mut *(w_locals_object_slot as *mut majit_ir::GcRef));
+                    let w_locals_slot = &mut d.w_locals as *mut PyObjectRef;
+                    visitor(&mut *(w_locals_slot as *mut majit_ir::GcRef));
                     let w_f_trace_slot = &mut d.w_f_trace as *mut PyObjectRef;
                     visitor(&mut *(w_f_trace_slot as *mut majit_ir::GcRef));
-                    // A NEWLOCALS class body (`setdictscope` with a plain dict,
-                    // call.rs build_class_inner) binds names into
-                    // `debugdata.w_locals` — a raw DictStorage distinct from the
-                    // globals storage and not exposed as `w_locals_object`.  The
-                    // values it stores live nowhere else this walker reaches (the
-                    // globals walk below covers only the globals storage; the
-                    // array walk covers fastlocals), so a minor collection would
-                    // relocate a young binding and leave a dangling ref that
-                    // faults on a later read or guard-failure resume.  Forward
-                    // those values in place, mirroring the globals walk.  Skip
-                    // the module alias (`w_locals` IS the globals storage,
-                    // walked below) and the mapping/object scope (`w_locals`
-                    // null — rooted via `w_locals_object`).
-                    let w_locals = d.w_locals;
-                    let globals_storage = if (*frame).w_globals.is_null() {
-                        std::ptr::null_mut()
-                    } else {
-                        pyre_object::dictmultiobject::w_dict_get_dict_storage_proxy(
-                            (*frame).w_globals,
-                        ) as *mut crate::DictStorage
-                    };
-                    if !w_locals.is_null() && w_locals != globals_storage {
-                        let value_slots: Vec<*mut PyObjectRef> = (&mut *w_locals)
-                            .values_mut()
-                            .iter_mut()
-                            .map(|value| value as *mut PyObjectRef)
-                            .collect();
-                        for value in value_slots {
-                            visitor(&mut *(value as *mut majit_ir::GcRef));
-                            walk_raw_function_roots(*value, visitor);
-                        }
-                        // The class-body namespace's lazily-cached canonical
-                        // `W_DictObject` (the storage's `mirror_target`,
-                        // materialized when the body's locals are accessed as a
-                        // dict) is GC-managed but reachable only through this
-                        // off-GC storage field; forward it so a relocating
-                        // collection updates the cache instead of leaving a
-                        // dangling pointer, mirroring the type-namespace walk
-                        // above and the globals back-mirror below.
-                        if let Some(mirror_slot) = (&mut *w_locals).mirror_target_slot_mut() {
-                            visitor(
-                                &mut *(mirror_slot as *mut PyObjectRef as *mut majit_ir::GcRef),
-                            );
-                        }
-                    }
                 }
                 // pyframe.py:49 `self.w_globals` is the dict OBJECT.  Its slot
                 // was forwarded above (before the debugdata walk), so this
@@ -698,8 +682,8 @@ pub fn walk_suspended_generator_frame(
 
         if !(*frame).debugdata.is_null() {
             let d = &mut *(*frame).debugdata;
-            let w_locals_object_slot = &mut d.w_locals_object as *mut PyObjectRef;
-            visitor(&mut *(w_locals_object_slot as *mut majit_ir::GcRef));
+            let w_locals_slot = &mut d.w_locals as *mut PyObjectRef;
+            visitor(&mut *(w_locals_slot as *mut majit_ir::GcRef));
             let w_f_trace_slot = &mut d.w_f_trace as *mut PyObjectRef;
             visitor(&mut *(w_f_trace_slot as *mut majit_ir::GcRef));
         }
@@ -1461,13 +1445,13 @@ impl NamespaceOpcodeHandler for PyFrame {
     /// Non-dict mapping locals (`exec(src, g, mapping)`,
     /// `pypy/interpreter/pyopcode.py:2003 ensure_ns`) bypass the
     /// `*mut DictStorage` fast path and route through
-    /// `space.getitem(w_locals_object, name)` directly per PyPy
+    /// `space.getitem(w_locals, name)` directly per PyPy
     /// `pyopcode.py:LOAD_NAME` `space.finditem_str(w_locals, name)`.
     fn load_name_value(&mut self, name: &str, nameindex: usize) -> Result<Self::Value, PyError> {
-        let w_locals_object = self.get_w_locals_object();
-        if !w_locals_object.is_null() {
+        let w_locals = self.get_w_locals();
+        if !w_locals.is_null() {
             let key = unsafe { pyre_object::w_str_new(name) };
-            match crate::baseobjspace::getitem(w_locals_object, key) {
+            match crate::baseobjspace::getitem(w_locals, key) {
                 Ok(value) => return Ok(value),
                 Err(err) if matches!(err.kind, PyErrorKind::KeyError) => {
                     // pyopcode.py:LOAD_NAME `if not w_value: w_value =
@@ -1478,13 +1462,7 @@ impl NamespaceOpcodeHandler for PyFrame {
             }
             return self.load_global_value(name, nameindex);
         }
-        let w_locals = self.get_w_locals();
-        if !w_locals.is_null() {
-            let locals = unsafe { &*w_locals };
-            if let Ok(value) = dict_storage_load(locals, name) {
-                return Ok(value);
-            }
-        }
+        // No locals mapping bound (degenerate): fall through to globals.
         self.load_global_value(name, nameindex)
     }
 
@@ -1502,14 +1480,9 @@ impl NamespaceOpcodeHandler for PyFrame {
         _nameindex: usize,
         value: Self::Value,
     ) -> Result<(), PyError> {
-        let w_locals_object = self.get_w_locals_object();
-        if !w_locals_object.is_null() {
-            let key = unsafe { pyre_object::w_str_new(name) };
-            crate::baseobjspace::setitem(w_locals_object, key, value)?;
-            return Ok(());
-        }
-        let ns = unsafe { &mut *self.get_or_create_w_locals() };
-        dict_storage_store(ns, name, value);
+        let w_locals = self.get_or_create_w_locals();
+        let key = unsafe { pyre_object::w_str_new(name) };
+        crate::baseobjspace::setitem(w_locals, key, value)?;
         Ok(())
     }
 
@@ -1527,9 +1500,6 @@ impl NamespaceOpcodeHandler for PyFrame {
             unsafe {
                 pyre_object::dictmultiobject::w_dict_setitem_str(w_globals, name, value);
             }
-        } else {
-            let ns = unsafe { &mut *self.get_w_globals_storage() };
-            dict_storage_store(ns, name, value);
         }
         Ok(())
     }
@@ -2320,13 +2290,12 @@ impl OpcodeStepExecutor for PyFrame {
     /// pyre-equivalent flow runs the bytecode opcode and writes into
     /// the class_locals namespace just like CPython).
     fn setup_annotations(&mut self) -> Result<(), PyError> {
-        let ns = self.getdictscope()?;
-        if ns.is_null() {
-            return Ok(());
-        }
-        let ns = unsafe { &mut *ns };
-        if dict_storage_load(ns, "__annotations__").is_err() {
-            dict_storage_store(ns, "__annotations__", pyre_object::w_dict_new());
+        // Route the `__annotations__` ensure through `space.contains` /
+        // `space.setitem` on the locals mapping object, mirroring STORE_NAME.
+        let w_locals = self.get_or_create_w_locals();
+        let key = unsafe { pyre_object::w_str_new("__annotations__") };
+        if !crate::baseobjspace::contains(w_locals, key)? {
+            crate::baseobjspace::setitem(w_locals, key, pyre_object::w_dict_new())?;
         }
         Ok(())
     }
@@ -2921,13 +2890,6 @@ impl OpcodeStepExecutor for PyFrame {
                 self.push(val);
                 return Ok(());
             }
-        } else {
-            unsafe {
-                if let Some(&val) = (*self.get_w_globals_storage()).get(name) {
-                    self.push(val);
-                    return Ok(());
-                }
-            }
         }
         Err(PyError::name_error_with_name(
             format!("name '{name}' is not defined"),
@@ -3077,40 +3039,18 @@ impl OpcodeStepExecutor for PyFrame {
     // ── delete_name ──
     // pypy/interpreter/pyopcode.py:821 DELETE_NAME — delete from w_locals; KeyError → NameError.
     fn delete_name(&mut self, name: &str) -> Result<(), PyError> {
-        let w_locals_object = self.get_w_locals_object();
-        if !w_locals_object.is_null() {
-            let key = unsafe { pyre_object::w_str_new(name) };
-            crate::baseobjspace::delitem(w_locals_object, key).map_err(|err| {
-                if matches!(err.kind, PyErrorKind::KeyError) {
-                    PyError::name_error_with_name(format!("name '{name}' is not defined"), name)
-                } else {
-                    err
-                }
-            })?;
-            return Ok(());
-        }
-        let w_locals = self.get_w_locals();
-        let w_globals = self.get_w_globals();
-        let found: bool = if !w_locals.is_null() {
-            // No `get_w_locals_obj` accessor yet — locals DictStorage
-            // doesn't have a canonical W_DictObject sibling for routing.
-            unsafe { crate::dict_storage_delete(&mut *w_locals, name) }
-        } else if w_globals.is_null() {
-            let ns = self.get_w_globals_storage();
-            unsafe { crate::dict_storage_delete(&mut *ns, name) }
-        } else {
-            // Globals fallback: route through `w_dict_delitem_str` on
-            // the canonical W_DictObject so the W_ModuleDictObject
-            // strategy and mirror `DictStorage` stay coherent via
-            // `maybe_sync_dict_storage_delete`.
-            unsafe { pyre_object::w_dict_delitem_str(w_globals, name) }
-        };
-        if !found {
-            return Err(PyError::name_error_with_name(
-                format!("name '{name}' is not defined"),
-                name,
-            ));
-        }
+        // `space.delitem(w_locals, w_name)`; at module scope `w_locals` is the
+        // globals dict, so a module DELETE_NAME routes through the canonical
+        // W_DictObject too.  KeyError → NameError.
+        let w_locals = self.get_or_create_w_locals();
+        let key = unsafe { pyre_object::w_str_new(name) };
+        crate::baseobjspace::delitem(w_locals, key).map_err(|err| {
+            if matches!(err.kind, PyErrorKind::KeyError) {
+                PyError::name_error_with_name(format!("name '{name}' is not defined"), name)
+            } else {
+                err
+            }
+        })?;
         Ok(())
     }
 
@@ -3147,14 +3087,8 @@ impl OpcodeStepExecutor for PyFrame {
     // generic `w_obj`.
     fn import_star(&mut self) -> Result<(), PyError> {
         let module = self.pop();
-        let w_locals_object = self.get_w_locals_object();
-        if !w_locals_object.is_null() {
-            crate::importing::import_all_from_w(module, w_locals_object)?;
-            return Ok(());
-        }
-        let w_locals = self.getdictscope()?;
-        crate::importing::import_all_from(module, w_locals)?;
-        self.setdictscope(w_locals)?;
+        let w_locals = self.get_or_create_w_locals();
+        crate::importing::import_all_from_w(module, w_locals)?;
         Ok(())
     }
 
@@ -3677,10 +3611,10 @@ impl OpcodeStepExecutor for PyFrame {
         let dict = pyre_object::w_dict_new();
         unsafe {
             let w_locals = self.get_w_locals();
-            if !w_locals.is_null() {
-                for (key, &value) in (*w_locals).entries() {
+            if !w_locals.is_null() && pyre_object::is_dict(w_locals) {
+                for (key, value) in pyre_object::dictmultiobject::w_dict_items(w_locals) {
                     if !value.is_null() {
-                        pyre_object::w_dict_store(dict, pyre_object::w_str_new(key), value);
+                        pyre_object::w_dict_store(dict, key, value);
                     }
                 }
             } else {
@@ -3698,15 +3632,6 @@ impl OpcodeStepExecutor for PyFrame {
                     {
                         if !value.is_null() {
                             pyre_object::w_dict_store(dict, key, value);
-                        }
-                    }
-                } else {
-                    let w_globals = self.get_w_globals_storage();
-                    if self.nlocals() == 0 && !w_globals.is_null() {
-                        for (key, &value) in (*w_globals).entries() {
-                            if !value.is_null() {
-                                pyre_object::w_dict_store(dict, pyre_object::w_str_new(key), value);
-                            }
                         }
                     }
                 }
@@ -3867,6 +3792,11 @@ mod tests {
     }
 
     fn run_exec_frame(source: &str) -> (PyResult, crate::pyframe::FrameBox) {
+        // Module globals are now a celldict whose str keys hash through the
+        // `hash_w` trampoline (production installs it before the first frame
+        // via `init_jit_hooks`); mirror that here so frame construction can
+        // seed the builtins.
+        crate::test_hooks::install_hash_hook();
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
         let result = frame.execute_frame(None, None);
@@ -3876,9 +3806,11 @@ mod tests {
     #[test]
     fn test_exception_is_valid_obj_as_class_w_matches_baseexception_subclass_rule() {
         let (_result, frame) = run_exec_frame("good = ValueError\nbad = int");
-        let w_globals = unsafe { &*frame.fget_w_globals_storage() };
-        let good = *w_globals.get("good").expect("missing good");
-        let bad = *w_globals.get("bad").expect("missing bad");
+        let w_globals = frame.get_w_globals();
+        let good =
+            unsafe { pyre_object::w_dict_getitem_str(w_globals, "good") }.expect("missing good");
+        let bad =
+            unsafe { pyre_object::w_dict_getitem_str(w_globals, "bad") }.expect("missing bad");
 
         unsafe {
             assert!(crate::baseobjspace::exception_is_valid_obj_as_class_w(good));
@@ -3902,8 +3834,9 @@ mod tests {
         let (_result, frame) = run_exec_frame(
             "def make_adder(n):\n    def add(x):\n        return x + n\n    return add\nresult = make_adder(10)(5)",
         );
-        let w_globals = unsafe { &*frame.fget_w_globals_storage() };
-        let result = *w_globals.get("result").expect("missing result");
+        let w_globals = frame.get_w_globals();
+        let result = unsafe { pyre_object::w_dict_getitem_str(w_globals, "result") }
+            .expect("missing result");
         assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 15);
     }
 
@@ -3917,8 +3850,9 @@ mod tests {
         let (_result, frame) = run_exec_frame(
             "class A:\n    def f(self):\n        return 1\nclass B(A):\n    def f(self):\n        return 10 + super().f()\nresult = B().f()",
         );
-        let w_globals = unsafe { &*frame.fget_w_globals_storage() };
-        let result = *w_globals.get("result").expect("missing result");
+        let w_globals = frame.get_w_globals();
+        let result = unsafe { pyre_object::w_dict_getitem_str(w_globals, "result") }
+            .expect("missing result");
         assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 11);
     }
 
@@ -3936,15 +3870,25 @@ mod tests {
     #[test]
     fn test_raise_from_sets_cause_attribute() {
         let (_result, frame) = run_exec_frame("exc = ValueError()\ncause = KeyError()");
-        let w_globals = unsafe { &*frame.fget_w_globals_storage() };
-        let exc = *w_globals.get("exc").expect("missing exc");
-        let cause = *w_globals.get("cause").expect("missing cause");
+        let w_globals = frame.get_w_globals();
+        let exc =
+            unsafe { pyre_object::w_dict_getitem_str(w_globals, "exc") }.expect("missing exc");
+        let cause =
+            unsafe { pyre_object::w_dict_getitem_str(w_globals, "cause") }.expect("missing cause");
 
         let code = compile_exec("raise exc from cause").expect("compile failed");
         let mut raise_frame = PyFrame::new(code);
         unsafe {
-            (*raise_frame.fget_w_globals_storage()).insert("exc".to_string(), exc);
-            (*raise_frame.fget_w_globals_storage()).insert("cause".to_string(), cause);
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                raise_frame.get_w_globals(),
+                "exc",
+                exc,
+            );
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                raise_frame.get_w_globals(),
+                "cause",
+                cause,
+            );
         }
 
         let err = raise_frame
@@ -5481,11 +5425,15 @@ except (ValueError, 42):
         let (_result, frame) = run_exec_frame(
             "exc = ValueError(\"boom\")\nplain = 5\nvalue_error = ValueError\ntype_error = TypeError",
         );
-        let w_globals = unsafe { &*frame.fget_w_globals_storage() };
-        let exc = *w_globals.get("exc").expect("missing exc");
-        let plain = *w_globals.get("plain").expect("missing plain");
-        let value_error = *w_globals.get("value_error").expect("missing value_error");
-        let type_error = *w_globals.get("type_error").expect("missing type_error");
+        let w_globals = frame.get_w_globals();
+        let exc =
+            unsafe { pyre_object::w_dict_getitem_str(w_globals, "exc") }.expect("missing exc");
+        let plain =
+            unsafe { pyre_object::w_dict_getitem_str(w_globals, "plain") }.expect("missing plain");
+        let value_error = unsafe { pyre_object::w_dict_getitem_str(w_globals, "value_error") }
+            .expect("missing value_error");
+        let type_error = unsafe { pyre_object::w_dict_getitem_str(w_globals, "type_error") }
+            .expect("missing type_error");
 
         assert!(check_exc_match_against(exc, value_error));
         assert!(!check_exc_match_against(exc, type_error));
