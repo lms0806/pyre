@@ -1,3 +1,4 @@
+use super::lower_value::struct_type_id;
 use super::*;
 
 impl<'c> Lowerer<'c> {
@@ -208,8 +209,8 @@ impl<'c> Lowerer<'c> {
         }
         // ref(T) scalar: the RHS must lower to a ref binding (another ref
         // state read or a residual ref-returning call).
-        if let Some(&field_index) = config.state_ref_scalars.get(&member_name) {
-            let fi = field_index as u16;
+        if let Some((field_index, _)) = config.state_ref_scalars.get(&member_name) {
+            let fi = *field_index as u16;
             let binding = self.lower_value_expr(&assign.right)?;
             if !matches!(binding.kind, BindingKind::Ref) {
                 return None;
@@ -630,8 +631,8 @@ impl<'c> Lowerer<'c> {
         }
         // ref(T) scalar: read into the ref register bank so a subsequent
         // getfield_gc reads its struct base from a real ref value.
-        if let Some(&field_index) = config.state_ref_scalars.get(&member_name) {
-            let fi = field_index as u16;
+        if let Some((field_index, _)) = config.state_ref_scalars.get(&member_name) {
+            let fi = *field_index as u16;
             let reg = self.alloc_reg();
             // Declare the ref identity slot as a read so the backward
             // liveness walk keeps it live across guards (mirrors the int
@@ -656,6 +657,226 @@ impl<'c> Lowerer<'c> {
             });
         }
         None
+    }
+
+    /// Recognizes a field READ through a `ref(T)` state scalar:
+    /// `state.<ref_scalar>.<member>` → `getfield_gc_i` on the heap object the
+    /// ref points at.  Unlike the residual-call form (an opaque CALL_I whose
+    /// result the optimizer can neither re-produce in the short preamble nor
+    /// invalidate on a write), a `getfield_gc` on a non-immutable field is
+    /// re-readable each loop entry and is invalidated by a matching
+    /// `setfield_gc` on the same `(struct_type_id, field)` — mirroring an
+    /// RPython `len(obj)`/`obj.field` getfield_gc_i on a mutable field.
+    ///
+    /// Only int fields are lowered here (the aheui length read); a ref field
+    /// read would route through `getfield_gc_r` and is left unimplemented
+    /// until a caller needs it.
+    pub(super) fn lower_state_ref_field_getfield(&mut self, expr: &Expr) -> Option<Binding> {
+        let config = self.config?;
+        let Expr::Field(field) = expr else {
+            return None;
+        };
+        // The base must be `state.<ref_scalar>` (a ref(T) state field).
+        let Expr::Field(base_field) = &*field.base else {
+            return None;
+        };
+        if !expr_matches_local_name(&base_field.base, "state") {
+            return None;
+        }
+        let base_name = named_member(&base_field.member)?;
+        let (_, struct_path) = config.state_ref_scalars.get(&base_name).cloned()?;
+        let member = field.member.clone();
+        let tid = struct_type_id(&struct_path);
+        // Lower the `state.<ref_scalar>` base to a ref binding (its
+        // load_state_field_ref already declares the ref identity slot live for
+        // resume), then read the field off that concrete ref.
+        let base = self.lower_state_field_read(&field.base)?;
+        if !matches!(base.kind, BindingKind::Ref) {
+            return None;
+        }
+        let base_reg = base.reg;
+        let result_reg = self.alloc_reg();
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::Vable,
+                vec![Register::ref_(base_reg)],
+                vec![Register::int(result_reg)],
+            ),
+            quote! {
+                // A `ref(T)` state scalar points at a host-owned native
+                // struct (no GC header), so `is_gc_managed = false`: the
+                // field read must not be runtime-type-pinned with a
+                // `GUARD_GC_TYPE` that would read a non-existent `ref - 8`
+                // type-id word.
+                //
+                // LATENT (no current consumer): `#tid = struct_type_id(T)` is
+                // shared with the GC `new_struct` path, and the size-descr
+                // cache is first-write-wins by `LLType::Struct(type_id)`.  If
+                // some `T` were used BOTH as a JIT-allocated struct literal
+                // (is_gc_managed=true) and as a `ref(T)` state scalar
+                // (is_gc_managed=false), whichever registered first would pin
+                // the flag for both — a raw getfield could then emit
+                // GUARD_GC_TYPE against a headerless pointer, or a GC alloc
+                // could lose its type guard.  No aheui type is used both ways
+                // (ref scalars are Stack/Storage, never New-allocated).  Fix
+                // when a dual-use type appears: fold raw-vs-GC into the
+                // descriptor identity (separate type IDs per kind).
+                __builder.register_struct_layout(
+                    ::core::mem::size_of::<#struct_path>(),
+                    #tid,
+                    false,
+                    &[(
+                        ::core::mem::offset_of!(#struct_path, #member),
+                        false,
+                        stringify!(#member),
+                    )],
+                );
+                __builder.getfield_gc_i(
+                    #result_reg,
+                    #base_reg,
+                    ::core::mem::offset_of!(#struct_path, #member),
+                    #tid,
+                );
+            },
+        );
+        Some(Binding {
+            reg: result_reg,
+            kind: BindingKind::Int,
+            depends_on_stack: false,
+        })
+    }
+
+    /// Recognizes a pool-array element read through a marker call
+    /// `<fn>(state.<pool_base_ref>, <int index>)` → `getarrayitem_gc_r` on the
+    /// raw-pointer array (`[*mut U; N]` at offset 0) the ref-scalar points at —
+    /// the aheui `pools[selected]` read.  Unlike the residual-call form (an
+    /// opaque CALL_R the optimizer can neither re-produce in the short preamble
+    /// nor invalidate), the getarrayitem on the immutable `pools` array
+    /// re-derives the element each loop entry from the consistent `selected`
+    /// index, so the loaded ref can no longer be carried as an independent
+    /// loop-red that diverges from the promoted index.
+    ///
+    /// `state.<base>` must be declared in `pool_arrays`; pointer elements are 8
+    /// bytes at array offset 0 (`add_ptr_array_descr`).  The call's function
+    /// name is irrelevant — what selects the lowering is that arg0 is a
+    /// declared pool-base ref-scalar (the marker function's body remains the
+    /// concrete-path fallback when no `pool_arrays` is configured).
+    pub(super) fn lower_pool_array_get_call(&mut self, call: &syn::ExprCall) -> Option<Binding> {
+        let config = self.config?;
+        if call.args.len() != 2 {
+            return None;
+        }
+        // arg0 must be `state.<base>` where <base> is a declared pool-array base.
+        let Expr::Field(base_field) = &call.args[0] else {
+            return None;
+        };
+        if !expr_matches_local_name(&base_field.base, "state") {
+            return None;
+        }
+        let base_name = named_member(&base_field.member)?;
+        if !config.pool_arrays.iter().any(|n| n == &base_name) {
+            return None;
+        }
+        // Lower the `state.<base>` ref-scalar (declares its ref identity slot
+        // live for resume) and the index, then read the pointer element.
+        let base = self.lower_state_field_read(&call.args[0])?;
+        if !matches!(base.kind, BindingKind::Ref) {
+            return None;
+        }
+        let base_reg = base.reg;
+        let index = self.lower_value_expr(&call.args[1])?;
+        if !matches!(index.kind, BindingKind::Int) {
+            return None;
+        }
+        let index_reg = index.reg;
+        let result_reg = self.alloc_reg();
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::Vable,
+                vec![Register::ref_(base_reg), Register::int(index_reg)],
+                vec![Register::ref_(result_reg)],
+            ),
+            quote! {
+                let __descr_idx = __builder.add_ptr_array_descr();
+                __builder.getarrayitem_gc_r(
+                    #result_reg as u16,
+                    #base_reg as u16,
+                    #index_reg as u16,
+                    __descr_idx,
+                );
+            },
+        );
+        Some(Binding {
+            reg: result_reg,
+            kind: BindingKind::Ref,
+            depends_on_stack: base.depends_on_stack || index.depends_on_stack,
+        })
+    }
+
+    /// Recognizes a field WRITE through a `ref(T)` state scalar:
+    /// `state.<ref_scalar>.<member> = <int expr>` → `setfield_gc_i`.  The
+    /// store shares the same `(struct_type_id, field)` interned `Field` descr
+    /// as [`Self::lower_state_ref_field_getfield`], so the heapcache
+    /// invalidates the cached getfield on every write — the in-trace
+    /// counterpart of an RPython inlined `self.field = ...` store that keeps a
+    /// length getfield from freezing to a loop-invariant constant.
+    pub(super) fn lower_state_ref_field_setfield(&mut self, expr: &Expr) -> Option<()> {
+        let config = self.config?;
+        let Expr::Assign(assign) = expr else {
+            return None;
+        };
+        let Expr::Field(field) = &*assign.left else {
+            return None;
+        };
+        let Expr::Field(base_field) = &*field.base else {
+            return None;
+        };
+        if !expr_matches_local_name(&base_field.base, "state") {
+            return None;
+        }
+        let base_name = named_member(&base_field.member)?;
+        let (_, struct_path) = config.state_ref_scalars.get(&base_name).cloned()?;
+        let member = field.member.clone();
+        let tid = struct_type_id(&struct_path);
+        let base = self.lower_state_field_read(&field.base)?;
+        if !matches!(base.kind, BindingKind::Ref) {
+            return None;
+        }
+        let base_reg = base.reg;
+        let rhs = self.lower_value_expr(&assign.right)?;
+        if !matches!(rhs.kind, BindingKind::Int) {
+            return None;
+        }
+        let src = rhs.reg;
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::SetfieldGc,
+                vec![Register::ref_(base_reg), Register::int(src)],
+                vec![],
+            ),
+            quote! {
+                // `ref(T)` state scalar = host-owned native struct (no GC
+                // header) → `is_gc_managed = false`; see the getfield
+                // lowering for the `GUARD_GC_TYPE` rationale.
+                __builder.register_struct_layout(
+                    ::core::mem::size_of::<#struct_path>(),
+                    #tid,
+                    false,
+                    &[(
+                        ::core::mem::offset_of!(#struct_path, #member),
+                        false,
+                        stringify!(#member),
+                    )],
+                );
+                __builder.setfield_gc_i(
+                    #base_reg,
+                    #src,
+                    ::core::mem::offset_of!(#struct_path, #member),
+                    #tid,
+                );
+            },
+        );
+        Some(())
     }
 
     /// Recognizes `state.array[index]` for array state fields.

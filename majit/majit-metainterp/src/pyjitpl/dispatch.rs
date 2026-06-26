@@ -57,6 +57,18 @@ enum ObservedCall {
         args: Vec<i64>,
         result: i64,
     },
+    /// A `getfield_gc` read of a mutable heap field recorded during the
+    /// observer walk. Unlike an immutable field, a residual-mutated field
+    /// (e.g. aheui's `Stack.size`) is advanced by the full-circuit observer
+    /// walk before the outer replay re-reads it, so a raw re-read sees a
+    /// stale value. Recording the loaded word lets the replay consume the
+    /// value the walk observed at the matching position, keyed by the live
+    /// object pointer and field offset.
+    Getfield {
+        obj: usize,
+        offset: usize,
+        result: i64,
+    },
 }
 
 /// Returns whether the current thread is running `JitCodeMachine::run_to_end`
@@ -225,6 +237,22 @@ pub fn record_observed_float_call(func: *const (), args: &[i64], result: i64) {
     });
 }
 
+/// Record a mutable-field `getfield_gc` load observed during the walk so the
+/// outer replay can reproduce the walk-position value instead of re-reading a
+/// field the rest of the walk has already advanced. See [`ObservedCall::Getfield`].
+pub fn record_observed_getfield(obj: usize, offset: usize, result: i64) {
+    if observer_debug() {
+        eprintln!("[observer] record getfield obj={obj:#x} offset={offset} result={result}");
+    }
+    OBSERVED_CALLS.with(|q| {
+        q.borrow_mut().push_back(ObservedCall::Getfield {
+            obj,
+            offset,
+            result,
+        });
+    });
+}
+
 #[inline(always)]
 pub fn consume_observed_void_call(func: *const (), args: &[i64]) -> bool {
     if !in_observer_replay() {
@@ -359,6 +387,48 @@ pub fn consume_observed_float_call(func: *const (), args: &[i64]) -> Option<i64>
     })
 }
 
+/// Replay a mutable-field `getfield_gc` load recorded by the observer walk.
+/// Returns `Some(result)` when the queue front is the matching `Getfield`
+/// (same object pointer + offset), so the outer interpreter reproduces the
+/// walk-position value rather than a stale re-read; `None` when not replaying
+/// (the caller then reads the field live).
+#[inline(always)]
+pub fn consume_observed_getfield(obj: usize, offset: usize) -> Option<i64> {
+    if !in_observer_replay() {
+        return None;
+    }
+    OBSERVED_CALLS.with(|q| {
+        let mut q = q.borrow_mut();
+        let Some(front) = q.front() else {
+            OBSERVER_REPLAY.with(|m| m.set(false));
+            return None;
+        };
+        if observer_debug() {
+            eprintln!("[observer] consume getfield obj={obj:#x} offset={offset}");
+        }
+        match front {
+            ObservedCall::Getfield {
+                obj: observed_obj,
+                offset: observed_offset,
+                result,
+            } if *observed_obj == obj && *observed_offset == offset => {
+                let result = *result;
+                q.pop_front();
+                if q.is_empty() {
+                    OBSERVER_REPLAY.with(|m| m.set(false));
+                }
+                Some(result)
+            }
+            other => observed_call_mismatch(
+                "getfield",
+                obj as *const (),
+                &[obj as i64, offset as i64],
+                other,
+            ),
+        }
+    })
+}
+
 /// RAII guard that toggles `OBSERVER_MODE` on for its lifetime.
 struct ObserverGuard {
     previous: bool,
@@ -472,6 +542,7 @@ fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrR
         type_id,
         vtable,
         all_fielddescrs,
+        is_gc_managed,
         ..
     } = descr
     {
@@ -483,6 +554,7 @@ fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrR
                 *type_id as u32,
                 *type_id,
                 *vtable,
+                *is_gc_managed,
                 &specs,
             );
             let sd: majit_ir::DescrRef = group.size_descr;
@@ -548,6 +620,7 @@ fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_i
                         p.type_id as u32,
                         p.type_id,
                         p.vtable,
+                        p.is_gc_managed,
                         &specs,
                     );
                     let struct_key = majit_ir::descr::LLType::Struct(p.type_id);
@@ -572,6 +645,96 @@ fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_i
         }
         other => panic!("getfield_gc/setfield_gc: descr is not a Field: {other:?}"),
     }
+}
+
+/// Build a `CanRaise` [`EffectInfo`] whose field write-set names `write_field`
+/// of struct `type_id`, sharing the exact keyed `Arc<SimpleFieldDescr>` that a
+/// `getfield_gc_i` on the same `(type_id, write_field)` resolves to.  A
+/// residual helper that mutates a struct field through opaque host code — e.g.
+/// aheui's `jit_storage_*` advancing the selected `Stack.size` — declares this
+/// so `OptHeap::force_from_effectinfo` invalidates the cached `getfield_gc_i`
+/// on that field after the call.  Without it the residual call carries an empty
+/// write-set, the optimizer CSE-folds the field load to a single loop-invariant
+/// read, and a loop whose exit condition derives from that field never
+/// re-observes the mutation.  This is the residual analogue of the in-trace
+/// `setfield_gc` write barrier a traced mutator would emit.
+///
+/// `fields` is the same `(offset, is_ref, name)` layout the matching getfield
+/// passes to `register_struct_layout`; the parented size+field group is rebuilt
+/// here identically (`make_simple_descr_group_keyed`, idempotent / first-write-
+/// wins) so the field descr published into `gc_cache()._cache_field[Struct
+/// (type_id)][name]` is the one `field_descr_ref_from_bh` reads back for the
+/// getfield — pointer identity, which `compute_bitstrings` keys on.  Must run
+/// before `finish_setup_descrs` (jitcode assembly does), matching the
+/// non-trivial-raw-set construction-timing `call_descr` asserts.
+pub fn struct_field_write_effect_info(
+    struct_size: usize,
+    type_id: u64,
+    is_gc_managed: bool,
+    fields: &[(usize, bool, &str)],
+    write_field: &str,
+) -> majit_ir::EffectInfo {
+    // Mirror `JitCodeBuilder::field_specs_from_layout`: sort by offset so
+    // `index_in_parent` is the stable by-offset rank, scalar = one machine word.
+    let mut ordered: Vec<(usize, bool, &str)> = fields.to_vec();
+    ordered.sort_by_key(|&(offset, _, _)| offset);
+    let specs: Vec<majit_ir::descr::SimpleFieldDescrSpec> = ordered
+        .iter()
+        .enumerate()
+        .map(|(idx, &(offset, is_ref, name))| {
+            let (field_type, flag) = if is_ref {
+                (
+                    majit_ir::value::Type::Ref,
+                    majit_ir::descr::ArrayFlag::Pointer,
+                )
+            } else {
+                (
+                    majit_ir::value::Type::Int,
+                    majit_ir::descr::ArrayFlag::Signed,
+                )
+            };
+            majit_ir::descr::SimpleFieldDescrSpec {
+                index: u32::MAX,
+                name: name.to_string(),
+                offset,
+                field_size: 8,
+                field_type,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                flag,
+                virtualizable: false,
+                index_in_parent: idx,
+            }
+        })
+        .collect();
+    majit_ir::descr::make_simple_descr_group_keyed(
+        u32::MAX,
+        struct_size,
+        type_id as u32,
+        type_id,
+        0,
+        is_gc_managed,
+        &specs,
+    );
+    let struct_key = majit_ir::descr::LLType::Struct(type_id);
+    let fd = majit_ir::descr::gc_cache()
+        .lock()
+        .unwrap()
+        ._cache_field
+        .get(&struct_key)
+        .and_then(|m| m.get(write_field))
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "struct_field_write_effect_info: field `{write_field}` not registered for type {type_id}"
+            )
+        });
+    let mut ei = majit_ir::EffectInfo::const_new(
+        majit_ir::ExtraEffect::CanRaise,
+        majit_ir::OopSpecIndex::None,
+    );
+    ei._write_descrs_fields = Some(vec![fd as majit_ir::DescrRef]);
+    ei
 }
 
 pub trait JitCodeSym {
@@ -1498,6 +1661,28 @@ where
              relying on the new shape.",
             cache_key.interior_fields,
         );
+        // A length-prefixed array (`len_offset = Some`) needs a real
+        // lendescr: the optimizer narrows the array's lenbound on a
+        // constant-index read (`heap.py:676 getlenbound().make_gt_const`)
+        // and the short preamble re-emits `ARRAYLEN_GC`, whose GC rewrite
+        // reads `lendescr.offset()` (`rewrite.rs` ARRAYLEN_GC arm) to load
+        // the length word.  Mirrors `descr.py:256-267
+        // get_field_arraylen_descr` — a `("len", ofs, WORD, FLAG_SIGNED)`
+        // FieldDescr with no parent.  `program: &[u8]` keeps
+        // `len_offset = None` (a fixed-size buffer with no length word) and
+        // stays `lendescr = None`.
+        let lendescr: Option<majit_ir::DescrRef> = len_offset.map(|ofs| {
+            let d: majit_ir::DescrRef = Arc::new(majit_ir::descr::SimpleFieldDescr::new_with_name(
+                u32::MAX,
+                ofs,
+                std::mem::size_of::<usize>(),
+                majit_ir::value::Type::Int,
+                false,
+                majit_ir::descr::ArrayFlag::Signed,
+                "len".to_string(),
+            ));
+            d
+        });
         let descr_arc = majit_ir::descr::make_array_descr_from_lltype_shape(
             // TODO: `make_array_descr_from_lltype_shape`
             // takes the u32 gc tid; this caller has the u64 cache key.
@@ -1511,7 +1696,7 @@ where
             is_array_of_pointers,
             is_array_of_structs,
             is_item_signed,
-            None,  // lendescr — `program: &[u8]` is fixed-size
+            lendescr,
             false, // is_pure — bytecode array is mutable from the JIT's POV
             ei_index,
             Vec::new(),
@@ -1966,7 +2151,50 @@ where
             .outer_program_pc
             .unwrap_or_else(|| self.frames.current_mut().pc);
         sym.begin_portal_op(portal_pc);
+        // Safety backstop against a runaway trace-recording loop.  A
+        // jitcode-level cycle that re-steps without growing the recorded op
+        // list never trips `is_too_long` (which counts ops), so the
+        // metainterp can spin unbounded and exhaust CPU/memory.  Two bounds:
+        //   * `stall_window` — abort once this many consecutive steps pass
+        //     with no new op recorded (a real trace grows ops continuously;
+        //     a non-productive spin never does).  Catches the cycle early.
+        //   * `step_limit` — absolute cap for any other runaway.
+        // `MAJIT_STALL_WINDOW` / `MAJIT_STEP_LIMIT` override for diagnosis.
+        let stall_window: u64 = std::env::var("MAJIT_STALL_WINDOW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_000_000);
+        let step_limit: u64 = std::env::var("MAJIT_STEP_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8_000_000);
+        let mut step_count: u64 = 0;
+        let mut last_num_ops = ctx.num_recorded_ops();
+        let mut steps_since_growth: u64 = 0;
         while !self.frames.is_empty() {
+            step_count += 1;
+            let n = ctx.num_recorded_ops();
+            if n > last_num_ops {
+                last_num_ops = n;
+                steps_since_growth = 0;
+            } else {
+                steps_since_growth += 1;
+            }
+            if steps_since_growth > stall_window || step_count > step_limit {
+                if crate::majit_log_enabled() {
+                    let why = if step_count > step_limit {
+                        "step limit"
+                    } else {
+                        "op-growth stall"
+                    };
+                    eprintln!(
+                        "[jit] trace_jitcode aborting ({why}): portal pc={portal_pc} jit pc={} steps={step_count} ops={n} (runaway trace)",
+                        self.frames.current_mut().pc
+                    );
+                }
+                sym.abort_portal_op();
+                return TraceAction::Abort;
+            }
             // Catch panics from BigInt overflow in runtime stack operations.
             // RPython doesn't have this issue (no BigInt); we abort the trace.
             let action = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2709,6 +2937,19 @@ where
                 } else {
                     0
                 };
+                // A non-pure (mutable) field is advanced by the residual storage
+                // ops of this full-circuit observer walk, so a raw re-read on the
+                // outer replay would see the already-advanced value. Record the
+                // loaded word keyed by (object ptr, offset) so the replay
+                // reproduces the walk-position value (`consume_observed_getfield`).
+                // Pure/immutable getfields never move, so they stay a live read.
+                let is_pure = matches!(
+                    bytecode,
+                    jitcode::insns::BC_GETFIELD_GC_I_PURE | jitcode::insns::BC_GETFIELD_GC_R_PURE
+                );
+                if !is_pure && in_observer_mode() {
+                    record_observed_getfield(struct_ptr as usize, offset, loaded);
+                }
                 let kind = if is_ref {
                     OpCode::GetfieldGcR
                 } else {
@@ -3014,6 +3255,70 @@ where
                         (opref, concrete)
                     };
                 self.set_int_reg(dst, Some(opref), Some(reg_concrete));
+            }
+            // ── BC_GETARRAYITEM_GC_R ──
+            //
+            // Ref-result element read for a raw-pointer array (aheui
+            // `pools[selected]` → `*mut Stack`).  Mirrors BC_GETARRAYITEM_GC_I
+            // but loads an 8-byte GC pointer and writes the ref bank.  Unlike
+            // the int arm there is NO all-constant fold: the array base is a
+            // live state pointer and the result must stay a `GetarrayitemGcR`
+            // op so the short preamble re-produces it each loop entry (the
+            // whole point of replacing the residual `jit_sel_get_ref` call).
+            // The `pools` array is immutable (`_immutable_fields_`), so a
+            // re-read during the observer concrete replay returns the same
+            // pointer — no `record_observed_*` queue is needed (none exists
+            // for getarrayitem).
+            jitcode::insns::BC_GETARRAYITEM_GC_R_RID => {
+                let (array_reg, index_reg, descr_idx, dst) = {
+                    let frame = self.frames.current_mut();
+                    let array_reg = frame.next_u8() as usize;
+                    let index_reg = frame.next_u8() as usize;
+                    let descr_idx = frame.next_u16() as usize;
+                    let dst = frame.next_u8() as usize;
+                    (array_reg, index_reg, descr_idx, dst)
+                };
+                let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
+                    return TraceAction::Abort;
+                };
+                let Some((base_size, itemsize, _is_signed)) =
+                    self.dispatch_array_geometry(descr_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let (array_opref, array_addr) = self.read_ref_reg(array_reg);
+                let (index_opref, index_value) = self.read_int_reg(index_reg);
+                let descr_index = descr.index();
+                let cached = ctx.heapcache_getarrayitem(array_opref, index_opref, descr_index);
+                // SAFETY: `array_addr` is the live pools-array base ref;
+                // `index_value` is the `selected` slot, bounded by
+                // STORAGE_COUNT. Pointer elements are 8 bytes (base_size=0).
+                let item_addr = (array_addr as usize)
+                    .wrapping_add(base_size)
+                    .wrapping_add((index_value as usize).wrapping_mul(itemsize));
+                let concrete = unsafe { *(item_addr as *const i64) };
+                let opref = if let Some(cached) = cached {
+                    ctx.profiler().count_ops(
+                        OpCode::GetarrayitemGcR,
+                        crate::pyjitpl::counters::HEAPCACHED_OPS,
+                    );
+                    cached
+                } else {
+                    let opref = ctx.record_op_with_descr(
+                        OpCode::GetarrayitemGcR,
+                        &[array_opref, index_opref],
+                        descr,
+                    );
+                    ctx.set_opref_concrete(opref, Value::Ref(majit_ir::GcRef(concrete as usize)));
+                    ctx.heapcache_getarrayitem_now_known(
+                        array_opref,
+                        index_opref,
+                        descr_index,
+                        opref,
+                    );
+                    opref
+                };
+                self.set_ref_reg(dst, Some(opref), Some(concrete));
             }
             jitcode::insns::BC_GETARRAYITEM_VABLE_I => {
                 let (opcode_pc, vable_reg, array_idx, index_reg, dest) = {
@@ -7603,8 +7908,8 @@ mod tests {
         builder.load_const_i_value(0, 99); // int reg 0 = 99
         builder.setfield_gc_i(0, 0, 0, 0xCD); // Node.value = 99
         builder.setfield_gc_r(0, 0, 8, 0xCD); // Node.next  = Node (self-ref)
-        builder.getfield_gc_i(1, 0, 0); // int reg 1 = Node.value
-        builder.getfield_gc_r(1, 0, 8); // ref reg 1 = Node.next
+        builder.getfield_gc_i(1, 0, 0, 0xCD); // int reg 1 = Node.value
+        builder.getfield_gc_r(1, 0, 8, 0xCD); // ref reg 1 = Node.next
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);

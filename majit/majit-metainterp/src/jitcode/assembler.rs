@@ -435,6 +435,7 @@ impl JitCodeBuilder {
             vtable,
             owner: String::new(),
             all_fielddescrs: Vec::new(),
+            is_gc_managed: true,
         });
         self.write_insn("new_with_vtable/d>r");
         self.push_u16(descr);
@@ -460,29 +461,65 @@ impl JitCodeBuilder {
         fields: &[(usize, bool, &str)],
     ) {
         self.touch_ref_reg(dest);
-        let all_fielddescrs = Self::field_specs_from_layout(fields);
         // descr.py:108-120 get_size_descr + init_size_descr: cache the
         // full per-struct layout so the matching setfield_gc_* resolves
-        // the parent SizeDescr and field index (descr.py:238).
-        self.struct_size_specs.insert(
-            type_id,
-            BhSizeSpec {
-                size,
-                type_id,
-                vtable: 0,
-                all_fielddescrs: all_fielddescrs.clone(),
-            },
-        );
+        // the parent SizeDescr and field index (descr.py:238).  A JIT
+        // `new` allocates a GC-headered struct, so `is_gc_managed = true`.
+        self.register_struct_layout(size, type_id, true, fields);
+        let all_fielddescrs = self
+            .struct_size_specs
+            .get(&type_id)
+            .expect("register_struct_layout just inserted this type_id")
+            .all_fielddescrs
+            .clone();
         let descr = self.add_bh_descr(CanonicalBhDescr::Size {
             size,
             type_id,
             vtable: 0,
             owner: String::new(),
             all_fielddescrs,
+            is_gc_managed: true,
         });
         self.write_insn("new/d>r");
         self.push_u16(descr);
         self.push_reg_u8(dest, "new result");
+    }
+
+    /// Register a struct's `(offset, is_ref, name)` layout under `type_id`
+    /// WITHOUT emitting a `new/d>r` allocation op.  Used for a struct that
+    /// is allocated natively (outside the JIT) but whose fields are still
+    /// read/written through `getfield_gc_*` / `setfield_gc_*`: the layout
+    /// must be cached so `add_struct_field_descr` can resolve the parent
+    /// SizeDescr + `index_in_parent`, giving read and write the same interned
+    /// `Field` descr (the heapcache aliases get against set by that identity).
+    /// Idempotent: re-registering the same `type_id` overwrites with an
+    /// identical layout.
+    ///
+    /// `is_gc_managed` records whether the struct carries a GC header
+    /// (`ref - 8` type-id word): `false` for a raw native struct (the
+    /// caller above the JIT owns the memory, no header), `true` when a
+    /// JIT-GC `new_struct` reuses this for layout caching.  Threaded to
+    /// `SimpleSizeDescr.is_gc_managed` so `StructPtrInfo.make_guards`
+    /// gates `GUARD_GC_TYPE`: a header-less raw struct must not be
+    /// runtime-type-pinned.
+    pub fn register_struct_layout(
+        &mut self,
+        size: usize,
+        type_id: u64,
+        is_gc_managed: bool,
+        fields: &[(usize, bool, &str)],
+    ) {
+        let all_fielddescrs = Self::field_specs_from_layout(fields);
+        self.struct_size_specs.insert(
+            type_id,
+            BhSizeSpec {
+                size,
+                type_id,
+                vtable: 0,
+                is_gc_managed,
+                all_fielddescrs,
+            },
+        );
     }
 
     /// Build `Vec<BhFieldSpec>` from a `(offset, is_ref, name)` layout,
@@ -660,10 +697,18 @@ impl JitCodeBuilder {
 
     /// Emit `getfield_gc_i/rd>i` (`blackhole.py:1432 bhimpl_getfield_gc_i`):
     /// load `struct_reg`'s int field at `offset` into `dest`.
-    pub fn getfield_gc_i(&mut self, dest: u16, struct_reg: u16, offset: usize) {
+    ///
+    /// `type_id` resolves the parent-carrying struct field descr (the same
+    /// `add_struct_field_descr` the matching `setfield_gc_i` uses), so a
+    /// getfield and a setfield on the same `(type_id, offset)` intern the
+    /// same `Field` descr and the heapcache can alias read against write.
+    /// A `type_id` whose layout was never registered degrades to a parentless
+    /// scalar descr (`add_struct_field_descr` returns the scalar form), which
+    /// keeps existing callers correct.
+    pub fn getfield_gc_i(&mut self, dest: u16, struct_reg: u16, offset: usize, type_id: u64) {
         self.touch_ref_reg(struct_reg);
         self.touch_reg(dest);
-        let descr = self.add_scalar_field_descr(offset, majit_ir::value::Type::Int);
+        let descr = self.add_struct_field_descr(offset, majit_ir::value::Type::Int, type_id);
         self.write_insn("getfield_gc_i/rd>i");
         self.push_reg_u8(struct_reg, "getfield_gc_i struct");
         self.push_u16(descr);
@@ -672,10 +717,12 @@ impl JitCodeBuilder {
 
     /// Emit `getfield_gc_r/rd>r` (`blackhole.py:1437 bhimpl_getfield_gc_r`):
     /// load `struct_reg`'s ref field at `offset` into `dest`.
-    pub fn getfield_gc_r(&mut self, dest: u16, struct_reg: u16, offset: usize) {
+    ///
+    /// See [`Self::getfield_gc_i`] for the `type_id` parent-descr contract.
+    pub fn getfield_gc_r(&mut self, dest: u16, struct_reg: u16, offset: usize, type_id: u64) {
         self.touch_ref_reg(struct_reg);
         self.touch_ref_reg(dest);
-        let descr = self.add_scalar_field_descr(offset, majit_ir::value::Type::Ref);
+        let descr = self.add_struct_field_descr(offset, majit_ir::value::Type::Ref, type_id);
         self.write_insn("getfield_gc_r/rd>r");
         self.push_reg_u8(struct_reg, "getfield_gc_r struct");
         self.push_u16(descr);
@@ -1293,6 +1340,22 @@ impl JitCodeBuilder {
         self.push_reg_u8(dst, "getarrayitem_gc_i dst");
     }
 
+    /// Ref-result array read: `dst = array[index]` where the element is a
+    /// GC pointer (8 bytes). Mirrors [`Self::getarrayitem_gc_i`] but routes
+    /// `dst` through the ref register bank and uses the `/rid>r` mnemonic.
+    /// Used to re-derive a pointer-array element (aheui `pools[selected]`)
+    /// as a re-producible heap read instead of an opaque residual call.
+    pub fn getarrayitem_gc_r(&mut self, dst: u16, array_reg: u16, index_reg: u16, descr_idx: u16) {
+        self.touch_ref_reg(array_reg);
+        self.touch_reg(index_reg);
+        self.touch_ref_reg(dst);
+        self.write_insn("getarrayitem_gc_r/rid>r");
+        self.push_reg_u8(array_reg, "getarrayitem_gc_r array");
+        self.push_reg_u8(index_reg, "getarrayitem_gc_r index");
+        self.push_u16(descr_idx);
+        self.push_reg_u8(dst, "getarrayitem_gc_r dst");
+    }
+
     /// Add a GC-array descriptor for a byte-element array to the descrs pool.
     ///
     /// Returns the descr index to pass as `descr_idx` to `getarrayitem_gc_i`.
@@ -1327,6 +1390,34 @@ impl JitCodeBuilder {
             // `&[u8]` byte-array descrs are minted at assembler bootstrap
             // with no source-level array_type_id; the structural tuple
             // (base_size=0, itemsize=1, …) uniquely identifies them.
+            array_type_id: None,
+            interior_fields: Vec::new(),
+        })
+    }
+
+    /// Add a GC-array descriptor for a raw-pointer-element array (8-byte
+    /// `*mut T` items) to the descrs pool; returns the descr index for
+    /// `getarrayitem_gc_r`.  Models a length-prefixed `{ len: usize,
+    /// items: [*mut T; N] }` whose base pointer points at the `len` word:
+    /// `base_size = 8` (items start one word in), `len_offset = Some(0)`
+    /// (length at the base).  The lendescr is required: the optimizer
+    /// narrows the array's lenbound on a constant-index read (`heap.py:676
+    /// getlenbound().make_gt_const(index)`) and the short preamble re-emits
+    /// `ARRAYLEN_GC` to re-establish the `len > index` guard each loop entry
+    /// — without a lendescr the GC rewrite of that `ARRAYLEN_GC` panics.
+    /// The aheui `Storage` carries this header as `pools_len` (offset 0,
+    /// `pools` at offset 8).  Deduped structurally by `add_bh_descr`.
+    pub fn add_ptr_array_descr(&mut self) -> u16 {
+        self.add_array_descr(CanonicalBhDescr::Array {
+            base_size: std::mem::size_of::<usize>(),
+            itemsize: 8,
+            len_offset: Some(0),
+            type_id: 0,
+            item_type: majit_ir::value::Type::Ref,
+            is_array_of_pointers: true,
+            is_array_of_structs: false,
+            is_item_signed: false,
+            ei_index: u32::MAX,
             array_type_id: None,
             interior_fields: Vec::new(),
         })
