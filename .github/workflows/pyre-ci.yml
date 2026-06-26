@@ -87,6 +87,17 @@ jobs:
       if: steps.charon-cache.outputs.cache-hit != 'true'
       shell: bash
       run: scripts/install-charon.py
+    - name: Upload Charon artifact
+      # Hand the installed Charon tree to downstream jobs within this run.
+      # The cache above is still the cross-run source of truth; this artifact
+      # avoids late consumer jobs depending on a second cache restore.
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: charon-${{ runner.os }}-${{ runner.arch }}
+        path: .pyre-build/charon
+        retention-days: 1
+        include-hidden-files: true
+        if-no-files-found: error
     - name: Compute LLBC fingerprints
       id: llbc-fingerprint
       shell: bash
@@ -174,25 +185,18 @@ jobs:
     name: cargo test (ubuntu-24.04, ${{ matrix.backend }})
     runs-on: ubuntu-24.04
     needs: prepare-charon-llbc-linux
-    if: ${{ always() }}
+    if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
     env:
-      # See prepare-charon-llbc: keep the restored Charon install in the
-      # workspace so scripts/builds find the same platform-specific path.
+      # See prepare-charon-llbc: downstream jobs download the prepared Charon
+      # artifact into this workspace path.
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
-      PREPARE_CHARON_LLBC_RESULT: ${{ needs.prepare-charon-llbc-linux.result }}
     strategy:
       fail-fast: false
       matrix:
         backend: [dynasm, cranelift]
 
     steps: &cargo-test-steps
-    - name: Check prepare-charon-llbc result
-      if: ${{ env.PREPARE_CHARON_LLBC_RESULT != 'success' }}
-      shell: bash
-      run: |
-        echo "prepare-charon-llbc did not succeed: ${PREPARE_CHARON_LLBC_RESULT}" >&2
-        exit 1
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         persist-credentials: false
@@ -200,22 +204,14 @@ jobs:
     - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         cache-bin: false
-    - name: Restore Charon binary
-      id: restore-charon
-      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+    - name: Download Charon artifact
+      # Run-scoped handoff from prepare-charon-llbc. Cross-run reuse still
+      # comes from the prepare job's cache; consumers avoid cache eviction
+      # races by downloading the prepared install tree directly.
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
+        name: charon-${{ runner.os }}-${{ runner.arch }}
         path: .pyre-build/charon
-        key: charon-bin-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}
-    - name: Check prepared Charon cache hit
-      # Charon's cache key is shared repo-wide per OS/arch (no per-run
-      # fingerprint), so it stays LRU-warm and rarely evicts; the LLBC set
-      # is handed over as a run-scoped artifact below instead.
-      if: ${{ steps.restore-charon.outputs.cache-hit != 'true' }}
-      shell: bash
-      run: |
-        echo "Charon cache miss from prepare-charon-llbc" >&2
-        echo "Charon cache hit: ${{ steps.restore-charon.outputs.cache-hit }}" >&2
-        exit 1
     - name: Download LLBC artifact
       # Run-scoped handoff from prepare-charon-llbc. Unlike actions/cache,
       # an artifact is exempt from the repo-wide 10 GB cache budget and its
@@ -262,11 +258,10 @@ jobs:
     name: cargo test (macos-latest, ${{ matrix.backend }})
     runs-on: macos-latest
     needs: prepare-charon-llbc-macos
-    if: ${{ always() }}
+    if: ${{ !cancelled() && needs.prepare-charon-llbc-macos.result == 'success' }}
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
-      PREPARE_CHARON_LLBC_RESULT: ${{ needs.prepare-charon-llbc-macos.result }}
     strategy:
       fail-fast: false
       matrix:
@@ -277,11 +272,10 @@ jobs:
     name: cargo test (windows-latest, ${{ matrix.backend }})
     runs-on: windows-latest
     needs: prepare-charon-llbc-windows
-    if: ${{ always() }}
+    if: ${{ !cancelled() && needs.prepare-charon-llbc-windows.result == 'success' }}
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
-      PREPARE_CHARON_LLBC_RESULT: ${{ needs.prepare-charon-llbc-windows.result }}
     strategy:
       fail-fast: false
       matrix:
@@ -292,21 +286,14 @@ jobs:
     name: pyre/check.py (ubuntu-24.04)
     runs-on: ubuntu-24.04
     needs: prepare-charon-llbc-linux
-    if: ${{ always() }}
+    if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
     env:
-      # See prepare-charon-llbc: restore the shared build dir into the
-      # workspace and use the same Charon pin/cache key.
+      # See prepare-charon-llbc: downstream jobs download the prepared Charon
+      # artifact into this workspace path.
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
-      PREPARE_CHARON_LLBC_RESULT: ${{ needs.prepare-charon-llbc-linux.result }}
 
     steps: &pyre-check-steps
-    - name: Check prepare-charon-llbc result
-      if: ${{ env.PREPARE_CHARON_LLBC_RESULT != 'success' }}
-      shell: bash
-      run: |
-        echo "prepare-charon-llbc did not succeed: ${PREPARE_CHARON_LLBC_RESULT}" >&2
-        exit 1
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         persist-credentials: false
@@ -324,22 +311,14 @@ jobs:
     - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         cache-bin: false
-    - name: Restore Charon binary
-      id: restore-charon
-      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+    - name: Download Charon artifact
+      # Run-scoped handoff from prepare-charon-llbc. Cross-run reuse still
+      # comes from the prepare job's cache; consumers avoid cache eviction
+      # races by downloading the prepared install tree directly.
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
+        name: charon-${{ runner.os }}-${{ runner.arch }}
         path: .pyre-build/charon
-        key: charon-bin-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}
-    - name: Check prepared Charon cache hit
-      # Charon's cache key is shared repo-wide per OS/arch (no per-run
-      # fingerprint), so it stays LRU-warm and rarely evicts; the LLBC set
-      # is handed over as a run-scoped artifact below instead.
-      if: ${{ steps.restore-charon.outputs.cache-hit != 'true' }}
-      shell: bash
-      run: |
-        echo "Charon cache miss from prepare-charon-llbc" >&2
-        echo "Charon cache hit: ${{ steps.restore-charon.outputs.cache-hit }}" >&2
-        exit 1
     - name: Download LLBC artifact
       # Run-scoped handoff from prepare-charon-llbc. Unlike actions/cache,
       # an artifact is exempt from the repo-wide 10 GB cache budget and its
@@ -367,22 +346,20 @@ jobs:
     name: pyre/check.py (macos-latest)
     runs-on: macos-latest
     needs: prepare-charon-llbc-macos
-    if: ${{ always() }}
+    if: ${{ !cancelled() && needs.prepare-charon-llbc-macos.result == 'success' }}
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
-      PREPARE_CHARON_LLBC_RESULT: ${{ needs.prepare-charon-llbc-macos.result }}
     steps: *pyre-check-steps
 
   pyre-check-windows:
     name: pyre/check.py (windows-latest)
     runs-on: windows-latest
     needs: prepare-charon-llbc-windows
-    if: ${{ always() }}
+    if: ${{ !cancelled() && needs.prepare-charon-llbc-windows.result == 'success' }}
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
-      PREPARE_CHARON_LLBC_RESULT: ${{ needs.prepare-charon-llbc-windows.result }}
     steps: *pyre-check-steps
 
   cpython-tests:
@@ -391,21 +368,14 @@ jobs:
     # arch-specific, so the gate runs where the baseline was observed.
     runs-on: macos-latest
     needs: prepare-charon-llbc-macos
-    if: ${{ always() }}
+    if: ${{ !cancelled() && needs.prepare-charon-llbc-macos.result == 'success' }}
     timeout-minutes: 30
     env:
-      # See prepare-charon-llbc: restore the shared build dir into the
-      # workspace and use the same Charon pin/cache key.
+      # See prepare-charon-llbc: downstream jobs download the prepared Charon
+      # artifact into this workspace path.
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
-      PREPARE_CHARON_LLBC_RESULT: ${{ needs.prepare-charon-llbc-macos.result }}
     steps:
-    - name: Check prepare-charon-llbc result
-      if: ${{ env.PREPARE_CHARON_LLBC_RESULT != 'success' }}
-      shell: bash
-      run: |
-        echo "prepare-charon-llbc did not succeed: ${PREPARE_CHARON_LLBC_RESULT}" >&2
-        exit 1
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         persist-credentials: false
@@ -418,22 +388,14 @@ jobs:
     - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         cache-bin: false
-    - name: Restore Charon binary
-      id: restore-charon
-      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+    - name: Download Charon artifact
+      # Run-scoped handoff from prepare-charon-llbc. Cross-run reuse still
+      # comes from the prepare job's cache; consumers avoid cache eviction
+      # races by downloading the prepared install tree directly.
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
+        name: charon-${{ runner.os }}-${{ runner.arch }}
         path: .pyre-build/charon
-        key: charon-bin-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}
-    - name: Check prepared Charon cache hit
-      # Charon's cache key is shared repo-wide per OS/arch (no per-run
-      # fingerprint), so it stays LRU-warm and rarely evicts; the LLBC set
-      # is handed over as a run-scoped artifact below instead.
-      if: ${{ steps.restore-charon.outputs.cache-hit != 'true' }}
-      shell: bash
-      run: |
-        echo "Charon cache miss from prepare-charon-llbc" >&2
-        echo "Charon cache hit: ${{ steps.restore-charon.outputs.cache-hit }}" >&2
-        exit 1
     - name: Download LLBC artifact
       # Run-scoped handoff from prepare-charon-llbc. Unlike actions/cache,
       # an artifact is exempt from the repo-wide 10 GB cache budget and its
@@ -460,14 +422,13 @@ jobs:
     name: wasm build (pyre-wasm, ${{ matrix.binding }})
     runs-on: ubuntu-24.04
     needs: prepare-charon-llbc-linux
-    if: ${{ always() }}
+    if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
     env:
-      # See prepare-charon-llbc: keep the restored Charon install in the
-      # workspace and reuse the same pin/cache key. pyre-wasm pulls pyre-jit,
-      # whose build needs the extracted LLBC.
+      # See prepare-charon-llbc: downstream jobs download the prepared Charon
+      # artifact into this workspace path. pyre-wasm pulls pyre-jit, whose
+      # build needs the extracted LLBC.
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
-      PREPARE_CHARON_LLBC_RESULT: ${{ needs.prepare-charon-llbc-linux.result }}
     strategy:
       fail-fast: false
       matrix:
@@ -476,12 +437,6 @@ jobs:
         binding: [web, wasm-host]
 
     steps:
-    - name: Check prepare-charon-llbc result
-      if: ${{ env.PREPARE_CHARON_LLBC_RESULT != 'success' }}
-      shell: bash
-      run: |
-        echo "prepare-charon-llbc did not succeed: ${PREPARE_CHARON_LLBC_RESULT}" >&2
-        exit 1
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         persist-credentials: false
@@ -491,25 +446,14 @@ jobs:
     - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         cache-bin: false
-    - name: Restore Charon binary
-      id: restore-charon
-      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+    - name: Download Charon artifact
+      # Run-scoped handoff from prepare-charon-llbc. Cross-run reuse still
+      # comes from the prepare job's cache; consumers avoid cache eviction
+      # races by downloading the prepared install tree directly.
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
-        # Must match the prepare job's save path-set exactly: actions/cache
-        # derives the cache version from the path list, so restoring with an
-        # extra .pyre-build/charon-src entry computes a different version than
-        # the single-path save and always misses (failing the cache-hit gate).
+        name: charon-${{ runner.os }}-${{ runner.arch }}
         path: .pyre-build/charon
-        key: charon-bin-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}
-    - name: Install Charon
-      # Charon's cache key is shared repo-wide per OS/arch (no per-run
-      # fingerprint) so it usually stays LRU-warm, but the wasm matrix is the
-      # latest-scheduled consumer — late enough that the entry can be evicted
-      # before it runs. Reinstall on a miss instead of hard-failing (the same
-      # self-skipping installer prepare-charon-llbc uses).
-      if: steps.restore-charon.outputs.cache-hit != 'true'
-      shell: bash
-      run: scripts/install-charon.py
     - name: Download LLBC artifact
       # Run-scoped handoff from prepare-charon-llbc. Unlike actions/cache, an
       # artifact is exempt from the repo-wide 10 GB cache budget and its LRU
