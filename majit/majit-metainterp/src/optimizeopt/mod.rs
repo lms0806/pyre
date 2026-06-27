@@ -950,22 +950,24 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         self.ctx.get_replacement_opref(opref)
     }
 
-    fn get_box_replacement_boxref(&self, opref: OpRef) -> majit_ir::box_ref::BoxRef {
+    fn get_box_replacement_operand(&self, opref: OpRef) -> Operand {
         // resume.py:202 box.get_box_replacement() as a box OBJECT. The canonical
         // host is the producer Op / InputArg, so two reaches of one logical box
-        // return the same memoized Rc (ptr_eq) — the #160/S11 livebox dedup key.
-        self.ctx.get_box_replacement_box(opref).unwrap_or_else(|| {
-            // #160/S11 tripwire: a non-Const numbering key that resolves through
-            // the from_opref fallback would mint a fresh, non-ptr_eq box and
-            // corrupt the livebox dedup. #157 drained these fires to zero;
-            // PYRE_S11_TRIPWIRE surfaces any regression across the corpus.
-            if std::env::var_os("PYRE_S11_TRIPWIRE").is_some() {
-                eprintln!(
-                    "[s11-tripwire] get_box_replacement_boxref from_opref fallback on {opref:?}"
-                );
-            }
-            majit_ir::box_ref::BoxRef::from_opref(self.ctx.get_replacement_opref(opref))
-        })
+        // return the same producer Rc (ptr_eq) — the #160/S11 livebox dedup key.
+        // `get_box_replacement_operand_opt` carries the debug-build tripwire that
+        // the native Operand walk agrees with the BoxRef form on presence and
+        // identity, so the resume-numbering path validates the BoxRef→Operand
+        // equivalence across the corpus. The fallback PANICS on a producerless
+        // position (E3 dropped the position-only Operand variant), the armed
+        // hazard-5 tripwire: a non-Const numbering key with no findable producer
+        // would otherwise mint a fresh, non-ptr_eq box and corrupt the livebox
+        // dedup. #157 drained these fires to zero across the corpus.
+        if opref.is_none() {
+            return Operand::None;
+        }
+        self.ctx
+            .get_box_replacement_operand_opt(opref)
+            .unwrap_or_else(|| Operand::from_opref(self.ctx.get_replacement_opref(opref)))
     }
 
     fn get_box_replacement_not_const(&self, opref: OpRef) -> OpRef {
@@ -4576,7 +4578,23 @@ impl OptContext {
     /// `Operand::Const` for a const-namespace OpRef. `materialize_box_at` never
     /// returns a position-only box, so the lowering is panic-free.
     pub(crate) fn materialize_operand_at(&mut self, opref: OpRef) -> Operand {
-        Operand::from_boxref(&self.materialize_box_at(opref))
+        // `materialize_box_at` always yields a box bound to a canonical host
+        // (a producing `Op`, an `InputArg`, or a `Const`). Read that host
+        // directly to build the `Operand` natively — the same lowering
+        // `Operand::from_boxref` performs for a bound box, but without the
+        // wrapper round-trip and without leaning on the `box_cache` memo for
+        // identity (the `Rc<Op>` / `Rc<InputArg>` itself is the identity).
+        let b = self.materialize_box_at(opref);
+        if let Some(op) = b.bound_op() {
+            Operand::from_bound_op(&op)
+        } else if let Some(ia) = b.bound_inputarg() {
+            Operand::from_bound_inputarg(&ia)
+        } else {
+            Operand::const_from_value(
+                b.const_value()
+                    .expect("materialize_box_at yields a bound or const box"),
+            )
+        }
     }
 
     /// Migration bridge: lower a (possibly position-only) box to its canonical
@@ -4742,16 +4760,6 @@ impl OptContext {
         } else {
             self.get_box_replacement(arg.to_opref())
         }
-    }
-
-    /// Operand-yielding sibling of [`OptContext::resolve_box_box`]: resolve a
-    /// `BoxRef` to its canonical producer and shed it to an [`Operand`]. For
-    /// op-emission sites that consume the resolved box only as an `Op::new`
-    /// argument, this drops the `Operand::from_boxref(&resolve_box_box(..))`
-    /// round-trip. `resolve_box_box` returns a bound / const box for a bound or
-    /// constant input, so the lowering is panic-free for those callers.
-    pub fn resolve_box_operand(&self, arg: &majit_ir::box_ref::BoxRef) -> Operand {
-        Operand::from_boxref(&self.resolve_box_box(arg))
     }
 
     /// `Option`-returning sibling of [`OptContext::resolve_box_box`], the
@@ -9727,12 +9735,11 @@ mod boxref_forwarding_tests {
     #[test]
     fn int_bound_handle_const_arms_are_not_ptr_eq() {
         use majit_ir::Value;
-        use majit_ir::box_ref::BoxRef;
 
         let mut ctx = OptContext::with_num_inputs(0, 0);
-        let b = BoxRef::new_const(Value::Int(7));
-        let h1 = ctx.getintbound_handle(&Operand::from_boxref(&b));
-        let h2 = ctx.getintbound_handle(&Operand::from_boxref(&b));
+        let c = Operand::const_from_value(Value::Int(7));
+        let h1 = ctx.getintbound_handle(&c);
+        let h2 = ctx.getintbound_handle(&c);
         assert!(
             !h1.ptr_eq(&h2),
             "Const arms must be fresh independent objects, never ptr_eq"
@@ -9750,11 +9757,10 @@ mod boxref_forwarding_tests {
     #[test]
     fn int_bound_handle_const_arm_is_locally_mutable() {
         use majit_ir::Value;
-        use majit_ir::box_ref::BoxRef;
 
         let mut ctx = OptContext::with_num_inputs(0, 0);
-        let b = BoxRef::new_const(Value::Int(7));
-        let h = ctx.getintbound_handle(&Operand::from_boxref(&b));
+        let c = Operand::const_from_value(Value::Int(7));
+        let h = ctx.getintbound_handle(&c);
         // Direct field mutation through the RefMut — `make_ge_const`
         // would reject 20 on `from_constant(7)` (empty interval); the
         // parity claim is "borrow_mut succeeds and writes land in the
@@ -9773,7 +9779,7 @@ mod boxref_forwarding_tests {
         // A fresh getintbound_handle call mints an independent cell —
         // mutations on `h` do not leak across calls (PyPy: each
         // `IntBound.from_constant(7)` is a distinct object).
-        let h_fresh = ctx.getintbound_handle(&Operand::from_boxref(&b));
+        let h_fresh = ctx.getintbound_handle(&c);
         assert_eq!(
             h_fresh.borrow().upper,
             7,

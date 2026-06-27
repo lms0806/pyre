@@ -607,7 +607,7 @@ fn clone_bridge_ops_preserving_value(bridge_ops: &[majit_ir::Op]) -> Vec<majit_i
         .collect()
 }
 
-fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<majit_ir::box_ref::BoxRef>]) -> OpRef {
+fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<majit_ir::operand::Operand>]) -> OpRef {
     if opref.is_none() || opref.is_constant() {
         return opref;
     }
@@ -631,7 +631,7 @@ fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<majit_ir::box_ref::B
 
 fn translate_trace_iter_box_map(
     mut box_map: SnapshotBoxes,
-    cache: &[Option<majit_ir::box_ref::BoxRef>],
+    cache: &[Option<majit_ir::operand::Operand>],
 ) -> SnapshotBoxes {
     for boxes in box_map.iter_mut().flatten() {
         for boxref in boxes.iter_mut() {
@@ -1554,10 +1554,12 @@ impl<M: Clone> MetaInterp<M> {
         // Python object graph automatically; pyre's `Vec<Option<OpRef>>`
         // storage needs an explicit walker. Independent of `self.tracing`:
         // frames are pushed for both recording and recursive-portal calls.
-        for frame in self.framestack.frames.iter() {
-            for slot in frame.ref_regs.iter() {
-                if let Some(b) = slot.as_ref() {
-                    b.walk_const_ptr_refs(&mut visitor);
+        for frame in self.framestack.frames.iter_mut() {
+            for slot in frame.ref_regs.iter_mut() {
+                // Forward the inline `ConstPtr` gcref in place; non-Const
+                // positions (ResOp / InputArg refs) carry no inline ref.
+                if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
+                    visitor(gcref);
                 }
             }
         }
@@ -15624,10 +15626,7 @@ mod metainterp_static_data_tests {
         assert_eq!(f.int_values[0], Some(100));
         assert_eq!(f.int_regs[1], Some(OpRef::int_op(11)));
         assert_eq!(f.int_values[1], Some(101));
-        assert_eq!(
-            f.ref_regs[0].as_ref().map(|b| b.to_opref()),
-            Some(OpRef::ref_op(20))
-        );
+        assert_eq!(f.ref_regs[0], Some(OpRef::ref_op(20)));
         assert_eq!(f.ref_values[0], Some(200));
         assert_eq!(f.float_regs[0], Some(OpRef::float_op(30)));
         assert_eq!(f.float_values[0], Some(300));
