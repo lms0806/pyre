@@ -35,7 +35,11 @@ pub struct GcConfig {
 /// env.py:17-36 `_read_float_and_factor_from_env`. Parse `varname` as a float
 /// with an optional `k`/`m`/`g` size suffix (optionally followed by `b`/`B`),
 /// returning `(value, factor)`. `None` mirrors PyPy's `(0.0, 0)` absent /
-/// unparseable result, which callers treat as "unset".
+/// unparseable result, which callers treat as "unset".  A non-finite parse
+/// (`inf`/`nan`/overflow, which `f64::from_str` accepts but `float`+`r_uint`
+/// does not survive — `int(inf)`/`r_uint(inf)` raise) is treated as unset too,
+/// so callers fall back to the default instead of computing a `usize::MAX`
+/// byte count.
 fn read_float_and_factor_from_env(varname: &str) -> Option<(f64, f64)> {
     let raw = std::env::var(varname).ok()?;
     let mut value = raw.trim();
@@ -56,7 +60,7 @@ fn read_float_and_factor_from_env(varname: &str) -> Option<(f64, f64)> {
         Some(b'g') | Some(b'G') => (&value[..value.len() - 1], 1024.0 * 1024.0 * 1024.0),
         _ => (value, 1.0),
     };
-    let parsed = number.parse::<f64>().ok()?;
+    let parsed = number.parse::<f64>().ok().filter(|v| v.is_finite())?;
     Some((parsed, factor))
 }
 
