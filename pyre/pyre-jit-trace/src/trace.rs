@@ -104,17 +104,19 @@ pub fn trace_bytecode(
     } else {
         start_pc
     };
-    // RPython MetaInterp._interpret() parity: root frame owns a concrete
-    // PyFrame snapshot. MetaInterp drives both symbolic tracing AND
-    // concrete execution — the interpreter does not run during tracing.
+    // RPython MetaInterp._interpret() parity: the walker (sole tracer)
+    // executes as it records over a concrete `PyFrame` snapshot
+    // (`snapshot_for_tracing`); the interpreter does not run during tracing.
+    // The snapshot copies frame-LOCAL state (abort-safety) while sharing
+    // `w_globals`; vable-statics capture reads pointer-valued fields from the
+    // live frame (`live_vable_frame_addr` below), not the snapshot copy.
     //
-    // KNOWN DIVERGENCE (live miscompile, memory
-    // `cf-executor-into-walker-epic-2026-06-08`): tracing runs on a SNAPSHOT
-    // (`snapshot_for_tracing`), not the real frame, and the compiled loop
-    // re-runs the traced iteration from the loop header.  RPython's `_interpret`
-    // advances the SINGLE real frame so the compiled loop resumes AFTER the
-    // traced iterations.  For inline-frame SHARED-heap STOREs this re-run
-    // double-applies (see `metainterp::concrete_execute_step`).
+    // The former snapshot double-apply (inline-frame SHARED-heap STOREs
+    // leaking during tracing and re-applying on the compiled loop's re-run)
+    // is resolved by gap 10: the concrete executor is deleted so STOREs are
+    // record-only, and `flush_walk_end_state_to_frame`
+    // (`raise_continue_running_normally` parity) advances the real frame so
+    // the interpreter resumes AFTER the walked region, not from its start.
     concrete_frame.set_last_instr_from_next_instr(start_pc);
     let w_code = concrete_frame.pycode;
     // Issue #73 walker-as-tracer foundation probe (read-only).
@@ -670,6 +672,54 @@ fn run_perfn_walk(
                 }
             }
         }
+
+        // `abort_permanent` marker abort (DELETE_FAST and the other
+        // emit_abort_permanent opcodes): the marker's contract is "resume
+        // the interpreter AT this unsupported opcode and run it" — codewriter
+        // stores `last_instr = py_pc - 1` for the blackhole.  On the
+        // full-body walk that recorded write is discarded with the aborted
+        // trace, while the walk already executed the region's residual side
+        // effects concretely, so the legacy `ContinueRunningNormally` replays
+        // them from entry → double-execution (e.g. a `del`-bearing method
+        // whose prior STORE_ATTR ran once during the walk, then again on
+        // replay).  Flush the abort-point frame (locals + last_instr) so the
+        // portal resumes at the unsupported opcode instead of replaying —
+        // same mechanism and same no-unjournaled-effect predicate as the
+        // CloseLoop end-flush above.  `PYRE_FBW_ABORT_FLUSH=0` opts out.
+        if std::env::var_os("PYRE_FBW_ABORT_FLUSH").as_deref() != Some(std::ffi::OsStr::new("0")) {
+            if let Err(crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached { pc }) =
+                &walk_result
+            {
+                let abort_jit_pc = *pc;
+                if crate::jitcode_dispatch::fbw_has_unjournaled_effect()
+                    || crate::jitcode_dispatch::fbw_abort_in_subwalk()
+                {
+                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
+                             (unjournaled effect or inline sub-walk) — legacy replay kept"
+                        );
+                    }
+                } else if let Some(resume_py_pc) =
+                    crate::jitcode_dispatch::fbw_abort_resume_py_pc(sym, abort_jit_pc)
+                {
+                    if crate::state::flush_walk_end_state_to_frame(ctx, cf_addr, resume_py_pc) {
+                        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[fbw-abort-flush] COMMIT abort_jit_pc={abort_jit_pc} \
+                                 resume_py_pc={resume_py_pc}"
+                            );
+                        }
+                        WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                    } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
+                             (shadow slot without concrete / depth / lastblock) — legacy replay kept"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // No-replay portal exit for a loop-free function trace: a `Terminate`
@@ -1047,7 +1097,7 @@ fn dump_perfn_jitcode_for_trace(w_code: *const (), start_pc: usize) {
     eprintln!(
         "[perfn-jitcode] code_len={} pc_map_len={} start_pc={} entry_jitcode_pc={:?} \
          num_regs_r={} num_regs_i={} num_regs_f={} portal_frame_reg={} portal_ec_reg={} \
-         built_as_portal={} merge_point_pc={:?}",
+         built_as_portal={}",
         code.len(),
         pjc.metadata.pc_map.len(),
         start_pc,
@@ -1058,7 +1108,6 @@ fn dump_perfn_jitcode_for_trace(w_code: *const (), start_pc: usize) {
         pjc.metadata.portal_frame_reg,
         pjc.metadata.portal_ec_reg,
         pjc.metadata.built_as_portal,
-        pjc.merge_point_pc,
     );
     let mut count = 0usize;
     let mut last_next = 0usize;

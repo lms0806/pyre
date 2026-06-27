@@ -2662,13 +2662,14 @@ impl<M: Clone> MetaInterp<M> {
     /// the `read_boxes(...) ; append(virtualizable_box)` shape from
     /// pyjitpl.py:3302-3306).
     ///
-    /// `live_values` is the pyre analog of RPython's `original_boxes`,
-    /// with one structural difference: pyre carries greens in the
-    /// `green_key` side channel, so `live_values` holds only the red
-    /// inputargs. The absolute index inside `live_values` therefore
-    /// collapses to `index_of_virtualizable` (and `num_green_args`
-    /// contributes zero for all currently registered drivers, mirroring
-    /// pyre's single-portal discipline).
+    /// `live_values` is reds-only (greens fold to consts in the `green_key`
+    /// side channel, matching the compiled loop's reds-only entry contract), so
+    /// by default the absolute index collapses to `index_of_virtualizable`.
+    /// `PYRE_ORIGINAL_BOXES` restores RPython's `original_boxes = greens ++ reds`
+    /// shape locally (greens prepended as positional placeholders) so the read
+    /// uses the literal `num_green_args + index_of_virtualizable` index; the
+    /// resolved virtualizable pointer and its ref-bank index are unchanged
+    /// either way (the gate is a structural-parity no-op).
     fn initialize_virtualizable(&self, ctx: &mut TraceCtx, live_values: &[Value]) {
         // pyjitpl.py:3291: vinfo = self.jitdriver_sd.virtualizable_info
         // Prefer the trace-bound `active_jitdriver_sd` (RPython
@@ -2694,9 +2695,30 @@ impl<M: Clone> MetaInterp<M> {
         // driver (empty reds + named virtualizable), matching the
         // portal convention, so the strict RPython read works for
         // every driver.
-        let num_green_args = jd_sd.num_greens();
-        debug_assert_eq!(
-            num_green_args, 0,
+        // pyjitpl.py:3293 reads `original_boxes[num_green_args +
+        // index_of_virtualizable]`. pyre keeps `live_values` reds-only — the
+        // compiled loop's reds-only entry contract (`live_values_match_descriptor`,
+        // warmstate.py:387 execute_assembler), so greens normally contribute 0 and
+        // `index` collapses to `index_of_virtualizable`. `PYRE_ORIGINAL_BOXES`
+        // restores RPython's `original_boxes = greens ++ reds` shape LOCALLY: greens
+        // are prepended below as positional placeholders (their const values live in
+        // the `green_key`, so they only offset `index` to the virtualizable red) and
+        // `num_green_args` comes from the active driver descriptor. The trace
+        // inputargs / entry stay reds-only, so the virtualizable's ref-bank index
+        // (`box_ref_index`) decouples from the flat `index`.
+        let descriptor_num_greens = ctx
+            .driver_descriptor()
+            .map(|driver| driver.num_greens())
+            .unwrap_or(0);
+        let use_original_boxes = descriptor_num_greens > 0
+            && std::env::var_os("PYRE_ORIGINAL_BOXES").map_or(false, |v| v != "0");
+        let num_green_args = if use_original_boxes {
+            descriptor_num_greens
+        } else {
+            jd_sd.num_greens()
+        };
+        debug_assert!(
+            use_original_boxes || num_green_args == 0,
             "pyre green args live in green_key, not in live_values (pyjitpl.py:3293)"
         );
         assert!(
@@ -2707,6 +2729,18 @@ impl<M: Clone> MetaInterp<M> {
         );
         let index_of_virtualizable = jd_sd.index_of_virtualizable as usize;
         let index = num_green_args + index_of_virtualizable;
+        // original_boxes = [green placeholders ++ live_values]; identical to
+        // `live_values` when the gate is off (num_green_args == 0). Read by `index`
+        // for the virtualizable pointer; the reds-only `live_values` still drives the
+        // expanded-tail and inputarg-minting paths below.
+        let original_boxes: std::borrow::Cow<[Value]> = if num_green_args > 0 {
+            let mut boxes = Vec::with_capacity(num_green_args + live_values.len());
+            boxes.resize(num_green_args, Value::Void);
+            boxes.extend_from_slice(live_values);
+            std::borrow::Cow::Owned(boxes)
+        } else {
+            std::borrow::Cow::Borrowed(live_values)
+        };
 
         let num_static = info.num_static_extra_boxes;
         // virtualizable.py:86-99 `read_boxes` iterates `for i in range(len(lst))`
@@ -2720,7 +2754,7 @@ impl<M: Clone> MetaInterp<M> {
             if !reported.is_empty() {
                 reported
             } else if info.can_read_all_array_lengths_from_heap() {
-                let vable_ptr = match live_values.get(index) {
+                let vable_ptr = match original_boxes.get(index) {
                     Some(Value::Ref(r)) => r.as_usize() as *const u8,
                     Some(Value::Int(v)) => *v as *const u8,
                     _ => std::ptr::null(),
@@ -2788,26 +2822,29 @@ impl<M: Clone> MetaInterp<M> {
         // path and the regular JitDriver registry agree. The virtualizable
         // is a Ref-typed inputarg (resoperation.py:739 InputArgRef).
         //
-        // `index` is a flat arg ordinal; `OpRef::input_arg_ref` wants a
-        // ref-register-bank index. They coincide only when no ref arg precedes
-        // the virtualizable in the ref bank (PyFrame strips its green refs, so
-        // its frame is ref-bank 0 == ordinal 0). A host whose lowering keeps a
-        // green ref ahead of the identity (the state-field JIT's `program` at
-        // ref reg 0) publishes the true ref-bank index via
-        // `identity_ref_bank_index`; honor it so the minted box matches the
-        // traced vable base. `index` still drives the flat `live_values` reads.
-        let box_ref_index = info.identity_ref_bank_index.unwrap_or(index);
+        // `OpRef::input_arg_ref` wants a ref-register-bank index into the trace
+        // inputargs, which are reds-only (greens fold to consts in the green_key,
+        // never recorded as inputargs). So the virtualizable's box index is its
+        // reds-bank position (`index_of_virtualizable` — PyFrame's frame is reds[0]),
+        // NOT the greens-shifted flat `index` that reads `original_boxes`. A host
+        // whose lowering keeps a green ref ahead of the identity (the state-field
+        // JIT's `program` at ref reg 0) publishes the true ref-bank index via
+        // `identity_ref_bank_index`; honor it so the minted box matches the traced
+        // vable base.
+        let box_ref_index = info
+            .identity_ref_bank_index
+            .unwrap_or(index_of_virtualizable);
         let virtualizable_box = OpRef::input_arg_ref(box_ref_index as u32);
         // The identity's concrete VALUE is the live virtualizable pointer.
-        // For PyFrame `live_values[index]` already IS the frame pointer
+        // For PyFrame `original_boxes[index]` already IS the frame pointer
         // (== `vable_ptr`), so this is a no-op there. For the state-field
-        // JIT `live_values[index]` is the first scalar (stackpos), NOT the
+        // JIT `original_boxes[index]` is the first scalar (stackpos), NOT the
         // `&state` identity, so prefer `vable_ptr` when it is set
         // (`virtualizable_heap_ptr` cached it in `sync_before`).
         let virtualizable_value = if !self.vable_ptr.is_null() {
             majit_ir::Value::Ref(majit_ir::GcRef(self.vable_ptr as usize))
         } else {
-            live_values[index]
+            original_boxes[index]
         };
         let has_expanded_tail = live_values.len() >= num_reds + total_vable;
         // pyjitpl.py:3302: virtualizable_boxes = vinfo.read_boxes(...)
@@ -3371,7 +3408,16 @@ impl<M: Clone> MetaInterp<M> {
             return BackEdgeAction::AlreadyTracing;
         }
 
-        match self.warm_state.force_start_tracing(green_key) {
+        // Force-start via the typed greenkey when the raw (code, pc) is
+        // present so the function-entry cell carries a `comparekey`;
+        // synthetic (0, 0) call sites keep the legacy u64 path.
+        let hot = match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+            self.warm_state.force_start_tracing_for_key(key)
+        }) {
+            Some(h) => h,
+            None => self.warm_state.force_start_tracing(green_key),
+        };
+        match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
                 self.prepare_trace_start_runtime();
@@ -3496,7 +3542,16 @@ impl<M: Clone> MetaInterp<M> {
             return BackEdgeAction::AlreadyTracing;
         }
 
-        match self.warm_state.force_start_tracing(green_key) {
+        // Force-start via the typed greenkey when the raw (code, pc) is
+        // present so the cell carries a `comparekey` like the back-edge
+        // path; synthetic (0, 0) call sites keep the legacy u64 path.
+        let hot = match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+            self.warm_state.force_start_tracing_for_key(key)
+        }) {
+            Some(h) => h,
+            None => self.warm_state.force_start_tracing(green_key),
+        };
+        match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
                 self.prepare_trace_start_runtime();
@@ -3525,7 +3580,19 @@ impl<M: Clone> MetaInterp<M> {
             return BackEdgeAction::AlreadyTracing;
         }
 
-        match self.warm_state.maybe_compile(green_key) {
+        // warmstate.py:446-511 — decide via the typed greenkey when the
+        // raw (code, pc) is available so the installed cell carries a
+        // `comparekey` (`maybe_compile_with_key` → `ensure_cell_for_key`),
+        // matching `JitCell.get_jitcell_for_args`. The cell bucket is
+        // `key.get_uhash()` == `make_green_key`, so the legacy u64 hash
+        // flow still resolves to the same cell.
+        let hot = match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+            self.warm_state.maybe_compile_with_key(key)
+        }) {
+            Some(h) => h,
+            None => self.warm_state.maybe_compile(green_key),
+        };
+        match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
                 self.prepare_trace_start_runtime();
@@ -3540,6 +3607,45 @@ impl<M: Clone> MetaInterp<M> {
             HotResult::AlreadyTracing => BackEdgeAction::AlreadyTracing,
             HotResult::RunCompiled => BackEdgeAction::RunCompiled,
         }
+    }
+
+    /// Run `f` with the typed greenkey `[next_instr, is_being_profiled=0,
+    /// pycode]` that matches `make_green_key` (warmstate.py:584-593),
+    /// reusing a thread-local `GreenKey` so the warmup-hot decision path
+    /// does not allocate the key's value/type vectors per back-edge.
+    /// `is_being_profiled` folds to 0 (the JIT path is not profiled;
+    /// trace-side keys have no frame). Returns `None` for synthetic call
+    /// sites with no raw `(code, pc)` (e.g. [`Self::on_back_edge`]), which
+    /// keep the legacy u64 hash path. On install, `ensure_cell_for_key`
+    /// clones the key into the cell's `comparekey`, so reuse is safe.
+    fn with_typed_decision_key<R>(
+        green_key: u64,
+        green_key_raw: (usize, usize),
+        f: impl FnOnce(&majit_ir::GreenKey) -> R,
+    ) -> Option<R> {
+        let (code_ptr, pc) = green_key_raw;
+        if code_ptr == 0 {
+            return None;
+        }
+        thread_local! {
+            static DECISION_KEY: std::cell::RefCell<majit_ir::GreenKey> =
+                std::cell::RefCell::new(majit_ir::GreenKey::with_types(
+                    vec![0_i64, 0, 0],
+                    vec![Type::Int, Type::Int, Type::Ref],
+                ));
+        }
+        Some(DECISION_KEY.with(|cell| {
+            let mut key = cell.borrow_mut();
+            key.values[0] = pc as i64;
+            key.values[1] = 0;
+            key.values[2] = code_ptr as i64;
+            debug_assert_eq!(
+                key.get_uhash(),
+                green_key,
+                "typed decision key must bucket to make_green_key(green_key_raw)"
+            );
+            f(&key)
+        }))
     }
 
     #[allow(dead_code)]
@@ -20207,6 +20313,66 @@ mod tests {
         assert_eq!(events[0].0, green_key, "green_key should match");
         assert!(events[0].1 > 0, "num_ops_before should be positive");
         assert!(events[0].2 > 0, "num_ops_after should be positive");
+    }
+
+    #[test]
+    fn on_back_edge_typed_installs_cell_with_typed_comparekey() {
+        // #203 gap-7 step-a cutover: a hot back-edge carrying a real
+        // (code, pc) must install a warm-state cell with a typed
+        // `comparekey`, so the marker-path lookup (`lookup_chain_with_key`)
+        // resolves to the same cell as the legacy u64 hash flow. The cell
+        // bucket is `key.get_uhash()`, which equals `make_green_key`.
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let code: usize = 0x4000;
+        let pc: usize = 11;
+        let green_key = crate::green_key_from_code_ptr(code, pc);
+        let live = [Value::Int(0)];
+        for _ in 0..2 {
+            meta.on_back_edge_typed(green_key, (code, pc), None, None, &live);
+        }
+        assert!(meta.tracing.is_some(), "expected tracing to start");
+
+        let key = majit_ir::GreenKey::with_types(
+            vec![pc as i64, 0, code as i64],
+            vec![Type::Int, Type::Int, Type::Ref],
+        );
+        assert_eq!(
+            key.get_uhash(),
+            green_key,
+            "typed key must bucket to make_green_key(code, pc)"
+        );
+        assert!(
+            meta.warm_state.lookup_chain_with_key(&key).is_some(),
+            "production back-edge cell must carry a typed comparekey"
+        );
+    }
+
+    #[test]
+    fn bound_reached_force_starts_cell_with_typed_comparekey() {
+        // #203 gap-7 step-a: the can_enter_jit force-start path
+        // (`bound_reached` → `force_start_tracing_for_key`) must also
+        // install a cell with a typed comparekey, bypassing the counter.
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let code: usize = 0x5000;
+        let pc: usize = 13;
+        let green_key = crate::green_key_from_code_ptr(code, pc);
+        let live = [Value::Int(0)];
+        meta.bound_reached(green_key, (code, pc), None, None, &live);
+        assert!(
+            meta.tracing.is_some(),
+            "bound_reached must force-start tracing"
+        );
+
+        let key = majit_ir::GreenKey::with_types(
+            vec![pc as i64, 0, code as i64],
+            vec![Type::Int, Type::Int, Type::Ref],
+        );
+        assert!(
+            meta.warm_state.lookup_chain_with_key(&key).is_some(),
+            "force-started cell must carry a typed comparekey"
+        );
     }
 
     #[test]

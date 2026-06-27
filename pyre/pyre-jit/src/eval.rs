@@ -2912,7 +2912,12 @@ pub(crate) fn call_depth() -> u32 {
 /// Each (code, pc) pair has independent warmup counter and compiled loop.
 #[inline(always)]
 pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
-    (code_ptr as u64).wrapping_mul(1000003) ^ (pc as u64)
+    // Full `JitCell.get_uhash` over the pypyjit green tuple
+    // `[next_instr, is_being_profiled, pycode]` (warmstate.py:584-593),
+    // computed allocation-free. `is_being_profiled` folds to 0 (the JIT
+    // path is never profiled), so this matches the typed marker-path key
+    // and both lookups resolve to the same cell.
+    majit_ir::pypyjit_greenkey_uhash(pc, false, code_ptr as u64)
 }
 
 // JIT_CALL_DEPTH removed — pyre-interpreter::call::CALL_DEPTH is the single
@@ -3881,67 +3886,14 @@ fn jit_merge_point_hook(
     let concrete_frame = frame as *mut PyFrame as usize;
     let green_key = make_green_key(frame.pycode, pc);
 
-    // S2.5 (wiggly-barto plan, Stage 2 — dual verification mode).
-    //
-    // TODO(delete in S3.2): the env var and this whole soak block ship
-    // out alongside the direct-hook deletion. Upstream has no eval-side
-    // marker gate (rlib/jit.py:881-1006 + warmspot.py:874-1075 run
-    // unconditionally). The gate exists only as scaffolding for the
-    // S3.1 cutover so we can bring up the marker/static-data path
-    // alongside the legacy `make_green_key` hash flow without flipping
-    // production default in one commit.
-    //
-    // While `PYRE_JIT_MARKER_PARITY_SOAK=1` is set, this block runs
-    // shadow-style next to the production decision: it constructs the
-    // typed `GreenKey` mirroring `pypyjitdriver.greens` (rlib/jit.py:649,
-    // interp_jit.py:69 — `[next_instr, is_being_profiled, pycode]`) and
-    // exercises `WarmEnterState::lookup_chain_with_key` so the typed-key
-    // surface stays warm for the cutover; the result is intentionally
-    // discarded so the legacy hash-only flow below still owns the
-    // decision (incremental hash unification
-    // is blocked by a fannkuch perf regression, so the soak gate is the
-    // S3.1 prereq instead).
-    static PYRE_JIT_MARKER_PARITY_SOAK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *PYRE_JIT_MARKER_PARITY_SOAK
-        .get_or_init(|| std::env::var_os("PYRE_JIT_MARKER_PARITY_SOAK").is_some())
-    {
-        // pypyjitdriver greens declaration order
-        // (interp_jit.py:69 / rlib/jit.py:649): pc first, then
-        // is_being_profiled, then pycode — verify_green_args upstream
-        // walks the same prefix (pyjitpl.py:1532-1535).
-        //
-        // The hot-path overhead would dominate variance if we allocated
-        // three Vecs per tick; reuse a thread-local GreenKey with
-        // pre-built `types` so each call only mutates `values[0..3]`.
-        thread_local! {
-            static SOAK_KEY: std::cell::RefCell<majit_ir::GreenKey> =
-                std::cell::RefCell::new(majit_ir::GreenKey::with_types(
-                    vec![0_i64, 0, 0],
-                    vec![
-                        majit_ir::Type::Int,
-                        majit_ir::Type::Int,
-                        majit_ir::Type::Ref,
-                    ],
-                ));
-        }
-        SOAK_KEY.with(|cell| {
-            let mut key = cell.borrow_mut();
-            key.values[0] = pc as i64;
-            key.values[1] = if frame.get_is_being_profiled() { 1 } else { 0 };
-            key.values[2] = frame.pycode as i64;
-            // Shadow lookup — read-only, no install. Discarded result.
-            // Pre-S3.1 the typed `get_uhash` and the legacy
-            // `make_green_key` hash differ, so this lookup
-            // intentionally misses. The soak's value is exercising the
-            // typed-API call site so a regression in
-            // `lookup_chain_with_key` surfaces under
-            // `PYRE_JIT_MARKER_PARITY_SOAK=1` before S3.1 cutover.
-            let _shadow = driver
-                .meta_interp()
-                .warm_state_ref()
-                .lookup_chain_with_key(&key);
-        });
-    }
+    // The trace-START decision (counter / threshold / start-tracing) lives
+    // in the warmstate marker path — `maybe_compile_with_key` (back-edge)
+    // and `force_start_tracing_for_key` (function-entry/recursion) walk the
+    // cell chain by `comparekey_matches` and own the decision. This hook is
+    // only the trace FEED: it runs once tracing is already active and hands
+    // each merge-point opcode to `jit_merge_point_keyed`. `make_green_key`
+    // and the warmstate cell key are the same allocation-free
+    // `pypyjit_greenkey_uhash`, so the feed key and the decision key agree.
 
     let mut jit_state = build_jit_state(frame, info);
     let current_depth = call_depth();
@@ -3964,7 +3916,7 @@ fn jit_merge_point_hook(
             // starts, populating all_liveness. In pyre, JitCode compilation is
             // lazy — ensure the code's JitCode (with liveness) exists before
             // tracing so get_list_of_active_boxes can use it.
-            crate::jit::codewriter::register_portal_jitdriver(code, frame.pycode, Some(pc));
+            crate::jit::codewriter::register_portal_jitdriver(code, frame.pycode);
             let snapshot = frame.snapshot_for_tracing();
             let _ = concrete_frame;
             let live_frame_addr = &*frame as *const PyFrame as usize;
@@ -4680,11 +4632,7 @@ fn bound_reached(
                 || {},
                 |meta, sym| {
                     use pyre_jit_trace::trace::trace_bytecode;
-                    crate::jit::codewriter::register_portal_jitdriver(
-                        code,
-                        frame.pycode,
-                        Some(loop_header_pc),
-                    );
+                    crate::jit::codewriter::register_portal_jitdriver(code, frame.pycode);
                     let concrete_frame = frame.snapshot_for_tracing();
                     let live_frame_addr = &*frame as *const PyFrame as usize;
                     let (action, executed_frame) = trace_bytecode(
@@ -7697,7 +7645,7 @@ mod tests {
                 as *const pyre_interpreter::CodeObject
         };
         let canonical_code = unsafe { &*raw_code };
-        crate::jit::codewriter::register_portal_jitdriver(canonical_code, w_code, None);
+        crate::jit::codewriter::register_portal_jitdriver(canonical_code, w_code);
     }
 
     /// Translate Python-stack depths into the post-regalloc Ref-bank
