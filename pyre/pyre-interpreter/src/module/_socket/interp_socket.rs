@@ -182,14 +182,35 @@ fn socket_writebuf(obj: pyre_object::PyObjectRef) -> Result<&'static mut [u8], c
     if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
         return Ok(unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(obj) });
     }
-    if let Some(t) = crate::typedef::r#type(obj) {
-        if unsafe { pyre_object::w_type_get_name(t) } == "memoryview" {
-            let buf = crate::baseobjspace::getattr_str(obj, "__pyre_buf__")?;
-            if unsafe { pyre_object::bytearrayobject::is_bytearray(buf) } {
-                return Ok(unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(buf) });
-            }
-            return Err(crate::PyError::type_error("cannot modify read-only memory"));
+    if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
+        // `space.buffer_w` rejects a released view before exposing its storage.
+        unsafe { crate::builtins::memoryview_check_released(obj) }?;
+        // A read-write buffer is required; a read-only view cannot back recv_into.
+        if unsafe { pyre_object::memoryview::w_memoryview_readonly(obj) } {
+            return Err(crate::PyError::type_error(
+                "a read-write bytes-like object is required, not 'memoryview'",
+            ));
         }
+        // Only contiguous views are accepted; a strided slice (`m[::2]`,
+        // `m[::-1]`) would need a scatter writer pyre does not have.
+        if unsafe {
+            pyre_object::memoryview::w_memoryview_stride0(obj)
+                != pyre_object::memoryview::w_memoryview_itemsize(obj)
+        } {
+            return Err(crate::PyError::type_error(
+                "a read-write bytes-like object is required, not 'memoryview'",
+            ));
+        }
+        let backing = unsafe { pyre_object::memoryview::w_memoryview_backing(obj) };
+        if unsafe { pyre_object::bytearrayobject::is_bytearray(backing) } {
+            // Honour the view window: write only into `[offset, offset+length)`
+            // of the backing store, not the whole buffer.
+            let off = unsafe { pyre_object::memoryview::w_memoryview_offset(obj) } as usize;
+            let len = unsafe { pyre_object::memoryview::w_memoryview_length(obj) } as usize;
+            let full = unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(backing) };
+            return Ok(&mut full[off..off + len]);
+        }
+        return Err(crate::PyError::type_error("cannot modify read-only memory"));
     }
     Err(crate::PyError::type_error(
         "a writable bytes-like object is required",

@@ -684,19 +684,21 @@ fn pattern_is_known_unicode(pat: PyObjectRef) -> bool {
 
 /// `readbuf_w` (interp_sre.py:283) — the buffer-providing object backing a
 /// read-buffer subject that is not itself `bytes`/`bytearray`.  pyre's only
-/// such producer is `memoryview` (a stub carrying its backing buffer in the
-/// `__pyre_buf__` slot); the returned `bytes` plays the captured
-/// `BufMatchContext._buffer`.  `PY_NULL` if `obj` exposes no such buffer.
+/// such producer is `memoryview`; its live byte backing plays the captured
+/// `BufMatchContext._buffer` (kept alive by the match it is stored into).
+/// `PY_NULL` if `obj` is not a memoryview over a `bytes`/`bytearray`.
 unsafe fn readbuf_obj(obj: PyObjectRef) -> PyObjectRef {
-    let Some(w_type) = crate::typedef::r#type(obj) else {
-        return pyre_object::PY_NULL;
-    };
-    if unsafe { pyre_object::w_type_get_name(w_type) } != "memoryview" {
+    if !unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
         return pyre_object::PY_NULL;
     }
-    match crate::baseobjspace::getattr_str(obj, "__pyre_buf__") {
-        Ok(buf) if unsafe { pyre_object::bytesobject::is_bytes_like(buf) } => buf,
-        _ => pyre_object::PY_NULL,
+    let backing = unsafe { pyre_object::memoryview::w_memoryview_backing(obj) };
+    if unsafe { pyre_object::bytesobject::is_bytes_like(backing) } {
+        // The subject is the view window (offset/itemsize/length/strides),
+        // not the whole backing — materialize the gathered slice bytes.
+        let gathered = unsafe { crate::builtins::memoryview_gather_bytes(obj) };
+        pyre_object::bytesobject::w_bytes_from_bytes(&gathered)
+    } else {
+        pyre_object::PY_NULL
     }
 }
 
@@ -733,12 +735,20 @@ fn make_subject(pat: PyObjectRef, string: PyObjectRef) -> Result<Subject, crate:
         Ok(Subject::Bytes(unsafe {
             pyre_object::bytesobject::bytes_like_data(string)
         }))
-    } else if let Some(buf) = unsafe { readbuf_bytes(string) } {
+    } else if unsafe { pyre_object::memoryview::is_w_memoryview(string) } {
+        // `make_ctx` acquires the subject through `readbuf_w` → `buffer_w`,
+        // which rejects a released view before reading its bytes.
+        unsafe { crate::builtins::memoryview_check_released(string) }?;
         if pattern_is_known_unicode(pat) {
             return Err(crate::PyError::type_error(
                 "can't use a string pattern on a bytes-like object",
             ));
         }
+        let Some(buf) = (unsafe { readbuf_bytes(string) }) else {
+            return Err(crate::PyError::type_error(
+                "expected string or bytes-like object",
+            ));
+        };
         Ok(Subject::Bytes(buf))
     } else {
         Err(crate::PyError::type_error(

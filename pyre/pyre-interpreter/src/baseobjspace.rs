@@ -2171,6 +2171,17 @@ pub(crate) fn setitem_slot(obj: PyObjectRef, index: PyObjectRef, value: PyObject
         if is_instance(obj) {
             return setitem_instance(obj, index, value);
         }
+        // descroperation.py:382-392 DescrOperation.setitem — any object
+        // whose type defines `__setitem__` on its MRO supports item
+        // assignment (the arms above are fast paths for builtin mutable
+        // containers).  Mirrors the generic `__getitem__` fallback in
+        // `getitem_slot`; covers native W_Root types like `memoryview`
+        // whose typedef registers `__setitem__`.
+        if let Some(w_type) = crate::typedef::r#type(obj) {
+            if let Some(method) = lookup_in_type_where(w_type, "__setitem__") {
+                return get_and_call_function(method, obj, w_type, &[index, value]);
+            }
+        }
         Err(PyError::type_error(format!(
             "'{}' object does not support item assignment",
             (*(*obj).ob_type).name,
@@ -8981,6 +8992,23 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             let len = pyre_object::interp_array::w_array_len(obj);
             return Ok(pyre_object::w_seq_iter_new(obj, len));
         }
+        // `memoryview` — `memoryobject.py descr_iter` returns
+        // `space.newseqiter(self)`; the cursor fetches each element through
+        // `__getitem__`.  Element count is `shape[0]` == length / itemsize.
+        if pyre_object::memoryview::is_w_memoryview(obj) {
+            if pyre_object::memoryview::w_memoryview_released(obj) {
+                return Err(PyError::value_error(
+                    "operation forbidden on released memoryview object",
+                ));
+            }
+            let itemsize = pyre_object::memoryview::w_memoryview_itemsize(obj);
+            let len = if itemsize > 0 {
+                (pyre_object::memoryview::w_memoryview_length(obj) / itemsize) as usize
+            } else {
+                0
+            };
+            return Ok(pyre_object::w_seq_iter_new(obj, len));
+        }
         // pypy/objspace/descroperation.py:330-346 `def iter(space, w_obj)`
         // — `space.lookup(w_obj, '__iter__')` is type-MRO-only; PyPy never
         // consults the instance dict for special-method lookup (CPython
@@ -10746,7 +10774,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                 }
                 return Ok(hay.contains(&(v as u8)));
             }
-            if let Some(src) = crate::typedef::buffer_as_bytes_like(needle) {
+            if let Some(src) = crate::typedef::buffer_as_bytes_like(needle)? {
                 let sub = pyre_object::bytesobject::bytes_like_data(src);
                 return Ok(sub.is_empty() || hay.windows(sub.len()).any(|w| w == sub));
             }
@@ -10860,6 +10888,12 @@ pub fn hash_w_strict(obj: PyObjectRef) -> Result<i64, PyError> {
         };
         if let Some(name) = kind {
             return Err(PyError::type_error(format!("unhashable type: '{}'", name)));
+        }
+        // A released or writable memoryview is unhashable; route through the
+        // fallible hasher so it raises the proper ValueError instead of an
+        // infallible identity hash (`memoryobject.py descr_hash`).
+        if pyre_object::memoryview::is_w_memoryview(obj) {
+            return crate::builtins::try_hash_value(obj);
         }
     }
     Ok(crate::builtins::hash_value(obj))

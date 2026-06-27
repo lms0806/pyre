@@ -1134,9 +1134,9 @@ thread_local! {
         // `pytype_to_tid`, so this pre-registration wins over its
         // generic `object_subclass(sizeof(PyObject), parent_tid)`
         // default which would underallocate `W_BaseException`.
-        for kind_idx in 0u8..=(pyre_object::interp_exceptions::ExcKind::SyntaxError as u8) {
+        for kind_idx in 0u8..=(pyre_object::interp_exceptions::ExcKind::BufferError as u8) {
             // Round-trip the byte through the enum so we don't depend
-            // on unsafe transmute; every value in [0, SyntaxError] is
+            // on unsafe transmute; every value in [0, BufferError] is
             // a valid `ExcKind` variant by construction.
             let kind = match kind_idx {
                 0 => pyre_object::interp_exceptions::ExcKind::BaseException,
@@ -1170,6 +1170,7 @@ thread_local! {
                 28 => pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError,
                 29 => pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError,
                 30 => pyre_object::interp_exceptions::ExcKind::SyntaxError,
+                31 => pyre_object::interp_exceptions::ExcKind::BufferError,
                 _ => unreachable!(),
             };
             let pytype_ptr = pyre_object::interp_exceptions::exc_kind_to_pytype(kind)
@@ -1901,6 +1902,18 @@ thread_local! {
             &mut gc,
             &mut pytype_to_tid,
             <pyre_object::interp_array::W_Array
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
+        // W_MemoryView (`memoryview`) — typed payload via `#[pyre_class]`
+        // in AUTO-ID mode; its five `PyObjectRef` fields (obj / backing /
+        // format / shape / strides) are traced edges the collector must
+        // walk.  Absent from `all_foreign_pytypes`, so this is the only
+        // path that GC-manages it.  Registered at the tail of the tid chain
+        // so no earlier explicit-id / hardcoded-constant slot shifts.
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_object::memoryview::W_MemoryView
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // rclass.py:340-346 — assign subclassrange_{min,max} to each
