@@ -971,6 +971,87 @@ pub(crate) unsafe fn get_and_call_function(
     crate::call::call_function_impl_result(w_impl, args_w)
 }
 
+/// `isinstance(w_obj, Coroutine) or gen_is_coroutine(w_obj)` from
+/// `generator.py:569`, collapsed onto pyre's single generator object: an
+/// `async def` coroutine and a `@types.coroutine`-marked generator both carry
+/// their marker on the suspended frame's code (`CO_COROUTINE` /
+/// `CO_ITERABLE_COROUTINE`), so the distinct PyPy `Coroutine` class becomes a
+/// code-flag test here.
+fn is_coroutine(w_obj: PyObjectRef) -> bool {
+    unsafe {
+        if !pyre_object::generator::is_generator(w_obj) {
+            return false;
+        }
+        let frame_ptr =
+            pyre_object::generator::w_generator_get_frame(w_obj) as *const crate::pyframe::PyFrame;
+        // An exhausted generator has a null frame and so no readable flags; an
+        // awaited coroutine is never exhausted at this point.
+        if frame_ptr.is_null() {
+            return false;
+        }
+        (*frame_ptr)
+            .code()
+            .flags
+            .intersects(crate::CodeFlags::COROUTINE | crate::CodeFlags::ITERABLE_COROUTINE)
+    }
+}
+
+/// `generator.py:563 get_awaitable_iter` — return the iterator implementing the
+/// awaitable protocol for `w_obj`:
+///   - `w_obj` itself when it is a coroutine (or `@types.coroutine` generator);
+///   - otherwise `w_obj.__await__()`, which must be an iterator.
+///
+/// `context`: 0 = plain `await`, 1 = `__aenter__`, 2 = `__aexit__` — only the
+/// missing-`__await__` error message differs.
+pub fn get_awaitable_iter(w_obj: PyObjectRef, context: u32) -> PyResult {
+    if is_coroutine(w_obj) {
+        return Ok(w_obj);
+    }
+    let w_await = crate::typedef::r#type(w_obj)
+        .and_then(|w_type| unsafe { lookup_in_type(w_type, "__await__") });
+    let Some(w_await) = w_await else {
+        let msg = match context {
+            1 => format!(
+                "'async with' received an object from __aenter__ that does not \
+                 implement __await__: {}",
+                object_functionstr_type_name(w_obj),
+            ),
+            2 => format!(
+                "'async with' received an object from __aexit__ that does not \
+                 implement __await__: {}",
+                object_functionstr_type_name(w_obj),
+            ),
+            _ => format!(
+                "object {} can't be used in 'await' expression",
+                object_functionstr_type_name(w_obj),
+            ),
+        };
+        return Err(PyError::type_error(msg));
+    };
+    let w_type = crate::typedef::r#type(w_obj).unwrap_or(w_obj);
+    let w_res = unsafe { get_and_call_function(w_await, w_obj, w_type, &[]) }?;
+    if is_coroutine(w_res) {
+        return Err(PyError::type_error(
+            "__await__() returned a coroutine (it must return an iterator \
+             instead, see PEP 492)",
+        ));
+    }
+    // `space.lookup(w_res, "__next__")` — w_res must be an iterator.  pyre's
+    // generator object (the usual `__await__` return) carries `__next__` at the
+    // instance level rather than on its type, so it is accepted directly; other
+    // iterators expose `__next__` on their type.
+    let has_next = unsafe { pyre_object::generator::is_generator(w_res) }
+        || crate::typedef::r#type(w_res)
+            .is_some_and(|w_type| unsafe { lookup_in_type(w_type, "__next__") }.is_some());
+    if !has_next {
+        return Err(PyError::type_error(format!(
+            "__await__() returned non-iterator of type '{}'",
+            object_functionstr_type_name(w_res),
+        )));
+    }
+    Ok(w_res)
+}
+
 /// _set_names (typeobject.py:1006) — invoke `__set_name__(owner, name)` for one
 /// class-body entry.  `__set_name__` is found by a type-only lookup on
 /// `type(w_value)` (`space.lookup`, NOT the full attribute protocol, so a
@@ -4659,12 +4740,16 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             // arguments, with class default `None` (`:360`).  Each is a
             // plain slot read: an instance allocated via `__new__` (which
             // never touches the slot) reads `None`.  Gated on the
-            // ImportError kind (which also tags ModuleNotFoundError).
+            // ImportError-family kind (ImportError / ModuleNotFoundError).
             // `name` is handled by the shared arm below since NameError /
             // AttributeError expose it too.
             "msg" | "path" | "name_from" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::interp_exceptions::ExcKind::ImportError {
+                if matches!(
+                    kind,
+                    pyre_object::interp_exceptions::ExcKind::ImportError
+                        | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
+                ) {
                     let stored = unsafe {
                         match name {
                             "msg" => {
@@ -4689,15 +4774,16 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 }
             }
             // Shared `name` attribute for the kinds that expose it —
-            // `W_ImportError`, `W_NameError`, and `W_AttributeError`
-            // (Python 3.10+).  Read from the shared `w_exc_name` slot
-            // (default `None`); falls through to normal attribute lookup
-            // on every other exception kind.
+            // `W_ImportError` (and `W_ModuleNotFoundError`), `W_NameError`,
+            // and `W_AttributeError` (Python 3.10+).  Read from the shared
+            // `w_exc_name` slot (default `None`); falls through to normal
+            // attribute lookup on every other exception kind.
             "name" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
                     pyre_object::interp_exceptions::ExcKind::ImportError
+                        | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
                         | pyre_object::interp_exceptions::ExcKind::NameError
                         | pyre_object::interp_exceptions::ExcKind::AttributeError
                 ) {
@@ -6951,11 +7037,15 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
             // `interp_exceptions.py:679-681 W_ImportError` writable
             // `msg` / `name` / `path` (plus `name_from`) slots; the
             // matching getattr arm reads them back.  Gated on the
-            // ImportError kind (covers ModuleNotFoundError).  `name` is
-            // handled by the shared arm below.
+            // ImportError-family kind (ImportError / ModuleNotFoundError).
+            // `name` is handled by the shared arm below.
             "msg" | "path" | "name_from" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::interp_exceptions::ExcKind::ImportError {
+                if matches!(
+                    kind,
+                    pyre_object::interp_exceptions::ExcKind::ImportError
+                        | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
+                ) {
                     unsafe {
                         match name {
                             "msg" => pyre_object::interp_exceptions::w_exception_set_import_msg(
@@ -6972,13 +7062,15 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                     return Ok(w_none());
                 }
             }
-            // Shared writable `name` slot for ImportError / NameError /
-            // AttributeError; the matching getattr arm reads it back.
+            // Shared writable `name` slot for ImportError / ModuleNotFoundError
+            // / NameError / AttributeError; the matching getattr arm reads it
+            // back.
             "name" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
                     pyre_object::interp_exceptions::ExcKind::ImportError
+                        | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
                         | pyre_object::interp_exceptions::ExcKind::NameError
                         | pyre_object::interp_exceptions::ExcKind::AttributeError
                 ) {

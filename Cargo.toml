@@ -58,11 +58,11 @@ pyre-jit-trace = { version = "0.0.2", path = "pyre/pyre-jit-trace" }
 pyre-wasm = { version = "0.0.2", path = "pyre/pyre-wasm" }
 pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 
-rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "1385c4e472f8187f5087011a8c4e3619875cff89" }
-rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "1385c4e472f8187f5087011a8c4e3619875cff89" }
-rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "1385c4e472f8187f5087011a8c4e3619875cff89" }
-rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "1385c4e472f8187f5087011a8c4e3619875cff89" }
-sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "1385c4e472f8187f5087011a8c4e3619875cff89" }
+rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
+rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
+rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
+rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
+sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
 
 # majit JIT framework
 majit = { version = "0.0.2", path = "majit/majit" }
@@ -121,8 +121,9 @@ wasmparser = "0.225"
 # `wasm_js` is enabled only by `pyre-wasm`'s `web` feature (browser crypto via
 # wasm-bindgen). The native-host `wasm-host` build instead selects getrandom's
 # `custom` backend (`--cfg getrandom_backend="custom"`) so it carries no
-# wasm-bindgen imports.
-getrandom = "0.3.4"
+# wasm-bindgen imports. Kept on the same 0.4 line as `rustpython-host_env` so
+# the `web` build's `getrandom/wasm_js` feature reaches that shared instance.
+getrandom = "0.4.2"
 # Native host runtime for the wasm runner. Pinned to the wasmtime release whose
 # `wasmtime-internal-*` support crates already ride along with cranelift 0.132
 # (the version the dynasm/cranelift backends use), so it reuses the existing

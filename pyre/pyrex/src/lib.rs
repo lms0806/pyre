@@ -35,6 +35,7 @@ Options:
 -i     : inspect interactively after running script
 -O     : optimize (no-op, reserved for compatibility)
 -q     : don't print version on interactive startup
+-S     : don't imply 'import site' on initialization
 -V     : print the Python version number and exit (also --version)
 file   : program read from script file
 -      : program read from stdin (default; interactive mode if a tty)
@@ -54,22 +55,25 @@ fn drain_args(parser: &mut lexopt::Parser) -> Result<Vec<String>, lexopt::Error>
     Ok(rest)
 }
 
-fn parse_args(binary_name: &str) -> Result<(RunMode, bool, bool, Vec<String>), lexopt::Error> {
+fn parse_args(
+    binary_name: &str,
+) -> Result<(RunMode, bool, bool, bool, Vec<String>), lexopt::Error> {
     let mut parser = lexopt::Parser::from_env();
     let mut inspect = false;
     let mut quiet = false;
+    let mut no_site = false;
 
     while let Some(arg) = parser.next()? {
         match arg {
             Short('c') => {
                 let cmd = parser.value()?.string()?;
                 let rest = drain_args(&mut parser)?;
-                return Ok((RunMode::Command(cmd), inspect, quiet, rest));
+                return Ok((RunMode::Command(cmd), inspect, quiet, no_site, rest));
             }
             Short('m') => {
                 let module = parser.value()?.string()?;
                 let rest = drain_args(&mut parser)?;
-                return Ok((RunMode::Module(module), inspect, quiet, rest));
+                return Ok((RunMode::Module(module), inspect, quiet, no_site, rest));
             }
             Short('h') | Long("help") => {
                 print!("{}", usage(binary_name));
@@ -78,6 +82,7 @@ fn parse_args(binary_name: &str) -> Result<(RunMode, bool, bool, Vec<String>), l
             Short('i') => inspect = true,
             Short('O') => {} // no-op
             Short('q') => quiet = true,
+            Short('S') => no_site = true,
             Short('V') | Long("version") => {
                 println!("{binary_name} 0.0.1");
                 std::process::exit(0);
@@ -85,15 +90,15 @@ fn parse_args(binary_name: &str) -> Result<(RunMode, bool, bool, Vec<String>), l
             Value(script) => {
                 let script = script.string()?;
                 if script == "-" {
-                    return Ok((RunMode::Repl, inspect, quiet, vec![]));
+                    return Ok((RunMode::Repl, inspect, quiet, no_site, vec![]));
                 }
                 let rest = drain_args(&mut parser)?;
-                return Ok((RunMode::Script(script), inspect, quiet, rest));
+                return Ok((RunMode::Script(script), inspect, quiet, no_site, rest));
             }
             _ => return Err(arg.unexpected()),
         }
     }
-    Ok((RunMode::Repl, inspect, quiet, vec![]))
+    Ok((RunMode::Repl, inspect, quiet, no_site, vec![]))
 }
 
 pub fn main_entry(binary_name: &'static str) {
@@ -140,7 +145,7 @@ fn real_main(binary_name: &str) {
             default_hook(info);
         }
     }));
-    let (mode, inspect, quiet, args) = match parse_args(binary_name) {
+    let (mode, inspect, quiet, no_site, args) = match parse_args(binary_name) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{binary_name}: {e}");
@@ -169,9 +174,9 @@ fn real_main(binary_name: &str) {
             let mut argv = vec!["-c".to_string()];
             argv.extend(args);
             importing::set_sys_argv(&argv);
-            run_source(&cmd, Mode::Exec, "<string>");
+            run_source(&cmd, Mode::Exec, "<string>", no_site);
             if inspect {
-                repl::run_repl(true);
+                repl::run_repl(true, no_site);
             }
         }
         RunMode::Module(module) => {
@@ -182,9 +187,9 @@ fn real_main(binary_name: &str) {
             let mut argv = vec![module.clone()];
             argv.extend(args);
             importing::set_sys_argv(&argv);
-            run_module(&module);
+            run_module(&module, no_site);
             if inspect {
-                repl::run_repl(true);
+                repl::run_repl(true, no_site);
             }
         }
         RunMode::Script(path) => {
@@ -206,16 +211,16 @@ fn real_main(binary_name: &str) {
             let mut argv = vec![path.clone()];
             argv.extend(args);
             importing::set_sys_argv(&argv);
-            run_source(&source, Mode::Exec, &path);
+            run_source(&source, Mode::Exec, &path, no_site);
             if inspect {
-                repl::run_repl(true);
+                repl::run_repl(true, no_site);
             }
         }
         RunMode::Repl => {
             // Initialize sys.path with CWD for REPL mode.
             let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
             importing::init_sys_path(&cwd);
-            repl::run_repl(quiet);
+            repl::run_repl(quiet, no_site);
         }
     }
 }
@@ -259,9 +264,101 @@ fn setup_exec_context() -> Rc<PyExecutionContext> {
     execution_context
 }
 
+/// app_main.py:875-882 — unless `-S` (`no_site`) was given, `import site`
+/// once `__main__` is registered so the standard `site` initialization runs
+/// before user code (sys.path finalization, the `quit`/`exit`/`help`
+/// builtins). The import failing is non-fatal (the bare `except`): print
+/// "'import site' failed" to stderr and continue.
+pub(crate) fn import_site(
+    no_site: bool,
+    w_main_globals: pyre_object::PyObjectRef,
+    ec_ptr: *const pyre_interpreter::PyExecutionContext,
+) {
+    if no_site {
+        return;
+    }
+    if importing::importhook("site", w_main_globals, pyre_object::PY_NULL, 0, ec_ptr).is_err() {
+        eprintln!("'import site' failed");
+    }
+}
+
+/// Run the `init_importlib` / `init_importlib_external` sequence
+/// (pylifecycle.c) so `sys.meta_path` / `sys.path_hooks` are populated and
+/// `importlib.util.find_spec` works — which `runpy._get_module_details`
+/// (the `-m` entry) requires. pyre's native importer does not consult
+/// `sys.meta_path`, so before this `importlib._bootstrap` has neither `sys`
+/// nor `_imp` injected and `meta_path` is empty.
+///
+/// `_bootstrap._setup` (importlib/_bootstrap.py) reads the bootstrap builtins
+/// `_thread`/`_warnings`/`_weakref` from `sys.modules`, so import them first to
+/// seed `sys.modules` (otherwise `_setup` falls into `_builtin_from_name` →
+/// `_imp.create_builtin`, which the native importer does not implement).
+fn init_importlib_bootstrap(
+    canonical: pyre_object::PyObjectRef,
+    ec_ptr: *const pyre_interpreter::PyExecutionContext,
+) -> Result<(), pyre_interpreter::PyError> {
+    let import =
+        |name: &str| importing::importhook(name, canonical, pyre_object::PY_NULL, 0, ec_ptr);
+    let call_checked = |func: pyre_object::PyObjectRef,
+                        args: &[pyre_object::PyObjectRef]|
+     -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+        let res = pyre_interpreter::call_function(func, args);
+        if res.is_null() {
+            return Err(
+                pyre_interpreter::call::take_call_error().unwrap_or_else(|| {
+                    pyre_interpreter::PyError::new(
+                        pyre_interpreter::PyErrorKind::RuntimeError,
+                        "importlib bootstrap _install returned NULL without an exception",
+                    )
+                }),
+            );
+        }
+        Ok(res)
+    };
+
+    for name in ["_thread", "_warnings", "_weakref"] {
+        import(name)?;
+    }
+    let sys_mod = import("sys")?;
+    let imp_mod = import("_imp")?;
+    import("importlib._bootstrap")?;
+    import("importlib._bootstrap_external")?;
+    let bootstrap = importing::get_sys_module("importlib._bootstrap").ok_or_else(|| {
+        pyre_interpreter::PyError::new(
+            pyre_interpreter::PyErrorKind::RuntimeError,
+            "importlib._bootstrap missing from sys.modules after import",
+        )
+    })?;
+    let bootstrap_ext =
+        importing::get_sys_module("importlib._bootstrap_external").ok_or_else(|| {
+            pyre_interpreter::PyError::new(
+                pyre_interpreter::PyErrorKind::RuntimeError,
+                "importlib._bootstrap_external missing from sys.modules after import",
+            )
+        })?;
+
+    // init_importlib: importlib._bootstrap._install(sys, _imp)
+    let install = pyre_interpreter::getattr(bootstrap, pyre_object::w_str_new("_install"))?;
+    call_checked(install, &[sys_mod, imp_mod])?;
+    // init_importlib_external: importlib._bootstrap_external._install(_bootstrap)
+    let install_ext = pyre_interpreter::getattr(bootstrap_ext, pyre_object::w_str_new("_install"))?;
+    call_checked(install_ext, &[bootstrap])?;
+    // importlib/__init__.py: _bootstrap._bootstrap_external = _bootstrap_external
+    // (`_install` only calls `_set_bootstrap_module`; the reverse link that
+    // `ModuleSpec.cached` / `_get_cached` reads is wired by importlib's package
+    // init, which the native importer does not run for `_bootstrap`).
+    pyre_interpreter::baseobjspace::setattr_str(bootstrap, "_bootstrap_external", bootstrap_ext)?;
+    // The bootstrap modules are exposed under their frozen names; modules such
+    // as `zipimport` import `_frozen_importlib{,_external}` directly. Register
+    // the same objects under the frozen names once `_install` has wired them.
+    importing::set_sys_module("_frozen_importlib", bootstrap);
+    importing::set_sys_module("_frozen_importlib_external", bootstrap_ext);
+    Ok(())
+}
+
 /// Run a library module as `__main__` via `runpy._run_module_as_main`,
 /// the `-m` entry point. `vm.run_module` analog.
-fn run_module(module: &str) {
+fn run_module(module: &str, no_site: bool) {
     let execution_context = setup_exec_context();
     let ec_ptr = Rc::as_ptr(&execution_context);
 
@@ -287,6 +384,11 @@ fn run_module(module: &str) {
     importing::set_sys_module("__main__", main_module);
 
     let result = (|| -> Result<(), pyre_interpreter::PyError> {
+        init_importlib_bootstrap(canonical, ec_ptr)?;
+        // Mirror the native search path into Python `sys.path` so `PathFinder`
+        // (used by `find_spec` for top-level module names) can resolve modules.
+        importing::sync_python_sys_path();
+        import_site(no_site, canonical, ec_ptr);
         let runpy = importing::importhook("runpy", canonical, pyre_object::PY_NULL, 0, ec_ptr)?;
         let func = pyre_interpreter::getattr(runpy, pyre_object::w_str_new("_run_module_as_main"))?;
         let res = pyre_interpreter::call_function(func, &[pyre_object::w_str_new(module)]);
@@ -315,7 +417,7 @@ fn run_module(module: &str) {
     maybe_print_jit_stats();
 }
 
-fn run_source(source: &str, mode: Mode, filename: &str) {
+fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
     let code = match compile_source_with_filename(source, mode, filename) {
         Ok(code) => code,
         Err(e) => {
@@ -325,6 +427,7 @@ fn run_source(source: &str, mode: Mode, filename: &str) {
     };
 
     let execution_context = setup_exec_context();
+    let ec_ptr = Rc::as_ptr(&execution_context);
     let mut frame = match PyFrame::new_with_context(code, execution_context) {
         Ok(frame) => frame,
         Err(e) => {
@@ -367,6 +470,8 @@ fn run_source(source: &str, mode: Mode, filename: &str) {
             pyre_object::w_none(),
         );
     }
+
+    import_site(no_site, canonical, ec_ptr);
 
     match eval_with_jit(&mut frame) {
         Ok(result) => {

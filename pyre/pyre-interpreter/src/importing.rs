@@ -433,6 +433,7 @@ pub fn install_builtin_modules() {
     pyre_install_module!(binascii);
     pyre_install_module!(zlib);
     pyre_install_module!(_typing);
+    pyre_install_module!(_template);
     pyre_install_module!(_hashlib);
     pyre_install_module!(_blake2);
     pyre_install_module!(gc);
@@ -780,6 +781,32 @@ pub fn get_sys_module(name: &str) -> Option<PyObjectRef> {
     check_sys_modules(name)
 }
 
+/// Mirror the native search path (`SYS_PATH`) into Python `sys.path` so
+/// `PathFinder` — reached by `importlib.util.find_spec` for top-level module
+/// names — can resolve modules. `runpy._get_module_details` (the `-m` entry)
+/// drives that path, which is otherwise left empty.
+#[cfg(feature = "host_env")]
+pub fn sync_python_sys_path() {
+    // wasm seeds `sys.path` from its bootstrap and has no current_exe/python3
+    // lazy stdlib detection, so `ensure_stdlib_path` exists only off-wasm.
+    #[cfg(not(target_arch = "wasm32"))]
+    ensure_stdlib_path();
+    let items: Vec<PyObjectRef> = SYS_PATH.with(|p| {
+        p.borrow()
+            .iter()
+            .map(|d| pyre_object::w_str_new(&d.to_string_lossy()))
+            .collect()
+    });
+    if let Some(sys_mod) = get_sys_module("sys") {
+        let _ = crate::setattr_str(sys_mod, "path", pyre_object::w_list_new(items));
+    }
+}
+
+/// Off-`host_env` builds keep no native `SYS_PATH`, so there is nothing to
+/// mirror into Python `sys.path`.
+#[cfg(not(feature = "host_env"))]
+pub fn sync_python_sys_path() {}
+
 /// The Python-visible `sys.modules` dict, or `PY_NULL` before it is
 /// installed. Used by callers that need to iterate every loaded module
 /// (e.g. pickle's `whichmodule` scan).
@@ -930,6 +957,10 @@ enum FindInfo {
     /// A package directory with __init__.py was found.
     #[cfg(feature = "host_env")]
     Package { dirpath: PathBuf },
+    /// PEP 420 namespace package: one or more matching directories that carry
+    /// no `__init__.py`. The portions become the package's `__path__`.
+    #[cfg(feature = "host_env")]
+    Namespace { dirs: Vec<PathBuf> },
     /// A builtin (Rust-implemented) module was found.
     /// PyPy equivalent: C_BUILTIN modtype in find_module()
     Builtin,
@@ -1008,6 +1039,7 @@ fn ensure_stdlib_path() {
 
 #[cfg(feature = "host_env")]
 fn find_in_dirs(partname: &str, dirs: &[PathBuf]) -> Option<FindInfo> {
+    let mut namespace_dirs: Vec<PathBuf> = Vec::new();
     for dir in dirs {
         // Check for package: <dir>/<partname>/__init__.py
         let pkg_dir = dir.join(partname);
@@ -1023,6 +1055,19 @@ fn find_in_dirs(partname: &str, dirs: &[PathBuf]) -> Option<FindInfo> {
                 pathname: source_file,
             });
         }
+
+        // PEP 420: a matching directory without `__init__.py` is a namespace
+        // portion. Record it and keep scanning — a regular module or package
+        // in a later directory still wins; only if no concrete match is found
+        // do the recorded portions form a namespace package.
+        if with_source_provider(|p| p.is_dir(&pkg_dir)) {
+            namespace_dirs.push(pkg_dir);
+        }
+    }
+    if !namespace_dirs.is_empty() {
+        return Some(FindInfo::Namespace {
+            dirs: namespace_dirs,
+        });
     }
     None
 }
@@ -1340,6 +1385,46 @@ fn load_package(
     load_source_module(modulename, &init_path, Some(dirpath), execution_context)
 }
 
+// ── load_namespace_package ───────────────────────────────────────────
+// PEP 420: a package directory (or set of directories) with no `__init__.py`.
+
+#[cfg(feature = "host_env")]
+fn load_namespace_package(
+    modulename: &str,
+    dirs: &[PathBuf],
+    execution_context: *const PyExecutionContext,
+) -> Result<PyObjectRef, crate::PyError> {
+    // A namespace package has no source to read or execute: it is a module
+    // carrying `__path__` (the portions) and `__package__`, but no `__file__`.
+    // Submodule imports resolve against `__path__` exactly as for a regular
+    // package.
+    let ctx = unsafe { &*execution_context };
+    let mut namespace = Box::new(ctx.fresh_dict_storage());
+    namespace.fix_ptr();
+
+    crate::dict_storage_store(
+        &mut namespace,
+        "__package__",
+        pyre_object::w_str_new(modulename),
+    );
+
+    let path_items: Vec<PyObjectRef> = dirs
+        .iter()
+        .map(|d| pyre_object::w_str_new(&d.to_string_lossy()))
+        .collect();
+    crate::dict_storage_store(
+        &mut namespace,
+        "__path__",
+        pyre_object::w_list_new(path_items),
+    );
+
+    let ns_ptr = Box::into_raw(namespace);
+    let canonical = crate::baseobjspace::dict_storage_to_dict(ns_ptr);
+    let module = pyre_object::w_module_new_aliasing_dict(modulename, ns_ptr as *mut u8, canonical);
+    set_sys_module(modulename, module);
+    Ok(module)
+}
+
 // ── load_part ────────────────────────────────────────────────────────
 // PyPy equivalent: importing.py `load_part()`
 
@@ -1398,6 +1483,10 @@ fn load_part(
         }
         #[cfg(feature = "host_env")]
         FindInfo::Package { dirpath } => load_package(modulename, &dirpath, execution_context)?,
+        #[cfg(feature = "host_env")]
+        FindInfo::Namespace { dirs } => {
+            load_namespace_package(modulename, &dirs, execution_context)?
+        }
         FindInfo::Builtin => {
             // Same builtins-identity path as the full_is_builtin branch
             // above: route `import builtins` through `EC.get_builtin()`
@@ -1429,6 +1518,31 @@ fn absolute_import(
     w_fromlist: PyObjectRef,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
+    // The frozen importlib bootstrap modules live on disk as the
+    // `importlib._bootstrap{,_external}` submodules. A direct
+    // `import _frozen_importlib` / `_frozen_importlib_external` (zipimport,
+    // the runpy diagnostics) loads the corresponding submodule and, only once
+    // it has been fully imported, aliases it under the frozen name. Registering
+    // the alias after a successful import (rather than when the module is
+    // pre-registered) means a body that raises during execution does not leave
+    // a stale alias behind. The recursive call terminates: the submodule name
+    // does not match.
+    let frozen_target = match modulename {
+        "_frozen_importlib" => Some("importlib._bootstrap"),
+        "_frozen_importlib_external" => Some("importlib._bootstrap_external"),
+        _ => None,
+    };
+    if let Some(target) = frozen_target {
+        if let Some(cached) = check_sys_modules(modulename) {
+            return Ok(cached);
+        }
+        absolute_import(target, pyre_object::PY_NULL, execution_context)?;
+        if let Some(leaf) = check_sys_modules(target) {
+            set_sys_module(modulename, leaf);
+            return Ok(leaf);
+        }
+    }
+
     let parts: Vec<&str> = modulename.split('.').collect();
     let mut first: Option<PyObjectRef> = None;
     let mut parent: Option<PyObjectRef> = None;
@@ -1442,9 +1556,11 @@ fn absolute_import(
         let parent_dirs = parent.and_then(parent_package_path);
         let w_mod = load_part(&full_name, part, parent_dirs.as_deref(), execution_context)?;
         let Some(module) = w_mod else {
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::ModuleNotFoundError,
-                format!("No module named '{modulename}'"),
+            // _bootstrap.py:1335 raises for the prefix that actually failed
+            // (`name=name`): `import a.b.c` with `a.b` missing reports `a.b`.
+            return Err(crate::PyError::module_not_found_with_name(
+                format!("No module named '{full_name}'"),
+                &full_name,
             ));
         };
         // _bootstrap._find_and_load (_bootstrap.py:1346-1352): bind the
@@ -1482,9 +1598,9 @@ fn absolute_import(
 
     // `import X.Y` → return the top-level module (X)
     first.ok_or_else(|| {
-        crate::PyError::new(
-            crate::PyErrorKind::ModuleNotFoundError,
+        crate::PyError::module_not_found_with_name(
             format!("No module named '{modulename}'"),
+            modulename,
         )
     })
 }

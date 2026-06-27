@@ -1257,6 +1257,12 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn end_send(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("end_send not implemented").into())
     }
+    /// GET_AWAITABLE — replace TOS with its awaitable iterator (`__await__`).
+    /// Overridden by the interpreter; the trace path declines (await suspends
+    /// the frame and is never JIT-traced).
+    fn get_awaitable(&mut self, _context: u32) -> Result<(), PyError> {
+        Err(crate::PyError::type_error("get_awaitable not implemented").into())
+    }
 
     // Class
     fn load_build_class(&mut self) -> Result<(), PyError> {
@@ -1309,6 +1315,21 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn match_stub(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("pattern matching not implemented").into())
     }
+    // MATCH_MAPPING / MATCH_SEQUENCE / MATCH_KEYS / MATCH_CLASS (PEP 634).
+    // The JIT tracer inherits these erroring defaults and declines a trace
+    // that reaches a match statement; the interpreter overrides them.
+    fn match_mapping(&mut self) -> Result<(), PyError> {
+        Err(crate::PyError::type_error("pattern matching not implemented").into())
+    }
+    fn match_sequence(&mut self) -> Result<(), PyError> {
+        Err(crate::PyError::type_error("pattern matching not implemented").into())
+    }
+    fn match_keys(&mut self) -> Result<(), PyError> {
+        Err(crate::PyError::type_error("pattern matching not implemented").into())
+    }
+    fn match_class(&mut self, _count: usize) -> Result<(), PyError> {
+        Err(crate::PyError::type_error("pattern matching not implemented").into())
+    }
     fn unpack_ex(&mut self, _args: crate::bytecode::UnpackExArgs) -> Result<(), PyError> {
         Err(crate::PyError::type_error("unpack_ex not implemented").into())
     }
@@ -1342,6 +1363,25 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         let result = self.call_callable(func, &[arg1, arg2])?;
         self.push_value(result)?;
         Ok(())
+    }
+
+    /// BUILD_TEMPLATE: pop the interpolations and strings tuples and build a
+    /// `string.templatelib.Template`.  Overridden by the interpreter; the trace
+    /// path declines (t-strings run at import time, never inside a JIT-traced
+    /// loop).
+    fn build_template_op(&mut self) -> Result<(), PyError> {
+        Err(crate::PyError::type_error("BUILD_TEMPLATE not implemented").into())
+    }
+
+    /// BUILD_INTERPOLATION: build a `string.templatelib.Interpolation` from the
+    /// value/expression (and optional format spec) on the stack, with the
+    /// conversion taken from the opcode oparg.  Overridden by the interpreter.
+    fn build_interpolation_op(
+        &mut self,
+        _conversion: u32,
+        _has_format_spec: bool,
+    ) -> Result<(), PyError> {
+        Err(crate::PyError::type_error("BUILD_INTERPOLATION not implemented").into())
     }
 
     fn call_intrinsic_1(&mut self, func: IntrinsicFunction1) -> Result<(), PyError> {
@@ -1895,6 +1935,39 @@ pub fn execute_match_stub<E: OpcodeStepExecutor>(
     Ok(StepResult::Continue)
 }
 
+pub fn execute_match_mapping<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.match_mapping()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_match_sequence<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.match_sequence()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_match_keys<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.match_keys()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_match_class<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::MatchClass { count } = instruction else {
+        unreachable!()
+    };
+    executor.match_class(count.get(op_arg) as usize)?;
+    Ok(StepResult::Continue)
+}
+
 pub fn execute_yield_value<E: OpcodeStepExecutor>(
     executor: &mut E,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
@@ -1918,7 +1991,7 @@ pub fn execute_get_len<E: OpcodeStepExecutor>(
 pub fn execute_build_template<E: OpcodeStepExecutor>(
     executor: &mut E,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
-    OpcodeStepExecutor::build_tuple(executor, 2)?;
+    OpcodeStepExecutor::build_template_op(executor)?;
     Ok(StepResult::Continue)
 }
 
@@ -1932,16 +2005,9 @@ pub fn execute_build_interpolation<E: OpcodeStepExecutor>(
     };
     let oparg_val = u32::from(format.get(op_arg));
     let has_format_spec = (oparg_val & 1) != 0;
-    if has_format_spec {
-        // `let _ = expr?` rewritten as a plain expression-statement to
-        // stay inside the Rust-AST adapter's RPython-orthodox subset
-        // (Position-2 adaptation; the adapter's `lower_let` accepts
-        // `Pat::Ident` / `Pat::Type(Pat::Ident)` only — there is no
-        // upstream analogue for binding `_`).
-        executor.pop_value()?;
-    }
-    // Stack: [value, expression_str] — wrap as a 2-tuple interpolation.
-    OpcodeStepExecutor::build_tuple(executor, 2)?;
+    // The conversion (`!s` / `!r` / `!a`) is encoded in the upper oparg bits.
+    let conversion = oparg_val >> 2;
+    OpcodeStepExecutor::build_interpolation_op(executor, conversion, has_format_spec)?;
     Ok(StepResult::Continue)
 }
 
@@ -2079,6 +2145,18 @@ pub fn execute_get_yield_from_iter<E: OpcodeStepExecutor>(
     executor: &mut E,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
     executor.get_yield_from_iter()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_get_awaitable<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::GetAwaitable { r#where } = instruction else {
+        unreachable!()
+    };
+    executor.get_awaitable(r#where.get(op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -3239,7 +3317,10 @@ where
         }
 
         // ── Pattern matching (Python 3.10+) ──
-        Instruction::MatchMapping | Instruction::MatchSequence => execute_match_stub(executor),
+        Instruction::MatchMapping => execute_match_mapping(executor),
+        Instruction::MatchSequence => execute_match_sequence(executor),
+        Instruction::MatchKeys => execute_match_keys(executor),
+        Instruction::MatchClass { .. } => execute_match_class(executor, instruction, op_arg),
 
         // ── Unpack extended ──
         Instruction::UnpackEx { .. } => execute_unpack_ex(executor, instruction, op_arg),
@@ -3252,9 +3333,11 @@ where
             execute_call_intrinsic_2(executor, instruction, op_arg)
         }
 
+        // ── Await ──
+        Instruction::GetAwaitable { .. } => execute_get_awaitable(executor, instruction, op_arg),
+
         // ── Async stubs ──
-        Instruction::GetAwaitable { .. }
-        | Instruction::GetAiter
+        Instruction::GetAiter
         | Instruction::GetAnext
         | Instruction::EndAsyncFor
         | Instruction::CleanupThrow => {
