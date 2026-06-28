@@ -4807,6 +4807,14 @@ fn builtin_delattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 }
 
 pub(crate) fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `tuple.__new__` is positional-only, so any keyword is a TypeError
+    // (an empty `**{}` is not a keyword and is allowed).
+    let (args, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "tuple() takes no keyword arguments",
+        ));
+    }
     if args.is_empty() {
         return Ok(w_tuple_new(vec![]));
     }
@@ -4832,6 +4840,14 @@ pub(crate) fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 pub(crate) fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `list.__new__` is positional-only, so any keyword is a TypeError
+    // (an empty `**{}` is not a keyword and is allowed).
+    let (args, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "list() takes no keyword arguments",
+        ));
+    }
     if args.is_empty() {
         return Ok(w_list_new(vec![]));
     }
@@ -8336,10 +8352,17 @@ fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
 /// `complex(real=0, imag=0)` — complexobject.c complex_new.
 pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     use pyre_object::*;
-    // String form accepts only a single argument.
-    if let Some(&a) = args.first() {
+    // `complex(real=0, imag=0)` — both arguments are positional-or-keyword
+    // (complexobject.py descr__new__ `w_real`/`w_imag`).
+    let (pos, kwargs) = split_builtin_kwargs(args);
+    kwarg_reject_unknown(kwargs, &["real", "imag"], "complex")?;
+    let w_real = resolve_pos_or_kw(pos.first().copied(), kwargs, "real", "complex", 1)?;
+    let w_imag = resolve_pos_or_kw(pos.get(1).copied(), kwargs, "imag", "complex", 2)?;
+
+    // String form accepts only the real argument.
+    if let Some(a) = w_real {
         if unsafe { is_str(a) } {
-            if args.len() > 1 {
+            if w_imag.is_some() {
                 return Err(crate::PyError::type_error(
                     "complex() can't take second arg if first is a string",
                 ));
@@ -8354,20 +8377,27 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
             return Ok(w_complex_new(r, i));
         }
     }
-    let (mut real, mut imag) = match args.first() {
-        Some(&a) => complex_coerce(a)?,
+    let (mut real, mut imag) = match w_real {
+        Some(a) => complex_coerce(a)?,
         None => (0.0, 0.0),
     };
-    if let Some(&b) = args.get(1) {
+    if let Some(b) = w_imag {
         if unsafe { is_str(b) } {
             return Err(crate::PyError::type_error(
                 "complex() second arg can't be a string",
             ));
         }
-        // complex(a, b) = (a.real - b.imag) + (a.imag + b.real)j.
+        // complexobject.py:370-377 preserves signed zeroes by checking the
+        // numeric components, not whether either operand is a complex object.
         let (br, bi) = complex_coerce(b)?;
-        real -= bi;
-        imag += br;
+        if bi != 0.0 {
+            real -= bi;
+        }
+        if imag != 0.0 {
+            imag += br;
+        } else {
+            imag = br;
+        }
     }
     Ok(w_complex_new(real, imag))
 }
@@ -8454,6 +8484,19 @@ mod tests {
         assert_eq!(
             unsafe { w_int_get_value(w_tuple_getitem(result, 1).unwrap()) },
             2
+        );
+    }
+
+    #[test]
+    fn test_builtin_complex_preserves_imag_arg_negative_zero_with_complex_real() {
+        let result = builtin_complex(&[w_complex_new(1.0, 0.0), w_float_new(-0.0)]).unwrap();
+        assert_eq!(
+            unsafe { w_complex_get_real(result).to_bits() },
+            1.0f64.to_bits()
+        );
+        assert_eq!(
+            unsafe { w_complex_get_imag(result).to_bits() },
+            (-0.0f64).to_bits()
         );
     }
 
