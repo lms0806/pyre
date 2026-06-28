@@ -263,27 +263,21 @@ fn trace_set_tuple_w_class(ctx: &mut TraceCtx, tuple: OpRef, descr: DescrRef) {
     ctx.heapcache_setfield_cached(tuple, descr.index(), w_class);
 }
 
-/// The elidable `rbigint` payload helper + effect for a specialised
+/// The elidable `rbigint` payload helper + effect for a walker-specialised
 /// W_LongObject binary op (see [`long_binop_raw_helper`]). The bigint result is
-/// boxed by the caller via `jit_bigint_result_box` (→ Python int, demoting).
+/// boxed by the caller as a `W_LongObject` after the pyre-specific fits-int
+/// demotion guard.
 /// True-divide is NOT here — it returns a float (`CallPureF` + `wrapfloat`), so
 /// it has its own specialisation ([`try_walker_specialize_truediv_op_long`]).
 pub(crate) struct LongBinopSpec {
-    /// Pure `rbigint` payload op `[Ref, Ref] → Int`, returning a bare
-    /// `*mut BigInt` (arithmetic / divmod / shift).
-    pub raw_fn: extern "C" fn(i64, i64) -> i64,
+    /// Pure `rbigint` op over the two bare `*const BigInt` *payloads*
+    /// `[Ref, Ref] -> Ref`. The walker emits this after a
+    /// `GetfieldGcPure(value)` on each operand, so the elidable call is pure on
+    /// the immutable bigints (not the wrappers) and the optimizer never
+    /// reorders it ahead of the boxing `setfield_gc` that initializes a fresh
+    /// result wrapper.
+    pub payload_fn: extern "C" fn(i64, i64) -> i64,
     pub effect: majit_ir::EffectInfo,
-    /// True for the divmod ops, whose helper publishes ZeroDivisionError on a
-    /// zero divisor. The trait path pre-checks the divisor with `w_long_is_zero`
-    /// before invoking the helper for `call_pure_results`.
-    pub is_division: bool,
-    /// False for the shift ops, whose raising inputs (negative / over-large
-    /// count) are not a simple divisor check. The trait path defers these to the
-    /// generic residual rather than risk publishing an exception mid-trace; the
-    /// walker still specialises them (it executes the authentic op first and
-    /// bails on a raise, so the concrete helper call here only runs on a
-    /// non-raising op).
-    pub trait_safe: bool,
 }
 
 /// Map a `BinaryOperator` to its `rbigint` payload helper, or `None` when the
@@ -294,80 +288,47 @@ pub(crate) struct LongBinopSpec {
 /// `cr == "mem"`); the divmod / shift ops also raise (ZeroDivision /
 /// ValueError·Overflow) so they are `EF_ELIDABLE_CAN_RAISE` (`call.py:296`).
 /// Both classes have `check_can_raise()` true, so `pyjitpl.py:2110-2112` emits
-/// the guard. Shared by the trait path ([`binary_long_value`]) and the walker
-/// (`try_walker_specialize_binary_op_long`).
+/// the guard. The legacy trait path delegates to the generic residual because
+/// it cannot reuse the authentic boxed result's payload.
 pub(crate) fn long_binop_raw_helper(op: BinaryOperator) -> Option<LongBinopSpec> {
     use majit_metainterp::{ELIDABLE_EFFECT_INFO, ELIDABLE_OR_MEMERROR_EFFECT_INFO};
     use pyre_interpreter::objspace::descroperation as desc;
     use pyre_object::longobject as lo;
-    // (raw_fn, effect, is_division, trait_safe)
-    let (raw_fn, effect, is_division, trait_safe): (extern "C" fn(i64, i64) -> i64, _, _, _) =
-        match op {
-            BinaryOperator::Add | BinaryOperator::InplaceAdd => (
-                lo::jit_w_long_add_raw,
-                ELIDABLE_OR_MEMERROR_EFFECT_INFO,
-                false,
-                true,
-            ),
-            BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => (
-                lo::jit_w_long_sub_raw,
-                ELIDABLE_OR_MEMERROR_EFFECT_INFO,
-                false,
-                true,
-            ),
-            BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => (
-                lo::jit_w_long_mul_raw,
-                ELIDABLE_OR_MEMERROR_EFFECT_INFO,
-                false,
-                true,
-            ),
-            BinaryOperator::And | BinaryOperator::InplaceAnd => (
-                lo::jit_w_long_and_raw,
-                ELIDABLE_OR_MEMERROR_EFFECT_INFO,
-                false,
-                true,
-            ),
-            BinaryOperator::Or | BinaryOperator::InplaceOr => (
-                lo::jit_w_long_or_raw,
-                ELIDABLE_OR_MEMERROR_EFFECT_INFO,
-                false,
-                true,
-            ),
-            BinaryOperator::Xor | BinaryOperator::InplaceXor => (
-                lo::jit_w_long_xor_raw,
-                ELIDABLE_OR_MEMERROR_EFFECT_INFO,
-                false,
-                true,
-            ),
-            BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => (
-                desc::jit_w_long_floordiv_raw,
-                ELIDABLE_EFFECT_INFO,
-                true,
-                true,
-            ),
-            BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => {
-                (desc::jit_w_long_mod_raw, ELIDABLE_EFFECT_INFO, true, true)
-            }
-            BinaryOperator::Lshift | BinaryOperator::InplaceLshift => (
-                desc::jit_w_long_lshift_raw,
-                ELIDABLE_EFFECT_INFO,
-                false,
-                false,
-            ),
-            BinaryOperator::Rshift | BinaryOperator::InplaceRshift => (
-                desc::jit_w_long_rshift_raw,
-                ELIDABLE_EFFECT_INFO,
-                false,
-                false,
-            ),
-            _ => return None,
-        };
-    Some(LongBinopSpec {
-        raw_fn,
-        effect,
-        is_division,
-        trait_safe,
-    })
+    type PayloadFn = extern "C" fn(i64, i64) -> i64;
+    let (payload_fn, effect): (PayloadFn, _) = match op {
+        BinaryOperator::Add | BinaryOperator::InplaceAdd => {
+            (lo::jit_bigint_add, ELIDABLE_OR_MEMERROR_EFFECT_INFO)
+        }
+        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => {
+            (lo::jit_bigint_sub, ELIDABLE_OR_MEMERROR_EFFECT_INFO)
+        }
+        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => {
+            (lo::jit_bigint_mul, ELIDABLE_OR_MEMERROR_EFFECT_INFO)
+        }
+        BinaryOperator::And | BinaryOperator::InplaceAnd => {
+            (lo::jit_bigint_and, ELIDABLE_OR_MEMERROR_EFFECT_INFO)
+        }
+        BinaryOperator::Or | BinaryOperator::InplaceOr => {
+            (lo::jit_bigint_or, ELIDABLE_OR_MEMERROR_EFFECT_INFO)
+        }
+        BinaryOperator::Xor | BinaryOperator::InplaceXor => {
+            (lo::jit_bigint_xor, ELIDABLE_OR_MEMERROR_EFFECT_INFO)
+        }
+        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => {
+            (desc::jit_bigint_floordiv, ELIDABLE_EFFECT_INFO)
+        }
+        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => {
+            (desc::jit_bigint_mod, ELIDABLE_EFFECT_INFO)
+        }
+        BinaryOperator::Lshift | BinaryOperator::InplaceLshift => {
+            (desc::jit_bigint_lshift, ELIDABLE_EFFECT_INFO)
+        }
+        BinaryOperator::Rshift | BinaryOperator::InplaceRshift => {
+            (desc::jit_bigint_rshift, ELIDABLE_EFFECT_INFO)
+        }
+        _ => return None,
+    };
+    Some(LongBinopSpec { payload_fn, effect })
 }
 
 /// Emit `GetfieldGcR(w_class) → PtrEq(expected) → GuardTrue` so the trace
@@ -6043,96 +6004,21 @@ impl MIFrame {
         self.trace_binary_value(a, b, op)
     }
 
-    /// W_LongObject (bigint) arithmetic fast path. Mirrors PyPy's
-    /// `W_LongObject._add` trace shape: `GuardClass(LONG_TYPE)` on each
-    /// operand, then a `CALL_PURE_I` to the elidable `rbigint` payload helper
-    /// ([`long_binop_raw_helper`]) producing a bare bigint, then a residual
-    /// `CALL_R` to `jit_bigint_result_box` (the `W_LongObject(...)` NEW /
-    /// `bigint_result` demote). Unlike the generic `binary_value` residual
-    /// neither is a `CALL_MAY_FORCE`, so the loop body sheds the
-    /// per-iteration force-token store + `GUARD_NOT_FORCED`. Each op keeps a
-    /// trailing `GUARD_NO_EXCEPTION`: the arithmetic ops (add/sub/mul/and/or/
-    /// xor) allocate so they are `EF_ELIDABLE_OR_MEMORYERROR`, the divmod / shift
-    /// ops are `EF_ELIDABLE_CAN_RAISE`; both have `check_can_raise()` true
-    /// (`pyjitpl.py:2110-2112`). The trait path only specialises the ops it can
-    /// pre-screen for raising inputs (arithmetic + divmod); shift is walker-only
-    /// (`trait_safe == false`). True-divide (float result) and pow fall through
-    /// to the generic residual here — true-divide has its own walker fast path
-    /// (`try_walker_specialize_truediv_op_long`).
+    /// Long-object BINARY_OP trait path. The production tracer is the jitcode
+    /// walker; this legacy path cannot observe the authentic boxed result before
+    /// recording, so it must not call raw bigint helpers as a trace-time probe.
+    /// Delegate to the generic residual here and keep the raw-payload
+    /// specialization in the walker, which reuses the already-executed boxed
+    /// result's payload.
     pub(crate) fn binary_long_value(
         &mut self,
         a: OpRef,
         b: OpRef,
         op: BinaryOperator,
-        concrete_lhs: PyObjectRef,
-        concrete_rhs: PyObjectRef,
+        _concrete_lhs: PyObjectRef,
+        _concrete_rhs: PyObjectRef,
     ) -> Result<OpRef, PyError> {
-        let Some(spec) = long_binop_raw_helper(op) else {
-            return self.trace_binary_value(a, b, op);
-        };
-        // Shift raises on inputs the trait path cannot cheaply pre-screen
-        // (negative or over-large shift count), so it defers to the generic
-        // residual here — the walker still specialises it, executing the
-        // authentic op first. (True-divide is not in `long_binop_raw_helper`
-        // at all, so it already took the early return above.)
-        if !spec.trait_safe {
-            return self.trace_binary_value(a, b, op);
-        }
-        // The division helpers publish ZeroDivisionError on a zero divisor;
-        // that path is handled by the generic residual, so fast-path only
-        // nonzero divisors (the helper is otherwise side-effect-free when
-        // invoked for `call_pure_results` below). The arithmetic helpers only
-        // ever fail with MemoryError, which cannot fire during tracing.
-        if spec.is_division && unsafe { pyre_object::longobject::w_long_is_zero(concrete_rhs) } {
-            return self.trace_binary_value(a, b, op);
-        }
-        self.with_ctx(|this, ctx| {
-            this.guard_class(ctx, a, &LONG_TYPE as *const PyType);
-            this.guard_class(ctx, b, &LONG_TYPE as *const PyType);
-            // Pure `rbigint` payload op → bare `*mut BigInt` (Int), recorded as
-            // CALL_PURE_I via `record_result_of_call_pure` (patches CALL_I and
-            // populates `call_pure_results`), mirroring the walker fast path.
-            // Every op allocates (`EF_ELIDABLE_OR_MEMORYERROR`) or divides
-            // (`EF_ELIDABLE_CAN_RAISE`), so `check_can_raise()` is true and a
-            // trailing `GuardNoException` follows (`pyjitpl.py:2110-2112`).
-            let fn_ptr = spec.raw_fn as *const ();
-            let raw_concrete = (spec.raw_fn)(concrete_lhs as i64, concrete_rhs as i64);
-            let concrete_args = [
-                Value::Int(fn_ptr as usize as i64),
-                Value::Ref(GcRef(concrete_lhs as usize)),
-                Value::Ref(GcRef(concrete_rhs as usize)),
-            ];
-            let raw = ctx.call_typed_with_effect_pure_can_raise(
-                OpCode::CallI,
-                fn_ptr,
-                &[a, b],
-                &[Type::Ref, Type::Ref],
-                Type::Int,
-                spec.effect,
-                &concrete_args,
-                Value::Int(raw_concrete),
-            );
-            // pyjitpl.py:1946: exc = exc and not isinstance(op, Const). When all
-            // args were constant the pure call folds to a Const, so no
-            // GuardNoException is recorded.
-            if raw.inline_const_to_value().is_none() {
-                this.generate_guard(ctx, OpCode::GuardNoException, &[]);
-            }
-            // …then the residual `bigint_result` box/demote → Python int (Ref).
-            // Models the `W_LongObject(...)` NEW: `EF_CANNOT_RAISE` and
-            // non-elidable (`dont_look_inside`), so it is never pure-CSE'd and,
-            // like upstream's NEW, carries no `GuardNoException` (a MemoryError
-            // from the allocation is the GC slowpath's concern, not a guard).
-            let box_fn = pyre_object::longobject::jit_bigint_result_box as *const ();
-            Ok::<_, PyError>(ctx.call_typed_with_effect(
-                OpCode::CallR,
-                box_fn,
-                &[raw],
-                &[Type::Int],
-                Type::Ref,
-                majit_metainterp::cannot_raise_effect_info(),
-            ))
-        })
+        self.trace_binary_value(a, b, op)
     }
 
     pub(crate) fn binary_float_value(

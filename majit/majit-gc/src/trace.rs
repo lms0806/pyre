@@ -93,6 +93,13 @@ impl TypeInfoLayout {
     pub const T_HAS_CUSTOM_TRACE: u64 = 0x200000;
     /// `T_HAS_OLDSTYLE_FINALIZER` (gctypelayout.py:198).
     pub const T_HAS_OLDSTYLE_FINALIZER: u64 = 0x400000;
+    /// Lightweight-destructor marker (bit 23, the otherwise-unused slot
+    /// between `T_HAS_OLDSTYLE_FINALIZER` and `T_HAS_GCPTR`). RPython
+    /// folds the lightweight-destructor case into its `q_finalizer`
+    /// machinery rather than a distinct infobit; majit models the
+    /// `TypeInfo.destructor` half with its own bit so the materialized
+    /// table reflects which types carry a destructor.
+    pub const T_HAS_DESTRUCTOR: u64 = 0x800000;
     /// `T_HAS_GCPTR` (gctypelayout.py:199).
     pub const T_HAS_GCPTR: u64 = 0x1000000;
     /// `T_HAS_MEMORY_PRESSURE` (gctypelayout.py:200) — first field is
@@ -170,6 +177,7 @@ impl TypeEntry {
 ///   bit   20    : T_IS_RPYTHON_INSTANCE
 ///   bit   21    : T_HAS_CUSTOM_TRACE
 ///   bit   22    : T_HAS_OLDSTYLE_FINALIZER
+///   bit   23    : T_HAS_DESTRUCTOR (majit lightweight-destructor bit)
 ///   bit   24    : T_HAS_GCPTR
 ///   bit   25    : T_HAS_MEMORY_PRESSURE
 ///   bits 26..31 : T_KEY_VALUE  (T_KEY_MASK sanity check)
@@ -233,6 +241,11 @@ pub fn encode_type_shape(info: &TypeInfo, index: u32) -> u64 {
     // gctypelayout.py:294-295 `is_subclass_of_object`.
     if info.is_object {
         infobits |= TypeInfoLayout::T_IS_RPYTHON_INSTANCE;
+    }
+    // Lightweight-destructor marker (majit's half of the
+    // gctypelayout.py:245-257 destructor surface).
+    if info.destructor.is_some() {
+        infobits |= TypeInfoLayout::T_HAS_DESTRUCTOR;
     }
     // gctypelayout.py:296 — T_KEY_VALUE sanity tag.
     infobits | TypeInfoLayout::T_KEY_VALUE
@@ -313,6 +326,30 @@ impl TypeRegistry {
 /// called for each GC reference slot address.
 pub type CustomTraceFn = unsafe fn(obj_addr: usize, f: &mut dyn FnMut(*mut GcRef));
 
+/// Lightweight destructor function type.
+///
+/// RPython parity: the `destructor` half of
+/// `gctypelayout.py:245-257` (the `q_finalizer` / lightweight
+/// destructor path). When set, the collector calls this on an object
+/// that is about to be reclaimed — at minor collection for a dead
+/// nursery object and at major collection for a dead old-gen object —
+/// so a payload owning non-GC heap memory (e.g. a foreign `BigInt`'s
+/// limb `Vec`) gets its drop glue run instead of leaking. As in
+/// incminimark's `deal_with_young/old_objects_with_destructors`
+/// (incminimark.py:2884-2912), a destructor "just" runs and does not
+/// resurrect the object.
+///
+/// `obj_addr` is the object payload start (post-header), the same
+/// convention as [`CustomTraceFn`].
+pub type DestructorFn = unsafe fn(obj_addr: usize);
+
+/// Returns the off-heap (GC-invisible) byte footprint owned by the object at
+/// `obj_addr` — e.g. a foreign `BigInt`'s limb `Vec`, which lives in the system
+/// heap and is not counted by `oldgen.total_bytes()`. The collector folds a
+/// promoted instance's result into `get_total_memory_used` so the major
+/// threshold reflects the true footprint, not just the tracked struct.
+pub type ExternalSizeFn = unsafe fn(obj_addr: usize) -> usize;
+
 /// Information about a GC-managed type.
 pub struct TypeInfo {
     /// Fixed size of the object (excluding header), or base size for varsize objects.
@@ -368,6 +405,21 @@ pub struct TypeInfo {
     /// so the collector's minor / major cycles can locate weakref
     /// objects when scanning the type-info group.
     pub is_weakref: bool,
+    /// `gctypelayout.py:245-257` lightweight-destructor parity. When
+    /// `Some`, an instance of this type is recorded on the GC's
+    /// `young_objects_with_destructors` list at allocation, and the
+    /// collector runs this hook when the instance dies (minor cycle for
+    /// a dead nursery object, major cycle for a dead old-gen object) so
+    /// payloads owning non-GC heap memory get their drop glue run. See
+    /// [`DestructorFn`].
+    pub destructor: Option<DestructorFn>,
+    /// When set, returns the off-heap byte footprint of an instance (see
+    /// [`ExternalSizeFn`]). A promoted instance's result is added to
+    /// `oldgen_external_bytes` so the major-collection threshold accounts for
+    /// memory the GC cannot see (a foreign `BigInt`'s limb `Vec`). Only
+    /// meaningful alongside a `destructor` (the type whose external memory the
+    /// destructor frees).
+    pub external_size: Option<ExternalSizeFn>,
 }
 
 impl TypeInfo {
@@ -386,7 +438,40 @@ impl TypeInfo {
             subclassrange_min: 0,
             subclassrange_max: 0,
             is_weakref: false,
+            destructor: None,
+            external_size: None,
         }
+    }
+
+    /// Create a type info for a fixed-size object with no GC pointers
+    /// that owns non-GC heap memory reclaimed by a lightweight
+    /// `destructor`. The collector runs `destructor` when an instance
+    /// dies (see [`DestructorFn`]). Used for the foreign `BigInt`
+    /// payload, whose limb `Vec` must be dropped rather than leaked.
+    pub fn with_destructor(size: usize, destructor: DestructorFn) -> Self {
+        TypeInfo {
+            size,
+            has_gc_ptrs: false,
+            gc_ptr_offsets: Vec::new(),
+            item_size: 0,
+            length_offset: 0,
+            items_have_gc_ptrs: false,
+            custom_trace: None,
+            is_object: false,
+            parent: None,
+            subclassrange_min: 0,
+            subclassrange_max: 0,
+            is_weakref: false,
+            destructor: Some(destructor),
+            external_size: None,
+        }
+    }
+
+    /// Builder: attach an [`ExternalSizeFn`] so the collector folds a promoted
+    /// instance's off-heap footprint into the major-collection threshold.
+    pub fn with_external_size(mut self, external_size: ExternalSizeFn) -> Self {
+        self.external_size = Some(external_size);
+        self
     }
 
     /// `gctypelayout.is_weakref_type(WEAKREF)` parity — TypeInfo for
@@ -408,6 +493,8 @@ impl TypeInfo {
             subclassrange_min: 0,
             subclassrange_max: 0,
             is_weakref: true,
+            destructor: None,
+            external_size: None,
         }
     }
 
@@ -435,6 +522,8 @@ impl TypeInfo {
             subclassrange_min: 0,
             subclassrange_max: 0,
             is_weakref: false,
+            destructor: None,
+            external_size: None,
         }
     }
 
@@ -459,6 +548,8 @@ impl TypeInfo {
             subclassrange_min: 0,
             subclassrange_max: 0,
             is_weakref: false,
+            destructor: None,
+            external_size: None,
         }
     }
 
@@ -492,6 +583,8 @@ impl TypeInfo {
             subclassrange_min: 0,
             subclassrange_max: 0,
             is_weakref: false,
+            destructor: None,
+            external_size: None,
         }
     }
 
@@ -515,6 +608,8 @@ impl TypeInfo {
             subclassrange_min: 0,
             subclassrange_max: 0,
             is_weakref: false,
+            destructor: None,
+            external_size: None,
         }
     }
 
@@ -535,6 +630,8 @@ impl TypeInfo {
             subclassrange_min: 0,
             subclassrange_max: 0,
             is_weakref: false,
+            destructor: None,
+            external_size: None,
         }
     }
 
@@ -559,6 +656,8 @@ impl TypeInfo {
             subclassrange_min: 0,
             subclassrange_max: 0,
             is_weakref: false,
+            destructor: None,
+            external_size: None,
         }
     }
 
@@ -579,6 +678,8 @@ impl TypeInfo {
             subclassrange_min: 0,
             subclassrange_max: 0,
             is_weakref: false,
+            destructor: None,
+            external_size: None,
         }
     }
 
@@ -605,6 +706,8 @@ impl TypeInfo {
             subclassrange_min: 0,
             subclassrange_max: 0,
             is_weakref: false,
+            destructor: None,
+            external_size: None,
         }
     }
 

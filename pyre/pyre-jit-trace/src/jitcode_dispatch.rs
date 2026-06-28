@@ -12294,6 +12294,25 @@ fn walker_int_eq_const(
     r
 }
 
+/// Record `uint_lt(raw, const k)` and stamp its already-known concrete truth.
+/// Used to guard a machine shift count into `[0, k)`: the x86 SHL/SAR encoding
+/// masks the count mod 64, so a reused trace whose shift count leaves the range
+/// must bail to the generic (bignum-capable) leg rather than shift by `count &
+/// 63`. `uint_lt` folds the negative case in (a negative count reads as a huge
+/// unsigned value `>= k`).
+fn walker_uint_lt_const(
+    ctx: &mut WalkContext<'_, '_>,
+    raw: OpRef,
+    k: i64,
+    concrete_truth: i64,
+) -> OpRef {
+    let k_const = ctx.trace_ctx.const_int(k);
+    let r = ctx.trace_ctx.record_op(OpCode::UintLt, &[raw, k_const]);
+    ctx.trace_ctx
+        .set_opref_concrete(r, majit_ir::Value::Int(concrete_truth));
+    r
+}
+
 /// Record `float_eq(raw, const k)` and stamp its already-known concrete
 /// truth.  Used to build the float-div zero-divisor precondition guard
 /// walker-native (the JIT representation of `floatobject.py:519 _floatdiv`'s
@@ -12408,33 +12427,31 @@ fn try_walker_specialize_binary_op_int(
                 }
             }
             OpCode::IntLshift => {
-                let Ok(shift) = u32::try_from(rb) else {
-                    return Ok(None);
-                };
-                if shift >= i64::BITS {
-                    return Ok(None);
-                }
-                // intobject.py:207 ovfcheck(a << b)
-                let result = la.wrapping_shl(shift);
-                if result.wrapping_shr(shift) != la {
-                    return Ok(None);
-                }
+                // Don't specialize int `<<`: route to the generic (residual
+                // BINARY_OP) leg, which carries the full intobject.py
+                // descr_lshift semantics (promote to bignum on overflow, raise
+                // ValueError on a negative count). A bare walker-native IntLshift
+                // would be wrong — the trace is reused for any operands and x86
+                // SHL masks the count mod 64 — and a *guarded* specialization
+                // (range + round-trip guards, bail to bignum) crashes the
+                // cranelift backend: when the lshift result is the loop variable
+                // its box alternates small-int / bignum across the guard's
+                // bridge boundary, and that trips a cranelift bridge bug (works
+                // on dynasm). The generic leg handles the alternation correctly
+                // on both backends.
+                return Ok(None);
             }
             OpCode::IntRshift => {
+                // A count >= LONG_BIT (or negative) folds to 0/-1 in
+                // intobject.py:229-231, but that fold would be baked into the
+                // reused trace and be wrong for an in-range count; route it to
+                // the generic leg instead. An in-range recorded count is
+                // specialized below behind a runtime range guard.
                 let Ok(shift) = u32::try_from(rb) else {
                     return Ok(None);
                 };
                 if shift >= i64::BITS {
-                    // intobject.py:229-231 large shift → 0 or -1, no IR op.
-                    let result = if la < 0 { -1i64 } else { 0i64 };
-                    let raw = ctx.trace_ctx.const_int(result);
-                    let boxed = crate::state::wrapint(ctx.trace_ctx, raw);
-                    ctx.trace_ctx.set_opref_concrete(
-                        boxed,
-                        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
-                    );
-                    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
-                    return Ok(Some(()));
+                    return Ok(None);
                 }
             }
             _ => {}
@@ -12498,6 +12515,18 @@ fn try_walker_specialize_binary_op_int(
             );
             (r, concrete_result)
         }
+        OpCode::IntRshift => {
+            // The machine SAR masks the count mod 64, so guard the count into
+            // [0, LONG_BIT) — a reused trace bails rather than shifting by
+            // `count & 63`. (The recorded count is < LONG_BIT here: a count
+            // >= LONG_BIT const-folds to 0/-1 in the needs_check block above.)
+            let in_range = walker_uint_lt_const(ctx, rhs_raw, i64::BITS as i64, 1);
+            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[in_range])?;
+            let r = ctx
+                .trace_ctx
+                .record_op(OpCode::IntRshift, &[lhs_raw, rhs_raw]);
+            (r, majit_metainterp::eval_binop_i(OpCode::IntRshift, la, rb))
+        }
         _ => {
             let r = ctx.trace_ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
             (r, majit_metainterp::eval_binop_i(op_code, la, rb))
@@ -12549,10 +12578,11 @@ fn walker_guard_class(
 /// Walker-native W_LongObject (bigint) arithmetic specialization for the
 /// `BINARY_OP` helper residual_call (oopspec `BinaryOp`).  When both
 /// operands are concrete `W_LongObject`, emit `GUARD_CLASS(LONG_TYPE)` per
-/// operand + a `CALL_PURE_I` to the elidable `rbigint` payload helper
-/// (`long_binop_raw_helper`, `rbigint.py @jit.elidable`) producing a bare
-/// bigint, then a residual `CALL_R` to `jit_bigint_result_box` (the
-/// `W_LongObject(...)` NEW / `bigint_result` demote).  Neither is the opaque
+/// operand + `GETFIELD_GC_PURE_R(value)` + a `CALL_PURE_R` to the elidable
+/// `rbigint` payload helper (`long_binop_raw_helper`, `rbigint.py
+/// @jit.elidable`) producing a bare Ref-typed bigint, then inline
+/// `W_LongObject(...)` boxing via `new_with_vtable` + `setfield_gc('value')`.
+/// Neither is the opaque
 /// `CALL_MAY_FORCE` the generic leg records, so this sheds the per-iteration
 /// force-token store + `GUARD_NOT_FORCED` + `GUARD_NO_EXCEPTION` from
 /// bigint-heavy loops (e.g. `fib_loop`).
@@ -12603,59 +12633,109 @@ fn try_walker_specialize_binary_op_long(
     let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
         return Ok(None);
     };
+    // Pyre representation demote: when the bigint result fits i64 it becomes a
+    // W_IntObject in pyre's two-class int model, which the inline-NEW long box
+    // cannot represent — so decline the spec here (before emitting any op) and
+    // let the generic record handle the demote. Reuse the authentic boxed
+    // result's payload instead of running `spec.raw_fn` a second time; the raw
+    // helpers allocate/publish exception state and must not be used as a
+    // trace-time probe.
+    let boxed_result_obj = boxed_result_i64 as usize as pyre_object::PyObjectRef;
+    if boxed_result_obj == pyre_object::PY_NULL || unsafe { pyre_object::is_int(boxed_result_obj) }
+    {
+        return Ok(None);
+    }
+    if !unsafe { pyre_object::is_long(boxed_result_obj) } {
+        return Ok(None);
+    }
+    let raw_concrete = unsafe {
+        *((boxed_result_obj as *const u8).add(pyre_object::longobject::LONG_VALUE_OFFSET)
+            as *const i64)
+    };
+    let fits_concrete = 0_i64;
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
     walker_guard_class(ctx, op_pc, rhs, long_type_addr)?;
-    // Pure `rbigint` payload op: read both W_LongObject payloads and return a
-    // bare `*mut BigInt` (Int). The raw pointer is consumed only by the
-    // residual box below — it is dead after it and never spans a guard, so it
-    // needs no blackhole reconstruction. Every op allocates
-    // (`EF_ELIDABLE_OR_MEMORYERROR`) or divides (`EF_ELIDABLE_CAN_RAISE`), so a
-    // trailing `GuardNoException` follows (`pyjitpl.py:2110-2112`).
-    // `walker_execute_may_force_boxed` above already executed the op
-    // authentically, so for the division helpers the divisor is guaranteed
-    // nonzero here (a zero divisor would have raised → `None` → generic defer);
-    // the guard still covers a divide-by-zero / OOM on a later replay.
-    let raw_concrete = (spec.raw_fn)(lhs_obj as i64, rhs_obj as i64);
-    let add_fn = spec.raw_fn as *const ();
+    // Read each operand's immutable `value` payload (`GetfieldGcPure`), then call
+    // the elidable `rbigint` op on the bare `*const BigInt` payloads. Passing the
+    // payloads (not the wrappers) keeps the call pure on the immutable bigints, so
+    // the optimizer forwards the field read and never reorders this elidable call
+    // ahead of the boxing `setfield_gc` below — which would otherwise read the
+    // freshly-allocated result wrapper's uninitialized `value` (the function-loop
+    // unroll exposed exactly that reorder). The result is a GC-managed
+    // `*mut BigInt`, Ref-typed so the JIT gcmap roots it across the collecting
+    // boxing NEW. Every op allocates (`EF_ELIDABLE_OR_MEMORYERROR`) or divides
+    // (`EF_ELIDABLE_CAN_RAISE`), so a trailing `GuardNoException` follows
+    // (`pyjitpl.py:2110-2112`).
+    let off = pyre_object::longobject::LONG_VALUE_OFFSET;
+    let lhs_payload = unsafe { *((lhs_obj as *const u8).add(off) as *const i64) };
+    let rhs_payload = unsafe { *((rhs_obj as *const u8).add(off) as *const i64) };
+    let lhs_pl = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcPureR,
+        &[lhs],
+        crate::descr::long_value_descr(),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        lhs_pl,
+        majit_ir::Value::Ref(majit_ir::GcRef(lhs_payload as usize)),
+    );
+    let rhs_pl = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcPureR,
+        &[rhs],
+        crate::descr::long_value_descr(),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        rhs_pl,
+        majit_ir::Value::Ref(majit_ir::GcRef(rhs_payload as usize)),
+    );
+    let add_fn = spec.payload_fn as *const ();
     let concrete_args = [
         majit_ir::Value::Int(add_fn as usize as i64),
-        majit_ir::Value::Ref(majit_ir::GcRef(lhs_obj as usize)),
-        majit_ir::Value::Ref(majit_ir::GcRef(rhs_obj as usize)),
+        majit_ir::Value::Ref(majit_ir::GcRef(lhs_payload as usize)),
+        majit_ir::Value::Ref(majit_ir::GcRef(rhs_payload as usize)),
     ];
     let raw = ctx.trace_ctx.call_typed_with_effect_pure_can_raise(
-        OpCode::CallI,
+        OpCode::CallR,
         add_fn,
-        &[lhs, rhs],
+        &[lhs_pl, rhs_pl],
         &[majit_ir::Type::Ref, majit_ir::Type::Ref],
-        majit_ir::Type::Int,
+        majit_ir::Type::Ref,
         spec.effect,
         &concrete_args,
-        majit_ir::Value::Int(raw_concrete),
+        majit_ir::Value::Ref(majit_ir::GcRef(raw_concrete as usize)),
     );
-    ctx.trace_ctx
-        .set_opref_concrete(raw, majit_ir::Value::Int(raw_concrete));
-    // pyjitpl.py:1946: no GuardNoException when the pure call folded to a Const.
+    ctx.trace_ctx.set_opref_concrete(
+        raw,
+        majit_ir::Value::Ref(majit_ir::GcRef(raw_concrete as usize)),
+    );
     if raw.inline_const_to_value().is_none() {
         walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
     }
-    // Residual `bigint_result` box: wrap the bigint in a Python int, demoting to
-    // W_IntObject when it fits. Non-elidable (`dont_look_inside`), so the wrapper
-    // object is never pure-CSE'd — a distinct result per op, matching upstream's
-    // separate `NEW`; `EF_CANNOT_RAISE` ⇒ no GuardNoException and non-forcing.
-    let box_fn = pyre_object::longobject::jit_bigint_result_box as *const ();
-    let result = ctx.trace_ctx.call_typed_with_effect(
-        OpCode::CallR,
-        box_fn,
+    // `newlong` demote guard: `GuardFalse(fits_int(raw))`. Passes at record time
+    // (checked above), deopts to the interpreter if a future replay yields an
+    // i64-fitting result. Resumes at op_pc (the BINARY_OP), like the GuardClass
+    // guards.
+    let fits_fn = pyre_object::longobject::jit_bigint_fits_int as *const ();
+    let fits = ctx.trace_ctx.call_typed_with_effect(
+        OpCode::CallI,
+        fits_fn,
         &[raw],
-        &[majit_ir::Type::Int],
-        majit_ir::Type::Ref,
+        &[majit_ir::Type::Ref],
+        majit_ir::Type::Int,
         majit_metainterp::cannot_raise_effect_info(),
     );
-    // Stamp the result's concrete shadow so `write_residual_call_result_to_dst`
-    // (via `concrete_from_recorded_opref`) propagates the authentic sum object
-    // into the dst slot; the subsequent STORE_FAST then carries it. Without
-    // this the dst shadow is Null and the local materializes unbound.
+    ctx.trace_ctx
+        .set_opref_concrete(fits, majit_ir::Value::Int(fits_concrete));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[fits])?;
+    // Inline `W_LongObject(raw)` NEW (`new_with_vtable` + `setfield_gc('value')`).
+    // NewWithVtable lowers to the collecting `CallMallocNursery` — the GC
+    // safepoint that lets bigint-heavy loops reclaim dead bigints.
+    let result = crate::helpers::emit_box_long_inline(
+        ctx.trace_ctx,
+        raw,
+        crate::descr::w_long_size_descr(),
+        crate::descr::long_value_descr(),
+    );
     ctx.trace_ctx.set_opref_concrete(
         result,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),

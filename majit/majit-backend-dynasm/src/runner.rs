@@ -234,6 +234,43 @@ fn dynasm_alloc_nursery_typed(type_id: u32, size: usize) -> GcRef {
     })
 }
 
+/// Host-side *collecting* nursery allocation trampoline. Unlike
+/// [`dynasm_alloc_nursery_typed`], this runs a minor collection when the nursery
+/// is full (instead of spilling to old-gen). Used only by the elidable bigint
+/// payload helpers, which are invoked from a residual `CallR` whose gcmap roots
+/// the trace's live set and which hold no unrooted GC pointer across the
+/// allocation — so the embedded minor cycle is safe and dead bigints are
+/// reclaimed instead of accumulating in old-gen.
+fn dynasm_alloc_nursery_collecting_typed(type_id: u32, size: usize) -> GcRef {
+    DYNASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        match guard.as_deref_mut() {
+            Some(gc) => gc.alloc_nursery_typed(type_id, size),
+            None => GcRef(0),
+        }
+    })
+}
+
+/// Host-side old-gen external-byte trampoline — charges off-heap
+/// (GC-invisible) bytes such as a freshly-built bignum's limb `Vec` on the
+/// active GC when the initialized object landed in old-gen. Never forces a
+/// minor collection.
+fn dynasm_charge_oldgen_external(obj_addr: usize, bytes: usize) {
+    DYNASM_ACTIVE_GC.with(|cell| {
+        if let Some(gc) = cell.borrow_mut().as_deref_mut() {
+            gc.charge_oldgen_external(obj_addr, bytes);
+        }
+    })
+}
+
+fn dynasm_charge_memory_pressure(bytes: usize) {
+    DYNASM_ACTIVE_GC.with(|cell| {
+        if let Some(gc) = cell.borrow_mut().as_deref_mut() {
+            gc.charge_memory_pressure(bytes);
+        }
+    })
+}
+
 /// Host-side old-gen allocation trampoline. Used by
 /// pyre-object allocators (`w_int_new`, `w_float_new`) whose
 /// callers cannot register the returned pointer as a GC root before
@@ -1228,6 +1265,11 @@ impl DynasmBackend {
             supports_guard_gc_type,
         });
         majit_gc::set_active_alloc_nursery_typed(Some(dynasm_alloc_nursery_typed));
+        majit_gc::set_active_alloc_nursery_collecting_typed(Some(
+            dynasm_alloc_nursery_collecting_typed,
+        ));
+        majit_gc::set_active_charge_memory_pressure(Some(dynasm_charge_memory_pressure));
+        majit_gc::set_active_charge_oldgen_external(Some(dynasm_charge_oldgen_external));
         majit_gc::set_active_alloc_oldgen_typed(Some(dynasm_alloc_oldgen_typed));
         majit_gc::set_active_collect_full(Some(dynasm_collect_full));
         majit_gc::set_active_collect_oldgen(Some(dynasm_collect_oldgen_nonmoving));

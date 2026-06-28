@@ -1,8 +1,9 @@
 //! W_LongObject -- arbitrary-precision integer backed by `BigInt`.
 //!
 //! Used when i64 overflow is detected in `W_IntObject` arithmetic.
-//! The JIT never inlines bigint operations; `GuardClass(INT_TYPE)` rejects
-//! `W_LongObject` and deoptimizes back to the interpreter.
+//! The JIT may specialize bigint operations by reading immutable `value`
+//! payloads, calling pure raw-payload helpers, and boxing the resulting payload
+//! with the same `W_LongObject` layout.
 
 use malachite_bigint::BigInt;
 
@@ -11,7 +12,8 @@ use crate::pyobject::*;
 /// Arbitrary-precision integer object.
 ///
 /// Layout: `[ob_type: *const PyType | value: *mut BigInt]`
-/// The `value` pointer owns a heap-allocated `BigInt` (via `Box::into_raw`).
+/// The `value` pointer references an immutable `BigInt` payload, usually
+/// GC-managed and occasionally leaked via `malloc_raw` before GC init.
 #[repr(C)]
 pub struct W_LongObject {
     pub ob_header: PyObject,
@@ -39,30 +41,221 @@ impl crate::lltype::GcType for W_LongObject {
     const SIZE: usize = W_LONG_OBJECT_SIZE;
 }
 
+/// Payload size of a raw `BigInt` GC object (the malachite struct only; its
+/// limb `Vec` lives in malachite's own heap and is freed by [`bigint_destructor`]).
+pub const BIGINT_PAYLOAD_SIZE: usize = std::mem::size_of::<BigInt>();
+
+/// GC type id for the raw `BigInt` payload, published at JitDriver init by
+/// `set_bigint_gc_type_id`. `0` until then, in which case the alloc helpers
+/// fall back to the leaked `malloc_raw` (bare unit tests / pre-init bootstrap).
+///
+/// Unlike the `W_*` object ids this is set at runtime rather than a fixed
+/// const: the `BigInt` payload is never embedded in a JIT descr (it is only
+/// ever allocated by the host `try_gc_alloc` path, never `NewWithVtable`'d in a
+/// trace), so it needs no compile-time-stable value.
+static BIGINT_GC_TYPE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Record the GC type id registered for the `BigInt` payload (called once from
+/// `pyre-jit::eval` after `gc.register_type`).
+pub fn set_bigint_gc_type_id(id: u32) {
+    BIGINT_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn bigint_gc_type_id() -> u32 {
+    BIGINT_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Lightweight GC destructor for the `BigInt` payload: run its drop glue so
+/// malachite's limb `Vec` is freed when the collector reclaims a dead bigint.
+/// Registered on [`BIGINT_GC_TYPE_ID`] via `TypeInfo::with_destructor`; the
+/// copying nursery would otherwise abandon the payload without dropping it,
+/// leaking the limbs (the `malloc_raw` leak this whole path replaces).
+///
+/// # Safety
+/// `addr` must point at a live, initialized `BigInt` payload the GC is
+/// reclaiming. The collector calls it exactly once, on the final dead copy
+/// (a survived/forwarded object is re-listed, never destructed).
+pub unsafe fn bigint_destructor(addr: usize) {
+    unsafe { std::ptr::drop_in_place(addr as *mut BigInt) }
+}
+
+/// Allocate `value` as a GC-managed `BigInt` in the nursery (no-collect host
+/// path). For the JIT `*_raw` arithmetic helpers, whose result flows straight
+/// into the boxing `NewWithVtable` in the same trace — that collecting NEW
+/// gcmap-roots the returned pointer, so a young payload is forwarded/promoted
+/// rather than dangling. Falls back to the leaked `malloc_raw` when no GC hook
+/// is installed (bare unit tests, where the result is never traced).
+#[inline]
+pub fn alloc_bigint_nursery(value: BigInt) -> *mut BigInt {
+    let tid = bigint_gc_type_id();
+    if tid != 0 {
+        if let Some(raw) =
+            crate::gc_hook::try_gc_alloc(tid, BIGINT_PAYLOAD_SIZE).filter(|p| !p.is_null())
+        {
+            let external = bigint_external_bytes(&value);
+            unsafe {
+                std::ptr::write(raw as *mut BigInt, value);
+            }
+            crate::gc_hook::try_gc_charge_oldgen_external(raw as usize, external);
+            return raw as *mut BigInt;
+        }
+    }
+    crate::lltype::malloc_raw(value)
+}
+
+/// The external (off-heap, GC-invisible) byte footprint of a `BigInt`'s limb
+/// `Vec` — `ceil(bits/64)` limbs of 8 bytes each. `bits()` is constant-time
+/// (reads only the top limb, no allocation). Values that fit one machine word
+/// (`bits <= 64`) are stored inline with no `Vec`, so they carry 0 external bytes.
+#[inline]
+fn bigint_external_bytes(value: &BigInt) -> usize {
+    let bits = value.bits();
+    if bits <= 64 {
+        0
+    } else {
+        ((bits + 63) / 64) as usize * 8
+    }
+}
+
+/// External (off-heap) byte footprint of a GC `BigInt` payload at `addr` — the
+/// payload base is the `BigInt` itself (see [`bigint_destructor`]). Registered
+/// as the type's `external_size` so the collector folds a promoted bigint's
+/// limb `Vec` into the major-collection threshold.
+///
+/// # Safety
+/// `addr` must point at a live, initialized `BigInt` payload (true for a
+/// promoted or surviving old-gen bigint the collector is accounting for).
+pub unsafe fn bigint_external_size(addr: usize) -> usize {
+    bigint_external_bytes(unsafe { &*(addr as *const BigInt) })
+}
+
+/// Allocate `value` as a GC-managed `BigInt` through the *collecting* nursery —
+/// a minor collection fires when the nursery is full (reclaiming dead bigints)
+/// instead of spilling to old-gen unbounded. Only for the elidable bigint
+/// payload helpers (`jit_bigint_*`), which the walker emits as a residual
+/// `CallR` whose gcmap roots the trace's live set, and which read both operand
+/// payloads into a local sum before allocating — so nothing unrooted is held
+/// across the embedded minor cycle. Falls back to the no-collect path when no
+/// collecting hook is installed (other backends), then to `malloc_raw`.
+///
+/// Before allocating, the result's limb-`Vec` bytes are charged as off-heap
+/// memory pressure so the nursery's minor cadence reflects the bignum's true
+/// footprint, not just the 48-byte struct the bump pointer tracks (otherwise the
+/// last nursery generation of large bigints accumulates uncollected). The charge
+/// may itself force a minor; that is safe here because it runs before the fresh
+/// `value` is written into the nursery (it still lives only on the Rust stack and
+/// holds no nursery GC pointer) while the operand bigints are already boxed and
+/// gcmap-rooted at the residual call.
+#[inline]
+pub fn alloc_bigint_nursery_collecting(value: BigInt) -> *mut BigInt {
+    let tid = bigint_gc_type_id();
+    if tid != 0 {
+        let external = bigint_external_bytes(&value);
+        crate::gc_hook::try_gc_charge_memory_pressure(external);
+        if let Some(raw) = crate::gc_hook::try_gc_alloc_collecting(tid, BIGINT_PAYLOAD_SIZE)
+            .filter(|p| !p.is_null())
+        {
+            unsafe {
+                std::ptr::write(raw as *mut BigInt, value);
+            }
+            crate::gc_hook::try_gc_charge_oldgen_external(raw as usize, external);
+            return raw as *mut BigInt;
+        }
+    }
+    alloc_bigint_nursery(value)
+}
+
+/// Allocate `value` as a GC-managed `BigInt` at a stable (old-gen, non-moving)
+/// address, for host/interpreter callers (`w_long_new`) that hold the pointer
+/// on the Rust stack without rooting it. Mirrors `w_float_new`'s
+/// `try_gc_alloc_stable`. Falls back to the leaked `malloc_raw` pre-init.
+#[inline]
+pub fn alloc_bigint_stable(value: BigInt) -> *mut BigInt {
+    let tid = bigint_gc_type_id();
+    if tid != 0 {
+        if let Some(raw) =
+            crate::gc_hook::try_gc_alloc_stable(tid, BIGINT_PAYLOAD_SIZE).filter(|p| !p.is_null())
+        {
+            // Charge the limb-`Vec` bytes against the old-gen external total so a
+            // directly-old-gen bignum's footprint enters the major threshold now,
+            // not only at the next major's recompute. No minor is forced, so this
+            // is safe on the unrooted host/interpreter path (a memory-pressure
+            // charge here could force an unsafe moving minor).
+            let external = bigint_external_bytes(&value);
+            unsafe {
+                std::ptr::write(raw as *mut BigInt, value);
+            }
+            crate::gc_hook::try_gc_charge_oldgen_external(raw as usize, external);
+            return raw as *mut BigInt;
+        }
+    }
+    crate::lltype::malloc_raw(value)
+}
+
 /// Wrap an already heap-allocated `*mut BigInt` in a fresh W_LongObject
 /// without copying the payload — the wrapper just stores `value`, it does not
 /// take exclusive ownership. Pure-call CSE of the elidable `rbigint` helpers
 /// can fold two ops to the same `*mut BigInt`, so one payload may back more
-/// than one wrapper; that is sound only because payloads are never freed
-/// (`malloc_raw` / `Box::leak`).
+/// than one wrapper; that is sound because payloads are immutable after
+/// initialization and every wrapper/trace op treats the payload as a GC ref.
 pub fn w_long_from_raw(value: *mut BigInt) -> PyObjectRef {
     // W_LongObject shares the `int` type with W_IntObject — the two only
     // differ in their storage layout, not their Python-level identity
     // (PyPy does the same via W_AbstractIntObject's typedef). Wire
     // `w_class` to INT_TYPE.instantiate so `type(x) is int` and
     // `isinstance(x, int)` both hold for long integers.
+    let header = PyObject {
+        ob_type: &LONG_TYPE as *const PyType,
+        w_class: get_instantiate(&INT_TYPE),
+    };
+    if crate::gc_interp::enabled() {
+        // Pin the (possibly young) `value` payload across the wrapper malloc:
+        // a minor collection inside `try_gc_alloc_stable` can move a young
+        // bigint, so re-read its address afterwards. The proxy/dictproxy
+        // `gct_fv_gc_malloc` bracket pattern, but for a raw `*mut BigInt`
+        // rooted as a GcRef slot rather than a PyObjectRef.
+        let mut slot = value as *mut u8;
+        let pinned = unsafe { crate::gc_hook::try_gc_add_root(&mut slot as *mut *mut u8) };
+        let raw = crate::gc_hook::try_gc_alloc_stable(W_LONG_GC_TYPE_ID, W_LONG_OBJECT_SIZE)
+            .filter(|p| !p.is_null());
+        let value = slot as *mut BigInt;
+        if pinned {
+            crate::gc_hook::try_gc_remove_root(&mut slot as *mut *mut u8);
+        }
+        if let Some(raw) = raw {
+            // Advance the dispatch-loop safepoint counter, as w_int_new /
+            // w_float_new do for their stable allocs — otherwise a long-dominated
+            // interpreter workload never reaches the safepoint threshold and the
+            // dead old-gen long wrappers + their bigint payloads accumulate.
+            crate::gc_interp::note_alloc();
+            unsafe {
+                std::ptr::write(
+                    raw as *mut W_LongObject,
+                    W_LongObject {
+                        ob_header: header,
+                        value,
+                    },
+                );
+            }
+            // Creation write barrier: the old-gen wrapper may reference a young
+            // bigint, so remember it for the next minor collection's tracer.
+            crate::gc_hook::try_gc_write_barrier(raw);
+            return raw as PyObjectRef;
+        }
+    }
     crate::lltype::malloc_typed(W_LongObject {
-        ob_header: PyObject {
-            ob_type: &LONG_TYPE as *const PyType,
-            w_class: get_instantiate(&INT_TYPE),
-        },
+        ob_header: header,
         value,
     }) as PyObjectRef
 }
 
-/// Allocate a new W_LongObject on the heap from a `BigInt` value.
+/// Allocate a new W_LongObject on the heap from a `BigInt` value. The bigint
+/// payload is GC-managed at a stable address (held on the Rust stack by host
+/// callers without rooting), and the wrapper traces it via the registered
+/// `LONG_VALUE_OFFSET` gc-pointer.
 pub fn w_long_new(value: BigInt) -> PyObjectRef {
-    w_long_from_raw(crate::lltype::malloc_raw(value))
+    w_long_from_raw(alloc_bigint_stable(value))
 }
 
 /// Create a W_LongObject from an i64 value.
@@ -123,6 +316,22 @@ pub extern "C" fn jit_w_long_fits_int(obj: i64) -> i64 {
     unsafe { w_long_fits_int(obj) as i64 }
 }
 
+/// `rbigint.fits_int()` on a bare `*mut BigInt` — the demote guard for the
+/// inline-NEW boxing of a `jit_w_long_*_raw` result. Returns 1 when the bigint
+/// fits i64 (i.e. should demote to `W_IntObject`), 0 otherwise. The walker/trait
+/// emit `GuardFalse(fits)` after the raw op so a result that does fit deopts to
+/// the interpreter (which performs the demote); the common bigint case (does
+/// not fit) passes the guard and falls through to `NewWithVtable(W_LONG)`.
+/// Non-elidable, cannot-raise (mirrors [`jit_w_long_fits_int`]).
+///
+/// # Safety note: `extern "C"` over an `i64`-encoded `*mut BigInt`, matching the
+/// raw-helper ABI. The pointer is a live GC bigint produced by a preceding
+/// raw op in the same trace.
+pub extern "C" fn jit_bigint_fits_int(num: i64) -> i64 {
+    let num = num as *const BigInt;
+    unsafe { i64::try_from(&*num).is_ok() as i64 }
+}
+
 /// `W_LongObject.toint()` (`pypy/objspace/std/longobject.py:138`) →
 /// `rbigint.toint()` (`rpython/rlib/rbigint.py:465`, `@jit.elidable`).
 /// Extract an i64 from a W_LongObject. RPython `toint` raises
@@ -155,56 +364,105 @@ pub extern "C" fn jit_w_long_toint(obj: i64) -> i64 {
 /// `GuardNoException` covers the allocation. The result is an internal bigint
 /// never exposed to Python `is`, so sharing one payload for two equal-input
 /// adds is unobservable.
+/// Wrapper-level (`W_LongObject` operands) variants used for record-time
+/// concrete evaluation and the trait path, which run OUTSIDE a JIT safepoint and
+/// hold the operand wrappers natively — so they allocate via the NO-COLLECT
+/// `alloc_bigint_nursery` (a collection here would move the tracer's operands).
+/// The walker-emitted runtime call uses the collecting payload variants below.
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_w_long_add_raw(a: i64, b: i64) -> i64 {
-    let a = a as PyObjectRef;
-    let b = b as PyObjectRef;
-    unsafe {
-        let sum = w_long_get_value(a) + w_long_get_value(b);
-        crate::lltype::malloc_raw(sum) as i64
-    }
+    let (a, b) = (a as PyObjectRef, b as PyObjectRef);
+    unsafe { alloc_bigint_nursery(w_long_get_value(a) + w_long_get_value(b)) as i64 }
 }
 
-/// `rbigint.sub` — the payload half of `W_LongObject._sub`
-/// (`pypy/objspace/std/longobject.py`). Like [`jit_w_long_add_raw`] but
-/// subtracts; allocates, so `EF_ELIDABLE_OR_MEMORYERROR`.
+/// `rbigint.sub` over `W_LongObject` operands (no-collect). See [`jit_w_long_add_raw`].
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_w_long_sub_raw(a: i64, b: i64) -> i64 {
-    let a = a as PyObjectRef;
-    let b = b as PyObjectRef;
-    unsafe { crate::lltype::malloc_raw(w_long_get_value(a) - w_long_get_value(b)) as i64 }
+    let (a, b) = (a as PyObjectRef, b as PyObjectRef);
+    unsafe { alloc_bigint_nursery(w_long_get_value(a) - w_long_get_value(b)) as i64 }
 }
 
-/// `rbigint.mul` payload half of `W_LongObject._mul`. Allocates → `EF_ELIDABLE_OR_MEMORYERROR`.
+/// `rbigint.mul` over `W_LongObject` operands (no-collect). See [`jit_w_long_add_raw`].
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_w_long_mul_raw(a: i64, b: i64) -> i64 {
-    let a = a as PyObjectRef;
-    let b = b as PyObjectRef;
-    unsafe { crate::lltype::malloc_raw(w_long_get_value(a) * w_long_get_value(b)) as i64 }
+    let (a, b) = (a as PyObjectRef, b as PyObjectRef);
+    unsafe { alloc_bigint_nursery(w_long_get_value(a) * w_long_get_value(b)) as i64 }
 }
 
-/// `rbigint.and_` payload half of `W_LongObject._and`. Allocates → `EF_ELIDABLE_OR_MEMORYERROR`.
+/// `rbigint.and_` over `W_LongObject` operands (no-collect). See [`jit_w_long_add_raw`].
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_w_long_and_raw(a: i64, b: i64) -> i64 {
-    let a = a as PyObjectRef;
-    let b = b as PyObjectRef;
-    unsafe { crate::lltype::malloc_raw(w_long_get_value(a) & w_long_get_value(b)) as i64 }
+    let (a, b) = (a as PyObjectRef, b as PyObjectRef);
+    unsafe { alloc_bigint_nursery(w_long_get_value(a) & w_long_get_value(b)) as i64 }
 }
 
-/// `rbigint.or_` payload half of `W_LongObject._or`. Allocates → `EF_ELIDABLE_OR_MEMORYERROR`.
+/// `rbigint.or_` over `W_LongObject` operands (no-collect). See [`jit_w_long_add_raw`].
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_w_long_or_raw(a: i64, b: i64) -> i64 {
-    let a = a as PyObjectRef;
-    let b = b as PyObjectRef;
-    unsafe { crate::lltype::malloc_raw(w_long_get_value(a) | w_long_get_value(b)) as i64 }
+    let (a, b) = (a as PyObjectRef, b as PyObjectRef);
+    unsafe { alloc_bigint_nursery(w_long_get_value(a) | w_long_get_value(b)) as i64 }
 }
 
-/// `rbigint.xor_` payload half of `W_LongObject._xor`. Allocates → `EF_ELIDABLE_OR_MEMORYERROR`.
+/// `rbigint.xor_` over `W_LongObject` operands (no-collect). See [`jit_w_long_add_raw`].
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_w_long_xor_raw(a: i64, b: i64) -> i64 {
-    let a = a as PyObjectRef;
-    let b = b as PyObjectRef;
-    unsafe { crate::lltype::malloc_raw(w_long_get_value(a) ^ w_long_get_value(b)) as i64 }
+    let (a, b) = (a as PyObjectRef, b as PyObjectRef);
+    unsafe { alloc_bigint_nursery(w_long_get_value(a) ^ w_long_get_value(b)) as i64 }
+}
+
+/// `rbigint.add`/`sub`/`mul`/`and_`/`or_`/`xor_` (`rpython/rlib/rbigint.py`,
+/// each `@jit.elidable`) on bare `*const BigInt` payloads — the elidable
+/// arithmetic the walker emits after reading each operand's immutable `value`
+/// via `GetfieldGcPure`. Taking the payloads (not the `W_LongObject` wrappers)
+/// keeps the call's inputs the immutable bigints, so the optimizer forwards the
+/// field read and never reorders this elidable call ahead of the boxing
+/// `setfield_gc` that initializes the fresh result wrapper. Allocates the result
+/// via the COLLECTING nursery (the call is a gcmap-rooted residual `CallR`
+/// holding no unrooted pointer across the alloc), so dead bigints are reclaimed
+/// by minor collections instead of accumulating in old-gen. Returns a freshly
+/// heap-allocated `*mut BigInt` (as i64). Allocates → `EF_ELIDABLE_OR_MEMORYERROR`.
+///
+/// # Safety note: `extern "C"` over `i64`-encoded `*const BigInt`. The pointers
+/// are live GC bigints (the operands' value fields) for the duration of the call.
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_bigint_add(a: i64, b: i64) -> i64 {
+    let (a, b) = (a as *const BigInt, b as *const BigInt);
+    unsafe { alloc_bigint_nursery_collecting(&*a + &*b) as i64 }
+}
+
+/// `rbigint.sub` on bare payloads (collecting). See [`jit_bigint_add`].
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_bigint_sub(a: i64, b: i64) -> i64 {
+    let (a, b) = (a as *const BigInt, b as *const BigInt);
+    unsafe { alloc_bigint_nursery_collecting(&*a - &*b) as i64 }
+}
+
+/// `rbigint.mul` on bare payloads (collecting). See [`jit_bigint_add`].
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_bigint_mul(a: i64, b: i64) -> i64 {
+    let (a, b) = (a as *const BigInt, b as *const BigInt);
+    unsafe { alloc_bigint_nursery_collecting(&*a * &*b) as i64 }
+}
+
+/// `rbigint.and_` on bare payloads (collecting). See [`jit_bigint_add`].
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_bigint_and(a: i64, b: i64) -> i64 {
+    let (a, b) = (a as *const BigInt, b as *const BigInt);
+    unsafe { alloc_bigint_nursery_collecting(&*a & &*b) as i64 }
+}
+
+/// `rbigint.or_` on bare payloads (collecting). See [`jit_bigint_add`].
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_bigint_or(a: i64, b: i64) -> i64 {
+    let (a, b) = (a as *const BigInt, b as *const BigInt);
+    unsafe { alloc_bigint_nursery_collecting(&*a | &*b) as i64 }
+}
+
+/// `rbigint.xor_` on bare payloads (collecting). See [`jit_bigint_add`].
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_bigint_xor(a: i64, b: i64) -> i64 {
+    let (a, b) = (a as *const BigInt, b as *const BigInt);
+    unsafe { alloc_bigint_nursery_collecting(&*a ^ &*b) as i64 }
 }
 
 /// `rbigint` comparison payload for `W_LongObject` — returns the sign of

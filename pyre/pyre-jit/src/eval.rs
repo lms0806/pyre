@@ -60,6 +60,31 @@ fn pyre_object_gc_alloc_stable_trampoline(type_id: u32, size: usize) -> *mut u8 
     majit_gc::alloc_oldgen_typed(type_id, size).0 as *mut u8
 }
 
+/// Trampoline for *collecting* nursery host-side allocations — routes
+/// pyre-object's collecting-allocation hook to the backend's collecting nursery
+/// allocator (minor-on-full). Only the elidable bigint payload helpers use it,
+/// from a gcmap-carrying residual call holding no unrooted pointer across the
+/// allocation, so the embedded minor cycle is safe.
+fn pyre_object_gc_alloc_collecting_trampoline(type_id: u32, size: usize) -> *mut u8 {
+    majit_gc::alloc_nursery_collecting_typed(type_id, size).0 as *mut u8
+}
+
+/// Trampoline for off-heap memory-pressure charges — routes pyre-object's
+/// memory-pressure hook to the backend's GC. The bignum collecting-alloc site
+/// charges its limb-`Vec` bytes here so minor cadence reflects true footprint;
+/// the charge may force a minor, safe because the caller is the same gcmap-rooted
+/// residual call as [`pyre_object_gc_alloc_collecting_trampoline`].
+fn pyre_object_gc_charge_memory_pressure_trampoline(bytes: usize) {
+    majit_gc::charge_memory_pressure(bytes);
+}
+
+/// Old-gen external-byte charge trampoline. Bridges a host stable bignum alloc
+/// (`alloc_bigint_stable`) to the active backend's major threshold without
+/// forcing a minor.
+fn pyre_object_gc_charge_oldgen_external_trampoline(obj_addr: usize, bytes: usize) {
+    majit_gc::charge_oldgen_external(obj_addr, bytes);
+}
+
 /// `gc.collect()` (interp_gc.py:7-26) trampoline. Bridges
 /// pyre-object's `try_gc_collect` to `majit_gc::collect_full`, which
 /// fans out to the active backend's `dynasm_collect_full` /
@@ -1244,11 +1269,14 @@ thread_local! {
             w_str_tid,
         );
         pytype_to_tid.insert(&pyre_object::STR_TYPE as *const _ as usize, w_str_tid);
-        // W_LongObject carries a `*mut BigInt` (raw heap) only. Same
-        // size-only registration shape as W_UnicodeObject.
-        let w_long_tid = gc.register_type(TypeInfo::object_subclass(
+        // W_LongObject carries a `value: *mut BigInt` that now points at a
+        // GC-managed bigint payload (BIGINT_GC_TYPE_ID, registered below), so
+        // the collector must trace/forward it — register the `value` offset as
+        // a gc-pointer rather than the old size-only shape.
+        let w_long_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
             std::mem::size_of::<pyre_object::longobject::W_LongObject>(),
             object_tid,
+            vec![pyre_object::longobject::LONG_VALUE_OFFSET],
         ));
         debug_assert_eq!(w_long_tid, W_LONG_GC_TYPE_ID);
         majit_gc::GcAllocator::register_vtable_for_type(
@@ -1916,6 +1944,22 @@ thread_local! {
             <pyre_object::memoryview::W_MemoryView
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
+        // Raw `BigInt` payload backing every `W_LongObject.value` (and the JIT
+        // `jit_w_long_*_raw` results). Not an `rclass.OBJECT` instance — a bare
+        // payload with no gc-pointer fields (malachite's limb `Vec` is off-GC),
+        // carrying a lightweight destructor that runs `BigInt`'s drop glue so
+        // the limbs are freed instead of leaked when the collector reclaims a
+        // dead bigint. Registered at runtime id (no fixed const) and published
+        // to pyre-object via `set_bigint_gc_type_id`; the id is never embedded
+        // in a JIT descr (bigints are host-allocated, never `NewWithVtable`'d).
+        let bigint_tid = gc.register_type(
+            TypeInfo::with_destructor(
+                pyre_object::longobject::BIGINT_PAYLOAD_SIZE,
+                pyre_object::longobject::bigint_destructor,
+            )
+            .with_external_size(pyre_object::longobject::bigint_external_size),
+        );
+        pyre_object::longobject::set_bigint_gc_type_id(bigint_tid);
         // rclass.py:340-346 — assign subclassrange_{min,max} to each
         // vtable entry. freeze_types() runs assign_inheritance_ids
         // (normalizecalls.py:373-389), then we write the computed ranges
@@ -2015,6 +2059,15 @@ thread_local! {
         // lives here.
         pyre_object::register_gc_alloc_hook(pyre_object_gc_alloc_trampoline);
         pyre_object::register_gc_alloc_stable_hook(pyre_object_gc_alloc_stable_trampoline);
+        pyre_object::gc_hook::register_gc_alloc_collecting_hook(
+            pyre_object_gc_alloc_collecting_trampoline,
+        );
+        pyre_object::gc_hook::register_gc_charge_memory_pressure_hook(
+            pyre_object_gc_charge_memory_pressure_trampoline,
+        );
+        pyre_object::gc_hook::register_gc_charge_oldgen_external_hook(
+            pyre_object_gc_charge_oldgen_external_trampoline,
+        );
         pyre_object::register_gc_collect_hook(pyre_object_gc_collect_trampoline);
         pyre_object::gc_hook::register_gc_collect_oldgen_hook(
             pyre_object_gc_collect_oldgen_trampoline,
