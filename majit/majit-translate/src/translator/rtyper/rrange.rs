@@ -440,7 +440,11 @@ impl Repr for AbstractRangeRepr {
     /// Both the constant-step (`step != 0` → `RANGEITER`) and the
     /// variable-step (`step == 0` → `RANGESTITER`) iterators are built by
     /// [`RangeIteratorRepr::new`].
-    fn make_iterator_repr(&self, variant: &[String]) -> Result<Arc<dyn Repr>, TyperError> {
+    fn make_iterator_repr(
+        &self,
+        variant: &[String],
+        _foldable: bool,
+    ) -> Result<Arc<dyn Repr>, TyperError> {
         if !variant.is_empty() {
             return Err(TyperError::message(format!(
                 "unsupported {variant:?} iterator over a range list"
