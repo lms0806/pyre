@@ -5,8 +5,9 @@
 //! pointers as `llmemory.GCREF` while preserving the original external
 //! repr. The port mirrors the cache/keying, constant opaque casts, and
 //! pairtype conversions used by `externalvsinternal(..., gcref=True)`.
-//! `DummyValueBuilderGCRef` is deferred until pyre grows the matching
-//! `rtyper.cache_dummy_values` surface.
+//! `DummyValueBuilderGCRef.ll_dummy_value` and the conditional
+//! `GCRefRepr.ll_str` wrapper are deferred as latent surfaces (see their
+//! doc comments for the precise blockers).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -27,15 +28,36 @@ use crate::translator::rtyper::rtyper::{
     variable_with_lltype,
 };
 
+/// RPython `UNKNOWN = object()` (`rgcref.py:6`): sentinel marking a
+/// `_ll_eq_func` / `_ll_hash_func` slot as not-yet-computed, distinct from a
+/// computed `None` (the base repr has no eq/hash helper).
+#[derive(Debug, Clone)]
+enum LlHelperCache {
+    Unknown,
+    Computed(Option<LowLevelFunction>),
+}
+
 #[derive(Debug)]
 pub struct GCRefRepr {
     r_base: Arc<dyn Repr>,
     lltype: LowLevelType,
     state: ReprState,
+    /// `self._ll_eq_func = UNKNOWN` (`rgcref.py:21`), memoized on first
+    /// `get_ll_eq_function` call.
+    _ll_eq_func: RefCell<LlHelperCache>,
+    /// `self._ll_hash_func = UNKNOWN` (`rgcref.py:22`).
+    _ll_hash_func: RefCell<LlHelperCache>,
 }
 
 impl GCRefRepr {
-    /// RPython `GCRefRepr.make(r_base, cache)` (`rgcref.py:11-17`).
+    /// RPython `GCRefRepr.make(r_base, cache)` (`rgcref.py:11-17`),
+    /// folding in `__init__` (`rgcref.py:20-28`).
+    ///
+    /// The conditional `self.ll_str` wrapper (`rgcref.py:24-28`, installed
+    /// only `if hasattr(r_base, 'll_str')`) is omitted: no pyre `Repr`
+    /// exposes an `ll_str` method, so the `hasattr` guard is always false
+    /// and there is nothing to wrap. It can be ported once the
+    /// `Repr::ll_str` / `rtype_str` surface lands.
     pub fn make(
         r_base: Arc<dyn Repr>,
         cache: &RefCell<HashMap<usize, Arc<GCRefRepr>>>,
@@ -48,6 +70,8 @@ impl GCRefRepr {
             r_base,
             lltype: GCREF.clone(),
             state: ReprState::new(),
+            _ll_eq_func: RefCell::new(LlHelperCache::Unknown),
+            _ll_hash_func: RefCell::new(LlHelperCache::Unknown),
         });
         cache.borrow_mut().insert(key, repr.clone());
         repr
@@ -92,69 +116,89 @@ impl Repr for GCRefRepr {
         ))
     }
 
+    /// RPython `GCRefRepr.get_ll_eq_function` (`rgcref.py:32-46`): compute the
+    /// wrapper once, caching it in `_ll_eq_func` past the `UNKNOWN` sentinel.
     fn get_ll_eq_function(
         &self,
         rtyper: &RPythonTyper,
     ) -> Result<Option<LowLevelFunction>, TyperError> {
-        let Some(base_eq) = self.r_base.get_ll_eq_function(rtyper)? else {
-            return Ok(None);
-        };
-        let name = format!("ll_gcref_eq_{}", self.r_base.lowleveltype().short_name());
-        let base_lltype = self.r_base.lowleveltype().clone();
-        rtyper
-            .lowlevel_helper_function_with_builder(
-                name.clone(),
-                vec![self.lltype.clone(), self.lltype.clone()],
-                LowLevelType::Bool,
-                move |_rtyper, args, result| {
-                    build_gcref_wrapper_graph(
-                        &name,
-                        args,
-                        result,
-                        &base_lltype,
-                        base_eq.clone(),
-                        "ptr",
-                    )
-                },
-            )
-            .map(Some)
+        if matches!(*self._ll_eq_func.borrow(), LlHelperCache::Unknown) {
+            let ll_eq_func = match self.r_base.get_ll_eq_function(rtyper)? {
+                None => None,
+                Some(base_eq) => {
+                    let name = format!("ll_gcref_eq_{}", self.r_base.lowleveltype().short_name());
+                    let base_lltype = self.r_base.lowleveltype().clone();
+                    Some(rtyper.lowlevel_helper_function_with_builder(
+                        name.clone(),
+                        vec![self.lltype.clone(), self.lltype.clone()],
+                        LowLevelType::Bool,
+                        move |_rtyper, args, result| {
+                            build_gcref_wrapper_graph(
+                                &name,
+                                args,
+                                result,
+                                &base_lltype,
+                                base_eq.clone(),
+                                "ptr",
+                            )
+                        },
+                    )?)
+                }
+            };
+            *self._ll_eq_func.borrow_mut() = LlHelperCache::Computed(ll_eq_func);
+        }
+        match &*self._ll_eq_func.borrow() {
+            LlHelperCache::Computed(func) => Ok(func.clone()),
+            LlHelperCache::Unknown => unreachable!("_ll_eq_func computed above"),
+        }
     }
 
+    /// RPython `GCRefRepr.get_ll_hash_function` (`rgcref.py:48-62`).
     fn get_ll_hash_function(
         &self,
         rtyper: &RPythonTyper,
     ) -> Result<Option<LowLevelFunction>, TyperError> {
-        let Some(base_hash) = self.r_base.get_ll_hash_function(rtyper)? else {
-            return Ok(None);
-        };
-        let name = format!("ll_gcref_hash_{}", self.r_base.lowleveltype().short_name());
-        let base_lltype = self.r_base.lowleveltype().clone();
-        rtyper
-            .lowlevel_helper_function_with_builder(
-                name.clone(),
-                vec![self.lltype.clone()],
-                LowLevelType::Signed,
-                move |_rtyper, args, result| {
-                    build_gcref_wrapper_graph(
-                        &name,
-                        args,
-                        result,
-                        &base_lltype,
-                        base_hash.clone(),
-                        "ptr",
-                    )
-                },
-            )
-            .map(Some)
+        if matches!(*self._ll_hash_func.borrow(), LlHelperCache::Unknown) {
+            let ll_hash_func = match self.r_base.get_ll_hash_function(rtyper)? {
+                None => None,
+                Some(base_hash) => {
+                    let name = format!("ll_gcref_hash_{}", self.r_base.lowleveltype().short_name());
+                    let base_lltype = self.r_base.lowleveltype().clone();
+                    Some(rtyper.lowlevel_helper_function_with_builder(
+                        name.clone(),
+                        vec![self.lltype.clone()],
+                        LowLevelType::Signed,
+                        move |_rtyper, args, result| {
+                            build_gcref_wrapper_graph(
+                                &name,
+                                args,
+                                result,
+                                &base_lltype,
+                                base_hash.clone(),
+                                "ptr",
+                            )
+                        },
+                    )?)
+                }
+            };
+            *self._ll_hash_func.borrow_mut() = LlHelperCache::Computed(ll_hash_func);
+        }
+        match &*self._ll_hash_func.borrow() {
+            LlHelperCache::Computed(func) => Ok(func.clone()),
+            LlHelperCache::Unknown => unreachable!("_ll_hash_func computed above"),
+        }
     }
 }
 
-/// RPython `class DummyValueBuilderGCRef(object)` (`rgcref.py:66-104`).
+/// RPython `class DummyValueBuilderGCRef(object)` (`rgcref.py:74-104`).
 ///
-/// The `ll_dummy_value` property depends on
-/// `RPythonTyper.cache_dummy_values`, which is still deferred in this
-/// port. The identity, hash, and freeze behavior is available so callers
-/// can use the same object surface.
+/// The `ll_dummy_value` property (`rgcref.py:93-104`) is deferred along
+/// with the generic [`super::super::rmodel::DummyValueBuilder`] it
+/// delegates to: it is a latent surface (no caller reaches it) and needs
+/// the `RPythonTyper.cache_dummy_values` map plus the typer threaded in to
+/// run `getinstancerepr(None)` → `DummyValueBuilder(TYPE.TO)` →
+/// `cast_opaque_ptr(GCREF, ...)`. The identity, hash, and freeze behavior
+/// is available so callers can use the same object surface.
 #[derive(Clone, Debug)]
 pub struct DummyValueBuilderGCRef {
     rtyper_id: usize,
@@ -177,7 +221,8 @@ impl DummyValueBuilderGCRef {
 
     pub fn ll_dummy_value(&self) -> Result<Constant, TyperError> {
         Err(TyperError::missing_rtype_operation(
-            "DummyValueBuilderGCRef.ll_dummy_value - RPythonTyper.cache_dummy_values deferred",
+            "DummyValueBuilderGCRef.ll_dummy_value - latent: needs cache_dummy_values + \
+             getinstancerepr(None) → DummyValueBuilder(TYPE.TO) → cast_opaque_ptr(GCREF)",
         ))
     }
 }

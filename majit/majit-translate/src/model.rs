@@ -3702,7 +3702,29 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
             }
         }
         for (dup_i, _) in removable_slots.into_iter().rev() {
+            // Drop the `OpKind::Input` op paired with the DUPLICATE slot by its
+            // slot position — `del block.inputargs[i]` by index
+            // (simplify.py:650-653).  After the rename several Input ops can
+            // share the survivor's result, so a result match would risk
+            // dropping the survivor (first-seen) slot's own `name`/`ty`/
+            // `class_root` metadata instead of the duplicate's.  The k-th
+            // `OpKind::Input` op mirrors the k-th inputarg (paired in order at
+            // construction; earlier passes preserve that order).
+            let mut seen_inputs = 0usize;
+            let mut dup_op_idx = None;
+            for (op_idx, op) in graph.blocks[block_idx].operations.iter().enumerate() {
+                if matches!(op.kind, OpKind::Input { .. }) {
+                    if seen_inputs == dup_i {
+                        dup_op_idx = Some(op_idx);
+                        break;
+                    }
+                    seen_inputs += 1;
+                }
+            }
             graph.blocks[block_idx].inputargs.remove(dup_i);
+            if let Some(op_idx) = dup_op_idx {
+                graph.blocks[block_idx].operations.remove(op_idx);
+            }
             for pred_idx in 0..graph.blocks.len() {
                 for link in &mut graph.blocks[pred_idx].exits {
                     if link.target == block_id {

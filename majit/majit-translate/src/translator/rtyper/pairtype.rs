@@ -175,6 +175,11 @@ pub enum ReprClassId {
     /// iterator over a list/slice (`GcStruct("listiter", ("list", LIST),
     /// ("index", Signed))`).
     ListIteratorRepr,
+    /// `rrange.py:145 AbstractRangeIteratorRepr(IteratorRepr)` — the
+    /// iterator over a `range()` list (`GcStruct("range", ("next",
+    /// Signed), ("stop", Signed))`). Distinct from `RangeRepr`: an
+    /// iterator repr is its own iterator, not the container.
+    RangeIteratorRepr,
 }
 
 impl ReprClassId {
@@ -242,6 +247,7 @@ impl ReprClassId {
             // → Repr`; the abstract bases carry no pairtype entries, so
             // the resolution chain collapses to `Self → Repr`.
             ListIteratorRepr => &[ListIteratorRepr, Repr],
+            RangeIteratorRepr => &[RangeIteratorRepr, Repr],
         }
     }
 }
@@ -1155,13 +1161,14 @@ fn dispatch_rtype_is_(
         // rnone.py:61-64 — `pairtype(NoneRepr, Repr).rtype_is_` calls
         // `rtype_is_None(robj2, rnone1, hop, pos=1)`.
         (NoneRepr, Repr) => super::rnone::pair_none_any_rtype_is_(r1, r2, hop),
-        // rpbc.py:713-725 — `pairtype(MultipleUnrelatedFrozenPBCRepr,
-        // MultipleUnrelatedFrozenPBCRepr).rtype_is_` emits adr_eq.
-        // The (MU, Single) / (Single, MU) arms in the same upstream
-        // block depend on a Single->MU convert_from_to that has not
-        // landed yet; those shapes still fall through to the generic
-        // (Repr, Repr) dispatcher below.
-        (MultipleUnrelatedFrozenPBCRepr, MultipleUnrelatedFrozenPBCRepr) => {
+        // rpbc.py:713-725 — the one upstream block registers
+        // `rtype_is_` on `pairtype(MU, MU)`, `pairtype(MU, Single)`,
+        // and `pairtype(Single, MU)`. All three emit adr_eq after
+        // converting both operands to the MU repr; a Single operand is
+        // a constant PBC and converts via `inputconst -> convert_const`.
+        (MultipleUnrelatedFrozenPBCRepr, MultipleUnrelatedFrozenPBCRepr)
+        | (MultipleUnrelatedFrozenPBCRepr, SingleFrozenPBCRepr)
+        | (SingleFrozenPBCRepr, MultipleUnrelatedFrozenPBCRepr) => {
             super::rpbc::pair_mu_mu_rtype_is_(r1, r2, hop).map(Some)
         }
         // rpbc.py:558-571 — `pairtype(FunctionReprBase,

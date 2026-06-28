@@ -1250,10 +1250,15 @@ pub fn mangle(prefix: &str, name: &str) -> String {
 
 /// RPython `class DummyValueBuilder(object)` (`rmodel.py:432-464`).
 ///
-/// The lazy `ll_dummy_value` allocation depends on
-/// `RPythonTyper.cache_dummy_values`, which is still absent in this
-/// port. The identity, hash, and freeze surfaces are present so
-/// `Repr.get_ll_dummyval_obj` can return the same object shape.
+/// The lazy `ll_dummy_value` allocation (`rmodel.py:452-464`) is deferred:
+/// it is a latent surface — no caller reaches `Repr.get_ll_dummyval_obj`
+/// yet — and completing it needs three pieces: (1) a
+/// `RPythonTyper.cache_dummy_values` map (the `LowLevelType` key is
+/// already `Hash + Eq`), (2) this builder to receive the `&RPythonTyper`
+/// at call time (it stores only `rtyper_id` for identity, not the typer),
+/// and (3) `malloc(TYPE, immortal=True)` (`malloc(TYPE, 1, ...)` for
+/// `_is_varsize()`). The identity, hash, and freeze surfaces are present
+/// so `get_ll_dummyval_obj` can already return the same object shape.
 #[allow(non_snake_case)]
 #[derive(Clone, Debug)]
 pub struct DummyValueBuilder {
@@ -1284,7 +1289,8 @@ impl DummyValueBuilder {
 
     pub fn ll_dummy_value(&self) -> Result<lltype::LowLevelValue, TyperError> {
         Err(TyperError::missing_rtype_operation(
-            "DummyValueBuilder.ll_dummy_value - RPythonTyper.cache_dummy_values deferred",
+            "DummyValueBuilder.ll_dummy_value - latent: needs RPythonTyper.cache_dummy_values \
+             + the typer threaded in for malloc(TYPE, immortal=True)",
         ))
     }
 }
@@ -3114,18 +3120,11 @@ pub fn rtyper_makerepr(
                 range_step.filter(|_| !mutated && !matches!(s_value, SomeValue::Impossible));
             use crate::translator::rtyper::rlist::{FixedSizeListRepr, ListRepr};
             if let Some(step) = range_repr_step {
-                if step == 1 {
-                    Ok(std::sync::Arc::new(
-                        crate::translator::rtyper::lltypesystem::rrange::RangeRepr::new(step)?,
-                    ) as std::sync::Arc<dyn Repr>)
-                } else {
-                    Err(TyperError::missing_rtype_operation(format!(
-                        "SomeList(range_step={step}).rtyper_makerepr — general \
-                         RangeRepr (const step != 1 / variable step) deferred; \
-                         ll_rangelen needs int_floordiv lowering (listdef: {:?})",
-                        s_list.listdef
-                    )))
-                }
+                // rlist.py:45 — any non-None range_step selects RangeRepr,
+                // constant (`RANGE`) or variable (`step == 0` → `RANGEST`).
+                Ok(std::sync::Arc::new(
+                    crate::translator::rtyper::lltypesystem::rrange::RangeRepr::new(step)?,
+                ) as std::sync::Arc<dyn Repr>)
             } else {
                 let item_r = rtyper.getrepr(&s_value)?;
                 let rtyper_rc = rtyper.self_rc()?;
