@@ -670,6 +670,29 @@ fn is_slice_reverse_segments(segments: &[String]) -> bool {
         && segments[3] == "reverse"
 }
 
+/// `Vec::push(l, item)` (Rust MIR `vec::Vec::push`) — the resizable-list
+/// append. Routed to the resized `ListRepr.rtype_method("append")`
+/// (`rlist.py:185`) via the `getattr(recv, "append") + simple_call` method
+/// shape, exactly like [`is_slice_reverse_segments`]; the Rust method name
+/// `push` maps to the RPython list method `append`.
+fn is_vec_push_segments(segments: &[String]) -> bool {
+    segments.len() == 3 && segments[0] == "vec" && segments[1] == "Vec" && segments[2] == "push"
+}
+
+/// `Vec::extend_from_slice(l, slice)` (Rust MIR `vec::Vec::extend_from_slice`)
+/// — appends every element of `slice` to the resizable list. Routed to the
+/// resized `ListRepr.rtype_method("extend")` (`rlist.py:204`) via the
+/// `getattr(recv, "extend") + simple_call` method shape, exactly like
+/// [`is_vec_push_segments`]; the Rust method name `extend_from_slice` maps to
+/// the RPython list method `extend` (whose argument is the slice, a
+/// non-resized list — `list_method_extend` takes the list-list path).
+fn is_vec_extend_from_slice_segments(segments: &[String]) -> bool {
+    segments.len() == 3
+        && segments[0] == "vec"
+        && segments[1] == "Vec"
+        && segments[2] == "extend_from_slice"
+}
+
 /// Test-only mirror of whether the flowspace op(s) this `OpKind`
 /// lowers to carry a non-empty `canraise` (`operation.py`).
 ///
@@ -1470,6 +1493,81 @@ pub fn translate_op(
                                 bound_method.clone(),
                             ),
                             FlowspaceOp::new("simple_call", vec![bound_method], result),
+                        ]);
+                    }
+                    // `Vec::push(recv, item)` lowers (in Rust MIR) to a call
+                    // to `vec::Vec::push`. Emit the *method* shape
+                    // `getattr(recv, "append") + simple_call(bound_method,
+                    // item)` that the annotator's `find_method("append")`
+                    // (`unaryop.rs`) and `BuiltinMethodRepr::rtype_simple_call`
+                    // → `ListRepr::rtype_method("append")` consume —
+                    // identical to the `slice.reverse` arm above, but the
+                    // bound method takes the appended `item` arg.
+                    if is_vec_push_segments(segments) {
+                        if arg_hls.len() != 2 {
+                            return Err(TyperError::message(format!(
+                                "Vec::push requires exactly two args (receiver, item), got {}",
+                                arg_hls.len()
+                            )));
+                        }
+                        let mut iter = arg_hls.into_iter();
+                        let receiver = iter.next().ok_or_else(|| {
+                            TyperError::message("Vec::push requires a receiver arg".to_string())
+                        })?;
+                        let item = iter.next().ok_or_else(|| {
+                            TyperError::message("Vec::push requires an item arg".to_string())
+                        })?;
+                        let bound_method = Hlvalue::Variable(Variable::new());
+                        return Ok(vec![
+                            FlowspaceOp::new(
+                                "getattr",
+                                vec![
+                                    receiver,
+                                    Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+                                        "append",
+                                    ))),
+                                ],
+                                bound_method.clone(),
+                            ),
+                            FlowspaceOp::new("simple_call", vec![bound_method, item], result),
+                        ]);
+                    }
+                    // `Vec::extend_from_slice(recv, slice)` — same method
+                    // shape as the `Vec::push` arm, but the bound method is
+                    // `extend` and its arg is the source slice (a non-resized
+                    // list). Reaches `ListRepr::rtype_method("extend")`.
+                    if is_vec_extend_from_slice_segments(segments) {
+                        if arg_hls.len() != 2 {
+                            return Err(TyperError::message(format!(
+                                "Vec::extend_from_slice requires exactly two args \
+                                 (receiver, slice), got {}",
+                                arg_hls.len()
+                            )));
+                        }
+                        let mut iter = arg_hls.into_iter();
+                        let receiver = iter.next().ok_or_else(|| {
+                            TyperError::message(
+                                "Vec::extend_from_slice requires a receiver arg".to_string(),
+                            )
+                        })?;
+                        let source = iter.next().ok_or_else(|| {
+                            TyperError::message(
+                                "Vec::extend_from_slice requires a source-slice arg".to_string(),
+                            )
+                        })?;
+                        let bound_method = Hlvalue::Variable(Variable::new());
+                        return Ok(vec![
+                            FlowspaceOp::new(
+                                "getattr",
+                                vec![
+                                    receiver,
+                                    Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+                                        "extend",
+                                    ))),
+                                ],
+                                bound_method.clone(),
+                            ),
+                            FlowspaceOp::new("simple_call", vec![bound_method, source], result),
                         ]);
                     }
                     let key =
@@ -2830,10 +2928,23 @@ pub fn function_graph_to_flowspace(
                 && !value_map.contains_key(result_var)
                 && !matches!(legacy_op.kind, OpKind::Abort { .. })
             {
+                // The op result is `result_var`'s sole definition site, so
+                // its freshly-seeded flowspace Variable is the authority for
+                // `value_to_var` — `insert`, not `or_insert_with`. A use of
+                // `result_var` reached earlier in block-storage order (e.g.
+                // a `*_ovf` raising op whose result the `checked_arith` front
+                // rewrite also threads through a link) may already have
+                // seeded a *different*, block-local typed Variable under the
+                // same legacy key. Keeping that earlier entry splits the
+                // identity: `specialize_block` writes the `concretetype` onto
+                // this op-result Variable (the one `value_map` carries and
+                // `translate_op` emits), while the dual gate reads the stale
+                // earlier entry — a spurious `real=Unknown` divergence. The
+                // per-block-Variable invariant still holds: this seed stays
+                // local to the defining block; only the legacy→typed map is
+                // repointed to the definition.
                 let var = seed_variable(result_var);
-                value_to_var
-                    .entry(result_var.clone())
-                    .or_insert_with(|| var.clone());
+                value_to_var.insert(result_var.clone(), var.clone());
                 value_map.insert(result_var.clone(), Hlvalue::Variable(var));
             }
             translated_ops.extend(translate_op(legacy_op, &value_map, call_registry)?);

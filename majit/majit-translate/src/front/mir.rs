@@ -1714,6 +1714,13 @@ fn simplify_lowered_graph(graph: &mut FunctionGraph) {
     if dirty {
         crate::model::prune_dead_phis(graph);
     }
+    // Re-thread boxing-cluster operands the dead-var sweeps above stripped out
+    // of the `NewWithVtable`-chain blocks' inputargs.  Runs last so no later
+    // pass can remove the threaded inputarg, restoring the adapter's per-block
+    // operand invariant for cross-block boxing clusters (e.g. `w_int_new`,
+    // whose `intval` payload and `__pyre_cast_instance` return chain span the
+    // blocks split by the `get_instantiate` / `gc_interp::enabled` calls).
+    crate::model::thread_undefined_op_operands(graph);
 }
 
 /// Order in which [`Lowering::lower`] walks the MIR basic blocks.
@@ -5010,8 +5017,13 @@ impl<'a> Lowering<'a> {
                 // read collapses to the bound element), and record the
                 // `(base, index)` pair so the paired `*p = v` write
                 // (`arr[i] = v` desugar) emits `ArrayWrite` from the
-                // `emit_projection_write` `Deref` arm.
-                if args.len() == 2 && self.is_workspace_index_call(&reg) {
+                // `emit_projection_write` `Deref` arm.  `Vec<T>::index`
+                // ([`is_vec_index_call`]) lowers identically — the
+                // resized-list indirection is supplied downstream by the
+                // repr-dispatched `getitem`, not here.
+                if args.len() == 2
+                    && (self.is_workspace_index_call(&reg) || self.is_vec_index_call(&reg))
+                {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -5322,14 +5334,14 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 // `Vec::as_slice` / `<[T]>::as_slice` borrows the same
-                // elements as a slice — identity on the list model.  Alias
-                // the result to the receiver so the slice consumer reads
-                // the list directly, instead of the `getattr("as_slice")`
-                // the generic method fallback emits, which dead-ends at
-                // `Cannot find attribute "as_slice"` on the list
-                // annotation.  Same shape as the reflexive identity
-                // aliases below.
-                if args.len() == 1 && self.is_container_as_slice(&reg) {
+                // elements over shared storage — identity on the list
+                // model.  Alias the result to the receiver so the consumer
+                // reads the list directly, instead of the
+                // `getattr("as_slice")` the generic method fallback emits,
+                // which dead-ends at `Cannot find attribute …` on the list
+                // annotation.  Same shape as the reflexive identity aliases
+                // below.
+                if args.len() == 1 && self.is_container_slice_identity(&reg) {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -6014,6 +6026,40 @@ impl<'a> Lowering<'a> {
         is_workspace_index_regular(reg, self.llbc)
     }
 
+    /// `v[i]` on a `Vec<T>` — its `<Vec<T> as Index>::index` impl,
+    /// returning `&T`.  Unlike the workspace fixed arrays
+    /// ([`is_workspace_index_call`]), the receiver is a resized
+    /// `ListRepr` (`length` + `items` block), so the element load goes
+    /// through the rtyper's `getitem` (`AbstractBaseListRepr.rtype_getitem`,
+    /// which loads the `items` field before indexing).  The caller lowers
+    /// both to the same `ArrayRead`; the flowspace `getitem` it becomes is
+    /// repr-dispatched, so the resized indirection is added by
+    /// `rtype_getitem` rather than the front end.  Owner/leaf are derived
+    /// the same way [`call_target_segments`] derives the call key
+    /// (`impl_method_owner_for_fundecl`), so the match tracks the segment
+    /// spelling (`["vec", "Vec", "index"]`) the generic fallback would
+    /// otherwise leave unregistered.
+    ///
+    /// Restricted to the integer-index impl (`Index<usize>`, the element
+    /// load).  `Vec`'s `Index<Range<…>>` impls share the `index` leaf but
+    /// return a sub-`&[T]` slice, not an element — lowering those to a
+    /// scalar `ArrayRead` would mis-index, so the index argument
+    /// (`inputs[1]`) must type as an integer.
+    fn is_vec_index_call(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            impl_method_owner_for_fundecl(self.llbc, fd)
+                .is_some_and(|(owner, leaf)| owner == "vec::Vec" && leaf == "index")
+                && fd
+                    .signature
+                    .inputs
+                    .get(1)
+                    .is_some_and(|t| matches!(tyref_to_value_type(t, self.llbc), ValueType::Int))
+        })
+    }
+
     /// `<[T]>::swap(s, a, b)` (`core::slice::<Impl>::swap`) — an
     /// in-place element exchange through a `&mut [T]`.  The slice base
     /// is the same `FixedObjectArray` shape `is_workspace_index_call`
@@ -6434,7 +6480,13 @@ impl<'a> Lowering<'a> {
                 fd.item_meta.name_path().as_str(),
                 "core::slice::iter::<Impl>::into_iter"
                     | "alloc::vec::<Impl>::into_iter"
+                    // `core::array::<Impl>` is the `&[T; N]` by-reference
+                    // `IntoIterator` (delegates to slice iter); `core::array::
+                    // iter::<Impl>` is the by-value `[T; N]` form
+                    // (`core/src/array/iter.rs`, yielding owned `T`). Both walk
+                    // the same element sequence — an identity on the list model.
                     | "core::array::<Impl>::into_iter"
+                    | "core::array::iter::<Impl>::into_iter"
             )
         })
     }
@@ -6457,9 +6509,16 @@ impl<'a> Lowering<'a> {
     }
 
     /// `Vec::as_slice` / `<[T]>::as_slice` — a borrowed slice view of the
-    /// same elements.  Identity on the list model, so the callsite aliases
-    /// its receiver instead of leaving the unregistered method callee.
-    fn is_container_as_slice(&self, reg: &RegularCall) -> bool {
+    /// same elements over shared storage, so it is an identity on the list
+    /// model and the callsite aliases its receiver instead of leaving the
+    /// unregistered method callee.
+    ///
+    /// `<[T]>::to_vec` is deliberately NOT matched: it allocates an
+    /// independent list, so aliasing it to the receiver would let a later
+    /// mutation of the copy (or of the original) be observed through the
+    /// other — `let mut c = s.to_vec(); c.push(x)` must not touch `s`.  It
+    /// needs a real copy lowering (alloc + element copy), not an alias.
+    fn is_container_slice_identity(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
