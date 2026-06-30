@@ -405,8 +405,8 @@ def test_search_two_way_utf8():
     # strings; multi-byte characters just look like more bytes (and these two
     # share a lead byte, making the byte stream adversarially periodic).
     for N in (10, 600, 1500):
-        A = (u'ā' * N).encode('utf-8')   # 'a with macron' -> c4 81
-        B = (u'Ă' * N).encode('utf-8')   # 'A with breve'  -> c4 82
+        A = b'\xc4\x81'   # 'a with macron'
+        B = b'\xc4\x82'   # 'A with breve'
         haystack = A + A + B + A + A
         needle = A + B + B + A
         _check_find_count(haystack, needle)
