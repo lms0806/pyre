@@ -665,17 +665,45 @@ impl CodeWriter {
             && graph_result_kind(rewritten_graph) == 'r'
         {
             crate::front::result_exc::widen_unit_return_to_void(rewritten_graph);
-            // Sweep the unit producers the widen just orphaned.  Clearing
-            // the returnblock args/inputargs leaves the `()` ctor (or a
-            // tail-forwarded `Ref` call result) unread; without a dead-op
-            // pass it would survive into flatten as a value the void
-            // return no longer consumes.  `rpython/translator/simplify.py`
-            // `remove_dead_links_and_setattrs` runs after exceptiontransform
-            // for the same reason — `prune_dead_phis` keeps raising/impure
-            // producers and only drops the genuinely pure dead unit shells.
+        }
+        // Sweep the orphaned unit producers of any void-returning graph.
+        // A void function's `()` value is built (a pure `ConstRefNull`
+        // after `fold_unit_variant_ctors`) but the void return never
+        // consumes it; without a dead-op pass it survives into flatten as
+        // a value regalloc must colour, colliding a register with a live
+        // parameter.  Run on every graph whose result kind is now void —
+        // both the just-widened `declared='v' && cfg='r'` case and graphs
+        // whose CFG already returns void (`cfg='v'`, e.g. `w_list_append`).
+        // `rpython/translator/simplify.py remove_dead_links_and_setattrs`
+        // runs after exceptiontransform for the same reason; `prune_dead_phis`
+        // keeps raising/impure producers and only drops genuinely pure dead
+        // shells.
+        if graph_result_kind(rewritten_graph) == 'v' {
             crate::model::prune_dead_phis(rewritten_graph);
         }
         crate::model::remove_duplicate_inputargs(rewritten_graph);
+        // Re-establish SSI before register allocation.  RPython runs the
+        // codewriter on graphs the translator already converted to SSI via
+        // `SSA_to_SSI` (`simplify.py:1067`); `perform_register_allocation`
+        // (`regalloc.rs`, ported from `rpython/jit/codewriter/regalloc.py`)
+        // therefore derives cross-block liveness purely from link-threading
+        // — a value lives across a block boundary only when it is passed
+        // through an exit link's args into the successor's inputargs.  pyre's
+        // rtyper/front-end produces these model graphs in global-SSA form:
+        // a value defined in one block is referenced directly in a later
+        // block (one block per former call) without being threaded along the
+        // linear chain between them.  Without threading the colourer sees no
+        // interference between two values simultaneously live across such a
+        // chain (e.g. `w_list_append`'s `length` from `int_items.len` and
+        // `capacity` from `int_items.heap_cap`, both live into the `int_lt`
+        // capacity check) and aliases them to one register — the body
+        // miscompiles to `int_lt(cap, cap)` and always takes the resize
+        // path.  Run `SSA_to_SSI` (`model_ssa.rs`) here, after the dead-phi
+        // / duplicate-inputarg cleanups and immediately before regalloc, so
+        // every graph reaching the colourer is SSI.  Idempotent on graphs
+        // already in SSI form (empty pending set), so non-split graphs are
+        // unaffected.
+        crate::model_ssa::ssa_to_ssi(rewritten_graph);
         let mut regallocs = crate::codewriter::transform_profile::time_phase(
             "step2_perform_all_register_allocations",
             || crate::regalloc::perform_all_register_allocations(rewritten_graph),
