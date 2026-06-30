@@ -1101,6 +1101,13 @@ pub fn emit_new_pyframe_inline_with_params(
         .map(|info| info.array_item_descr(0).index())
         .unwrap_or_else(|| array_descr.index());
     for (i, &p) in param_boxes.iter().enumerate() {
+        // A NONE slot (an unbound local in a reconstructed bridge-carrier
+        // callee frame) keeps the NewArrayClear zero-fill (PY_NULL); only
+        // bound slots are stored.  Forward-inline callees pass dense param
+        // boxes, so this skips nothing on that path.
+        if p.is_none() {
+            continue;
+        }
         let idx = ctx.const_int(i as i64);
         ctx.record_op_with_descr(
             OpCode::SetarrayitemGc,

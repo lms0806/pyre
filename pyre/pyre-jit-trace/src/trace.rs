@@ -144,6 +144,17 @@ pub fn trace_bytecode(
     // (trace_opcode.rs:3323-3424) and don't call init_symbolic; this path
     // handles the root frame push.
     sym.init_symbolic(ctx, cf_addr);
+    // Issue #215 item 2 (P2 drain, `PYRE_P2_DRAIN`): drive the multiframe
+    // bridge-carrier resume via the full-body walker (reconstruct the in-flight
+    // callee framestack + walk innermost-first) instead of aborting to a no-JIT
+    // re-interpret below.  Default off → the carrier abort path is unchanged.
+    if let Some(ref carrier) = carrier {
+        if crate::state::p2_drain_enabled() {
+            let action =
+                drive_bridge_carrier_walk(ctx, sym, w_code, start_pc, cf_addr, carrier);
+            return (action, concrete_frame);
+        }
+    }
     // Issue #73 walker-as-tracer foundation probe (slice #1, gated).
     // `PYRE_WALK_PERFN_JITCODE=1` attempts to walk the per-CodeObject
     // JitCode body via `dispatch_via_miframe` from the resume entry pc,
@@ -270,6 +281,222 @@ type PerfnWalkResult = Result<
 /// disposition: the probe captures a trace position beforehand and
 /// `cut_trace`s + logs; the production path maps `walk_result` to a
 /// `TraceAction` and keeps the recording.
+/// Per-frame jitcode dispatch shared by the root full-body walk
+/// ([`run_perfn_walk`]) and the multiframe bridge-carrier drain
+/// ([`drive_bridge_carrier_walk`]).  Resolves the five terminal descrs off
+/// `MetaInterpStaticData`, builds the per-CodeObject descr pool + sub-jitcode
+/// lookup off `pjc.jitcode.exec.descrs`, and runs `dispatch_via_miframe` from
+/// `entry` with the caller-seeded `argboxes_r`.  Returns
+/// `(code_len, walk_result)`; `None` when the terminal descrs are unwired.
+fn dispatch_perfn_frame(
+    mi: &mut crate::state::MIFrame,
+    pjc: &std::sync::Arc<crate::PyJitCode>,
+    entry: usize,
+    argboxes_r: &[majit_ir::OpRef],
+    authoritative: bool,
+) -> Option<(usize, PerfnWalkResult)> {
+    // Resolve the five terminal descrs off MetaInterpStaticData so the
+    // walk's Finish / exit-with-exception records carry production descr
+    // identities.  A missing one means setup never ran — log and bail
+    // rather than feed placeholder descrs.
+    let (done_void, done_int, done_ref, done_float, exit_exc_ref) = {
+        let sd = mi.ctx().metainterp_sd();
+        match (
+            sd.done_with_this_frame_descr_void.clone(),
+            sd.done_with_this_frame_descr_int.clone(),
+            sd.done_with_this_frame_descr_ref.clone(),
+            sd.done_with_this_frame_descr_float.clone(),
+            sd.exit_frame_with_exception_descr_ref.clone(),
+        ) {
+            (Some(v), Some(i), Some(r), Some(f), Some(e)) => (v, i, r, f, e),
+            _ => {
+                eprintln!("[walk-perfn] terminal descrs not wired; skipping walk");
+                return None;
+            }
+        }
+    };
+
+    // Per-fn descr-pool plumbing: the per-CodeObject body resolves `d`/`j`
+    // descr operands through its OWN runtime pool (`pjc.jitcode.exec.descrs`,
+    // `Vec<RuntimeBhDescr>`), NOT the global `all_descr_refs()`.  Build the
+    // index-parallel adapted `descr_refs` and resolve `inline_call` callee
+    // jitcodes through the same pool.
+    use majit_metainterp::jitcode::RuntimeBhDescr;
+    // The per-CodeObject JitCode lives in the process-global jitcode registry
+    // (installed by `install_jitcodes` before tracing); `pjc` is an `Arc` clone
+    // of that data, so the descr pool (and the callee jitcode bodies it
+    // references) outlive this walk.  Extend the borrow to `'static` so the
+    // `'static`-bodied `SubJitCodeBody` from `sub_jitcode_lookup` type-checks —
+    // mirrors the production arm-entry borrow extension at `trace_opcode.rs`.
+    let perfn_descrs: &'static [RuntimeBhDescr] =
+        unsafe { &*(pjc.jitcode.exec.descrs.as_slice() as *const [RuntimeBhDescr]) };
+    let perfn_descr_refs: Vec<majit_ir::DescrRef> = perfn_descrs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| match d {
+            RuntimeBhDescr::Descr(bh) => crate::descr::make_descr_from_bh(bh),
+            // `inline_call`'s `d` operand resolves the callee through
+            // `JitCodeDescr::jitcode_index()` → `sub_jitcode_lookup`.  Key the
+            // descr by its own pool slot `i` so the per-fn lookup below
+            // re-reads `exec.descrs[i].as_jitcode()`.  `Call` /
+            // `AssemblerToken` pool entries belong to the `BC_CALL_*` /
+            // `BC_CALL_ASSEMBLER_*` op families, whose walker handlers read the
+            // target straight from `RawDescrPool::PerFn`, not through this
+            // adapted `DescrRef` slot; the jitcode-descr stand-in is a
+            // fail-loud tripwire for a mis-routed slot.
+            RuntimeBhDescr::JitCode(_) => crate::descr::make_jitcode_descr(i),
+            RuntimeBhDescr::Call(_) | RuntimeBhDescr::AssemblerToken(_) => {
+                crate::descr::make_jitcode_descr(i)
+            }
+        })
+        .collect();
+
+    let sub_jitcode_lookup = |idx: usize| -> Option<crate::jitcode_dispatch::SubJitCodeBody> {
+        perfn_descrs
+            .get(idx)
+            .and_then(|d| d.as_jitcode())
+            .map(|jc| crate::jitcode_dispatch::SubJitCodeBody {
+                code: jc.code.as_slice(),
+                num_regs_r: jc.num_regs_r() as usize,
+                num_regs_i: jc.num_regs_i() as usize,
+                num_regs_f: jc.num_regs_f() as usize,
+                constants_i: jc.constants_i.as_slice(),
+                constants_r: jc.constants_r.as_slice(),
+                constants_f: jc.constants_f.as_slice(),
+            })
+    };
+
+    let code = pjc.jitcode.code.as_slice();
+    let code_len = code.len();
+    let walk_result = crate::jitcode_dispatch::dispatch_via_miframe(
+        mi,
+        code,
+        entry,
+        &perfn_descr_refs,
+        crate::jitcode_dispatch::RawDescrPool::PerFn(perfn_descrs),
+        // Authoritative concrete execution: `false` for a read-only probe
+        // (trace discarded → re-executing would corrupt live state); `true`
+        // for the production full-body tracer (the walk IS the execution).
+        authoritative,
+        &sub_jitcode_lookup,
+        done_ref,
+        done_int,
+        done_float,
+        done_void,
+        exit_exc_ref,
+        true,
+        pjc.jitcode.num_regs_r() as usize,
+        pjc.jitcode.num_regs_i() as usize,
+        pjc.jitcode.num_regs_f() as usize,
+        pjc.jitcode.constants_r.as_slice(),
+        pjc.jitcode.constants_i.as_slice(),
+        pjc.jitcode.constants_f.as_slice(),
+        argboxes_r,
+        &[],
+        &[],
+    );
+    Some((code_len, walk_result))
+}
+
+/// Issue #215 item 2 (P2 drain): drive a multiframe bridge-carrier resume via
+/// the full-body walker instead of aborting to a no-JIT re-interpret.
+///
+/// The carrier reconstructs the in-flight callee framestack
+/// (`rebuild_from_resumedata`, resume.py:1042-1057); each callee is rebuilt as
+/// a virtualizable the walker can drive (`setup_reconstructed_callee_frame`),
+/// then walked innermost-first via [`dispatch_perfn_frame`], threading each
+/// frame's return into its parent before the parent walks, until the root
+/// walks forward to a terminator.
+///
+/// Increment 1 (diagnostic): walk only the DEEPEST reconstructed callee
+/// (`recipes` is outermost-first, so the last entry is the guard-failing
+/// frame), log the outcome, discard the trace, and abort — validates the
+/// reconstructed-frame walk plumbing before result-threading + the root walk
+/// are wired.  Gated behind `PYRE_P2_DRAIN` (default off → unchanged behavior).
+fn drive_bridge_carrier_walk(
+    ctx: &mut TraceCtx,
+    sym: &mut PyreSym,
+    _w_code: *const (),
+    root_pc: usize,
+    _cf_addr: usize,
+    carrier: &majit_metainterp::BridgeInlineCarrier,
+) -> TraceAction {
+    crate::jitcode_dispatch::bool_box_truth_reset();
+    crate::jitcode_dispatch::fbw_finish_payload_reset();
+    crate::jitcode_dispatch::fbw_store_journal_reset();
+
+    let root_ec = sym.concrete_execution_context;
+    let Some(recipe) = carrier.recipes.last() else {
+        crate::jitcode_dispatch::census_record("P2Drain::NoRecipes");
+        return TraceAction::Abort;
+    };
+
+    let pre_pos = ctx.get_trace_position();
+    // `setup_reconstructed_callee_frame` emits the callee frame vable into the
+    // trace and returns `argboxes_r` seeding the portal reds + in-flight
+    // operand-stack temps; the `_pending` callee sym/concrete frame is unused on
+    // the sub-walk path (the sub-walk drives the callee body off `argboxes_r` +
+    // the emitted frame vable, not a callee MIFrame).
+    let Some((_pending, argboxes_r)) =
+        crate::state::setup_reconstructed_callee_frame(ctx, recipe, root_ec, Vec::new())
+    else {
+        ctx.cut_trace(pre_pos);
+        crate::jitcode_dispatch::census_record("P2Drain::SetupFailed");
+        return TraceAction::Abort;
+    };
+    let Some(callee_pjc) = crate::state::pyjitcode_for_code(recipe.code_ptr) else {
+        ctx.cut_trace(pre_pos);
+        crate::jitcode_dispatch::census_record("P2Drain::NoCalleePjc");
+        return TraceAction::Abort;
+    };
+    let Some(entry) = callee_pjc.resume_jitcode_pc_for(recipe.pc) else {
+        ctx.cut_trace(pre_pos);
+        crate::jitcode_dispatch::census_record("P2Drain::NoCalleeEntry");
+        return TraceAction::Abort;
+    };
+    let callee_w_globals = crate::state::recover_inline_callee_globals(recipe.code_ptr) as usize;
+
+    // Increment 2b-i: drive the deepest callee as an inline SUB-WALK rooted on
+    // the portal `sym` (is_top_level=false), so its `ref_return` surfaces
+    // `SubReturn` instead of the top-level `Finish` pyre's own-portal model
+    // rejects.  Diagnostic: log the outcome, then abort (trace discarded).
+    let walk = crate::jitcode_dispatch::drive_bridge_carrier_subwalk(
+        ctx,
+        sym,
+        root_pc,
+        &callee_pjc,
+        recipe.code_ptr as usize,
+        callee_w_globals,
+        entry,
+        &argboxes_r,
+    );
+    match &walk {
+        Some(Ok((outcome, end_pc))) => {
+            eprintln!(
+                "[p2-drain] callee sub-walk OK recipe.pc={} entry={entry} end_pc={end_pc} outcome={outcome:?}",
+                recipe.pc
+            );
+            crate::jitcode_dispatch::census_record("P2Drain::SubWalkOk");
+        }
+        Some(Err(e)) => {
+            eprintln!(
+                "[p2-drain] callee sub-walk STOP recipe.pc={} entry={entry} err={e:?}",
+                recipe.pc
+            );
+            crate::jitcode_dispatch::census_record("P2Drain::SubWalkStop");
+        }
+        None => {
+            crate::jitcode_dispatch::census_record("P2Drain::SubWalkSetupNone");
+        }
+    }
+
+    ctx.cut_trace(pre_pos);
+    crate::jitcode_dispatch::bool_box_truth_reset();
+    crate::jitcode_dispatch::fbw_finish_payload_reset();
+    crate::jitcode_dispatch::fbw_store_journal_reset();
+    TraceAction::Abort
+}
+
 fn run_perfn_walk(
     ctx: &mut TraceCtx,
     sym: &mut PyreSym,
@@ -327,27 +554,6 @@ fn run_perfn_walk(
 
     let is_bridge_trace = ctx.is_bridge_trace;
     let mut mi = crate::state::MIFrame::from_sym(ctx, sym, cf_addr, start_pc, start_pc);
-
-    // Resolve the five terminal descrs off MetaInterpStaticData so the
-    // walk's Finish / exit-with-exception records carry production descr
-    // identities.  A missing one means setup never ran — log and bail
-    // rather than feed placeholder descrs.
-    let (done_void, done_int, done_ref, done_float, exit_exc_ref) = {
-        let sd = mi.ctx().metainterp_sd();
-        match (
-            sd.done_with_this_frame_descr_void.clone(),
-            sd.done_with_this_frame_descr_int.clone(),
-            sd.done_with_this_frame_descr_ref.clone(),
-            sd.done_with_this_frame_descr_float.clone(),
-            sd.exit_frame_with_exception_descr_ref.clone(),
-        ) {
-            (Some(v), Some(i), Some(r), Some(f), Some(e)) => (v, i, r, f, e),
-            _ => {
-                eprintln!("[walk-perfn] terminal descrs not wired; skipping walk");
-                return None;
-            }
-        }
-    };
 
     // setup_call argbox: seed r0 = the standard virtualizable identity box
     // (`virtualizable_boxes[-1]`, the `InputArgRef(SYM_FRAME_IDX)` that
@@ -470,118 +676,11 @@ fn run_perfn_walk(
         v
     };
 
-    // Per-fn descr-pool plumbing: the per-CodeObject body
-    // resolves `d`/`j` descr operands through its OWN runtime pool
-    // (`pjc.jitcode.exec.descrs`, `Vec<RuntimeBhDescr>`), NOT the global
-    // `all_descr_refs()`.  Build the index-parallel adapted `descr_refs`
-    // and resolve `inline_call` callee jitcodes through the same pool.
-    use majit_metainterp::jitcode::RuntimeBhDescr;
-    // The per-CodeObject JitCode lives in the process-global jitcode
-    // registry (installed by `install_jitcodes` before tracing); `pjc` is
-    // an `Arc` clone of that data, so the descr pool (and the callee
-    // jitcode bodies it references) outlive this diagnostic walk.
-    // Extend the borrow to `'static` so the `'static`-bodied
-    // `SubJitCodeBody` from `sub_jitcode_lookup` type-checks — mirrors the
-    // production arm-entry borrow extension at `trace_opcode.rs:6735`.
-    let perfn_descrs: &'static [RuntimeBhDescr] =
-        unsafe { &*(pjc.jitcode.exec.descrs.as_slice() as *const [RuntimeBhDescr]) };
-    let perfn_descr_refs: Vec<majit_ir::DescrRef> = perfn_descrs
-        .iter()
-        .enumerate()
-        .map(|(i, d)| match d {
-            RuntimeBhDescr::Descr(bh) => crate::descr::make_descr_from_bh(bh),
-            // `inline_call`'s `d` operand resolves the callee through
-            // `JitCodeDescr::jitcode_index()` → `sub_jitcode_lookup`.
-            // Key the descr by its own pool slot `i` so the per-fn
-            // lookup below re-reads `exec.descrs[i].as_jitcode()`.
-            RuntimeBhDescr::JitCode(_) => crate::descr::make_jitcode_descr(i),
-            // `Call` / `AssemblerToken` pool entries belong to the
-            // `BC_CALL_*` / `BC_CALL_ASSEMBLER_*` op families, whose
-            // walker handlers read the target straight from the raw
-            // per-fn pool (`RawDescrPool::PerFn`), not through this
-            // adapted `DescrRef` slot; every `residual_call` `d` slot
-            // the codewriter emits is a `Descr(CanonicalBhDescr)` call
-            // descr (zero `ResidualCallDescrNotCallDescr` across the
-            // bench + synth suites with the walk default-on).  The
-            // jitcode-descr stand-in is a fail-loud tripwire: a
-            // mis-routed slot surfaces a clean typed error at the first
-            // such op instead of mis-dispatching (pinned by the
-            // FailDescr-fixture unit test in `jitcode_dispatch.rs`).
-            RuntimeBhDescr::Call(_) | RuntimeBhDescr::AssemblerToken(_) => {
-                crate::descr::make_jitcode_descr(i)
-            }
-        })
-        .collect();
-
-    let sub_jitcode_lookup = |idx: usize| -> Option<crate::jitcode_dispatch::SubJitCodeBody> {
-        perfn_descrs
-            .get(idx)
-            .and_then(|d| d.as_jitcode())
-            .map(|jc| crate::jitcode_dispatch::SubJitCodeBody {
-                code: jc.code.as_slice(),
-                num_regs_r: jc.num_regs_r() as usize,
-                num_regs_i: jc.num_regs_i() as usize,
-                num_regs_f: jc.num_regs_f() as usize,
-                constants_i: jc.constants_i.as_slice(),
-                constants_r: jc.constants_r.as_slice(),
-                constants_f: jc.constants_f.as_slice(),
-            })
+    let Some((code_len, mut walk_result)) =
+        dispatch_perfn_frame(&mut mi, &pjc, entry, &argboxes_r, authoritative)
+    else {
+        return None;
     };
-
-    let code = pjc.jitcode.code.as_slice();
-    let code_len = code.len();
-    let mut walk_result = crate::jitcode_dispatch::dispatch_via_miframe(
-        &mut mi,
-        code,
-        entry,
-        &perfn_descr_refs,
-        crate::jitcode_dispatch::RawDescrPool::PerFn(perfn_descrs),
-        // The diagnostic probe discards the trace (`cut_trace` + Abort)
-        // and the bench then runs interpreted, so the walker must NOT be
-        // the authoritative executor — executing may-force calls here
-        // would corrupt the live frame/iterator state `cut_trace` cannot
-        // roll back.  Concrete may-force execution lands with the
-        // production flip, not under the probe.
-        //
-        // (51d diagnosis, 2026-05-29: even with authoritative=true the walk
-        // STOPs at the loop `goto_if_not` because the boxed-PyLong compare
-        // may-force arg is non-concrete.  Root-caused with PYRE_DIAG_VGAI:
-        // the loop body's `getarrayitem_vable_r` (a `LOAD_FAST` of a boxed
-        // local) returns `Value::Void` NOT because the virtualizable shadow
-        // is wrong — the shadow ENTRY is the correct concrete Ref — but
-        // because the VABLE operand register read returns `OpRef::NONE`.  The
-        // post-merge-point loop body reads the frame from a LOOP-INPUT
-        // register bound by the `jit_merge_point` reds @ pc=94; the probe
-        // enters at pc=107 (past the merge point) seeding only r0, so that
-        // register stays NONE → `concrete_of_opref(NONE)` = `GcRef(usize::MAX)`
-        // sentinel → `is_nonstandard_virtualizable` takes the Void leg.  Fix =
-        // seed the live loop-input registers at walk entry, NOT a shadow/
-        // stack-depth issue (task #53).  Two further cascade gaps sit above
-        // it: a non-pure `CallR` result left symbolic (task #54), and
-        // may-force execution — now wired into BOTH residual dispatchers.)
-        //
-        // Authoritative concrete execution: `false` for the read-only probe
-        // (trace discarded → re-executing would corrupt live state); `true`
-        // for the production full-body tracer (the walk IS the execution, so
-        // there is no double-run and no rollback to miss).
-        authoritative,
-        &sub_jitcode_lookup,
-        done_ref,
-        done_int,
-        done_float,
-        done_void,
-        exit_exc_ref,
-        true,
-        pjc.jitcode.num_regs_r() as usize,
-        pjc.jitcode.num_regs_i() as usize,
-        pjc.jitcode.num_regs_f() as usize,
-        pjc.jitcode.constants_r.as_slice(),
-        pjc.jitcode.constants_i.as_slice(),
-        pjc.jitcode.constants_f.as_slice(),
-        &argboxes_r,
-        &[],
-        &[],
-    );
 
     // Full-body-walk loop close: the walker's `jit_merge_point` handler
     // produces RPython-style reds (`jump_args = [frame, ec]`, len 2 for the

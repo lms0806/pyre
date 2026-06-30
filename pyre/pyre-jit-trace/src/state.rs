@@ -5147,6 +5147,27 @@ impl BridgeVirtualCache {
 ///     stream, so a dead-frame rebuild would seed null cells and LOAD_DEREF
 ///     would raise `NameError`,
 ///   - the liveness enumeration count disagrees with the encoded section.
+/// `rd_virtuals[vidx]` with negative-index resolution already applied by the
+/// caller. Returns the `RdVirtualInfo` behind the `Rc`, or `None` when the
+/// index is out of range or no virtuals were decoded.
+fn rd_virtual_at(
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    vidx: usize,
+) -> Option<&majit_ir::RdVirtualInfo> {
+    rd_virtuals.and_then(|v| v.get(vidx)).map(|rc| &**rc)
+}
+
+/// P2 multi-frame bridge drain (`PYRE_P2_DRAIN`, default OFF): gates BOTH the
+/// `set_bridge_inline_carrier` decision and the `trace.rs` carrier drain. The
+/// carrier overrides the trace-start pc to the outermost frame's pc, which is
+/// only correct when the drain actually rebuilds + traces the reconstructed
+/// callee framestack forward; without the drain a carrier resume would resume
+/// the innermost frame at the root pc. Until the drain is net-positive the gate
+/// stays off so the bridge falls back to the single-frame resume.
+pub(crate) fn p2_drain_enabled() -> bool {
+    std::env::var_os("PYRE_P2_DRAIN").is_some()
+}
+
 fn reconstruct_inline_recipe(
     ctx: &mut majit_metainterp::TraceCtx,
     frame: &majit_ir::resumedata::RebuiltFrame,
@@ -5206,6 +5227,111 @@ fn reconstruct_inline_recipe(
     // the single-frame bridge rather than synthesize an unboxed local.
     if !reg_indices.int.is_empty() || !reg_indices.float.is_empty() {
         return None;
+    }
+
+    // Virtualizable-callee shape (pyre's "every function is its own portal"
+    // model): the callee's only live ref registers are the portal reds
+    // [frame, ec], and its locals live in the `frame` red's own
+    // `locals_cells_stack_w` virtual array — the same place the ROOT frame keeps
+    // its locals — NOT in the register section. Recover them into REGISTER-
+    // SECTION slots so the bridge rebuilds the callee as a plain MIFrame
+    // (resume.py:1042-1057 newframe + reload, reading `registers_r`), convergent
+    // with the RPython frame shape and creating NO new vable. The color==
+    // semantic identity check below only accepts a register-section callee
+    // (locals at colors 0..nlocals), which this shape never satisfies.
+    let (pframe_reg, pec_reg) = portal_red_regs_at(frame.jitcode_index);
+    let (pframe_reg, pec_reg) = (pframe_reg as u32, pec_reg as u32);
+    if pframe_reg != u32::from(u16::MAX)
+        && pec_reg != u32::from(u16::MAX)
+        && reg_indices.ref_.len() == 2
+        && reg_indices.ref_.contains(&pframe_reg)
+        && reg_indices.ref_.contains(&pec_reg)
+    {
+        use majit_ir::resumedata::{untag, RebuiltValue, TAGVIRTUAL, UNINITIALIZED_TAG};
+        let frame_pos = reg_indices.ref_.iter().position(|&c| c == pframe_reg)?;
+        let RebuiltValue::Virtual(frame_vidx) = &frame.values[frame_pos] else {
+            return None;
+        };
+        // The `frame` red virtual is a PyFrame VirtualInfo; its
+        // `locals_cells_stack_w` array field is at PYFRAME_LOCALS_CELLS_STACK_OFFSET.
+        let array_vidx = {
+            let majit_ir::RdVirtualInfo::VirtualInfo {
+                fieldnums,
+                fielddescrs,
+                ..
+            } = rd_virtual_at(rd_virtuals, *frame_vidx)?
+            else {
+                return None;
+            };
+            let arr_field_idx = fielddescrs.iter().position(|fd| {
+                fd.offset == crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET
+            })?;
+            let (av, tb) = untag(*fieldnums.get(arr_field_idx)?);
+            if tb != TAGVIRTUAL {
+                return None;
+            }
+            if av < 0 {
+                (rd_virtuals.map_or(0, |v| v.len()) as i32 + av) as usize
+            } else {
+                av as usize
+            }
+        };
+        let arr: Vec<i16> = match rd_virtual_at(rd_virtuals, array_vidx)? {
+            majit_ir::RdVirtualInfo::VArrayInfoClear { fieldnums, .. }
+            | majit_ir::RdVirtualInfo::VArrayInfoNotClear { fieldnums, .. } => fieldnums.clone(),
+            _ => return None,
+        };
+        let valuestackdepth =
+            match crate::liveness::liveness_for(raw_code).stack_depth_at(frame.pc as usize) {
+                Some(d) => nlocals + d,
+                None => return None,
+            };
+        if valuestackdepth > arr.len() {
+            return None;
+        }
+        let callinfocollection = ctx.callinfocollection.clone();
+        let mut registers_r = vec![OpRef::NONE; valuestackdepth];
+        let mut concrete_r = vec![majit_ir::Value::Void; valuestackdepth];
+        // locals_cells_stack_w is SEMANTIC-slot-ordered ([locals | stack]) and a
+        // W_Root array — every live slot is Ref. An UNINITIALIZED local stays
+        // NULL in the rebuilt frame; a missing operand-stack slot is
+        // unreconstructable and declines below.
+        for k in 0..valuestackdepth {
+            let tag = arr[k];
+            if tag == UNINITIALIZED_TAG {
+                continue;
+            }
+            registers_r[k] = decode_fieldnum(ctx, tag, rd_virtuals, resume_data, cache);
+            let bits = decode_tagged_concrete(
+                tag,
+                Type::Ref,
+                rd_virtuals,
+                fail_values,
+                resume_data.num_failargs,
+                resume_data.storage.as_ref(),
+                backend,
+                callinfocollection.as_ref(),
+                cache,
+            );
+            concrete_r[k] = value_for_slot(Type::Ref, bits);
+        }
+        for s in nlocals..valuestackdepth {
+            if registers_r[s] == OpRef::NONE {
+                return None;
+            }
+        }
+        return Some(ReconstructRecipe {
+            code_ptr: raw_code as *const (),
+            jitcode_index: frame.jitcode_index,
+            pc: frame.pc as usize,
+            nlocals,
+            valuestackdepth,
+            registers_i: Vec::new(),
+            registers_r,
+            registers_f: Vec::new(),
+            concrete_r,
+            nargs: nlocals,
+        });
     }
 
     // The recipe banks are written and read by the register COLOR reported in
@@ -6424,6 +6550,105 @@ fn materialize_concrete_virtual_int(
     }
 }
 
+/// resume.py:1556-1564 decode_box parity for fieldnums (i16 tagged): decode one
+/// tagged array/field value into its bridge `OpRef` (typed InputArg for TAGBOX,
+/// const for TAGINT/TAGCONST, recursively materialized virtual for TAGVIRTUAL).
+fn decode_fieldnum(
+    ctx: &mut majit_metainterp::TraceCtx,
+    tagged: i16,
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    resume_data: &majit_metainterp::ResumeDataResult,
+    cache: &mut BridgeVirtualCache,
+) -> OpRef {
+    use majit_ir::resumedata::{TAG_CONST_OFFSET, TAGBOX, TAGCONST, TAGINT, TAGVIRTUAL, untag};
+    // resume.py:1245 `decode_box` dispatches purely on the tag bits;
+    // it has no UNINITIALIZED case. The UNINITIALIZED skip lives in
+    // the callers (e.g. VArrayStructInfo.allocate, resume.py:629),
+    // so this decoder mirrors `decode_box` exactly — an UNINITIALIZED
+    // tag reaching here falls into the TAGCONST arm and fails loud on
+    // the out-of-range const index, matching upstream's IndexError.
+    let (val, tagbits) = untag(tagged);
+    match tagbits {
+        TAGBOX => {
+            // resume.py:1247-1264 decode_box parity:
+            //   if num < 0: num += len(liveboxes)
+            //   return self.liveboxes[num]
+            // The returned Box object carries `box.type` intrinsically
+            // (history.py:220). For the bridge tracer, those liveboxes
+            // are the bridge's `InputArg{Int,Ref,Float}` slots, so we
+            // mint the typed `OpRef::input_arg_typed` variant matching
+            // `fail_arg_types[idx]` rather than a bare untyped raw
+            // OpRef — variant-aware Eq (resoperation.rs:290) requires
+            // the optimizer/heap-cache key to be the same typed variant
+            // the bridge inputarg list produces.
+            let idx = if val < 0 {
+                val + resume_data.num_failargs
+            } else {
+                val
+            };
+            // resume.py:1261 `box = self.liveboxes[num]` — direct
+            // indexing, IndexError on out-of-range. Encoder /
+            // decoder asymmetry is a bug, not a silent fallback;
+            // mirror the upstream fail-loud contract.
+            let tp = *resume_data
+                .fail_arg_types
+                .get(idx as usize)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "decode_fieldnum TAGBOX out-of-range: idx={} num_failargs={} \
+                         fail_arg_types.len()={} (encoder/decoder mismatch — see \
+                         resume.py:1245-1264 decode_box)",
+                        idx,
+                        resume_data.num_failargs,
+                        resume_data.fail_arg_types.len()
+                    )
+                });
+            OpRef::input_arg_typed(idx as u32, tp)
+        }
+        TAGINT => ctx.const_int(val as i64),
+        TAGCONST => {
+            // resume.py:1247-1251 decode_box parity:
+            //   if tag == TAGCONST:
+            //       if tagged_eq(tagged, NULLREF):
+            //           box = CONST_NULL
+            //       else:
+            //           box = self.consts[num - TAG_CONST_OFFSET]
+            if tagged == majit_ir::resumedata::NULLREF {
+                return ctx.const_null();
+            }
+            let ci = (val - TAG_CONST_OFFSET) as usize;
+            // resume.py:1251 `box = self.consts[num - TAG_CONST_OFFSET]`
+            // — direct indexing, fail-fast on out-of-range (mirrors
+            // Python IndexError; never silently substitutes).
+            // compile.py:853 `ResumeGuardDescr` storage — read off
+            // the shared Arc so the bridge tracer observes the
+            // same pool the GC walker updates.
+            let storage = resume_data
+                .storage
+                .as_ref()
+                .expect("resume_data.storage missing");
+            let c = storage.rd_consts()[ci];
+            match c.get_type() {
+                majit_ir::Type::Ref => ctx.const_ref(c.getref_base().as_usize() as i64),
+                majit_ir::Type::Float => ctx.const_float(c.getfloatstorage()),
+                _ => ctx.const_int(c.getint()),
+            }
+        }
+        TAGVIRTUAL => {
+            // resume.py:278-284 nested virtuals are numbered negatively;
+            // getvirtual resolves them via Python negative list indexing
+            // into rd_virtuals (resume.py:951-954).
+            let vidx = if val < 0 {
+                (rd_virtuals.map_or(0, |v| v.len()) as i32 + val) as usize
+            } else {
+                val as usize
+            };
+            materialize_bridge_virtual(ctx, vidx, rd_virtuals, resume_data, cache)
+        }
+        _ => OpRef::NONE,
+    }
+}
+
 fn materialize_bridge_virtual(
     ctx: &mut majit_metainterp::TraceCtx,
     vidx: usize,
@@ -6447,102 +6672,6 @@ fn materialize_bridge_virtual(
     // resume.py:951 self.rd_virtuals[index] — direct indexing, IndexError on
     // an out-of-range virtual number is a bug, not a silent NONE fallback.
     let entry = &virtuals[vidx];
-
-    // resume.py:1556-1564 decode_box parity for fieldnums (i16 tagged).
-    fn decode_fieldnum(
-        ctx: &mut majit_metainterp::TraceCtx,
-        tagged: i16,
-        rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
-        resume_data: &majit_metainterp::ResumeDataResult,
-        cache: &mut BridgeVirtualCache,
-    ) -> OpRef {
-        // resume.py:1245 `decode_box` dispatches purely on the tag bits;
-        // it has no UNINITIALIZED case. The UNINITIALIZED skip lives in
-        // the callers (e.g. VArrayStructInfo.allocate, resume.py:629),
-        // so this decoder mirrors `decode_box` exactly — an UNINITIALIZED
-        // tag reaching here falls into the TAGCONST arm and fails loud on
-        // the out-of-range const index, matching upstream's IndexError.
-        let (val, tagbits) = untag(tagged);
-        match tagbits {
-            TAGBOX => {
-                // resume.py:1247-1264 decode_box parity:
-                //   if num < 0: num += len(liveboxes)
-                //   return self.liveboxes[num]
-                // The returned Box object carries `box.type` intrinsically
-                // (history.py:220). For the bridge tracer, those liveboxes
-                // are the bridge's `InputArg{Int,Ref,Float}` slots, so we
-                // mint the typed `OpRef::input_arg_typed` variant matching
-                // `fail_arg_types[idx]` rather than a bare untyped raw
-                // OpRef — variant-aware Eq (resoperation.rs:290) requires
-                // the optimizer/heap-cache key to be the same typed variant
-                // the bridge inputarg list produces.
-                let idx = if val < 0 {
-                    val + resume_data.num_failargs
-                } else {
-                    val
-                };
-                // resume.py:1261 `box = self.liveboxes[num]` — direct
-                // indexing, IndexError on out-of-range. Encoder /
-                // decoder asymmetry is a bug, not a silent fallback;
-                // mirror the upstream fail-loud contract.
-                let tp = *resume_data
-                    .fail_arg_types
-                    .get(idx as usize)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "decode_fieldnum TAGBOX out-of-range: idx={} num_failargs={} \
-                             fail_arg_types.len()={} (encoder/decoder mismatch — see \
-                             resume.py:1245-1264 decode_box)",
-                            idx,
-                            resume_data.num_failargs,
-                            resume_data.fail_arg_types.len()
-                        )
-                    });
-                OpRef::input_arg_typed(idx as u32, tp)
-            }
-            TAGINT => ctx.const_int(val as i64),
-            TAGCONST => {
-                // resume.py:1247-1251 decode_box parity:
-                //   if tag == TAGCONST:
-                //       if tagged_eq(tagged, NULLREF):
-                //           box = CONST_NULL
-                //       else:
-                //           box = self.consts[num - TAG_CONST_OFFSET]
-                if tagged == majit_ir::resumedata::NULLREF {
-                    return ctx.const_null();
-                }
-                let ci = (val - TAG_CONST_OFFSET) as usize;
-                // resume.py:1251 `box = self.consts[num - TAG_CONST_OFFSET]`
-                // — direct indexing, fail-fast on out-of-range (mirrors
-                // Python IndexError; never silently substitutes).
-                // compile.py:853 `ResumeGuardDescr` storage — read off
-                // the shared Arc so the bridge tracer observes the
-                // same pool the GC walker updates.
-                let storage = resume_data
-                    .storage
-                    .as_ref()
-                    .expect("resume_data.storage missing");
-                let c = storage.rd_consts()[ci];
-                match c.get_type() {
-                    majit_ir::Type::Ref => ctx.const_ref(c.getref_base().as_usize() as i64),
-                    majit_ir::Type::Float => ctx.const_float(c.getfloatstorage()),
-                    _ => ctx.const_int(c.getint()),
-                }
-            }
-            TAGVIRTUAL => {
-                // resume.py:278-284 nested virtuals are numbered negatively;
-                // getvirtual resolves them via Python negative list indexing
-                // into rd_virtuals (resume.py:951-954).
-                let vidx = if val < 0 {
-                    (rd_virtuals.map_or(0, |v| v.len()) as i32 + val) as usize
-                } else {
-                    val as usize
-                };
-                materialize_bridge_virtual(ctx, vidx, rd_virtuals, resume_data, cache)
-            }
-            _ => OpRef::NONE,
-        }
-    }
 
     // resume.py:612-760 dispatch by virtual kind.
     // RPython: rd_virtuals[index].allocate(self, index) — polymorphic on
@@ -8024,7 +8153,7 @@ impl JitState for PyreJitState {
         // frame at its own pc while the carrier callees resume at their
         // frames[i].pc. A negative (no-snapshot) root pc aborts the
         // multi-frame path.
-        if resume_data.frames.len() > 1 && resume_data.frames[0].pc >= 0 {
+        if p2_drain_enabled() && resume_data.frames.len() > 1 && resume_data.frames[0].pc >= 0 {
             let root_pc = resume_data.frames[0].pc as usize;
             let mut recipes: Vec<ReconstructRecipe> =
                 Vec::with_capacity(resume_data.frames.len() - 1);
@@ -11655,7 +11784,7 @@ fn recipe_slot_to_pyobj(v: majit_ir::Value) -> PyObjectRef {
 /// live wrapper is registered or it carries no globals yet — the callers
 /// (`reconstruct_inline_recipe` and `assemble_bridge_inline_pending`) treat a
 /// null result as "decline the multi-frame path".
-fn recover_inline_callee_globals(code_ptr: *const ()) -> pyre_object::PyObjectRef {
+pub(crate) fn recover_inline_callee_globals(code_ptr: *const ()) -> pyre_object::PyObjectRef {
     let live = pyre_interpreter::live_code_wrapper(code_ptr);
     if !live.is_null() {
         let globals = unsafe { pyre_interpreter::w_code_get_w_globals(live) };
@@ -11814,6 +11943,93 @@ pub(crate) fn assemble_bridge_inline_pending(
         replay_callable: OpRef::NONE,
         replay_args: Vec::new(),
     }
+}
+
+/// Build the per-frame setup for ONE reconstructed bridge-carrier callee so
+/// the full-body walker can drive it (issue #215 item 2, P2 drain):
+///
+///   - emit the frame vable seeded with the recipe's LOCALS (slots
+///     `0..nlocals`); the live operand-stack temps stay in the abstract
+///     register file, seeded into `argboxes_r` below.  `valuestackdepth`
+///     passed to the vable builder is `nlocals`, matching the forward-inline
+///     callee (the stack is rebuilt in registers as the body runs);
+///   - assemble the symbolic + concrete frame
+///     (`assemble_bridge_inline_pending`) and bind `sym.frame` to the emitted
+///     vable so the portal body reads its locals through `getarrayitem_vable`
+///     (a NONE `sym.frame` would take the nonstandard-vable Void leg);
+///   - seed the walk's initial register file: frame/ec at their portal-red
+///     colors + the live stack temps at `[nlocals..valuestackdepth)` (the same
+///     semantic-prefix convention the root bridge seeding uses, trace.rs).
+///
+/// Returns `(pending, argboxes_r)`; `None` when the callee body/layout is
+/// unavailable.  Records the vable ops into `ctx` in trace order, so the
+/// caller must invoke this at the point the callee frame is reconstructed.
+pub(crate) fn setup_reconstructed_callee_frame(
+    ctx: &mut TraceCtx,
+    recipe: &ReconstructRecipe,
+    execution_context: *const pyre_interpreter::PyExecutionContext,
+    parent_frames: Vec<ResumeFrameState>,
+) -> Option<(PendingInlineFrame, Vec<OpRef>)> {
+    let raw_code = recipe.code_ptr as *const pyre_interpreter::CodeObject;
+    if raw_code.is_null() {
+        return None;
+    }
+    let code_ref = unsafe { &*raw_code };
+    let (_nlocals_plus_cells, frame_array_size) = callee_layout_for_call_assembler(code_ref);
+    let nlocals = recipe.nlocals;
+    let valuestackdepth = recipe.valuestackdepth;
+    if recipe.registers_r.len() < valuestackdepth || nlocals > valuestackdepth {
+        return None;
+    }
+
+    let (frame_reg, ec_reg) = portal_red_regs_at(recipe.jitcode_index);
+    if frame_reg == u16::MAX || ec_reg == u16::MAX {
+        return None;
+    }
+
+    let w_code = pyre_interpreter::live_code_wrapper(recipe.code_ptr) as *const ();
+    let w_globals = recover_inline_callee_globals(recipe.code_ptr);
+    let pycode_const = ctx.const_ref(w_code as i64);
+    let w_globals_const = ctx.const_ref(w_globals as i64);
+    let ec_const = ctx.const_ref(execution_context as i64);
+
+    let locals_boxes: Vec<OpRef> = recipe.registers_r[..nlocals].to_vec();
+    let frame_vable = crate::helpers::emit_new_pyframe_inline_with_params(
+        ctx,
+        &locals_boxes,
+        frame_array_size,
+        nlocals,
+        pycode_const,
+        w_globals_const,
+        ec_const,
+    );
+
+    let mut pending = assemble_bridge_inline_pending(ctx, recipe, execution_context, parent_frames);
+    pending.sym.frame = frame_vable;
+    // The portal reds are [frame, ec], force-alive at every pc; a guard snapshot
+    // (`collect_outer_active_boxes`) reads ec at portal_ec_reg via
+    // `sym.execution_context`.  `assemble_bridge_inline_pending` only seeds it
+    // from `parent_frames.first()`, so seed it directly here for the
+    // walker-driven callee (an unset ec surfaces as a liveness-active NONE
+    // panic at the first in-callee guard).
+    if pending.sym.execution_context.is_none() {
+        pending.sym.execution_context = ec_const;
+    }
+
+    let max_reg = valuestackdepth
+        .max(frame_reg as usize + 1)
+        .max(ec_reg as usize + 1);
+    let mut argboxes_r: Vec<OpRef> = vec![OpRef::NONE; max_reg];
+    argboxes_r[frame_reg as usize] = frame_vable;
+    argboxes_r[ec_reg as usize] = ec_const;
+    for i in nlocals..valuestackdepth {
+        let opref = recipe.registers_r[i];
+        if !opref.is_none() {
+            argboxes_r[i] = opref;
+        }
+    }
+
+    Some((pending, argboxes_r))
 }
 
 pub enum InlineTraceStepAction {

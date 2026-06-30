@@ -2521,6 +2521,239 @@ pub fn dispatch_via_miframe(
     result
 }
 
+/// Build the paused root portal frame for a multi-frame bridge-carrier
+/// sub-walk (#215 item 2 / P2 drain).  The root resumes at `root_pc` once the
+/// reconstructed deepest callee returns; the callee's in-callee guards must
+/// snapshot this frame on `FBW_INLINE_PARENT_FRAMES` so a guard-failure resume
+/// rebuilds both Python frames.  Mirror of [`compute_inline_caller_frame`], but
+/// the root register banks come straight from the bridge-seeded `root_sym`
+/// rather than a live caller [`WalkContext`] (the root walk has not started —
+/// this resumes mid-flight).
+fn compute_bridge_root_parent_frame(
+    root_sym: &crate::state::PyreSym,
+    trace_ctx: &mut TraceCtx,
+    root_pc: usize,
+) -> Option<InlineParentFrame> {
+    if root_sym.jitcode.is_null() {
+        return None;
+    }
+    let jitcode_index = unsafe { (*root_sym.jitcode).index as u32 };
+    // `root_pc` (`resume_data.frames[0].pc`) is already the post-call resume
+    // point — the slot the inner frame's result lands in — so it is the
+    // fallthrough `resume_py_pc` directly (no `semantic_fallthrough_pc`).
+    let resume_py_pc = root_pc as u32;
+    // Null the not-yet-produced call-result slot before collecting the active
+    // boxes (the reconstructed callee supplies it on `SubReturn`), mirroring
+    // `compute_inline_caller_frame`.  Operate on a clone of `registers_r` so
+    // `root_sym` stays a shared borrow.
+    let mut regs_r = root_sym.registers_r.clone();
+    if let Some(result_color) = crate::state::result_color_at_pc_at(jitcode_index as i32, root_pc) {
+        if result_color < regs_r.len() {
+            regs_r[result_color] = trace_ctx.const_ref(pyre_object::PY_NULL as i64);
+        }
+    }
+    let boxes = collect_outer_active_boxes(
+        root_sym,
+        trace_ctx,
+        &root_sym.registers_i,
+        &regs_r,
+        &root_sym.registers_f,
+        jitcode_index,
+        resume_py_pc,
+        None,
+        majit_ir::resumedata::NO_JITCODE_PC,
+        None,
+    );
+    Some(InlineParentFrame {
+        jitcode_index,
+        resume_py_pc,
+        boxes,
+    })
+}
+
+/// Issue #215 item 2 (P2 drain, increment 2b): drive the reconstructed deepest
+/// callee frame of a multi-frame bridge as an INLINE SUB-WALK
+/// (`is_top_level = false`) rooted on the caller-visible portal `root_sym`.
+///
+/// The callee resumes at `entry` (its `resume_jitcode_pc_for(recipe.pc)`) with
+/// its registers seeded by `argboxes_r` (portal reds + in-flight operand-stack
+/// temps from `setup_reconstructed_callee_frame`) and its locals carried in the
+/// already-emitted frame vable.  Because the walk is a sub-walk, the callee's
+/// `ref_return` surfaces `SubReturn { result }` (`pyjitpl.py:1688 finishframe`)
+/// instead of the top-level `Finish` that pyre's own-portal model rejects with
+/// `NonStandardVableFinishPortalUnsupported` — the original #215 item-2 wall.
+///
+/// The root portal is installed as `FULL_BODY_SNAPSHOT_SYM` and pushed onto
+/// `FBW_INLINE_PARENT_FRAMES` for the sub-walk's lifetime, so an in-callee guard
+/// snapshots both the callee frame and the paused root
+/// (`walker_capture_multi_frame_inline_snapshot`).
+///
+/// Increment 2b-i (diagnostic): returns the sub-walk outcome; the caller logs it
+/// and aborts (trace discarded).  Threading `SubReturn` into the root operand
+/// stack + the root top-level walk forward to a terminator is increment 2b-ii.
+/// `None` signals a setup failure (terminal descrs unwired / no root frame).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drive_bridge_carrier_subwalk(
+    ctx: &mut TraceCtx,
+    root_sym: &crate::state::PyreSym,
+    root_pc: usize,
+    callee_pjc: &std::sync::Arc<crate::PyJitCode>,
+    callee_code_key: usize,
+    callee_w_globals: usize,
+    entry: usize,
+    argboxes_r: &[OpRef],
+) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
+    use majit_metainterp::jitcode::RuntimeBhDescr;
+
+    // Terminal descrs off MetaInterpStaticData (mirror `dispatch_perfn_frame`).
+    let (done_void, done_int, done_ref, done_float, exit_exc_ref) = {
+        let sd = ctx.metainterp_sd();
+        match (
+            sd.done_with_this_frame_descr_void.clone(),
+            sd.done_with_this_frame_descr_int.clone(),
+            sd.done_with_this_frame_descr_ref.clone(),
+            sd.done_with_this_frame_descr_float.clone(),
+            sd.exit_frame_with_exception_descr_ref.clone(),
+        ) {
+            (Some(v), Some(i), Some(r), Some(f), Some(e)) => (v, i, r, f, e),
+            _ => return None,
+        }
+    };
+
+    // Per-fn descr pool + sub-jitcode lookup off the callee body's own runtime
+    // pool (mirror `dispatch_perfn_frame`).  `callee_pjc` is an `Arc` that
+    // outlives the walk, so extend the descr-slice borrow to `'static` for the
+    // `'static`-bodied `SubJitCodeBody` lookup.
+    let perfn_descrs: &'static [RuntimeBhDescr] =
+        unsafe { &*(callee_pjc.jitcode.exec.descrs.as_slice() as *const [RuntimeBhDescr]) };
+    let perfn_descr_refs: Vec<majit_ir::DescrRef> = perfn_descrs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| match d {
+            RuntimeBhDescr::Descr(bh) => crate::descr::make_descr_from_bh(bh),
+            RuntimeBhDescr::JitCode(_)
+            | RuntimeBhDescr::Call(_)
+            | RuntimeBhDescr::AssemblerToken(_) => crate::descr::make_jitcode_descr(i),
+        })
+        .collect();
+    let sub_jitcode_lookup = |idx: usize| -> Option<SubJitCodeBody> {
+        perfn_descrs
+            .get(idx)
+            .and_then(|d| d.as_jitcode())
+            .map(|jc| SubJitCodeBody {
+                code: jc.code.as_slice(),
+                num_regs_r: jc.num_regs_r() as usize,
+                num_regs_i: jc.num_regs_i() as usize,
+                num_regs_f: jc.num_regs_f() as usize,
+                constants_i: jc.constants_i.as_slice(),
+                constants_r: jc.constants_r.as_slice(),
+                constants_f: jc.constants_f.as_slice(),
+            })
+    };
+
+    // Allocate the callee register banks sized to `num_regs_* + constants_*`,
+    // seed the constant pool into the upper slots and `argboxes_r` into the
+    // leading slots (mirror `dispatch_via_miframe`).
+    let jc = &callee_pjc.jitcode;
+    let num_regs_r = jc.num_regs_r() as usize;
+    let num_regs_i = jc.num_regs_i() as usize;
+    let num_regs_f = jc.num_regs_f() as usize;
+    let total_r = num_regs_r + jc.constants_r.len();
+    let total_i = num_regs_i + jc.constants_i.len();
+    let total_f = num_regs_f + jc.constants_f.len();
+    let mut regs_r = vec![OpRef::NONE; total_r];
+    let mut regs_i = vec![OpRef::NONE; total_i];
+    let mut regs_f = vec![OpRef::NONE; total_f];
+    let mut concrete_r = vec![ConcreteValue::Null; total_r];
+    let mut concrete_i = vec![ConcreteValue::Null; total_i];
+    for (i, &v) in jc.constants_i.iter().enumerate() {
+        regs_i[num_regs_i + i] = ctx.const_int(v);
+        concrete_i[num_regs_i + i] = ConcreteValue::Int(v);
+    }
+    for (i, &v) in jc.constants_r.iter().enumerate() {
+        regs_r[num_regs_r + i] = ctx.const_ref(v);
+        if v != 0 {
+            concrete_r[num_regs_r + i] = ConcreteValue::Ref(v as pyre_object::PyObjectRef);
+        }
+    }
+    for (i, &v) in jc.constants_f.iter().enumerate() {
+        regs_f[num_regs_f + i] = ctx.const_float(v);
+    }
+    if argboxes_r.len() > num_regs_r {
+        return Some(Err(DispatchError::InlineCallArityMismatch {
+            pc: entry,
+            provided: argboxes_r.len(),
+            callee_num_regs_r: num_regs_r,
+        }));
+    }
+    for (i, &box_ref) in argboxes_r.iter().enumerate() {
+        regs_r[i] = box_ref;
+        if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = ctx.box_value(box_ref) {
+            concrete_r[i] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
+        }
+    }
+
+    // Paused root portal frame for the multi-frame guard snapshot.
+    let root_frame = compute_bridge_root_parent_frame(root_sym, ctx, root_pc)?;
+    let outer_jitcode_index = root_frame.jitcode_index;
+    let outer_active_boxes = root_frame.boxes.clone();
+
+    let callee_code = jc.code.as_slice();
+    let lookup_ref: &SubJitCodeLookup = &sub_jitcode_lookup;
+    let consts = InlineCalleeConsts {
+        w_globals: callee_w_globals,
+        w_code: callee_code_key,
+    };
+
+    // Install the ROOT sym as the snapshot sym (NOT the callee's) so in-callee
+    // guards snapshot the paused root; restored on drop.
+    let root_sym_ptr = root_sym as *const crate::state::PyreSym;
+    let _full_body_guard = FullBodySnapshotSymGuard::set(root_sym_ptr);
+
+    let outcome = {
+        let mut sub_wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut regs_f,
+            concrete_registers_r: &mut concrete_r,
+            concrete_registers_i: &mut concrete_i,
+            descr_refs: &perfn_descr_refs,
+            raw_descrs: RawDescrPool::PerFn(perfn_descrs),
+            // Diagnostic (2b-i): the trace is discarded, so the sub-walk must
+            // NOT execute may-force residual calls concretely.
+            is_authoritative_executor: false,
+            is_full_body_walk: true,
+            store_subscr_fn_addr: None,
+            pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
+            trace_ctx: ctx,
+            done_with_this_frame_descr_ref: done_ref,
+            done_with_this_frame_descr_int: done_int,
+            done_with_this_frame_descr_float: done_float,
+            done_with_this_frame_descr_void: done_void,
+            exit_frame_with_exception_descr_ref: exit_exc_ref,
+            is_top_level: false,
+            sub_jitcode_lookup: lookup_ref,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+            // The outer Python frame is the root, paused at `root_pc`.
+            entry_py_pc: root_pc as u32,
+            outer_jitcode_index,
+            outer_active_boxes,
+        };
+        let _inline_boundary = InlineSubwalkCaptureGuard::enter();
+        let _recursion_frame = InlineRecursionGuard::enter(callee_code_key);
+        let _callee_consts = InlineCalleeConstsGuard::enter(consts);
+        let _parent_frame_guard = InlineParentFrameGuard::enter(root_frame);
+        walk(callee_code, entry, &mut sub_wc)
+    };
+    Some(outcome)
+}
+
 /// Orthodox entry: walk a per-opcode arm jitcode with
 /// **fresh per-jitcode register banks** sized to the entry jitcode's
 /// declared `num_regs_<i|r|f>() + len(constants_<i|r|f>)`, with `r0`
