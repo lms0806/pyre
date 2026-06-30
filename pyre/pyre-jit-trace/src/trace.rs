@@ -672,6 +672,10 @@ fn run_perfn_walk(
             }
             v[reg] = val;
         };
+        // Colors holding the red virtualizable identity (frame) + ec — the
+        // standard virtualizable. The #124 operand-stack override below must
+        // not overwrite these (a kept temp never lives in a red-input color).
+        let mut reserved_red_colors: Vec<u8> = Vec::new();
         match loop_header_merge_point_regs(pjc.jitcode.code.as_slice(), entry) {
             Some((gr, rr)) => {
                 if let Some(&r) = gr.first() {
@@ -679,9 +683,11 @@ fn run_perfn_walk(
                 }
                 if let Some(&r) = rr.first() {
                     seed(r, frame_box);
+                    reserved_red_colors.push(r);
                 }
                 if let Some(&r) = rr.get(1) {
                     seed(r, ec_box);
+                    reserved_red_colors.push(r);
                 }
             }
             // Straight-line entry, no governing loop header (e.g. a
@@ -706,16 +712,20 @@ fn run_perfn_walk(
             //
             None => {
                 seed(0, pycode_box);
-                if portal_frame_reg != u16::MAX {
-                    seed(portal_frame_reg as u8, frame_box);
+                let frame_color = if portal_frame_reg != u16::MAX {
+                    portal_frame_reg as u8
                 } else {
-                    seed(1, frame_box);
-                }
-                if portal_ec_reg != u16::MAX {
-                    seed(portal_ec_reg as u8, ec_box);
+                    1
+                };
+                let ec_color = if portal_ec_reg != u16::MAX {
+                    portal_ec_reg as u8
                 } else {
-                    seed(2, ec_box);
-                }
+                    2
+                };
+                seed(frame_color, frame_box);
+                seed(ec_color, ec_box);
+                reserved_red_colors.push(frame_color);
+                reserved_red_colors.push(ec_color);
             }
         }
         // #124: a bridge enters mid-body, where the loop-header merge-point
@@ -729,12 +739,24 @@ fn run_perfn_walk(
         // setup_bridge_sym resolved; in that semantic prefix the abstract-
         // register color equals the semantic slot.  Locals (read through the
         // vable) and frame/ec (at their own colors) keep the seeding above.
+        //
+        // The `nl + i` slot→color shortcut collides with a red-input color
+        // when `portal_frame_reg == nlocals` (e.g. fib: frame=r1, nlocals=1,
+        // so operand-stack slot 0 → color 1 == frame).  A kept operand-stack
+        // temp never occupies a red-input color, so skip those: seeding a temp
+        // over the frame color overwrites the standard virtualizable identity
+        // and forces every later `vable_*` op onto the nonstandard leg
+        // (NonStandardVableFinishPortalUnsupported abort).
         if is_bridge_trace {
             if let Some(ref bridge_stack) = sym.bridge_stack_oprefs {
                 let nl = sym.nlocals;
                 for (i, &opref) in bridge_stack.iter().enumerate() {
                     if !opref.is_none() {
-                        seed((nl + i) as u8, opref);
+                        let color = (nl + i) as u8;
+                        if reserved_red_colors.contains(&color) {
+                            continue;
+                        }
+                        seed(color, opref);
                     }
                 }
             }
