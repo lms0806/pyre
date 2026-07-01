@@ -675,6 +675,15 @@ fn is_slice_reverse_segments(segments: &[String]) -> bool {
 /// (`rlist.py:185`) via the `getattr(recv, "append") + simple_call` method
 /// shape, exactly like [`is_slice_reverse_segments`]; the Rust method name
 /// `push` maps to the RPython list method `append`.
+///
+/// This recognizer fires only on the `CallTarget::FunctionPath` shape, and
+/// that is complete: `vec::Vec` is a foreign type with no extracted LLBC ADT,
+/// so `front::mir::impl_method_owner` cannot resolve it to a classdef-bound
+/// owner and returns `None`, which forces every `Vec::push` call to the
+/// `[vec, Vec, push]` FunctionPath segments rather than `CallTarget::Method`.
+/// The generic Method arm (which would `getattr(recv, "push")` against a list
+/// that has no `push`) is therefore unreachable for it — only user-defined
+/// classdef-bound receivers route through Method.
 fn is_vec_push_segments(segments: &[String]) -> bool {
     segments.len() == 3 && segments[0] == "vec" && segments[1] == "Vec" && segments[2] == "push"
 }
@@ -959,6 +968,21 @@ pub fn translate_op(
             }
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new("newtuple", hl_args, result)])
+        }
+
+        // ─── `newlist` — RPython `BUILD_LIST` / `space.newlist` ───
+        // `PureOperation`.  Same operand-routing discipline as
+        // `newtuple`: each `args[i]` Variable goes through `value_map`
+        // so the legacy SpaceOperation references the Hlvalue identities
+        // `checkgraph` tracks.
+        OpKind::NewList { args } => {
+            let mut hl_args: Vec<Hlvalue> = Vec::with_capacity(args.len());
+            for (i, var) in args.iter().enumerate() {
+                let role = format!("arg{i}");
+                hl_args.push(lookup_operand(value_map, var, op, &role)?);
+            }
+            let result = resolve_result_hlvalue(op, value_map)?;
+            Ok(vec![FlowspaceOp::new("newlist", hl_args, result)])
         }
 
         // ─── `NewWithVtable` — boxing GC allocation (`fuse_boxing_alloc`) ───

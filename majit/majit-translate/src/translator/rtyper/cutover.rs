@@ -68,6 +68,16 @@ use crate::translator::rtyper::pyre_call_registry::{
     FunctionPathKey, PyreCallRegistry, PyreFunctionEntry,
 };
 
+/// The `graph.return_type` marker the front-end stamps on a
+/// `dont_look_inside` callee that returns `*mut PyObject` (a
+/// `PyObjectRef`).  `front::mir::output_type_is_objectptr` gates the
+/// stamp (`lib.rs merge_hints_from_llbcs`), so this string only ever
+/// labels a genuine object-pointer return; the residual prefill maps it
+/// to `OBJECTPTR` so the residualized constructor reports a `Ref` result
+/// rather than the `None`→`Void` default.  The literal doubles as the
+/// readable Rust return type.
+pub(crate) const OBJECTPTR_RETURN_TYPE: &str = "*mut PyObject";
+
 /// Project a post-`specialize` `LowLevelType` back to the legacy
 /// `ConcreteType` bucket the codewriter consumes (Signed / Float /
 /// GcRef / Void).
@@ -565,8 +575,19 @@ fn reachable_defined_vars(graph: &LegacyGraph) -> std::collections::HashSet<Vari
                 read_vars.insert(v);
             }
         }
-        if let Some(crate::model::ExitSwitch::Value(v)) = &block.exitswitch {
-            read_vars.insert(v.clone());
+        match &block.exitswitch {
+            Some(crate::model::ExitSwitch::Value(v)) => {
+                read_vars.insert(v.clone());
+            }
+            // A fused guard (`jtransform optimize_goto_if_not`) reads its
+            // comparison operands directly off the exitswitch, so those vars
+            // are live even when no op consumes them.
+            Some(crate::model::ExitSwitch::Fused { args, .. }) => {
+                for v in args {
+                    read_vars.insert(v.clone());
+                }
+            }
+            Some(crate::model::ExitSwitch::LastException) | None => {}
         }
         for link in &block.exits {
             stack.push(link.target);
@@ -1185,15 +1206,22 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // (the `ExtRegistryEntry.compute_result_annotation` shape) so
         // callers annotate the declared unit/bool result and the
         // codewriter emits the residual call via the fn's registered
-        // C ABI address (`pyre/jit_fnaddr.rs`).  Non-scalar returns
-        // fall through to the normal lift — no current marker needs
-        // them, and the stub builder's coverage is unaudited for that
-        // case.
+        // C ABI address (`pyre/jit_fnaddr.rs`).  The object-pointer
+        // marker (`OBJECTPTR_RETURN_TYPE`, stamped by the front-end on a
+        // `*mut PyObject`-returning opaque callee) projects to
+        // `OBJECTPTR` — the `default_someshell_for_lltype` →
+        // `lltype_to_annotation` path already covers `Ptr(_)`.  Other
+        // non-scalar returns fall through to the normal lift — no
+        // current marker needs them, and the stub builder's coverage is
+        // unaudited for that case.
         if graph.hints.iter().any(|h| h == "dont_look_inside") {
             let return_lltype = match graph.return_type.as_deref() {
                 None | Some("()") => Some(LowLevelType::Void),
                 Some("bool") => Some(LowLevelType::Bool),
                 Some("i64") => Some(LowLevelType::Signed),
+                Some(s) if s == OBJECTPTR_RETURN_TYPE => {
+                    Some(crate::translator::rtyper::rclass::OBJECTPTR.clone())
+                }
                 _ => None,
             };
             if let Some(return_lltype) = return_lltype

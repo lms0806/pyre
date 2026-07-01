@@ -778,6 +778,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             .and_then(|p| p.rsplit("::").next())
             .map(str::to_string)
             .or_else(|| trait_default_owner_for_fundecl(fd, &known_trait_names));
+        let returns_objectptr = output_type_is_objectptr(&fd.signature.output, llbc);
         functions.push(crate::front::semantic::SemanticFunction {
             name,
             graph,
@@ -788,6 +789,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             access_directly: false,
             trait_root,
             trait_qualified,
+            returns_objectptr,
         });
     }
     // Coverage gate. Every `skipped` entry is a function whose MIR shape
@@ -5382,6 +5384,33 @@ impl<'a> Lowering<'a> {
                 // `unaryop.rs:3587` (lib test
                 // `generic_handler_graphs_keep_symbolic_fnaddr_surface`).
                 let (segments, method_hint) = self.call_target_segments(mir_bb, &reg)?;
+                // `<[T]>::to_vec(slice)` copies the slice into an owned Vec —
+                // the RPython `list(slice)` builtin, whose `rtype_bltn_list`
+                // (`rlist.py:118-122`) `gendirectcall`s `ll_copy`. Retarget the
+                // call to the single-segment `list` builtin path so both the
+                // annotator (SomeList result) and the rtyper (`rtype_n` ->
+                // `rtype_bltn_list`) see a list construction. (The old
+                // slice-identity alias was a miscompile: `to_vec` is a fresh
+                // allocation, not an alias of the source.)
+                let (segments, method_hint) = if args.len() == 1 && is_slice_to_vec(&segments) {
+                    (vec!["list".to_string()], None)
+                } else {
+                    (segments, method_hint)
+                };
+                // `vec![e0, …, eN]` lowers to
+                // `box_assume_init_into_vec_unsafe(box [e0, …, eN])`, whose
+                // `box_assume_init` primitive is unregistered, so the legacy
+                // CodeWriter residualizes it as a plain call (the same
+                // treatment `w_int_new` / `w_float_new` get).  An earlier
+                // recognizer rewrote this shape to `OpKind::NewList`, but those
+                // graphs fail the two-phase prepass on the dead cross-block
+                // `Box::new_uninit` and drop to the legacy CodeWriter, which
+                // cannot run `rtype_newlist` (the legacy annotator types the
+                // result `Ref`, not `ListRepr`).  The un-lowered `newlist`
+                // opname then reached the build-time `Assembler.insns` table
+                // with no blackhole handler.  Until the vec! graphs two-phase
+                // lift (`rtype_newlist` is implemented but dormant), the
+                // residual call is the correct lowering.
                 // For a method/direct callee this equals the callee's
                 // `name_path()`; the scope predicate keys on the module
                 // path, which the built `CallTarget::Method` drops.
@@ -10189,6 +10218,27 @@ fn output_type_is_ref(ty: &TyRef, llbc: &Llbc) -> bool {
     false
 }
 
+/// True when `ty`'s top-level constructor — after the dedup /
+/// hash-cons / reference indirections [`strip_ty_wrappers`] follows —
+/// is a raw pointer (`*mut` / `*const`) onto `PyObject` (the
+/// `PyObjectRef` alias, `pyobject.rs:79`).
+///
+/// This is the return shape of the `W_ListObject` / `W_TupleObject`
+/// constructors (`listobject.rs w_list_new`, `tupleobject.rs
+/// w_tuple_new`).  `output_type_is_ref` only catches `&T`/`&mut T`
+/// references — a raw pointer carries the `RawPtr` constructor, not
+/// `Ref` — so the object-pointer return needs its own probe.  Feeds the
+/// `dont_look_inside` residual prefill (`cutover.rs`): without a
+/// `return_type` marker an object-pointer-returning opaque callee maps
+/// `None`→`Void`, residualizing to a void result the caller cannot use.
+fn output_type_is_objectptr(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+        .and_then(|n| raw_ptr_pointee_class_root(n, llbc))
+        .as_deref()
+        == Some("PyObject")
+}
+
 /// Resolve a Charon [`TyRef`] to the Rust type STRING the
 /// `struct_fields` registry consumers expect, so
 /// `derive_program_metadata` can fill `struct_fields` with real type
@@ -11402,6 +11452,13 @@ fn fmt_path_ends_with(segments: &[String], tail: &[&str]) -> bool {
             .iter()
             .zip(tail)
             .all(|(s, t)| s.as_str() == *t)
+}
+
+/// `<[T]>::to_vec` — Rust MIR `alloc::slice::<Impl>::to_vec`, a slice→owned-Vec
+/// copy. Retargeted to the `list` builtin (`rtype_bltn_list` -> `ll_copy`).
+fn is_slice_to_vec(segments: &[String]) -> bool {
+    matches!(segments, [a, b, c, d]
+        if a == "alloc" && b == "slice" && c == "<Impl>" && d == "to_vec")
 }
 
 /// The `fmt::Arguments::new(pieces, args)` constructor that `format_args!`
