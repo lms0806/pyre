@@ -3811,53 +3811,6 @@ pub(crate) fn eval_loop_jit_bridge(frame: &mut PyFrame) -> LoopResult {
     }
 }
 
-/// #143 live-frame advance master switch. The precise gate is the
-/// per-loop `dm143_heap_mutated` marker (set only by concrete-during-trace
-/// mutation recorders: `list.append`/`pop`/`pop(i)`/`reverse`).
-/// `STORE_SUBSCR`/`STORE_ATTR` defer their heap write and never set the
-/// marker, so their loops are not advanced. `PYRE_DM_NO_ADVANCE` forces
-/// the advance off for A/B debugging.
-fn dm143_advance_enabled() -> bool {
-    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EN.get_or_init(|| std::env::var_os("PYRE_DM_NO_ADVANCE").is_none())
-}
-
-/// #143: at a successful loop close, advance the LIVE frame's locals to the
-/// post-traced-iteration concrete state captured during tracing
-/// (`PyreSym.concrete_locals`). Without this the live frame's locals stay at
-/// the pre-trace iteration, so the compiled loop RE-RUNS the traced iteration
-/// — re-applying any during-trace heap mutation (`list.append`) and producing
-/// an off-by-one result (#143).
-pub(crate) fn dm143_advance_live_locals(
-    frame: &mut PyFrame,
-    sym: &pyre_jit_trace::state::PyreSym,
-    action: &majit_metainterp::TraceAction,
-) {
-    if !dm143_advance_enabled()
-        || !matches!(
-            action,
-            majit_metainterp::TraceAction::CloseLoop
-                | majit_metainterp::TraceAction::CloseLoopWithArgs { .. }
-        )
-        // Only advance loops whose traced iteration concretely mutated the heap.
-        // A mutation-free loop's compiled re-run of the traced iteration has no
-        // heap side effect, so the advance is unnecessary; advancing it would
-        // also desync the guard-failure resume (`set_membership`).
-        || !sym.dm143_heap_mutated()
-    {
-        return;
-    }
-    let n = sym.tracked_local_count().min(frame.locals_w().len());
-    for i in 0..n {
-        // Materialize + root one box at a time: w_int_new/w_float_new
-        // allocate, so each box must reach the frame (a GC root) before the
-        // next materialize_local call can trigger a nursery collection.
-        if let Some(obj) = sym.materialize_local(i) {
-            frame.locals_w_mut()[i] = obj;
-        }
-    }
-}
-
 /// #57 Option C (deliver): on a FOR_ITER trace abort, deliver the in-flight
 /// iteration to the live frame instead of dropping it.
 ///
@@ -4028,13 +3981,6 @@ fn jit_merge_point_hook(
             if pyre_jit_trace::trace::take_walk_end_flush_committed() {
                 frame.restore_resume_state_from(&executed_frame);
             }
-            // Heap-mutation fallback (issue #143): when the trace took the
-            // trait leg and committed no walk-end flush, advance the live
-            // locals to the traced iteration's end so the post-abort
-            // interpreter re-run does not replay an append/pop that already
-            // mutated the heap concretely.  Idempotent with the flush above
-            // (both are absolute writes to the same iteration-end locals).
-            dm143_advance_live_locals(frame, sym, &action);
             action
         },
     ) {
@@ -4743,9 +4689,6 @@ fn bound_reached(
                     if pyre_jit_trace::trace::take_walk_end_flush_committed() {
                         frame.restore_resume_state_from(&executed_frame);
                     }
-                    // issue #143 heap-mutation fallback — see the
-                    // jit_merge_point_hook tracing site for the contract.
-                    dm143_advance_live_locals(frame, sym, &action);
                     action
                 },
             );
@@ -9143,125 +9086,6 @@ mod tests {
         assert!(saw_gc_field);
         assert!(!saw_raw_field);
         assert!(saw_gc_array);
-    }
-
-    #[test]
-    fn test_list_append_value_uses_gc_storage_fast_paths_with_compiled_trace_jitcode() {
-        use majit_ir::{OpCode, OpRef, Type};
-        use majit_metainterp::TraceCtx;
-        use pyre_jit_trace::state::{MIFrame, PyreSym};
-
-        let run_case = |concrete_list: pyre_object::PyObjectRef,
-                        symbolic_value_type: Type,
-                        concrete_value: pyre_object::PyObjectRef,
-                        expected_len_descr_idx: u32,
-                        expect_box_alloc: bool| {
-            let (frame, jitcode_ptr, resume_pc) = compiled_trace_fixture(
-                "def f(x):\n    return x\nf([1])\n",
-                "f",
-                &[],
-                &[],
-                |frame| {
-                    frame.locals_w_mut()[0] = concrete_list;
-                },
-            );
-            let frame_ptr = (&*frame) as *const PyFrame as usize;
-
-            let mut ctx = TraceCtx::for_test_types(&[Type::Ref, symbolic_value_type]);
-            let list = OpRef::input_arg_ref(0);
-            // resoperation.py:719/727/739 — InputArg has only Int/Float/Ref
-            // variants; `input_arg_typed` panics on Type::Void.
-            let value = OpRef::input_arg_typed(1, symbolic_value_type);
-            let mut sym = PyreSym::from_test_state(single_local_test_state(
-                &mut ctx,
-                &frame,
-                frame_ptr,
-                jitcode_ptr,
-                resume_pc,
-                Type::Ref,
-                list,
-            ));
-            let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
-
-            state
-                .capture_list_append_value(list, value, concrete_list, concrete_value)
-                .expect("typed-storage append fast path should trace");
-
-            let recorder = ctx.into_recorder();
-            let mut saw_gc_setitem = false;
-            let mut saw_len_update = false;
-            let mut saw_call = false;
-            let mut saw_new = false;
-            for pos in 2..(2 + recorder.num_ops() as u32) {
-                let Some(op) = recorder.get_op_by_raw_pos(pos) else {
-                    continue;
-                };
-                if matches!(
-                    op.opcode,
-                    OpCode::CallI | OpCode::CallN | OpCode::CallR | OpCode::CallF
-                ) {
-                    saw_call = true;
-                }
-                if op.opcode == OpCode::New {
-                    saw_new = true;
-                }
-                if op.opcode == OpCode::SetarrayitemGc {
-                    saw_gc_setitem = true;
-                }
-                if op.opcode == OpCode::SetfieldGc
-                    && op.getdescr().map(|d| d.index()) == Some(expected_len_descr_idx)
-                {
-                    saw_len_update = true;
-                }
-            }
-            assert!(saw_gc_setitem);
-            assert!(saw_len_update);
-            assert!(!saw_call);
-            assert_eq!(saw_new, expect_box_alloc);
-        };
-
-        let int_list =
-            pyre_object::w_list_new(vec![pyre_object::w_int_new(1), pyre_object::w_int_new(2)]);
-        unsafe {
-            // A freshly built list allocates capacity == length, so append
-            // once to force the over-allocating grow that leaves the
-            // append fast path spare capacity to write into.
-            pyre_object::listobject::w_list_append(int_list, pyre_object::w_int_new(3));
-            assert!(pyre_object::listobject::w_list_uses_int_storage(int_list));
-            assert!(pyre_object::listobject::w_list_can_append_without_realloc(
-                int_list
-            ));
-        }
-        run_case(
-            int_list,
-            Type::Int,
-            pyre_object::w_int_new(42),
-            pyre_jit_trace::descr::list_int_items_len_descr().index(),
-            false,
-        );
-
-        let float_list = pyre_object::w_list_new(vec![
-            pyre_object::w_float_new(1.5),
-            pyre_object::w_float_new(2.5),
-        ]);
-        unsafe {
-            // Same as the int case: force the over-allocating grow so the
-            // append fast path has spare capacity.
-            pyre_object::listobject::w_list_append(float_list, pyre_object::w_float_new(3.5));
-            assert!(pyre_object::listobject::w_list_uses_float_storage(
-                float_list
-            ));
-            assert!(pyre_object::listobject::w_list_can_append_without_realloc(
-                float_list
-            ));
-        }
-        run_case(
-            float_list,
-            Type::Float,
-            pyre_object::w_float_new(3.14),
-            pyre_jit_trace::descr::list_float_items_len_descr().index(),
-            false,
-        );
     }
 
     #[test]

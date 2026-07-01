@@ -7242,11 +7242,39 @@ pub(crate) fn fbw_store_journal_rollback() {
         }
     });
     // Rewind each eager append's length in reverse push order
-    // (`w_list_int_set_len`, allocation-free).
+    // (allocation-free length set; the journal records only spare-capacity
+    // appends, so there is no realloc to undo and the strategy at rollback
+    // equals the strategy at push). Dispatch the rewind to the strategy's
+    // length field: Object rewinds the `W_ListObject.length` header, Integer
+    // the `int_items` vec length.
     FBW_APPEND_JOURNAL.with(|j| {
         let mut entries = j.borrow_mut();
         while let Some((list, length_before)) = entries.pop() {
-            unsafe { pyre_object::listobject::w_list_int_set_len(list, length_before) };
+            unsafe {
+                let list_ref = &mut *(list as *mut pyre_object::listobject::W_ListObject);
+                match list_ref.strategy {
+                    pyre_object::listobject::ListStrategy::Object => {
+                        // The appended element is a GC ptr and the items block is
+                        // scanned over [0..capacity], so null the vacated slot
+                        // before shrinking (ll_pop_default: ll_setitem_fast(index,
+                        // ll_null_item) then _ll_resize_le) — otherwise the slot at
+                        // `length_before` holds a stale ref past the logical length.
+                        pyre_object::listobject::ll_list_obj_setitem_fast(
+                            list_ref,
+                            length_before,
+                            pyre_object::pyobject::PY_NULL,
+                        );
+                        pyre_object::listobject::ll_list_obj_set_len(list_ref, length_before);
+                    }
+                    pyre_object::listobject::ListStrategy::Integer => {
+                        pyre_object::listobject::ll_list_int_set_len(list_ref, length_before);
+                    }
+                    // Empty/Float never enter the append journal (no
+                    // spare-capacity fold path records them); nothing to rewind.
+                    pyre_object::listobject::ListStrategy::Empty
+                    | pyre_object::listobject::ListStrategy::Float => {}
+                }
+            }
         }
     });
 }
@@ -14280,16 +14308,17 @@ fn pyre_171_orthodox_enabled() -> bool {
     std::env::var("PYRE_171_ORTHODOX").as_deref() != Ok("0")
 }
 
-/// #171 experimental gate (default OFF — `PYRE_171_OBJ_APPEND=1` opts in):
-/// extend the orthodox `list.append` descent to object-strategy lists
-/// (a `Ref` value stored into the object items block) in addition to the
-/// int-storage specialization.  Gated off by default while the
-/// object-storage store path through the `w_list_append` sub-walk is
-/// validated; an unresolved object-store leaf declines via
-/// `OrthodoxSubWalkTraceUnsupported` (graceful interpreter fallback), so a
-/// gate-on miss never commits a wrong trace.
+/// #171 object-storage append gate (default ON — `PYRE_171_OBJ_APPEND=0`
+/// opts out): extend the orthodox `list.append` descent to object-strategy
+/// lists (a `Ref` value stored into the object items block) in addition to
+/// the int-storage specialization.  Shares the orthodox-fold entry gate
+/// (authoritative full-body walk, not inside an inline sub-walk — see the
+/// call site), so the object path carries the same loop/full-body
+/// restriction as the int fold; an unresolved object-store leaf declines
+/// via `OrthodoxSubWalkTraceUnsupported` (graceful interpreter fallback),
+/// so a miss never commits a wrong trace.
 fn pyre_171_obj_append_enabled() -> bool {
-    std::env::var("PYRE_171_OBJ_APPEND").as_deref() == Ok("1")
+    std::env::var("PYRE_171_OBJ_APPEND").as_deref() != Ok("0")
 }
 
 /// Global descr-pool sub-jitcode lookup (resolves a global jitcode index
@@ -14393,9 +14422,9 @@ fn try_walker_orthodox_list_append(
         let int_ok = pyre_object::w_list_uses_int_storage(inner_self)
             && pyre_object::is_plain_int1(value)
             && !pyre_object::pyobject::is_long(value);
-        // Object-storage extension (experimental, `PYRE_171_OBJ_APPEND=1`):
-        // any non-null `Ref` value stored into the object items block — no
-        // unboxing, so the value carries no type precondition.
+        // Object-storage extension (default ON, `PYRE_171_OBJ_APPEND=0` opts
+        // out): any non-null `Ref` value stored into the object items block —
+        // no unboxing, so the value carries no type precondition.
         let obj_ok = pyre_171_obj_append_enabled()
             && pyre_object::w_list_uses_object_storage(inner_self)
             && !value.is_null();
@@ -17719,6 +17748,20 @@ fn handle(
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "setarrayitem_gc_f/rifd" => setarrayitem_gc_via_heapcache(code, op, ctx, 'f'),
+        // `arraylen_gc` — `blackhole.py:1370 bhimpl_arraylen_gc`
+        // (@arguments("cpu","r","d", returns="i")).  Operand layout `rd>i`:
+        // 1B r-reg(array) + 2B descr + 1B i-reg(dst).  Delegates to
+        // `state::opimpl_arraylen_gc` (heapcache-aware length tracking,
+        // pyjitpl.py:744-748).
+        "arraylen_gc/rd>i" => {
+            let array = read_ref_reg(code, op, 0, ctx)?;
+            let descr = read_descr(code, op, 1, ctx)?;
+            let result = crate::state::opimpl_arraylen_gc(&mut ctx.trace_ctx, array, descr);
+            let dst = code[op.pc + 4] as usize;
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+            write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         // RPython `pyjitpl.py:746-755 opimpl_new_array_clear` —
         // `_opimpl_new_array(rop.NEW_ARRAY_CLEAR, lengthbox,
         // arraydescr)` records the op and seeds the heapcache via
@@ -19589,6 +19632,44 @@ mod tests {
         // no-op (does not shrink further).
         super::fbw_store_journal_rollback();
         assert_eq!(unsafe { w_list_len(list) }, len_before + 1);
+    }
+
+    #[test]
+    fn append_journal_rollback_rewinds_object_length() {
+        // #171 object-append: the orthodox fold journals object-strategy
+        // appends through the SAME `FBW_APPEND_JOURNAL` as the int spec, so a
+        // non-commit rollback must rewind the strategy-correct length — the
+        // `W_ListObject.length` header (`ll_list_obj_set_len`), not
+        // `int_items.len`.  Rewinding via the int leaf would leave the object
+        // header grown (legacy replay double-appends) and trip the
+        // `w_list_int_set_len` strategy assert.
+        use pyre_object::listobject::{w_list_can_append_without_realloc, w_list_len};
+        use pyre_object::{w_list_append, w_none};
+
+        super::fbw_store_journal_reset();
+
+        // `w_list_new_object` forces the Object strategy regardless of element
+        // type; None elements keep the test free of int/float boxing.
+        let list = pyre_object::listobject::w_list_new_object(vec![w_none(), w_none(), w_none()]);
+        // Grow once so the next append is an in-place spare-capacity store
+        // (the only shape the journal records).
+        unsafe { w_list_append(list, w_none()) };
+        let len_before = unsafe { w_list_len(list) };
+        assert_eq!(len_before, 4);
+        assert!(
+            unsafe { w_list_can_append_without_realloc(list) },
+            "post-grow object list must have spare capacity for the in-place append"
+        );
+
+        super::fbw_append_journal_push(list, len_before);
+        unsafe { w_list_append(list, w_none()) };
+        assert_eq!(unsafe { w_list_len(list) }, 5);
+        super::fbw_store_journal_rollback();
+        assert_eq!(
+            unsafe { w_list_len(list) },
+            len_before,
+            "non-commit walk must rewind the object append's length header"
+        );
     }
 
     /// Tests use the production `PyreJitCodeDescr` adapter
