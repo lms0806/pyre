@@ -200,8 +200,8 @@ use pyre_interpreter::eval::{attach_raise_cause, normalize_raise_cause};
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_interpreter::{
     OpcodeStepExecutor, PyError, SharedOpcodeHandler, call_function, decode_instruction_at,
-    execute_opcode_step, function_get_defaults, function_get_globals_obj, is_builtin_code,
-    is_function, range_iter_continues,
+    function_get_defaults, function_get_globals_obj, is_builtin_code, is_function,
+    range_iter_continues,
 };
 
 use pyre_object::PyObjectRef;
@@ -223,10 +223,6 @@ use pyre_object::{
 
 fn trace_abort_error(reason: &'static str) -> PyError {
     PyError::internal_trace_abort(reason)
-}
-
-fn is_trace_abort_error(err: &PyError) -> bool {
-    err.kind == pyre_interpreter::PyErrorKind::TraceAbort
 }
 
 fn trace_plain_int_payload(
@@ -2555,10 +2551,11 @@ impl MIFrame {
     /// heap between opcodes.  The refresh must run BEFORE
     /// `capture_pre_opcode_state` reads from `virtualizable_boxes`
     /// (`trace_opcode.rs:1014`) — otherwise guard fail_args would snapshot a
-    /// stale shadow whenever the prior opcode ran through trait dispatch.
+    /// stale shadow whenever the prior opcode ran through
+    /// `execute_opcode_step`.
     ///
-    /// Inline-frame guard: when `self.parent_frames` is non-empty we are
-    /// running `trace_code_step_inline` on a callee MIFrame.  The shared
+    /// Inline-frame guard: when `self.parent_frames` is non-empty the
+    /// full-body-walk walker is walking a callee MIFrame.  The shared
     /// `TraceCtx.virtualizable_boxes` shadow still belongs to the portal
     /// (caller) frame; refreshing it from heap mid-inline would overwrite
     /// any caller-side updates that the walker pushed into the shadow
@@ -4882,7 +4879,7 @@ impl MIFrame {
         // liveness is ported (codewriter/liveness.py). Until then, clear
         // them here so flush_to_frame_for_guard, get_list_of_active_boxes,
         // and list_of_boxes_virtualizable all read the current (post-pop)
-        // `registers_r` / valuestackdepth. The next trace_code_step
+        // `registers_r` / valuestackdepth. The next walker step
         // re-captures the snapshot, so no restore is needed.
         self.clear_pre_opcode_state();
 
@@ -7283,16 +7280,11 @@ impl MIFrame {
     /// RPython parity: `pyjitpl.py:1892 MetaInterp._interpret` dispatches
     /// each opcode through `staticdata.opcode_implementations[opnum]`,
     /// which is the jitcode-bytecode interpreter (the only dispatch path
-    /// upstream).  Pyre's transient deviation is the dual trait/walker
-    /// dispatch pair: `pyre_interpreter::execute_opcode_step` runs the
-    /// trait-driven Python-opcode interpreter while
-    /// `jitcode_dispatch::dispatch_via_miframe` walks the codewriter-
-    /// emitted jitcode arm.  The trait path retires opcode-by-
-    /// opcode; this helper is the per-opcode walker entry that root-frame
-    /// production dispatch (`trace_code_step`) calls for allow-listed
-    /// instructions.  Inline dispatch (`trace_code_step_inline`) remains
-    /// on the trait path until walker snapshot capture can represent the
-    /// full parent-frame chain.
+    /// upstream).  `jitcode_dispatch::dispatch_via_miframe` walks the
+    /// codewriter-emitted jitcode arm.  This helper is the per-opcode
+    /// walker entry hook invoked by the full-body-walk walker for
+    /// allow-listed instructions; inline frames are walked by the same
+    /// full-body-walk walker.
     ///
     /// PyPy `_opimpl_*` direct-record entry point for opcodes that emit
     /// IR and produce concrete effects directly from the tracer, bypassing
@@ -7302,10 +7294,9 @@ impl MIFrame {
     /// inline rather than walking an intermediate jitcode representation.
     ///
     /// Returns `Ok(Some(step_result))` when the opcode was handled here.
-    /// `Ok(None)` falls through to the arm-jitcode walker in
-    /// [`MIFrame::dispatch_via_walker_for_opcode`].  `Err(_)` propagates a
-    /// dispatch-time exception (e.g. `MIFrame::reraise` raising with
-    /// `reraise_lasti` populated).
+    /// `Ok(None)` falls through to the arm-jitcode walker.  `Err(_)`
+    /// propagates a dispatch-time exception (e.g. `MIFrame::reraise`
+    /// raising with `reraise_lasti` populated).
     ///
     /// Each direct-dispatch handler must:
     ///   1. Update the symbolic stack via `SharedOpcodeHandler::pop_value`
@@ -7340,12 +7331,13 @@ impl MIFrame {
         //
         // Resolve the constant here and delegate to the existing
         // `OpcodeStepExecutor::load_const` (the same method
-        // `execute_load_const` calls on the trait leg), which emits the
+        // `execute_load_const` calls), which emits the
         // type-specialised IR (`ConstRef` / `int_constant` / `str_constant`
         // / …) and pushes via `push_value` — keeping `sym.valuestackdepth`
         // / vable shadow / concrete mirror coherent.  Same delegation
-        // pattern as the StoreSubscr / PushNull hooks below; bypasses
-        // `apply_walker_stack_effect` because `push_value` handles vsd.
+        // pattern as the StoreSubscr / PushNull hooks below; the hook
+        // handles its own valuestackdepth (no separate post-dispatch
+        // stack adjustment) because `push_value` handles vsd.
         if let Instruction::LoadConst { consti } = instruction {
             use pyre_interpreter::OpcodeStepExecutor;
             let const_idx = consti.get(op_arg);
@@ -7434,8 +7426,9 @@ impl MIFrame {
         // borrow / non-borrow distinction collapses at the trace level (the
         // single LoadFast / LoadFastBorrow hook above already routes both
         // through `load_fast_checked`), so both superinstructions share the
-        // one pair recorder.  `push_value` advances vsd, so this bypasses
-        // `apply_walker_stack_effect` via the early return.
+        // one pair recorder.  `push_value` advances vsd, so the hook
+        // handles its own valuestackdepth (no separate post-dispatch
+        // stack adjustment) via the early return.
         if let Instruction::LoadFastLoadFast { var_nums }
         | Instruction::LoadFastBorrowLoadFastBorrow { var_nums } = instruction
         {
@@ -7456,35 +7449,38 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
-        // TO_BOOL walker activation via trait-path delegation.
+        // TO_BOOL walker activation via `OpcodeStepExecutor` delegation.
         //
         // The compiler only emits TO_BOOL ahead of a truthiness consumer
         // (POP_JUMP_IF_TRUE/FALSE or UNARY_NOT), each of which re-evaluates
         // the operand's truthiness through its own guard.  The MIFrame
         // `to_bool` override is therefore a stack-neutral no-op (the explicit
         // bool materialisation is redundant under tracing), matching exactly
-        // what the trait leg's `execute_to_bool` already records.  An entry
+        // what `execute_to_bool` already records.  An entry
         // hook delegating to the same no-op preserves that — routing through
         // the auto-gen arm walk instead would emit the arm's bool-conversion
-        // residual and diverge.  Early return bypasses
-        // `apply_walker_stack_effect` (net-zero effect, nothing to record).
+        // residual and diverge.  The hook handles its own valuestackdepth
+        // (no separate post-dispatch stack adjustment; net-zero effect,
+        // nothing to record).
         if let Instruction::ToBool = instruction {
             use pyre_interpreter::OpcodeStepExecutor;
             OpcodeStepExecutor::to_bool(self)?;
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
-        // LOAD_NAME / STORE_NAME walker activation via trait-path delegation.
+        // LOAD_NAME / STORE_NAME walker activation via `OpcodeStepExecutor`
+        // delegation.
         //
         // Module-level namespace ops whose name operand is an oparg-derived
         // index into `code.names` — the r0-only arm entry leaves that payload
         // register unbound (ResidualCallArgUnbound), the same gap the single
         // LoadFast hook handles.  Resolve the name here and delegate to the
         // existing `OpcodeStepExecutor::load_name` / `store_name` (the methods
-        // `execute_load_name` / `execute_store_name` call on the trait leg),
+        // `execute_load_name` / `execute_store_name` call),
         // whose MIFrame impls record the live namespace lookup/store IR and
-        // advance the vsd shadow via push_value / pop_value — so the early
-        // return bypasses `apply_walker_stack_effect`.
+        // advance the vsd shadow via push_value / pop_value — so the hook
+        // handles its own valuestackdepth (no separate post-dispatch stack
+        // adjustment).
         //
         // These handlers record the LIVE namespace lookup / store, not a
         // globals-only one.  Verified empirically once exec / import frames
@@ -7547,15 +7543,16 @@ impl MIFrame {
         // resume-safe kind), distinct from a globals-dict write.  The
         // updated local rides the vable shadow to the live PyFrame through
         // `synchronize_virtualizable`.  No `code` needed (store_fast takes
-        // only the index); bypasses `apply_walker_stack_effect` because
-        // `pop_value` handles vsd.
+        // only the index); the hook handles its own valuestackdepth (no
+        // separate post-dispatch stack adjustment) because `pop_value`
+        // handles vsd.
         if let Instruction::StoreFast { var_num } = instruction {
             use pyre_interpreter::OpcodeStepExecutor;
             OpcodeStepExecutor::store_fast(self, var_num.get(op_arg).as_usize())?;
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
-        // BINARY_OP walker activation via trait-path delegation.
+        // BINARY_OP walker activation via `OpcodeStepExecutor` delegation.
         //
         // Same oparg-payload shape (the operator tag is read from an arm
         // register the r0-only entry leaves unbound).  Delegate to
@@ -7564,11 +7561,10 @@ impl MIFrame {
         // arithmetic IR (`int_add_ovf` &c. behind class guards), and pushes
         // the result.  Unlike the load/store hooks above this is MAY-RAISE
         // (TypeError on mismatched operands): `binary_op` returns
-        // `Err(PyError)`, which propagates through
-        // `dispatch_via_walker_for_opcode` to `trace_code_step` exactly as
-        // an `execute_opcode_step` error would on the trait leg, so the
-        // recorder's exception handling is identical on either dispatch
-        // leg.  Bypasses `apply_walker_stack_effect` because `pop_value` /
+        // `Err(PyError)`, which propagates to the walker so the
+        // recorder's exception handling matches an `execute_opcode_step`
+        // error.  The hook handles its own valuestackdepth (no separate
+        // post-dispatch stack adjustment) because `pop_value` /
         // `push_value` handle vsd.
         if let Instruction::BinaryOp { op } = instruction {
             use pyre_interpreter::OpcodeStepExecutor;
@@ -7576,7 +7572,8 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
-        // COMPARE_OP walker activation via trait-path delegation (non-fused).
+        // COMPARE_OP walker activation via `OpcodeStepExecutor` delegation
+        // (non-fused).
         //
         // The fused COMPARE_OP + POP_JUMP_IF_* path is handled earlier by
         // `try_fused_compare_goto_if_not` (pyjitpl.py:541-556 parity), which
@@ -7584,19 +7581,20 @@ impl MIFrame {
         // standalone (result-materialised) CompareOp the fusion declined.
         // Same MAY-RAISE shape as BinaryOp: delegate to
         // `OpcodeStepExecutor::compare_op` (the method `execute_compare_op`
-        // calls on the trait leg), which pops the two operands, emits the
+        // calls), which pops the two operands, emits the
         // typed comparison IR (IntLt/FloatLt behind class guards) or the
         // generic `compare_value` residual, and pushes the boxed bool.  The
-        // following PopJumpIf* / consumer reads that bool exactly as on the
-        // trait leg.  `pop_value` / `push_value` handle vsd; early return
-        // bypasses `apply_walker_stack_effect`.
+        // following PopJumpIf* / consumer reads that bool.
+        // `pop_value` / `push_value` handle vsd; the hook handles its own
+        // valuestackdepth (no separate post-dispatch stack adjustment).
         if let Instruction::CompareOp { opname } = instruction {
             use pyre_interpreter::OpcodeStepExecutor;
             OpcodeStepExecutor::compare_op(self, opname.get(op_arg))?;
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
-        // STORE_SUBSCR walker activation via trait-path delegation.
+        // STORE_SUBSCR walker activation via `MIFrame::store_subscr_value`
+        // delegation.
         //
         // The auto-gen arm jitcode for `StoreSubscr` is
         // `int_copy, residual_call_r_r(bh_execute_store_subscr, frame),
@@ -7611,7 +7609,7 @@ impl MIFrame {
         // slot) — so the pop reads NULL and the helper raises every
         // iteration, surfacing as `DispatchOutcome::SubRaise`.
         //
-        // Trait dispatch documents `MIFrame::store_subscr` as
+        // `MIFrame::store_subscr` is documented as
         // "trace-only, no concrete mutation" (compiled trace handles
         // real mutations later).  Mirror that here by short-circuiting
         // the arm walk: pop 3 via `SharedOpcodeHandler::pop_value`
@@ -7620,14 +7618,14 @@ impl MIFrame {
         // which records the same specialized IR shape
         // (`guard_class + SETARRAYITEM_GC` family via
         // `generated_store_subscr_value`, or `Call(jit_setitem, ...)`
-        // fallback via `trace_store_subscr`).  Bypasses the
-        // `apply_walker_stack_effect` post-walk step because
-        // `pop_value` already handles vsd.
+        // fallback via `trace_store_subscr`).  The hook handles its own
+        // valuestackdepth (no separate post-dispatch stack adjustment)
+        // because `pop_value` already handles vsd.
         //
-        // This delegation reuses the trait method intentionally; the
-        // 141 cutover can later replace it with a pure-walker variant
-        // once the walker grows symbolic-stack-aware specialization
-        // primitives.
+        // This delegation reuses `MIFrame::store_subscr_value`
+        // intentionally; the 141 cutover can later replace it with a
+        // pure-walker variant once the walker grows symbolic-stack-aware
+        // specialization primitives.
         if matches!(instruction, Instruction::StoreSubscr) {
             use pyre_interpreter::SharedOpcodeHandler;
             let _ = op_arg;
@@ -7653,20 +7651,20 @@ impl MIFrame {
         // registry, so `try_execute_residual_call_via_executor` rejects
         // its placeholder funcptr (47-bit gate) and the arm walk records
         // the call WITHOUT executing it.  The concrete `PyFrame.
-        // valuestackdepth` then never advances, and the post-walk
-        // `resync_sym_vsd_from_concrete_frame` clobbers
-        // `sym.valuestackdepth` with the stale frame value — losing every
-        // preceding trait-leg push and underflowing the next CALL
+        // valuestackdepth` then never advances, so re-deriving
+        // `sym.valuestackdepth` from the stale frame value would lose every
+        // preceding push and underflow the next CALL
         // (`LOAD_NAME f; PUSH_NULL; LOAD_NAME s; CALL` at module scope,
         // `f = g; f(s)` local-callable calls in function scope).
         //
         // Short-circuit the arm walk with the symbolic effect directly:
         // PUSH_NULL pushes a constant NULL stack slot (the `_null_or_self`
         // operand `opcode_call` pops and discards), so no IR op is needed —
-        // a `const_ref(PY_NULL)` through the trait push machinery keeps
+        // a `const_ref(PY_NULL)` through the push machinery keeps
         // `sym.valuestackdepth` / vable shadow / concrete mirror coherent.
-        // Same delegation pattern as the StoreSubscr hook above; bypasses
-        // `apply_walker_stack_effect` because `push_value` handles vsd.
+        // Same delegation pattern as the StoreSubscr hook above; the hook
+        // handles its own valuestackdepth (no separate post-dispatch stack
+        // adjustment) because `push_value` handles vsd.
         if matches!(instruction, Instruction::PushNull) {
             use pyre_interpreter::SharedOpcodeHandler;
             let _ = op_arg;
@@ -7680,45 +7678,43 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
-        // `pyopcode.py:1348-1376 RERAISE` parity for the walker leg.
+        // `pyopcode.py:1348-1376 RERAISE` parity for the walker.
         //
-        // Production walker excluded `Reraise` because the trait path
-        // returns `Err(PyError)` with `reraise_lasti` populated for
-        // `oparg > 0`, while a walker hook returning `StepResult::Continue`
-        // (`Ok`) loses that channel and `trace_code_step` aborts on
+        // A walker hook returning `StepResult::Continue` (`Ok`) would lose
+        // the `reraise_lasti` channel and the walker would abort on
         // `oparg > 0 && reraise_lasti < 0`.  Delegate to the existing
         // `MIFrame::reraise` impl (which mirrors `pyopcode.py:1357-1376`
         // verbatim, reading the lasti from `concrete_stack[stack_idx]`
         // and seeding `err.reraise_lasti`) and propagate its `Err` so
-        // `trace_code_step`'s `step_result.err().map(|e| e.reraise_lasti)`
-        // extraction works the same on either dispatch leg.
+        // the walker's `step_result.err().map(|e| e.reraise_lasti)`
+        // extraction works.
         if let Instruction::Reraise { depth } = instruction {
             use pyre_interpreter::OpcodeStepExecutor;
             OpcodeStepExecutor::reraise(self, depth.get(op_arg))?;
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
-        // RAISE_VARARGS walker activation via trait-path delegation.
+        // RAISE_VARARGS walker activation via `OpcodeStepExecutor`
+        // delegation.
         //
         // Structural twin of the Reraise hook above: `raise_varargs` always
         // returns `Err(PyError)` (it raises), seeding `last_exc_box` /
         // `last_exc_value` on the valid-raise path before returning.  The `?`
         // propagates that `Err` out as the dispatch `step_result`, exactly as
-        // `execute_raise_varargs` does on the trait leg; `trace_code_step`'s
-        // post-dispatch handling is keyed on the instruction type
+        // `execute_raise_varargs` does; the walker's post-dispatch handling
+        // is keyed on the instruction type
         // (`Instruction::RaiseVarargs` → `handle_raise_varargs` when
-        // `last_exc_box != NONE`, else `handle_possible_exception`), so it
-        // runs identically on either dispatch leg.  Unlike a branch guard
-        // this records no kept-stack snapshot, so the #124 resume gap does
-        // not apply.
+        // `last_exc_box != NONE`, else `handle_possible_exception`).  Unlike
+        // a branch guard this records no kept-stack snapshot, so the #124
+        // resume gap does not apply.
         if let Instruction::RaiseVarargs { argc } = instruction {
             use pyre_interpreter::OpcodeStepExecutor;
             OpcodeStepExecutor::raise_varargs(self, u32::from(argc.get(op_arg)) as usize)?;
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
-        // BUILD_TUPLE / UNPACK_SEQUENCE walker activation via trait-path
-        // delegation.
+        // BUILD_TUPLE / UNPACK_SEQUENCE walker activation via
+        // `OpcodeStepExecutor` delegation.
         //
         // These two opcodes carry a specialised, virtualization-aware
         // recorder (`MIFrame::trace_build_tuple_value` /
@@ -7732,13 +7728,13 @@ impl MIFrame {
         // flows through an inlined call).  Routing through the generic arm
         // walk would therefore both lose the virtualization and abort on
         // inlined tuples — so dispatch them here, reusing the exact shared
-        // opcode functions the trait leg runs
+        // opcode functions
         // (`OpcodeStepExecutor::build_tuple` → `opcode_build_tuple` →
         // `pop_n` + `SharedOpcodeHandler::build_tuple` + `push_value`).
         // `pop_n`/`pop_value`/`push_value` update the symbolic + concrete-
-        // shadow stacks + vsd shadow, so this bypasses
-        // `apply_walker_stack_effect` (the early `return` below skips both
-        // the arm walk and the post-walk resync).  Same delegation pattern
+        // shadow stacks + vsd shadow, so the hook handles its own
+        // valuestackdepth (no separate post-dispatch stack adjustment; the
+        // early `return` below skips the arm walk).  Same delegation pattern
         // as the StoreSubscr / PushNull / Reraise hooks above.
         if let Instruction::BuildTuple { count } = instruction {
             use pyre_interpreter::OpcodeStepExecutor;
@@ -7751,7 +7747,7 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
-        // BUILD_MAP walker activation via trait-path delegation.
+        // BUILD_MAP walker activation via `OpcodeStepExecutor` delegation.
         //
         // The auto-gen arm jitcode for `BuildMap` inlines the interpreter's
         // `SharedOpcodeHandler::build_map` (`build_map_from_refs`, eval.rs:1267)
@@ -7762,8 +7758,9 @@ impl MIFrame {
         // the BUILD_MAP IR + maintains the concrete dict shadow, exactly like
         // `build_tuple`), bypassing the concrete `build_map_from_refs` the arm
         // walk inlines.  `pop_n` (count*2) / `push_value` keep the symbolic +
-        // concrete-shadow stacks + vsd shadow coherent, so this bypasses
-        // `apply_walker_stack_effect`.  Same delegation pattern as the
+        // concrete-shadow stacks + vsd shadow coherent, so the hook handles
+        // its own valuestackdepth (no separate post-dispatch stack
+        // adjustment).  Same delegation pattern as the
         // BuildTuple / UnpackSequence hooks above.
         if let Instruction::BuildMap { count } = instruction {
             use pyre_interpreter::OpcodeStepExecutor;
@@ -7771,7 +7768,8 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
-        // STORE_FAST_STORE_FAST walker activation via trait-path delegation.
+        // STORE_FAST_STORE_FAST walker activation via `OpcodeStepExecutor`
+        // delegation.
         //
         // The auto-gen arm jitcode lowers to a chain of `residual_call` ops
         // whose funcptr `constants_i` entries are unresolved symbolic-hash
@@ -7784,7 +7782,7 @@ impl MIFrame {
         //
         // Both hazards are arm-walk-only.  Delegate to
         // `OpcodeStepExecutor::store_fast_store_fast` (→ `pop_value` ×2 +
-        // `store_local_value` ×2) exactly as trait dispatch does: `pop_value`
+        // `store_local_value` ×2): `pop_value`
         // is the symbolic pop and `store_local_value` records the
         // `setarrayitem_vable` write into the virtualizable locals (the
         // frame is forced on deopt), so there is no live-frame pop and no
@@ -7792,7 +7790,8 @@ impl MIFrame {
         // `var_nums_to_second_index` fold the paired local indices from
         // `op_arg` (the same `#[elidable_cannot_raise]` helpers the seam
         // uses).  Same delegation pattern as the BuildTuple / UnpackSequence
-        // hooks above; bypasses `apply_walker_stack_effect`.
+        // hooks above; the hook handles its own valuestackdepth (no separate
+        // post-dispatch stack adjustment).
         if let Instruction::StoreFastStoreFast { var_nums } = instruction {
             use pyre_interpreter::OpcodeStepExecutor;
             let idx1 = pyre_interpreter::var_nums_to_first_index(*var_nums, op_arg);
@@ -7809,14 +7808,14 @@ impl MIFrame {
         // frame and underflows (`pyframe.rs:1320`, raise_catch_loop /
         // exception_inlined_callee_caught) — the same live-frame-pop hazard the
         // StoreFastStoreFast / StoreSubscr hooks above avoid.  Delegate to the
-        // shared symbolic handlers the trait leg already runs: `opcode_pop_top`
+        // shared symbolic handlers: `opcode_pop_top`
         // (`pop_value`), `OpcodeStepExecutor::push_exc_info` /
         // `pop_except` (vable-only `pop_value`/`push_value` for the stack
         // effect plus the EC `sys_exc_value` save/restore GETFIELD_GC /
         // SETFIELD_GC).  `pop_value`/`push_value` keep the symbolic + vable
-        // shadow + vsd coherent, so this bypasses `apply_walker_stack_effect`
-        // (the early `return` skips both the arm walk and the post-walk
-        // resync).  Same delegation pattern as the hooks above.
+        // shadow + vsd coherent, so the hook handles its own valuestackdepth
+        // (no separate post-dispatch stack adjustment; the early `return`
+        // skips the arm walk).  Same delegation pattern as the hooks above.
         if matches!(instruction, Instruction::PopTop) {
             use pyre_interpreter::SharedOpcodeHandler;
             let _ = op_arg;
@@ -7842,14 +7841,14 @@ impl MIFrame {
         // the live frame via `try_execute_residual_call_via_executor`
         // (live-frame-pop underflow), and `validate_check_exc_match_class`'s
         // `Result` Ok/Err is a `SwitchValueNotConcrete` arm-walk abort.  The
-        // `MIFrame::check_exc_match` override records complete leg-independent
+        // `MIFrame::check_exc_match` override records complete
         // IR — symbolic `pop_value` of the match type, a read of the
         // raise-seeded `sym.last_exc_value`, and a `push_value` of a
         // `const_ref` bool (the immortal TRUE/FALSE singleton); it records no
         // guard and is in neither `instruction_may_raise` nor
         // `instruction_needs_pre_opcode_snapshot`, so there is no
-        // dispatch-leg-dependent snapshot.  The class-mismatch `TypeError`
-        // `?`-propagates as a trace Abort identically on either leg.  Same
+        // snapshot.  The class-mismatch `TypeError`
+        // `?`-propagates as a trace Abort.  Same
         // delegation pattern as the PopTop / PushExcInfo / PopExcept hooks.
         if matches!(instruction, Instruction::CheckExcMatch) {
             use pyre_interpreter::OpcodeStepExecutor;
@@ -7858,7 +7857,7 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
-        // COPY walker activation via trait-path delegation.
+        // COPY walker activation via `OpcodeStepExecutor` delegation.
         //
         // The auto-gen arm jitcode for `Copy` lowers `opcode_copy_value`
         // (`peek_at` + `push_value`), whose `Result<(), PyError>` Ok/Err
@@ -7873,7 +7872,8 @@ impl MIFrame {
         // constant slot).  Delegate to `OpcodeStepExecutor::copy_value`
         // exactly as `execute_copy` (pyopcode.rs:1989) does;
         // `peek_at`/`push_value` keep the symbolic + concrete-shadow stacks
-        // + vsd shadow coherent, so this bypasses `apply_walker_stack_effect`.
+        // + vsd shadow coherent, so the hook handles its own valuestackdepth
+        // (no separate post-dispatch stack adjustment).
         // Same delegation pattern as the PopTop / PushNull hooks above.
         if let Instruction::Copy { i } = instruction {
             use pyre_interpreter::OpcodeStepExecutor;
@@ -7888,16 +7888,14 @@ impl MIFrame {
         // is `pop_value` + `finish_value` -> `StepResult::Return(value)`; the
         // `Finish` + `ensure_boxed_for_ca` + `store_token_in_vable` are
         // emitted post-dispatch in `trace_step_result_to_action`'s Return
-        // arm, reached identically by both legs.  It CANNOT go via the arm
+        // arm.  It CANNOT go via the arm
         // walk: the arm's `ref_return/r` surfaces as
         // `DispatchOutcome::SubReturn` (`is_top_level=false`), the wrong shape
-        // for a root return.  The entry hook propagates the Return verbatim
-        // (`dispatch_via_walker_for_opcode` returns it unchanged).  It records
+        // for a root return.  The entry hook propagates the Return verbatim.
+        // It records
         // no guard and is in neither `instruction_may_raise` nor
-        // `instruction_needs_pre_opcode_snapshot`, so there is no
-        // dispatch-leg-dependent snapshot; the dispatch gate routes
-        // inline-frame ReturnValue to the trait leg, so only the root
-        // portal-exit case is flipped.
+        // `instruction_needs_pre_opcode_snapshot`, so there is no snapshot;
+        // only the root portal-exit ReturnValue case is handled here.
         if matches!(instruction, Instruction::ReturnValue) {
             use pyre_interpreter::OpcodeStepExecutor;
             let _ = op_arg;
@@ -7909,22 +7907,20 @@ impl MIFrame {
         // arm walk, whose `ref_return/r`-style terminator surfaces as
         // `DispatchOutcome::SubReturn` and whose top-level outcomes are
         // rejected; the loop close needs `StepResult::CloseLoop`, which only
-        // the entry hook can propagate.  Delegate to the same pub
-        // `execute_jump_backward` the trait dispatch arm calls
-        // (pyopcode.rs:2942), with `next_instr = self.orgpc + 1` — identical
-        // to the trait leg's `pc + 1`, since `set_orgpc(pc)` ran before the
+        // the entry hook can propagate.  Delegate to the pub
+        // `execute_jump_backward`
+        // (pyopcode.rs:2942), with `next_instr = self.orgpc + 1`, since
+        // `set_orgpc(pc)` ran before the
         // gate and `close_loop_args_at`'s loop-header override of `orgpc` has
         // not happened yet.  `jump_backward` returns `StepResult::CloseLoop`,
-        // which `dispatch_via_walker_for_opcode` propagates verbatim and
-        // `trace_step_result_to_action` maps to `CloseLoopWithArgs` — the
-        // identical mapping the trait leg uses.  Unlike PopJumpIf (two
-        // divergent recording paths), JumpBackward has a SINGLE shared
-        // `close_loop_args_at` reached identically by both legs, and is absent
-        // from `apply_walker_stack_effect` (zero net stack delta) and
-        // `instruction_needs_pre_opcode_snapshot`, so the GuardFutureCondition
-        // snapshot reads the same pre-gate orgpc / vable shadow / registers_r
-        // on either leg.  The dispatch gate keeps inline-frame JumpBackward on
-        // the trait leg.
+        // which the walker propagates verbatim and
+        // `trace_step_result_to_action` maps to `CloseLoopWithArgs`.  Unlike
+        // PopJumpIf (two divergent recording paths), JumpBackward has a
+        // SINGLE shared `close_loop_args_at`, handles its own valuestackdepth
+        // (zero net stack delta, no separate post-dispatch stack adjustment),
+        // and is absent from `instruction_needs_pre_opcode_snapshot`, so the
+        // GuardFutureCondition snapshot reads the pre-gate orgpc / vable
+        // shadow / registers_r.
         if matches!(instruction, Instruction::JumpBackward { .. }) {
             let next_instr = self.orgpc + 1;
             let step = pyre_interpreter::execute_jump_backward(
@@ -8006,437 +8002,6 @@ impl MIFrame {
         }
 
         Ok(None)
-    }
-
-    /// `is_top_level=false` so the arm's `ref_return/r` terminator
-    /// surfaces as `DispatchOutcome::SubReturn` rather than emitting a
-    /// `Finish` (the outer Python frame's `Finish` is owned by the
-    /// trace_opcode dispatch's higher-level Return/Yield/CloseLoop
-    /// handling, not the per-opcode arm).
-    pub(crate) fn dispatch_via_walker_for_opcode(
-        &mut self,
-        instruction: &Instruction,
-        op_arg: pyre_interpreter::OpArg,
-        code: &CodeObject,
-    ) -> Result<pyre_interpreter::StepResult<FrontendOp>, PyError> {
-        // PyPy `_opimpl_*` direct-record entry point — opcodes that bypass
-        // the auto-gen arm-jitcode walk and emit IR / produce concrete
-        // effects directly, matching `MetaInterp.interpret`'s upstream
-        // dispatch shape (`pyjitpl.py:1346+ _opimpl_*`).
-        //
-        // Returns `Some(step_result)` when the opcode was handled here.
-        // The arm-jitcode walker below runs only when this returns `None`.
-        if let Some(step_result) =
-            self.try_walker_direct_opcode_dispatch(instruction, op_arg, code)?
-        {
-            return Ok(step_result);
-        }
-
-        let jitcode = match crate::jitcode_runtime::jitcode_for_instruction(instruction) {
-            Some(jc) => jc,
-            None => {
-                // The production-walker allow-list (`production_walker_handles`)
-                // expanded ahead of `jitcode_for_instruction` registering an
-                // arm for `instruction`; degrade to a trace abort so the
-                // outer tracer can fall back instead of crashing.
-                if majit_metainterp::majit_log_enabled() {
-                    eprintln!(
-                        "[jit][abort-reason] dispatch_via_walker_for_opcode \
-                         no_codewriter_arm instr={:?}",
-                        instruction,
-                    );
-                }
-                return Err(trace_abort_error(
-                    "production walker allow-listed instruction has no codewriter arm",
-                ));
-            }
-        };
-
-        let (done_void, done_int, done_ref, done_float, exit_exc_ref) =
-            {
-                let sd = self.ctx().metainterp_sd();
-                let void = sd.done_with_this_frame_descr_void.clone().expect(
-                    "done_with_this_frame_descr_void must be wired before production walker",
-                );
-                let int = sd.done_with_this_frame_descr_int.clone().expect(
-                    "done_with_this_frame_descr_int must be wired before production walker",
-                );
-                let ref_ = sd.done_with_this_frame_descr_ref.clone().expect(
-                    "done_with_this_frame_descr_ref must be wired before production walker",
-                );
-                let float = sd.done_with_this_frame_descr_float.clone().expect(
-                    "done_with_this_frame_descr_float must be wired before production walker",
-                );
-                let exc = sd.exit_frame_with_exception_descr_ref.clone().expect(
-                    "exit_frame_with_exception_descr_ref must be wired before production walker",
-                );
-                (void, int, ref_, float, exc)
-            };
-
-        let sub_jitcode_lookup = |idx: usize| -> Option<crate::jitcode_dispatch::SubJitCodeBody> {
-            let all = crate::jitcode_runtime::all_jitcodes();
-            all.get(idx)
-                .map(|jc| crate::jitcode_dispatch::SubJitCodeBody {
-                    code: jc.code.as_slice(),
-                    num_regs_r: jc.num_regs_r() as usize,
-                    num_regs_i: jc.num_regs_i() as usize,
-                    num_regs_f: jc.num_regs_f() as usize,
-                    constants_i: jc.constants_i.as_slice(),
-                    constants_r: jc.constants_r.as_slice(),
-                    constants_f: jc.constants_f.as_slice(),
-                })
-        };
-
-        // Per-opcode arm entry allocates fresh
-        // per-jitcode register banks and seeds r0 = sym.frame.  This
-        // matches RPython MIFrame.setup (`pyjitpl.py:74-91`) and breaks
-        // the prior alias of sym.registers_r (semantic frame mirror)
-        // into the walker's r0..rN — the structural blocker documented
-        // in `project_issue73_phase5_design.md`.  `jitcode_for_instruction`
-        // returns an Arc<JitCode> over the registry's `'static`
-        // collection; the leak below upgrades the borrow to `'static`
-        // for the duration of this call.
-        let entry_jitcode: &'static majit_translate::jitcode::JitCode =
-            unsafe { &*(jitcode.as_ref() as *const majit_translate::jitcode::JitCode) };
-        let walk_result = crate::jitcode_dispatch::dispatch_via_miframe_at_opcode_entry(
-            self,
-            entry_jitcode,
-            crate::jitcode_runtime::all_descr_refs(),
-            &sub_jitcode_lookup,
-            done_ref,
-            done_int,
-            done_float,
-            done_void,
-            exit_exc_ref,
-        );
-
-        use crate::jitcode_dispatch::DispatchOutcome;
-        match walk_result {
-            Ok((DispatchOutcome::SubReturn { .. }, _)) => {
-                // The walker arm records IR for the
-                // opcode but does NOT run the trait dispatch's
-                // `MIFrame::pop_value` / `push_typed_value` paths that
-                // mutate `sym.valuestackdepth`.  Apply the opcode's net
-                // stack effect here so the symbolic mirror stays
-                // consistent with the IR the walker just emitted, matching
-                // how the trait dispatch advances `sym.valuestackdepth` via
-                // its own push/pop trait methods.
-                apply_walker_stack_effect(self, instruction);
-                Ok(pyre_interpreter::StepResult::Continue)
-            }
-            Ok((outcome, _)) => {
-                // Allow-list expansion let an opcode through whose arm
-                // returns something other than `SubReturn` (e.g. an arm
-                // that emits `Finish` or `Goto`); the walker leg cannot
-                // unify with `trace_code_step`'s top-level control flow
-                // for those, so abort the trace and let `trace_code_step`
-                // fall back to the trait dispatch.
-                if majit_metainterp::majit_log_enabled() {
-                    eprintln!(
-                        "[jit][abort-reason] dispatch_via_walker_for_opcode \
-                         unexpected_outcome instr={:?} outcome={:?}",
-                        instruction, outcome,
-                    );
-                }
-                Err(trace_abort_error(
-                    "production walker received unexpected dispatch outcome",
-                ))
-            }
-            Err(e) => {
-                // Walker dispatch raised a structured error (e.g.
-                // `GotoIfNotValueNotConcrete`, register-bank size
-                // mismatch).  Surface as a trace abort so production
-                // recovers rather than crashing the process.
-                if majit_metainterp::majit_log_enabled() {
-                    eprintln!(
-                        "[jit][abort-reason] dispatch_via_walker_for_opcode \
-                         walker_error instr={:?} err={:?}",
-                        instruction, e,
-                    );
-                }
-                Err(trace_abort_error("production walker dispatch failed"))
-            }
-        }
-    }
-
-    /// True for the method-form `LOAD_ATTR` of a foldable builtin list
-    /// method (`append` / `pop` / `reverse`) on a concrete list receiver
-    /// at TOS.  The dispatch gate routes exactly this shape OFF the
-    /// walker leg so `MIFrame::load_method` can resolve it to a
-    /// class-guarded Const unbound function instead of the walker arm's
-    /// residual getattr (which materialises a fresh bound method every
-    /// iteration and resolves to a null callable on blackhole CALL
-    /// re-execution).
-    fn is_foldable_list_method_load_attr(
-        &self,
-        instruction: &Instruction,
-        op_arg: pyre_interpreter::OpArg,
-        code: &CodeObject,
-    ) -> bool {
-        let Instruction::LoadAttr { namei } = instruction else {
-            return false;
-        };
-        let attr = namei.get(op_arg);
-        if !attr.is_method() {
-            return false;
-        }
-        let Some(name) = code.names.get(attr.name_idx() as usize) else {
-            return false;
-        };
-        if !matches!(name.as_ref(), "append" | "pop" | "reverse") {
-            return false;
-        }
-        let s = self.sym();
-        let Some(stack_idx) = s.valuestackdepth.checked_sub(s.nlocals + 1) else {
-            return false;
-        };
-        matches!(
-            s.concrete_stack.get(stack_idx),
-            Some(ConcreteValue::Ref(obj)) if !obj.is_null() && unsafe { is_list(*obj) }
-        )
-    }
-
-    pub fn trace_code_step(&mut self, code: &CodeObject, pc: usize) -> TraceAction {
-        if pc >= code.instructions.len() {
-            if majit_metainterp::majit_log_enabled() {
-                eprintln!(
-                    "[jit][abort-reason] trace_code_step pc_oob pc={} code_len={}",
-                    pc,
-                    code.instructions.len()
-                );
-            }
-            return TraceAction::Abort;
-        }
-
-        let Some((instruction, op_arg)) = decode_instruction_at(code, pc) else {
-            if majit_metainterp::majit_log_enabled() {
-                eprintln!(
-                    "[jit][abort-reason] trace_code_step decode_failed pc={}",
-                    pc
-                );
-            }
-            return TraceAction::Abort;
-        };
-
-        // Resolve each opcode to its per-arm jitcode
-        // through the shared `MetaInterpStaticData.jitcodes` table
-        // (RPython `CallControl.jitcodes ≡ metainterp_sd.jitcodes`,
-        // warmspot.py:281-282). Env-gated log-only probe — no execution —
-        // confirming the build→runtime bridge stays in sync.
-        // `unresolved` logs the single-variant miss so a dispatch
-        // gap surfaces immediately.
-        if std::env::var_os("PYRE_JIT_JITCODE_PROBE").is_some() {
-            match crate::jitcode_runtime::jitcode_for_instruction(&instruction) {
-                Some(jc) => {
-                    // Walk the jitcode byte stream using the insns argcode
-                    // protocol (blackhole.py:105-232 `_get_method.handler`).
-                    // `complete` flags whether the decoder reached
-                    // `code.len()` without hitting an unknown opcode — a
-                    // structural check the probe can surface per-opcode.
-                    let mut opnames = Vec::new();
-                    let mut last_next = 0usize;
-                    for op in crate::jitcode_runtime::decoded_ops(&jc.code) {
-                        opnames.push(op.opname);
-                        last_next = op.next_pc;
-                    }
-                    let complete = last_next == jc.code.len();
-                    eprintln!(
-                        "[jit][probe] pc={pc} instr={} arm_jitcode={} code_len={} ops={} complete={} trace={:?}",
-                        crate::jitcode_runtime::instruction_variant_name(&instruction),
-                        jc.name,
-                        jc.code.len(),
-                        opnames.len(),
-                        complete,
-                        opnames,
-                    );
-                }
-                None => eprintln!(
-                    "[jit][probe] pc={pc} instr={} unresolved",
-                    crate::jitcode_runtime::instruction_variant_name(&instruction),
-                ),
-            }
-        }
-
-        self.set_orgpc(pc);
-        self.prepare_fallthrough();
-        // RPython pyjitpl.py captures resumedata at each guard site, not at
-        // every opcode boundary. Pyre still needs an opcode-start snapshot
-        // for stack-machine opcodes that can mutate stack/register state
-        // before emitting a guard; keep it off for instructions that cannot
-        // reach a guard at all.
-        let needs_pre_opcode_snapshot =
-            crate::state::instruction_needs_pre_opcode_snapshot(instruction);
-        if needs_pre_opcode_snapshot {
-            self.capture_pre_opcode_state();
-        }
-        // pyjitpl.py:541-556 opimpl_goto_if_not_<op>_<type> parity: when
-        // the CompareOp is followed by PopJumpIf* and operands form a
-        // compatible int/float pair, run the fused dispatch path and
-        // skip the separate PopJumpIf* dispatch entirely.
-        let fused_result = if let Instruction::CompareOp { opname } = instruction {
-            let comp_op = opname.get(op_arg);
-            match self.try_fused_compare_goto_if_not(code, pc, comp_op) {
-                Ok(Some(action)) => Some(Ok(action)),
-                Ok(None) => None,
-                Err(e) => Some(Err(e)),
-            }
-        } else {
-            None
-        };
-        let step_result = match fused_result {
-            Some(Ok(action)) => {
-                // Fused path consumed COMPARE + BRANCH. Clear snapshot
-                // and return the action immediately (matches the
-                // post-dispatch clear that normally follows
-                // execute_opcode_step below).
-                if needs_pre_opcode_snapshot {
-                    self.clear_pre_opcode_state();
-                }
-                return action;
-            }
-            Some(Err(e)) => Err(e),
-            None => {
-                // Inline-frame gate (PopTop activation):
-                // `walker_capture_snapshot_for_last_guard` only captures a
-                // single Python frame (the outer pyjitcode coordinates,
-                // jitcode_dispatch.rs:3568) because pyre's blackhole cannot
-                // resume into helper/sub jitcodes.  For inline-traced sub
-                // frames (`self.parent_frames` non-empty), the snapshot
-                // must carry the full framestack chain to make the resume
-                // point well-defined; walker dispatch in that context drops
-                // the parent frames, so deopt would re-enter at the wrong
-                // PyFrame.  Until the walker grows multi-frame snapshot
-                // capture (analogous to `capture_snapshot_for_last_guard_
-                // multi_frame_with_vable_vref`), fall back to trait
-                // dispatch in inline frames.
-                let in_inline_frame = !self.parent_frames.is_empty();
-                let foldable_list_load_attr =
-                    self.is_foldable_list_method_load_attr(&instruction, op_arg, code);
-                if production_walker_handles(&instruction)
-                    && !in_inline_frame
-                    && !foldable_list_load_attr
-                {
-                    self.dispatch_via_walker_for_opcode(&instruction, op_arg, code)
-                } else {
-                    if flip_probe_enabled() {
-                        let reason = if !production_walker_handles(&instruction) {
-                            "not-in-allowlist"
-                        } else if in_inline_frame {
-                            "in-inline-frame"
-                        } else {
-                            "foldable-list-load-attr"
-                        };
-                        flip_probe_record(&instruction, reason);
-                    }
-                    let shadow_outcome =
-                        crate::shadow_walker::shadow_validate_pre(self, &instruction, op_arg);
-                    let result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
-                    if result.is_ok() {
-                        if let Some(outcome) = shadow_outcome {
-                            crate::shadow_walker::shadow_validate_post(self, outcome);
-                        }
-                    }
-                    result
-                }
-            }
-        };
-        // Clear pre-opcode snapshot immediately after opcode execution.
-        // RPython: capture_resumedata is called at each guard; there is
-        // no per-opcode snapshot lifecycle. Clearing here ensures the
-        // snapshot doesn't leak into subsequent opcodes.
-        if needs_pre_opcode_snapshot {
-            self.clear_pre_opcode_state();
-        }
-        // RPython execute_ll_raised parity: generic exc=True ops store the
-        // exception in last_exc_value before handle_possible_exception.
-        // Valid raise/reraise paths seed `last_exc_box` directly; malformed
-        // bytecode-level raises still surface as ordinary interpreter errors
-        // and use the generic raised-exception path below.
-        if step_result.as_ref().err().is_some_and(is_trace_abort_error) {
-            return TraceAction::Abort;
-        }
-        if let Err(ref err) = step_result {
-            if !matches!(
-                instruction,
-                Instruction::Reraise { .. } | Instruction::RaiseVarargs { .. }
-            ) || self.sym().last_exc_box == OpRef::NONE
-            {
-                let exc_obj = err.to_exc_object();
-                let s = self.sym_mut();
-                if s.last_exc_value.is_null() {
-                    s.last_exc_value = exc_obj;
-                }
-            }
-        }
-        if let Instruction::Reraise { depth } = instruction {
-            // `pyopcode.py:1361` RERAISE extracts the saved lasti from the
-            // stack and routes through RaiseWithExplicitTraceback, which
-            // becomes `err.reraise_lasti` on our PyError.  When `oparg != 0`
-            // and the trace could not fold a const-int from the symbolic
-            // slot (`reraise()` returned -1), bail to the interpreter — the
-            // trace cannot represent a dynamic lasti at handler-entry push
-            // time as a constant int box.
-            let oparg_val = depth.get(op_arg);
-            let reraise_lasti = step_result
-                .as_ref()
-                .err()
-                .map(|e| e.reraise_lasti)
-                .unwrap_or(-1);
-            if oparg_val != 0 && reraise_lasti < 0 {
-                return TraceAction::Abort;
-            }
-            if self.sym().last_exc_box != OpRef::NONE {
-                return self.handle_reraise(code, pc, reraise_lasti);
-            }
-            // `last_exc_box == NONE` for RERAISE means the trace entered an
-            // except* handler without observing the prior PUSH_EXC_INFO —
-            // anomalous.  If the RERAISE carried a saved lasti, the
-            // generic handle_possible_exception fallback would drop it
-            // (its inner finishframe_exception call passes -1).  Abort so
-            // the interpreter handles the case faithfully.
-            if oparg_val != 0 {
-                return TraceAction::Abort;
-            }
-            if step_result.is_err() {
-                return self.handle_possible_exception(code, pc);
-            }
-        }
-        if let Instruction::RaiseVarargs { argc } = instruction {
-            if self.sym().last_exc_box != OpRef::NONE {
-                return self.handle_raise_varargs(code, pc, argc.get(op_arg) as usize);
-            }
-            if step_result.is_err() {
-                return self.handle_possible_exception(code, pc);
-            }
-        }
-        // RPython pyjitpl.py:1956-1957 execute_varargs: exc=True ops
-        // always call handle_possible_exception, which internally decides
-        // GUARD_EXCEPTION vs GUARD_NO_EXCEPTION.
-        if instruction_may_raise(instruction) {
-            let action = self.handle_possible_exception(code, pc);
-            if !matches!(action, TraceAction::Continue) {
-                return action;
-            }
-            // RPython: handle_possible_exception consumes the exception.
-            // If it returned Continue, the exception was handled (e.g.,
-            // GUARD_EXCEPTION emitted) and tracing continues normally.
-            // Treat handled exceptions as successful opcode completion.
-            if step_result.is_err() {
-                return TraceAction::Continue;
-            }
-        }
-        match step_result {
-            Err(ref e) => {
-                if majit_metainterp::majit_log_enabled() {
-                    eprintln!(
-                        "[jit][abort-reason] trace_code_step err at pc={} instr={:?} err={:?}",
-                        pc, instruction, e
-                    );
-                }
-                TraceAction::Abort
-            }
-            other => self.into_trace_action(other),
-        }
     }
 
     /// RPython pyjitpl.py:3380 handle_possible_exception.
@@ -8778,229 +8343,6 @@ impl MIFrame {
             TraceAction::Abort
         }
     }
-
-    pub fn trace_code_step_inline(
-        &mut self,
-        code: &CodeObject,
-        pc: usize,
-    ) -> InlineTraceStepAction {
-        if pc >= code.instructions.len() {
-            if majit_metainterp::majit_log_enabled() {
-                eprintln!(
-                    "[jit][abort-reason] trace_code_step_inline pc_oob pc={} code_len={}",
-                    pc,
-                    code.instructions.len()
-                );
-            }
-            return InlineTraceStepAction::Trace(TraceAction::Abort);
-        }
-
-        let Some((instruction, op_arg)) = decode_instruction_at(code, pc) else {
-            if majit_metainterp::majit_log_enabled() {
-                eprintln!(
-                    "[jit][abort-reason] trace_code_step_inline decode_failed pc={}",
-                    pc
-                );
-            }
-            return InlineTraceStepAction::Trace(TraceAction::Abort);
-        };
-
-        self.set_orgpc(pc);
-        self.prepare_fallthrough();
-        // Keep inline-frame guard capture aligned with the root-frame path:
-        // only opcodes that can actually reach a guard carry an opcode-start
-        // snapshot, and specific guard paths may still suppress it.
-        let needs_pre_opcode_snapshot =
-            crate::state::instruction_needs_pre_opcode_snapshot(instruction);
-        if needs_pre_opcode_snapshot {
-            self.capture_pre_opcode_state();
-        }
-        // pyjitpl.py:541-556 fused COMPARE_OP + PopJumpIf* parity (see
-        // trace_code_step's counterpart for the full rationale).
-        let fused_result = if let Instruction::CompareOp { opname } = instruction {
-            let comp_op = opname.get(op_arg);
-            match self.try_fused_compare_goto_if_not(code, pc, comp_op) {
-                Ok(Some(action)) => Some(Ok(action)),
-                Ok(None) => None,
-                Err(e) => Some(Err(e)),
-            }
-        } else {
-            None
-        };
-        let step_result = match fused_result {
-            Some(Ok(action)) => {
-                // Symmetry with trace_code_step: if pre_opcode_* were ever
-                // captured for the inline frame (none do today, but future
-                // work may add it), clear them on the fused-return path the
-                // same way the non-inline path does at the post-dispatch
-                // clear below.
-                if needs_pre_opcode_snapshot {
-                    self.clear_pre_opcode_state();
-                }
-                return InlineTraceStepAction::Trace(action);
-            }
-            Some(Err(e)) => Err(e),
-            None => {
-                // Inline-frame gate: `trace_code_step_inline` always
-                // steps in an inline-traced sub frame, so
-                // `walker_capture_snapshot_for_last_guard`'s single-frame
-                // capture would drop the parent chain (see comment in
-                // `trace_code_step` for full rationale).  Walker dispatch
-                // remains disabled here until multi-frame walker
-                // snapshots land; route every opcode through trait
-                // dispatch so the snapshot encoder sees a fully formed
-                // framestack at every guard.  Shadow validation is gated
-                // the same way: `shadow_validate_pre` runs the symbolic
-                // walker, which captures a single-frame snapshot under
-                // `MAJIT_SHADOW_WALKER=1` and would diverge from the
-                // trait dispatcher's multi-frame view in inline frames.
-                if flip_probe_enabled() {
-                    let reason = if self.parent_frames.is_empty() {
-                        "toplevel-inline-step"
-                    } else {
-                        "inline-frame"
-                    };
-                    flip_probe_record(&instruction, reason);
-                }
-                let shadow_outcome = if self.parent_frames.is_empty() {
-                    crate::shadow_walker::shadow_validate_pre(self, &instruction, op_arg)
-                } else {
-                    None
-                };
-                let result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
-                if result.is_ok() {
-                    if let Some(outcome) = shadow_outcome {
-                        crate::shadow_walker::shadow_validate_post(self, outcome);
-                    }
-                }
-                result
-            }
-        };
-        if needs_pre_opcode_snapshot {
-            self.clear_pre_opcode_state();
-        }
-        // RPython execute_ll_raised parity: generic exc=True ops store the
-        // exception in last_exc_value. Valid raise/reraise paths seed
-        // `last_exc_box` directly; malformed bytecode-level raises still
-        // use the generic raised-exception path below.
-        if step_result.as_ref().err().is_some_and(is_trace_abort_error) {
-            return InlineTraceStepAction::Trace(TraceAction::Abort);
-        }
-        if let Err(ref err) = step_result {
-            if !matches!(
-                instruction,
-                Instruction::Reraise { .. } | Instruction::RaiseVarargs { .. }
-            ) || self.sym().last_exc_box == OpRef::NONE
-            {
-                let exc_obj = err.to_exc_object();
-                let s = self.sym_mut();
-                if s.last_exc_value.is_null() {
-                    s.last_exc_value = exc_obj;
-                }
-            }
-        }
-        if let Instruction::Reraise { depth } = instruction {
-            // Mirror the root-frame dispatcher: thread `err.reraise_lasti`
-            // into `handle_reraise`, abort if `oparg != 0 && lasti < 0`
-            // (trace cannot fold a const-int from the symbolic stack — fall
-            // back to interpreter via TraceAction::Abort).
-            let oparg_val = depth.get(op_arg);
-            let reraise_lasti = step_result
-                .as_ref()
-                .err()
-                .map(|e| e.reraise_lasti)
-                .unwrap_or(-1);
-            if oparg_val != 0 && reraise_lasti < 0 {
-                // Wipe the trace's tracked exception state so the
-                // metainterp's Abort handler skips its in-trace
-                // `finishframe_exception` (which would otherwise dispatch
-                // a handler-entry push with `reraise_lasti=-1`,
-                // synthesizing the WRONG lasti the interpreter would
-                // then resume with).  `executor.reraise()` only mutated
-                // the symbolic stack and emitted IR — both abandoned on
-                // abort.  The concrete PyFrame is untouched, so the
-                // interpreter re-runs RERAISE freshly via its own
-                // `peekvalue(oparg)` path and gets the correct saved
-                // lasti from runtime state.
-                let s = self.sym_mut();
-                s.last_exc_value = pyre_object::PY_NULL;
-                s.last_exc_box = OpRef::NONE;
-                return InlineTraceStepAction::Trace(TraceAction::Abort);
-            }
-            if self.sym().last_exc_box != OpRef::NONE {
-                return InlineTraceStepAction::Trace(self.handle_reraise(code, pc, reraise_lasti));
-            }
-            // Same rationale as root dispatcher: abort RERAISE-with-saved-
-            // lasti when the trace lacks a tracked exception box (generic
-            // fallback would drop the lasti).
-            if oparg_val != 0 {
-                // last_exc_box is already NONE here; keep last_exc_value
-                // clear for symmetry with the const-fold-abort branch
-                // above so metainterp's `has_exc` check observes no
-                // tracked exception either way.
-                self.sym_mut().last_exc_value = pyre_object::PY_NULL;
-                return InlineTraceStepAction::Trace(TraceAction::Abort);
-            }
-            if step_result.is_err() {
-                return InlineTraceStepAction::Trace(self.handle_possible_exception(code, pc));
-            }
-        }
-        if let Instruction::RaiseVarargs { argc } = instruction {
-            if self.sym().last_exc_box != OpRef::NONE {
-                return InlineTraceStepAction::Trace(self.handle_raise_varargs(
-                    code,
-                    pc,
-                    argc.get(op_arg) as usize,
-                ));
-            }
-            if step_result.is_err() {
-                return InlineTraceStepAction::Trace(self.handle_possible_exception(code, pc));
-            }
-        }
-        if instruction_may_raise(instruction) {
-            let exc_action = self.handle_possible_exception(code, pc);
-            if !matches!(exc_action, TraceAction::Continue) {
-                return InlineTraceStepAction::Trace(exc_action);
-            }
-            if step_result.is_err() {
-                return InlineTraceStepAction::Trace(TraceAction::Continue);
-            }
-        }
-        let action = match step_result {
-            Ok(pyre_interpreter::StepResult::Return(value)) => {
-                // pyjitpl.py:2489-2502 compile_done_with_this_frame parity:
-                // result_type is always REF. ensure_boxed_for_ca re-boxes
-                // unboxed Int/Float values (NewWithVtable + SetfieldGc).
-                let v = value.opref;
-                let finish_value =
-                    self.with_ctx(|this, ctx| crate::state::ensure_boxed_for_ca(ctx, this, v));
-                TraceAction::Finish {
-                    finish_args: vec![finish_value],
-                    finish_arg_types: vec![Type::Ref],
-                    exit_with_exception: false,
-                }
-            }
-            Err(_) => TraceAction::Abort,
-            other => self.into_trace_action(other),
-        };
-        match action {
-            TraceAction::Continue => {
-                if let Some(mut pending) = self.pending_inline_frame.take() {
-                    let sym = self.sym();
-                    let result_idx = sym
-                        .valuestackdepth
-                        .saturating_sub(sym.nlocals)
-                        .checked_sub(1)
-                        .expect("pending inline frame missing caller result slot");
-                    pending.caller_result_stack_idx = Some(result_idx);
-                    InlineTraceStepAction::PushFrame(pending)
-                } else {
-                    InlineTraceStepAction::Trace(TraceAction::Continue)
-                }
-            }
-            other => InlineTraceStepAction::Trace(other),
-        }
-    }
 }
 
 /// Returns (is_int, is_float) for the fused-dispatch fuseability gate.
@@ -9033,552 +8375,6 @@ unsafe fn trace_check_exc_match_against(
         return false;
     };
     pyre_interpreter::baseobjspace::exception_match(w_exc_class, exc_type)
-}
-
-/// Production-walker allow-list for the walker cutover.
-///
-/// RPython parity: `pyjitpl.py:1892 MetaInterp._interpret` dispatches
-/// every opcode through the single jitcode-bytecode path; there is no
-/// dual trait/walker split upstream.  This predicate names the Python
-/// instructions for which pyre has already retired the root-frame trait
-/// dispatch — for those, `trace_code_step` routes directly through
-/// `MIFrame::dispatch_via_walker_for_opcode` and the root-frame trait
-/// path is dead code at runtime.  `trace_code_step_inline` intentionally
-/// stays on the trait path until walker snapshots can encode the full
-/// parent-frame chain.  The trait impl will be removed once every opcode
-/// is in this set and the inline-frame snapshot gap is closed.
-///
-/// The pre-jtransform unit-variant fold
-/// (`translator/rtyper/unit_variant_fold.rs::fold_unit_variant_ctors`)
-/// unblocked the Nop family by rewriting zero-arg
-/// `SyntheticTransparentCtor` calls (`StepResult::Continue`,
-/// `LoopResult::Done`, …) to `OpKind::ConstRef(prebuilt_instance)` on
-/// `model::FunctionGraph` before `Transformer::transform` runs.  Arm
-/// bytes then decode to the real no-op shape (`ref_return/r …`) without
-/// residual-call wrappers, so the Nop batch — plus every entry below —
-/// is safe to dispatch via walker today.
-///
-/// Subsequent batches grow this set until it covers every Python
-/// opcode.  The remaining wall is execution-side, not recording-side:
-/// `eval_loop_jit` skips `execute_opcode_step` for walker-handled
-/// opcodes, which is correct only when the arm body's heap effects ride
-/// `vable_setfield` / `setarrayitem_vable_r`, or when walker dispatch
-/// concrete-executes any non-elidable `residual_call` through
-/// `try_execute_residual_call_via_executor`.
-/// The trait infra is deleted only after this predicate covers every
-/// opcode.
-///
-pub fn production_walker_handles(instruction: &Instruction) -> bool {
-    // The unit-variant fold rewrites `StepResult::Continue` &c. to
-    // `ConstRef(prebuilt_instance)`; the assembler lowers `ConstRef`
-    // through `ref_copy/r>r` (`assembler.rs::emit_const_r`), so arms
-    // decode without residual-call wrappers around unit variants.
-    //
-    // BuildTuple / UnpackSequence are walker-handled via the
-    // `try_walker_direct_opcode_dispatch` entry hook (NOT the auto-gen arm
-    // jitcode): the hook delegates to `OpcodeStepExecutor::build_tuple` /
-    // `unpack_sequence`, which run the specialised arity-2 tuple
-    // build/unpack fast paths (`trace_build_tuple_value` /
-    // `unpack_sequence_value`).  The generic arm jitcode CANNOT express
-    // those (it records the opaque `bh_build_tuple` residual and aborts
-    // `InlineCallArityMismatch` when the tuple flows through an inlined
-    // call), so the direct hook is the orthodox dispatch — the same shape
-    // as the StoreSubscr / PushNull / Reraise hooks.
-    //
-    // StoreFastStoreFast is walker-handled via the
-    // `try_walker_direct_opcode_dispatch` entry hook (NOT the auto-gen arm
-    // jitcode): the hook delegates to
-    // `OpcodeStepExecutor::store_fast_store_fast`, whose symbolic
-    // `pop_value` + `store_local_value` (`setarrayitem_vable`) avoid both
-    // arm-walk hazards — the unresolved placeholder funcptrs the arm `blr`s
-    // and the concrete live-frame `PyFrame::pop` underflow.  See the hook
-    // comment for detail.
-    matches!(
-        instruction,
-        Instruction::Nop
-            // LoadConst handled by the dispatch_via_walker_for_opcode entry
-            // hook: resolves the constant from `consti` + the code pool and
-            // delegates to `OpcodeStepExecutor::load_const`, whose
-            // `push_value` advances vsd.  The auto-gen arm residualises
-            // `opcode_load_const(frame, &ConstantData)` with the
-            // oparg-derived `&ConstantData` operand left unbound by the
-            // r0-only arm entry (ResidualCallArgUnbound).
-            | Instruction::LoadConst { .. }
-            // LoadSmallInt handled by the entry hook (const-push sibling of
-            // LoadConst; small int in the oparg → load_small_int → int
-            // ConstRef + push_value).
-            | Instruction::LoadSmallInt { .. }
-            // LoadFast / LoadFastBorrow handled by the
-            // dispatch_via_walker_for_opcode entry hook: resolves the
-            // var_num local index + name and delegates to
-            // OpcodeStepExecutor::load_fast_checked (push_value advances
-            // vsd).  The auto-gen arm reads the var_num oparg payload from
-            // a register the r0-only arm entry leaves unbound.
-            | Instruction::LoadFast { .. }
-            | Instruction::LoadFastBorrow { .. }
-            // LoadFastLoadFast / LoadFastBorrowLoadFastBorrow handled by the
-            // dispatch_via_walker_for_opcode entry hook: resolves both packed
-            // var_num local indices + names and delegates to
-            // OpcodeStepExecutor::load_fast_pair_checked (two trace-aware
-            // load_local_value + push_value pairs).  The auto-gen arm reads
-            // the packed var_nums oparg payload from a register the r0-only
-            // arm entry leaves unbound — same gap as the single LoadFast.
-            | Instruction::LoadFastLoadFast { .. }
-            | Instruction::LoadFastBorrowLoadFastBorrow { .. }
-            // StoreFast handled by the dispatch_via_walker_for_opcode entry
-            // hook: delegates to OpcodeStepExecutor::store_fast (pop_value
-            // advances vsd, setarrayitem_vable_r writes the local).
-            // Distinct from StoreFastStoreFast, which stays trait-routed
-            // (#405 arm-entry var_nums seeding).
-            | Instruction::StoreFast { .. }
-            // BinaryOp handled by the dispatch_via_walker_for_opcode entry
-            // hook: delegates to OpcodeStepExecutor::binary_op (pop_value
-            // ×2 + specialised arithmetic IR + push_value).  May-raise; the
-            // Err propagates to trace_code_step like the trait leg.
-            | Instruction::BinaryOp { .. }
-            // CompareOp (non-fused) handled by the entry hook: delegates to
-            // OpcodeStepExecutor::compare_op (typed comparison IR or generic
-            // compare_value residual + push bool). May-raise; Err propagates
-            // like the trait leg. The fused compare+branch path is handled
-            // earlier by try_fused_compare_goto_if_not and never reaches here.
-            | Instruction::CompareOp { .. }
-            | Instruction::ExtendedArg
-            | Instruction::Resume { .. }
-            | Instruction::Cache
-            | Instruction::NotTaken
-            | Instruction::ExitInitCheck
-            | Instruction::EndFor
-            | Instruction::UnaryNot
-            | Instruction::UnaryInvert
-            // UnaryNegative walks the same MayForce residual-call arm as
-            // UnaryInvert/UnaryNot: pop 1, `residual_call_r_r(unary_negative_fn)`
-            // (`emit_frontend_neg` → `lower_unary_negative_hlop_to_insn`,
-            // a user `__neg__` may run Python), push 1 (net 0).  No oparg
-            // payload, so the #405 arm-seeding hazard does not apply.
-            | Instruction::UnaryNegative
-            // ToBool handled by the dispatch_via_walker_for_opcode entry hook:
-            // delegates to the stack-neutral no-op `to_bool` (truthiness is
-            // re-evaluated by the following branch / UnaryNot guard, so the
-            // bool materialisation is redundant under tracing).  Early return,
-            // so no apply_walker_stack_effect arm — unlike UnaryNot/UnaryInvert
-            // above, which arm-walk.
-            | Instruction::ToBool
-            | Instruction::GetIter
-            | Instruction::SetupAnnotations
-            | Instruction::FormatSimple
-            | Instruction::FormatWithSpec
-            | Instruction::MakeFunction
-            | Instruction::GetYieldFromIter
-            | Instruction::PopIter
-            | Instruction::EndSend
-            | Instruction::DeleteSubscr
-            | Instruction::LoadLocals
-            | Instruction::LoadBuildClass
-            | Instruction::BuildTemplate
-            | Instruction::Copy { .. }
-            | Instruction::BinarySlice
-            | Instruction::StoreSlice
-            | Instruction::ContainsOp { .. }
-            | Instruction::IsOp { .. }
-            | Instruction::Swap { .. }
-            | Instruction::BuildList { .. }
-            | Instruction::BuildSet { .. }
-            | Instruction::BuildString { .. }
-            | Instruction::BuildMap { .. }
-            | Instruction::BuildSlice { .. }
-            | Instruction::LoadFastAndClear { .. }
-            | Instruction::ListAppend { .. }
-            | Instruction::ListExtend { .. }
-            | Instruction::SetAdd { .. }
-            | Instruction::SetUpdate { .. }
-            | Instruction::MapAdd { .. }
-            | Instruction::DictUpdate { .. }
-            | Instruction::DictMerge { .. }
-            | Instruction::SetFunctionAttribute { .. }
-            | Instruction::UnpackEx { .. }
-            // LoadName / StoreName handled by the
-            // dispatch_via_walker_for_opcode entry hook: it resolves the
-            // &str name from `code.names[idx]` and delegates to the trait
-            // `load_name` / `store_name` (celldict ModuleDictStrategy fast
-            // path — LOAD_GLOBAL_cached celldict.py:285-322; STORE_GLOBAL_cached
-            // celldict.py:328-333). The auto-gen arm walk aborts on the
-            // oparg-derived &str name argument (ResidualCallArgUnbound); the
-            // hook pre-resolves it, the same gap the single LoadFast hook
-            // handles.
-            | Instruction::LoadName { .. }
-            | Instruction::StoreName { .. }
-            // LoadGlobal handled by the dispatch_via_walker_for_opcode entry
-            // hook: resolves the name index + PUSH_NULL flag and delegates to
-            // the trait load_global → load_name_value (shared celldict live
-            // lookup). The early return bypasses the arm walk + the
-            // EffectInfo-residual cell fold (try_walker_load_global_cell_fold),
-            // so the #336 moving-GC const-fold hazard is off this path. Same
-            // oparg-derived &str name gap as LoadName.
-            | Instruction::LoadGlobal { .. }
-            | Instruction::StoreGlobal { .. }
-            | Instruction::DeleteAttr { .. }
-            | Instruction::ImportName { .. }
-            | Instruction::ImportFrom { .. }
-            | Instruction::LoadSuperAttr { .. }
-            | Instruction::BuildInterpolation { .. }
-            | Instruction::CallIntrinsic1 { .. }
-            | Instruction::CallIntrinsic2 { .. }
-            | Instruction::GetLen
-            | Instruction::LoadSpecial { .. }
-            | Instruction::LoadFromDictOrGlobals { .. }
-            | Instruction::LoadFromDictOrDeref { .. }
-            | Instruction::LoadDeref { .. }
-            | Instruction::LoadFastCheck { .. }
-            | Instruction::LoadCommonConstant { .. }
-            | Instruction::GetAiter
-            | Instruction::GetAwaitable { .. }
-            | Instruction::StoreDeref { .. }
-            | Instruction::YieldValue { .. }
-            | Instruction::ReturnGenerator
-            | Instruction::Send { .. }
-            | Instruction::GetAnext
-            | Instruction::EndAsyncFor
-            | Instruction::CleanupThrow
-            | Instruction::WithExceptStart
-            | Instruction::DeleteFast { .. }
-            | Instruction::DeleteDeref { .. }
-            | Instruction::DeleteGlobal { .. }
-            | Instruction::DeleteName { .. }
-            | Instruction::CopyFreeVars { .. }
-            | Instruction::MakeCell { .. }
-            | Instruction::ConvertValue { .. }
-            | Instruction::Reraise { .. } // walker hook in dispatch_via_walker_for_opcode delegates to MIFrame::reraise which returns Err(PyError) with reraise_lasti seeded — `step_result.err().map(|e| e.reraise_lasti)` extraction works the same on either leg
-            | Instruction::RaiseVarargs { .. } // walker hook delegates to MIFrame::raise_varargs (always Err, seeds last_exc_box); trace_code_step's RaiseVarargs post-dispatch handler (handle_raise_varargs) is keyed on the instruction type, so it runs identically on either leg
-            | Instruction::PopJumpIfNone { .. }
-            | Instruction::PopJumpIfNotNone { .. }
-            | Instruction::ForIter { .. }
-            | Instruction::CallKw { .. }
-            | Instruction::CallFunctionEx
-            // Instruction::LoadAttr is walker-routed EXCEPT the foldable
-            // builtin list-method form (append/pop/reverse on a list
-            // receiver), which the dispatch gate carves out to the trait
-            // leg so MIFrame::load_method can resolve it to a
-            // class-guarded Const unbound function (the list
-            // specialization); see is_foldable_list_method_load_attr.
-            | Instruction::LoadAttr { .. }
-            | Instruction::StoreAttr { .. }
-            // Instruction::StoreFastStoreFast excluded: a probe flip
-            // (2026-06-13) confirmed the GcVec-fnaddr SIGBUS the prior
-            // comment described is gone (the #406 result_exc lowering
-            // drained the Result-shell residual chains in pop_value /
-            // store_local_value).  The remaining blocker is shared with
-            // BuildTuple / UnpackSequence: `ResidualCallArgUnbound`
-            // (var_nums payload register unbound) because arm entry seeds
-            // only r0.  Re-enable once arm-entry operand seeding (#405)
-            // lands on dispatch_via_miframe_at_opcode_entry.
-            | Instruction::StoreSubscr // handled by dispatch_via_walker_for_opcode entry hook
-            // PopExcept / PushExcInfo / PopTop — the exception-handler trio —
-            // handled by the dispatch_via_walker_for_opcode entry hook
-            // (try_walker_direct_opcode_dispatch), NOT the generic arm-jitcode
-            // walk.  The arm walk recurses through `inline_call` into the
-            // exc-info-stack helper jitcodes whose `PyFrame::pop` is
-            // concrete-executed by `try_execute_residual_call_via_executor`
-            // against the live frame and underflows (`pyframe.rs:1320`); the
-            // hook instead delegates to the shared symbolic
-            // `opcode_pop_top`/`push_exc_info`/`pop_except` (vable-only
-            // `pop_value`/`push_value` for the stack effect), exactly as the
-            // StoreSubscr / StoreFastStoreFast hooks avoid the same
-            // live-frame-pop hazard.
-            | Instruction::PopExcept
-            | Instruction::PushExcInfo
-            | Instruction::PopTop
-            // CheckExcMatch — same exception-handler family, handled by the
-            // entry hook (NOT the arm walk): the arm inlines the concrete
-            // `eval::check_exc_match` (live-frame pop underflow) and a
-            // `validate_check_exc_match_class` Result the walk cannot make
-            // concrete (`SwitchValueNotConcrete`).  The hook delegates to the
-            // `MIFrame::check_exc_match` override (symbolic `pop_value` +
-            // raise-seeded `sym.last_exc_value` read + `const_ref` bool push,
-            // no guard), exactly as the PopTop / PushExcInfo / PopExcept hooks
-            // avoid the same live-frame-pop hazard.
-            | Instruction::CheckExcMatch
-            // PushNull is handled by the dispatch_via_walker_for_opcode
-            // entry hook (direct const-NULL symbolic push): its auto-gen
-            // arm is an inert residual wrapper (`opcode_push_null` is not
-            // in the runtime fnaddr registry), so the arm-walk +
-            // vsd-resync route loses the push and underflows the
-            // following CALL.
-            | Instruction::PushNull
-            // BuildTuple / UnpackSequence handled by the
-            // dispatch_via_walker_for_opcode entry hook, delegating to the
-            // specialised `OpcodeStepExecutor::build_tuple` /
-            // `unpack_sequence` recorders (see the hook comment): the
-            // generic arm records an opaque residual that loses
-            // OptVirtualize's build→unpack elision and aborts
-            // `InlineCallArityMismatch` on inlined tuples.
-            | Instruction::BuildTuple { .. }
-            | Instruction::UnpackSequence { .. }
-            // ReturnValue — the root portal exit, handled by the entry hook
-            // (NOT the arm walk, whose ref_return/r surfaces as SubReturn,
-            // the wrong shape for a root return).  The hook propagates the
-            // default OpcodeStepExecutor::return_value's StepResult::Return
-            // verbatim; the Finish is emitted post-dispatch in
-            // trace_step_result_to_action's Return arm on both legs.  Records
-            // no guard; the dispatch gate keeps inline-frame ReturnValue on
-            // the trait leg, so only the root exit is flipped.
-            | Instruction::ReturnValue
-            // JumpForward — the unconditional forward sibling of the back-edge
-            // family, handled by the entry hook (NOT the arm walk, whose
-            // emit_goto! only emits graph IR and never advances the tracer pc).
-            // The hook delegates to the same pub execute_jump_forward the trait
-            // dispatch arm calls, returning StepResult::Continue (no loop close,
-            // so no CloseLoop outcome to reject); it records no guard and no
-            // resume data (`opimpl_goto`).  Forward by construction, so it never
-            // reaches the can_enter_jit / loop_header path; the gate keeps
-            // inline-frame JumpForward on the trait leg, like the rest.
-            | Instruction::JumpForward { .. }
-            // JumpBackward / JumpBackwardNoInterrupt — the loop back-edge,
-            // handled by the entry hook (NOT the arm walk, which surfaces
-            // SubReturn / rejects the top-level CloseLoop outcome).  The hook
-            // delegates to the same pub execute_jump_backward(_no_interrupt)
-            // the trait dispatch arms call, propagating StepResult::CloseLoop
-            // verbatim.  Unlike PopJumpIf, JumpBackward has a single shared
-            // close_loop_args_at reached identically by both legs (no
-            // leg-dependent kept-stack snapshot); the gate keeps inline-frame
-            // JumpBackward on the trait leg.
-            | Instruction::JumpBackward { .. }
-            | Instruction::JumpBackwardNoInterrupt { .. }
-            // StoreFastStoreFast handled by the
-            // dispatch_via_walker_for_opcode entry hook, delegating to the
-            // symbolic `OpcodeStepExecutor::store_fast_store_fast` (the arm
-            // jitcode carries unresolved placeholder funcptrs and would pop
-            // the live frame; see the hook comment).
-            | Instruction::StoreFastStoreFast { .. }
-    )
-}
-
-/// Phase-5 flip-completion probe: is `PYRE_FLIP_PROBE` set?  Read once.
-/// When set, the trait-dispatch fallback callers record each unique
-/// (opcode, reason) that still bypasses the walker, so the residual flip
-/// surface is measurable against the production workload.  Inert (a
-/// single cached bool load) when unset.
-fn flip_probe_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FLIP_PROBE").is_some())
-}
-
-/// Record one trait-dispatch fallback hit, deduplicated per
-/// (opcode-variant, reason) so each distinct residual case prints once
-/// instead of once-per-opcode-execution.  `reason` distinguishes
-/// not-in-allowlist vs the context gates (inline-frame / foldable
-/// list-method LOAD_ATTR).
-fn flip_probe_record(instruction: &Instruction, reason: &str) {
-    use std::cell::RefCell;
-    use std::collections::HashSet;
-    thread_local! {
-        static SEEN: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
-    }
-    let dbg = format!("{instruction:?}");
-    let name = dbg
-        .split(|c: char| c == ' ' || c == '{' || c == '(')
-        .next()
-        .unwrap_or(&dbg);
-    let key = format!("{name}|{reason}");
-    SEEN.with(|seen| {
-        if seen.borrow_mut().insert(key) {
-            eprintln!("[flip-probe] trait-fallback opcode={name} reason={reason}");
-        }
-    });
-}
-
-/// Apply the symbolic-tracker side effects of a walker-handled opcode.
-///
-/// The walker arm records IR ops for stack pushes/pops by walking the
-/// per-opcode arm body (which contains `setarrayitem_vable_r` /
-/// `setfield_vable_i` against the user-side virtualizable).  Those IR
-/// ops correctly mutate the live `PyFrame` at trace-execution time.
-/// What the walker arm does NOT do is update the tracer's symbolic
-/// shadow that subsequent trait-dispatched opcodes consult:
-///
-/// * `sym.valuestackdepth` — the symbolic mirror of
-///   `PyFrame.valuestackdepth`.  Trait dispatch advances it via
-///   `MIFrame::push_typed_value` / `MIFrame::pop_value` (trace_opcode.rs
-///   :1797..1925); the walker arm bypasses both.
-/// * `sym.vable_valuestackdepth` — the IR `OpRef` cache pointing at
-///   the current `const_int(vsd)` value.  Snapshot encoders read this
-///   OpRef into the guard's resume-data scalar header; if it lags the
-///   IR the blackhole resume restores a stale vsd into PyFrame.
-/// * `virtualizable_boxes[NUM_VABLE_SCALARS + semantic_idx]` — the
-///   heap-mirror shadow for the pushed/popped stack slot.  `pop_value`
-///   clears the popped slot to NULL (line 1901-1906); `push_typed_value`
-///   writes the new value via `write_stack_slot` (line 572-611).  The
-///   walker arm's `setarrayitem_vable_r` IR op updates the runtime
-///   heap, but the tracer's shadow needs the same update applied here.
-///
-/// Resync `sym.valuestackdepth` from the live `PyFrame` after a walker
-/// arm with non-zero net stack effect has run.
-///
-/// The walker arm emits `setfield_vable_i(valuestackdepth, …)` for any
-/// push/pop; that op routes through `vable_setfield` →
-/// `synchronize_virtualizable()` (pyjitpl.py:3470-3474), which writes
-/// the new vsd into the heap `PyFrame` at trace time.  Pyre's tracer
-/// maintains a parallel `sym.valuestackdepth` shadow that the walker
-/// path does not touch (pyre-only adaptation; PyPy's MIFrame has no
-/// such counter — rpython/jit/metainterp/pyjitpl.py:65-93).  Read the
-/// live depth back so the tracer's symbolic counter stays consistent
-/// with subsequent trait-dispatched opcodes that consume
-/// `sym.valuestackdepth`.
-fn resync_sym_vsd_from_concrete_frame(state: &mut MIFrame) {
-    let new_vsd = match state.concrete_valuestackdepth() {
-        Some(v) => v,
-        // Inline-callee tracing has no live `PyFrame`; the walker path
-        // is not reachable for inlined opcodes today (production walker
-        // dispatch only fires on top-level opcode entries), so a None
-        // here indicates the seed contract was violated upstream.
-        None => return,
-    };
-    // Mirror `sym.concrete_stack` from the live `PyFrame` so trait-
-    // dispatched callers reading `concrete_stack[stack_idx]` after a
-    // walker push/pop see the post-opcode value instead of the
-    // pre-opcode placeholder.  Same pattern as `PyreSym::setup_call`
-    // (state.rs:3336-3347).
-    let frame_addr = state.concrete_frame_addr;
-    let nlocals = state.sym().nlocals;
-    let new_stack_len = new_vsd.saturating_sub(nlocals);
-    let s = state.sym_mut();
-    let old_stack_len = s.concrete_stack.len();
-    if new_stack_len < old_stack_len {
-        s.concrete_stack.truncate(new_stack_len);
-    } else if new_stack_len > old_stack_len {
-        s.concrete_stack
-            .resize(new_stack_len, crate::state::ConcreteValue::Null);
-        for stack_idx in old_stack_len..new_stack_len {
-            let abs_idx = nlocals + stack_idx;
-            let obj = crate::state::concrete_stack_value(frame_addr, abs_idx)
-                .unwrap_or(pyre_object::PY_NULL);
-            s.concrete_stack[stack_idx] = crate::state::concrete_value_from_slot(obj);
-        }
-    }
-    s.valuestackdepth = new_vsd;
-}
-
-/// Mirrors `liveness.rs:528..588 _opcode_stack_effect` (Python
-/// `dis.stack_effect` parity).  Walker-handled opcodes must remain a
-/// closed set listed here AND in `production_walker_handles`.
-fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
-    let _ = state;
-    match instruction {
-        Instruction::Nop
-        | Instruction::ExtendedArg
-        | Instruction::Resume { .. }
-        | Instruction::Cache
-        | Instruction::NotTaken
-        | Instruction::ExitInitCheck
-        | Instruction::EndFor => {
-            // delta = 0, no shadow mutation.
-        }
-        Instruction::UnaryNot
-        | Instruction::UnaryInvert
-        | Instruction::UnaryNegative
-        | Instruction::GetIter
-        | Instruction::SetupAnnotations
-        | Instruction::FormatSimple
-        | Instruction::FormatWithSpec
-        | Instruction::MakeFunction
-        | Instruction::GetYieldFromIter => {
-            // 1-in-1-out at the TOS slot. The walker arm emits
-            // `inline_call_r_r/dR>r` whose dst writeback to
-            // `concrete_registers_r[dst]` replaces the TOS register
-            // operand in-place; `sym.valuestackdepth` is invariant.
-        }
-        Instruction::PopIter
-        | Instruction::EndSend
-        | Instruction::DeleteSubscr
-        | Instruction::LoadLocals
-        | Instruction::LoadBuildClass
-        | Instruction::BuildTemplate
-        | Instruction::Copy { .. }
-        | Instruction::BinarySlice
-        | Instruction::StoreSlice
-        | Instruction::ContainsOp { .. }
-        | Instruction::IsOp { .. }
-        | Instruction::Swap { .. }
-        | Instruction::BuildTuple { .. }
-        | Instruction::BuildList { .. }
-        | Instruction::BuildSet { .. }
-        | Instruction::BuildString { .. }
-        | Instruction::BuildMap { .. }
-        | Instruction::BuildSlice { .. }
-        | Instruction::LoadFastAndClear { .. }
-        | Instruction::ListAppend { .. }
-        | Instruction::ListExtend { .. }
-        | Instruction::SetAdd { .. }
-        | Instruction::SetUpdate { .. }
-        | Instruction::MapAdd { .. }
-        | Instruction::DictUpdate { .. }
-        | Instruction::DictMerge { .. }
-        | Instruction::SetFunctionAttribute { .. }
-        | Instruction::UnpackSequence { .. }
-        | Instruction::UnpackEx { .. }
-        | Instruction::LoadName { .. }
-        | Instruction::StoreName { .. }
-        | Instruction::StoreGlobal { .. }
-        | Instruction::DeleteAttr { .. }
-        | Instruction::ImportName { .. }
-        | Instruction::ImportFrom { .. }
-        | Instruction::LoadSuperAttr { .. }
-        | Instruction::BuildInterpolation { .. }
-        | Instruction::CallIntrinsic1 { .. }
-        | Instruction::CallIntrinsic2 { .. }
-        | Instruction::GetLen
-        | Instruction::LoadSpecial { .. }
-        | Instruction::LoadFromDictOrGlobals { .. }
-        | Instruction::LoadFromDictOrDeref { .. }
-        | Instruction::LoadDeref { .. }
-        | Instruction::LoadFastCheck { .. }
-        | Instruction::LoadCommonConstant { .. }
-        | Instruction::GetAiter
-        | Instruction::GetAwaitable { .. }
-        | Instruction::StoreDeref { .. }
-        | Instruction::YieldValue { .. }
-        | Instruction::ReturnGenerator
-        | Instruction::Send { .. }
-        | Instruction::GetAnext
-        | Instruction::EndAsyncFor
-        | Instruction::CleanupThrow
-        | Instruction::WithExceptStart
-        | Instruction::DeleteFast { .. }
-        | Instruction::DeleteDeref { .. }
-        | Instruction::DeleteGlobal { .. }
-        | Instruction::DeleteName { .. }
-        | Instruction::CopyFreeVars { .. }
-        | Instruction::MakeCell { .. }
-        | Instruction::ConvertValue { .. }
-        | Instruction::PopJumpIfNone { .. }
-        | Instruction::PopJumpIfNotNone { .. }
-        | Instruction::ForIter { .. }
-        | Instruction::CallKw { .. }
-        | Instruction::CallFunctionEx
-        | Instruction::LoadAttr { .. }
-        | Instruction::StoreAttr { .. }
-        // | Instruction::StoreSubscr { .. } // see production_walker_handles for the walker hook rationale
-        // | Instruction::PushNull // handled by the dispatch_via_walker_for_opcode entry hook; push_value advances vsd
-        | Instruction::StoreFastStoreFast { .. } => {
-            // Non-zero stack delta. The walker arm's
-            // `setfield_vable_i(valuestackdepth)` emit routes through
-            // `vable_setfield` (trace_ctx.rs:2608-2655) which calls
-            // `synchronize_virtualizable()` (`pyjitpl.py:3470-3474
-            // synchronize_virtualizable` parity) — that writes the new
-            // vsd back into the live `PyFrame` at trace time.  Resync
-            // `sym.valuestackdepth` from the concrete `PyFrame` so the
-            // tracer's parallel counter follows the live frame, mirroring
-            // PyPy's tracer which has no `MIFrame.valuestackdepth` shadow
-            // (rpython/jit/metainterp/pyjitpl.py:65-93) and reads stack
-            // depth directly from `metainterp.virtualizable_boxes`.
-            resync_sym_vsd_from_concrete_frame(state);
-        }
-        other => panic!(
-            "apply_walker_stack_effect: missing handler for {:?}; every entry \
-             in production_walker_handles must list its symbolic effect here",
-            other,
-        ),
-    }
 }
 
 fn classify_concrete(cv: ConcreteValue) -> (bool, bool) {

@@ -479,7 +479,11 @@ pub struct TraceCtx {
 /// stack_idx`. `concrete_r` is parallel to `registers_r` and seeds the
 /// assembled frame's `locals_cells_stack_w`.
 pub struct ReconstructRecipe {
-    pub w_code: *const (),
+    /// Raw `CodeObject*` identity of the callee (NOT the PyCode wrapper).
+    /// The globals-stamped wrapper is recovered on demand from the
+    /// `code_ptr -> live-wrapper` registry, so the recipe carries only the
+    /// stable code identity rather than a live wrapper courier.
+    pub code_ptr: *const (),
     pub jitcode_index: i32,
     pub pc: usize,
     pub nlocals: usize,
@@ -1682,7 +1686,7 @@ impl TraceCtx {
     /// via `PyFrame::push` / `PyFrame::pop` etc., bypassing the shadow).
     /// Between any pair of those dispatch paths the shadow can lag heap.
     ///
-    /// Calling this at each `trace_code_step` entry — *before* the walker
+    /// Calling this at each walker step entry — *before* the walker
     /// arm body reads any shadow slot or `synchronize_virtualizable` writes
     /// stale shadow back to heap — restores the RPython invariant that
     /// shadow == heap at every opcode boundary.  When dispatch unification
