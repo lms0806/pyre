@@ -1828,6 +1828,63 @@ impl<M: Clone> MetaInterp<M> {
             .map(|layout| layout.public(owning_key, trace_id, fail_index))
     }
 
+    /// Build the `CompiledExitLayout` for an exit identified by `descr`, owned
+    /// by the loop registered under `green_key`. Mirrors the inline layout
+    /// construction in `run_compiled_detailed_with_values`; the wasm in-guest
+    /// CALL_ASSEMBLER deopt path (`call_jit::wasm_ca_resume_deopt`) reuses it to
+    /// blackhole-resume a callee frame that left its trace through a guard,
+    /// rather than re-running it from the entry.
+    pub fn build_exit_layout_for_descr(
+        &self,
+        green_key: u64,
+        descr: &dyn majit_ir::FailDescr,
+    ) -> CompiledExitLayout {
+        let fail_index = descr.fail_index();
+        let trace_id = descr.trace_id();
+        let is_finish = descr.is_finish();
+        let is_exit_frame_with_exception = descr.is_exit_frame_with_exception();
+        let exit_types = descr.fail_arg_types().to_vec();
+        let gc_ref_slots: Vec<usize> = exit_types
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, _)| descr.is_gc_ref_slot(slot).then_some(slot))
+            .collect();
+        let force_token_slots = descr.force_token_slots().to_vec();
+        let rd_loop_token = majit_backend::descr_owning_jct(descr).map(|jct| jct.green_key);
+
+        let default_layout = || CompiledExitLayout {
+            rd_loop_token: green_key,
+            trace_id,
+            fail_index,
+            source_op_index: None,
+            exit_types: exit_types.clone(),
+            is_finish,
+            is_exception_exit: is_exit_frame_with_exception,
+            gc_ref_slots: gc_ref_slots.clone(),
+            force_token_slots: force_token_slots.clone(),
+            recovery_layout: None,
+            resume_layout: None,
+            storage: None,
+        };
+
+        // FINISH descrs (singletons) have `trace_id == 0`; skip the trace lookup
+        // and synthesize the default layout, as `run_compiled_detailed_with_values`
+        // does for the is_finish arm.
+        if is_finish {
+            return default_layout();
+        }
+        let Some(compiled) = self.compiled_loops.get(&green_key) else {
+            return default_layout();
+        };
+        Self::trace_for_exit(compiled, trace_id)
+            .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
+            .or_else(|| self.trace_for_exit_by_rd_loop_token(rd_loop_token, trace_id))
+            .and_then(|(owning_key, resolved_id, trace)| {
+                Self::compiled_exit_layout_from_trace(trace, owning_key, resolved_id, fail_index)
+            })
+            .unwrap_or_else(default_layout)
+    }
+
     /// `compile.py:855 ResumeGuardDescr._attrs_` parity: per-guard exit
     /// types live on the descr object itself.  RPython has no such
     /// recovery helper because every `Box` already carries `.type`
@@ -8820,20 +8877,25 @@ impl<M: Clone> MetaInterp<M> {
         fail_values: &[i64],
         fallback_green_key: u64,
     ) -> (bool, u64) {
+        crate::mc_diag_bump(0); // must_compile_with_values entered
         let descr_addr = std::sync::Arc::as_ptr(descr_arc) as *const () as usize;
         let descr_fd = descr_arc
             .as_fail_descr()
             .expect("must_compile_with_values: descr_arc must be a FailDescr");
         let trace_id = descr_fd.trace_id();
         let fail_index = descr_fd.fail_index_per_trace();
-        // A guard whose bridge the backend already declined as structurally
+        // A guard whose bridge a terminal-declining backend
+        // (`bridge_decline_is_terminal()`) already refused as structurally
         // `Unsupported` must not re-fire — re-tracing rebuilds the same
-        // unsupported bridge forever (a compile storm). Fall back to the
-        // blackhole resume the dormant path always used for this guard.
+        // unsupported bridge forever (a compile storm). Native backends never
+        // populate this set (their declines are transient), so this only ever
+        // short-circuits wasm guards. Fall back to the blackhole resume the
+        // dormant path always used for this guard.
         if self
             .declined_bridge_guards
             .contains(&(trace_id, fail_index))
         {
+            crate::mc_diag_bump(1); // declined_bridge_guards short-circuit
             let owning_key = majit_backend::descr_owning_jct(descr_fd)
                 .map(|jct| jct.green_key)
                 .unwrap_or(fallback_green_key);
@@ -8851,6 +8913,7 @@ impl<M: Clone> MetaInterp<M> {
             .map(|jct| jct.green_key)
             .unwrap_or(fallback_green_key);
         if descr_addr == 0 {
+            crate::mc_diag_bump(2); // descr_addr==0 skip
             crate::debug::log_one("jit-tracing", "must_compile: descr_addr=0, skip");
             return (false, owning_key);
         }
@@ -8864,6 +8927,7 @@ impl<M: Clone> MetaInterp<M> {
             status
         } else if status & Self::ST_BUSY_FLAG != 0 {
             // compile.py:750-751: already busy tracing.
+            crate::mc_diag_bump(3); // status-busy skip
             return (false, owning_key);
         } else {
             // compile.py:753-781: GUARD_VALUE per-value hash.
@@ -8884,6 +8948,9 @@ impl<M: Clone> MetaInterp<M> {
         };
         // compile.py:783-784: jitcounter.tick(hash, increment)
         let fired = self.warm_state.tick_guard_failure(hash);
+        if fired {
+            crate::mc_diag_bump(4); // jitcounter FIRED
+        }
         if fired && crate::majit_log_enabled() {
             eprintln!(
                 "[jit] must_compile FIRED: key={} trace={} guard={}",
@@ -10258,10 +10325,17 @@ impl<M: Clone> MetaInterp<M> {
                 // done_compiling). A structural `Unsupported` decline is the
                 // exception: it is deterministic in the source guard, so
                 // re-tracing rebuilds the identical unsupported bridge forever.
-                // Record the source guard so `must_compile_with_values` stops
-                // firing for it; the guard then resolves through blackhole
+                // Only backends that report `bridge_decline_is_terminal()` (the
+                // wasm backend, whose every decline is a structural shape
+                // mismatch) record it; native backends keep the transient-retry
+                // semantics above, since their `Unsupported` (cranelift
+                // op-lowering gaps) may be resolved on a differently-shaped
+                // retrace. Record the source guard so `must_compile_with_values`
+                // stops firing for it; the guard then resolves through blackhole
                 // resume (the always-correct fallback the dormant path uses).
-                if let majit_backend::BackendError::Unsupported(_) = e {
+                if matches!(e, majit_backend::BackendError::Unsupported(_))
+                    && self.backend.bridge_decline_is_terminal()
+                {
                     self.declined_bridge_guards
                         .insert((fail_descr.trace_id(), fail_descr.fail_index_per_trace()));
                 }
@@ -10308,6 +10382,7 @@ impl<M: Clone> MetaInterp<M> {
         // pyre's `compiled_loops` lookup below stands in for
         // `get_resumestorage`/`loop_token_wref()`; both gate the trace on
         // the source loop still being live.
+        crate::mc_diag_bump(6); // start_retrace_from_guard entered
         self.enter_profiler_tracing();
         self.try_to_free_some_loops();
         // bridgeopt.py:124 frontend_boxes come directly from the guard
@@ -10316,6 +10391,7 @@ impl<M: Clone> MetaInterp<M> {
         let _compiled = match self.compiled_loops.get(&green_key) {
             Some(c) => c,
             None => {
+                crate::mc_diag_bump(7); // start_retrace bailed: source loop evicted
                 // Source loop already evicted — bail out of the bridge
                 // before opening the M-ownership session.  Pair the
                 // `start_tracing` fired above so the profiler stack

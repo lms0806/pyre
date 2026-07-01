@@ -194,12 +194,24 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     // JIT trace modules emit `return_call_indirect` to chain a loop-closing bridge
     // back into its loop at constant stack depth (the tail-call proposal).
     config.wasm_tail_call(true);
+    // Optional instruction budget: PYRE_WASM_FUEL=N traps the guest after N fuel
+    // units so a diagnostic run that livelocks (e.g. a buggy loop-closing bridge)
+    // still reaches the stats readout instead of hanging forever.
+    let fuel_limit: Option<u64> = std::env::var("PYRE_WASM_FUEL")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    if fuel_limit.is_some() {
+        config.consume_fuel(true);
+    }
     let engine = Engine::new(&config)?;
 
     let module = load_main_module(&engine, module_path)?;
 
     let mut store = Store::new(&engine, Host::default());
     store.data_mut().stdlib_root = std::env::var("PYRE_STDLIB").ok();
+    if let Some(n) = fuel_limit {
+        store.set_fuel(n)?;
+    }
 
     let linker = build_linker(&engine)?;
     let instance = linker
@@ -224,6 +236,25 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     let run_python = instance.get_typed_func::<(u32, u32), u64>(&mut store, "pyre_run_python")?;
     let dealloc = instance.get_typed_func::<(u32, u32), ()>(&mut store, "pyre_dealloc")?;
 
+    // Enable the otherwise-dormant wasm bridge tracer (inter-trace chaining) when
+    // PYRE_WASM_ENABLE_BRIDGES is set, so chaining can be measured without
+    // rebuilding the guest. No-op if the export is absent (older modules).
+    if std::env::var_os("PYRE_WASM_ENABLE_BRIDGES").is_some() {
+        if let Ok(f) = instance.get_typed_func::<u32, ()>(&mut store, "pyre_jit_set_enable_bridges")
+        {
+            f.call(&mut store, 1)?;
+        }
+    }
+
+    // Enable the self-recursive CALL_ASSEMBLER guest→guest `call_indirect` arm
+    // (`PYRE_WASM_CA`). The guest has no environment, so the flag is plumbed
+    // through this export. No-op if the export is absent (older modules).
+    if std::env::var_os("PYRE_WASM_CA").is_some() {
+        if let Ok(f) = instance.get_typed_func::<u32, ()>(&mut store, "pyre_jit_set_wasm_ca") {
+            f.call(&mut store, 1)?;
+        }
+    }
+
     let src = source.as_bytes();
     let len = src.len() as u32;
     let in_ptr = if len == 0 {
@@ -234,19 +265,17 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
         p
     };
 
-    let packed = match run_python.call(&mut store, (in_ptr, len)) {
-        Ok(p) => p,
-        Err(e) => {
-            // wasm32-unknown-unknown has no stderr, but pyre-wasm's panic hook
-            // writes "panicked at …" into linear memory before the trap.
-            // Recover the formatted message (the heap String, not the static
-            // format template) so the real cause is visible.
-            for msg in recover_panic_messages(memory.data(&store)) {
-                eprintln!("pyre-wasm-runner: recovered panic: {msg}");
-            }
-            return Err(e);
-        }
-    };
+    // Keep the run result so the diagnostic stats can be read out even when the
+    // guest traps (a panic, or a PYRE_WASM_FUEL exhaustion that interrupts a
+    // livelock): the JIT counters are populated at compile time, before the run
+    // finishes, and the diag exports just read statics that survive a trap.
+    let run_result = run_python.call(&mut store, (in_ptr, len));
+    // After a fuel-exhaustion trap the store has no fuel, so the diagnostic
+    // export calls below would themselves immediately trap and read as 0.
+    // Refill so the readout reflects the real (compile-time) counter values.
+    if fuel_limit.is_some() {
+        let _ = store.set_fuel(u64::MAX);
+    }
     if std::env::var_os("PYRE_WASM_JIT_STATS").is_some() {
         let lin_mem = memory.data_size(&store);
         // Split linear-memory growth into GC-retained vs. host-heap: a leak that
@@ -284,6 +313,54 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
                 eprintln!("[jit-stats] heap_buckets {}", parts.join(" "));
             }
         }
+        // compile_bridge outcome tallies (diagnostic). 0=entered 1=declCALL_ASM
+        // 2=declMultiPeel 3=declNotDirect 4=declRefHome 5=BRIDGE_OK
+        // 6=loopClosing 7=srcHasPreamble.
+        if let Ok(diag) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_jit_bridge_diag") {
+            let labels = [
+                "entered",
+                "decl_callasm",
+                "decl_multipeel",
+                "decl_notdirect",
+                "decl_refhome",
+                "BRIDGE_OK",
+                "loopclosing",
+                "src_preamble",
+                "ml_descr_none",
+                "ml_nonlast",
+                "ml_arity_mismatch",
+                "decl_noadvance",
+                "ca_cell_set",
+                "ca_cells_zero",
+            ];
+            let mut parts = Vec::new();
+            for (i, lbl) in labels.iter().enumerate() {
+                let n = diag.call(&mut store, i as u32).unwrap_or(0);
+                parts.push(format!("{lbl}={n}"));
+            }
+            eprintln!("[jit-stats] bridge_diag {}", parts.join(" "));
+        }
+        // must_compile / start_retrace gate tallies (diagnostic).
+        if let Ok(mc) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_jit_mc_diag") {
+            let labels = [
+                "mc_entered",
+                "decl_shortcircuit",
+                "descr0_skip",
+                "busy_skip",
+                "FIRED",
+                "reserved",
+                "retrace_entered",
+                "retrace_bailed",
+            ];
+            let mut parts = Vec::new();
+            for (i, lbl) in labels.iter().enumerate() {
+                parts.push(format!(
+                    "{lbl}={}",
+                    mc.call(&mut store, i as u32).unwrap_or(0)
+                ));
+            }
+            eprintln!("[jit-stats] mc_diag {}", parts.join(" "));
+        }
         let host = store.data();
         eprintln!(
             "[jit-stats] compiles={} executes={} linear_mem={} gc_oldgen={} gc_nursery={} \
@@ -297,6 +374,19 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
             heap_live_count,
         );
     }
+    let packed = match run_result {
+        Ok(p) => p,
+        Err(e) => {
+            // wasm32-unknown-unknown has no stderr, but pyre-wasm's panic hook
+            // writes "panicked at …" into linear memory before the trap.
+            // Recover the formatted message (the heap String, not the static
+            // format template) so the real cause is visible.
+            for msg in recover_panic_messages(memory.data(&store)) {
+                eprintln!("pyre-wasm-runner: recovered panic: {msg}");
+            }
+            return Err(e);
+        }
+    };
     let out_ptr = (packed >> 32) as u32;
     let out_len = (packed & 0xffff_ffff) as u32;
 

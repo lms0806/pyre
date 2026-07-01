@@ -294,6 +294,46 @@ pub extern "C" fn pyre_heap_bucket(i: u32) -> i64 {
     }
 }
 
+/// Diagnostic-only: read a `compile_bridge` outcome tally from the wasm JIT
+/// backend (index legend in `majit_backend_wasm::BRIDGE_DIAG`). Exported (not
+/// an import) so it does not shift the module's function-index space, which
+/// would break the JIT's baked `fn as usize` table indices. The host runner
+/// prints these at `PYRE_WASM_JIT_STATS` time.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_bridge_diag(i: u32) -> u64 {
+    majit_backend_wasm::bridge_diag(i as usize)
+}
+
+/// Diagnostic-only: read a guard-failure → bridge-trace gate tally from the
+/// metainterp (`majit_metainterp::MC_DIAG`). Same export-not-import rationale
+/// as `pyre_jit_bridge_diag`.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_mc_diag(i: u32) -> u64 {
+    majit_metainterp::mc_diag(i as usize)
+}
+
+/// Enable the otherwise-dormant wasm bridge tracer (inter-trace chaining) at
+/// runtime, set by the host runner from an env flag. Exported (not an import)
+/// for the same function-index-stability reason as the diag readers.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_set_enable_bridges(enabled: u32) {
+    pyre_jit::call_jit::set_wasm_bridges_enabled(enabled != 0);
+}
+
+/// Enable the self-recursive CALL_ASSEMBLER guest→guest `call_indirect` arm
+/// (`PYRE_WASM_CA`) at runtime, set by the host runner from an env flag. The
+/// guest has no environment, so this export is the only way to reach the flag;
+/// same export-not-import / function-index-stability rationale as the diag
+/// readers and `pyre_jit_set_enable_bridges`.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_set_wasm_ca(enabled: u32) {
+    majit_backend_wasm::set_wasm_ca_enabled(enabled != 0);
+}
+
 static PANIC_HOOK: Once = Once::new();
 
 fn install_panic_hook() {
