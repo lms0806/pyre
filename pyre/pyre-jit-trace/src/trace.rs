@@ -695,24 +695,31 @@ fn drive_bridge_framestack_walk(
             "[p2-fs] subwalk outcome={:?} result={subwalk_result:?} pos_after_subwalk={pos_after_subwalk:?}",
             walk.as_ref().map(|r| r.as_ref().map(|(o, pc)| (format!("{o:?}"), *pc)))
         );
+        // Dump the ops the sub-walk recorded into `ctx` (pre_pos..now) to confirm
+        // the returned SubReturn result traces to the boxed ADD of the two live
+        // CALL_ASSEMBLER (the recursive fib(n-1)/fib(n-2) results), not a
+        // reconstructed-frame arg-slot read.
+        ctx.dump_trace_ops_diag("framestack-subwalk-end");
     }
 
-    // SAFE ON: do NOT compile the sub-walk+inject+root-walk bridge. Under
-    // `PYRE_FBW_REC_UNROLL` the root walk re-materialises the resumed recursion
-    // as inline reconstructed frames (verified: final bridge has ZERO
-    // `CALL_ASSEMBLER`; the `IntAddOvf` addends are `GetarrayitemGcR` reads of
-    // the reconstructed callee `localsplus[0]` = the arg-box `n-1`/`n-2`, not the
-    // recursive results — the SEGV). The sub-walk DOES emit live `CALL_ASSEMBLER`
-    // ops ([p2-ca] EMIT), but they are dropped when the authoritative concrete
-    // execution folds the callee return chain back through the reconstructed
-    // frame slot. A correct compiled multiframe bridge needs the register-based
-    // continuous-walk rebuild (resume.py:1042 `rebuild_from_resumedata`:
-    // `consume_boxes` into register banks + one forward walk, NO frame-vable
-    // reconstruction) so the callee's live `CALL_ASSEMBLER` results are the
-    // bridge values — a deeper slice. Until then, abort cleanly: the guard
-    // failure re-interprets and yields the correct result, so `PYRE_P2_FRAMESTACK`
-    // is safe to enable (no SEGV, correct output) instead of compiling a
-    // malformed bridge.
+    // SAFE ON: do NOT compile the continuation yet — abort cleanly after the
+    // sub-walk. The sub-walk drives the deepest reconstructed callee frame
+    // (WITH its emitted vable) forward and records into `ctx`: it emits the two
+    // live `CALL_ASSEMBLER` for the callee recursion ([p2-ca] EMIT=2) and its
+    // in-callee guards encode resume snapshots against the paused root
+    // (`FullBodySnapshotSymGuard`, snapshot_data_len>0), returning a live
+    // `SubReturn` result. That continuation is a VALID bridge fragment; the only
+    // reason it is discarded is the `cut_trace` below. Compiling the whole
+    // multiframe bridge is the walker-arch rework (task #41): keep the vable,
+    // do NOT cut, deliver the sub-walk result into the outer frame's call dst
+    // via `make_result_of_lastop` (physical slot), and continue the outer walk
+    // from its resume pc so the outer's second call + ADD join the same bridge.
+    // Retiring the vable is REFUTED: local reads lower to `getarrayitem_vable`,
+    // which aborts `VableBoxNotSeeded` on an unseeded base — the orthodox resume
+    // rebuilds the frame virtualizable (`rebuild_from_resumedata` resume.py:1042
+    // fills the jitcode registers; the Python locals live in the rebuilt vable).
+    // Until #41 lands, the clean abort re-interprets (correct result), so
+    // `PYRE_P2_FRAMESTACK` is safe to enable (no SEGV).
     let _ = subwalk_result;
     ctx.cut_trace(pre_pos);
     crate::jitcode_dispatch::bool_box_truth_reset();
