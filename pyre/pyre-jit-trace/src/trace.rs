@@ -152,13 +152,11 @@ pub fn trace_bytecode(
         // Shape A (`PYRE_P2_FRAMESTACK`): the orthodox driver-trampoline resume
         // takes precedence over the `PYRE_P2_DRAIN` sub-walk+inject deviation.
         if crate::state::p2_framestack_enabled() {
-            let action =
-                drive_bridge_framestack_walk(ctx, sym, w_code, start_pc, cf_addr, carrier);
+            let action = drive_bridge_framestack_walk(ctx, sym, w_code, start_pc, cf_addr, carrier);
             return (action, concrete_frame);
         }
         if crate::state::p2_drain_enabled() {
-            let action =
-                drive_bridge_carrier_walk(ctx, sym, w_code, start_pc, cf_addr, carrier);
+            let action = drive_bridge_carrier_walk(ctx, sym, w_code, start_pc, cf_addr, carrier);
             return (action, concrete_frame);
         }
     }
@@ -527,10 +525,9 @@ fn drive_bridge_carrier_walk(
     // the authoritative sub-walk that produced the `SubReturn`); other shapes /
     // outcomes log + abort (trace discarded).
     let subwalk_result = match &walk {
-        Some(Ok((
-            crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: Some(r) },
-            _,
-        ))) => Some(*r),
+        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: Some(r) }, _))) => {
+            Some(*r)
+        }
         _ => None,
     };
     if let Some(result) = subwalk_result {
@@ -643,7 +640,7 @@ fn drive_bridge_framestack_walk(
         crate::jitcode_dispatch::census_record("P2Framestack::SetupFailed");
         return TraceAction::Abort;
     };
-    let Some(callee_pjc) = crate::state::pyjitcode_for_code(recipe.w_code) else {
+    let Some(callee_pjc) = crate::state::pyjitcode_for_code(recipe.code_ptr) else {
         ctx.cut_trace(pre_pos);
         crate::jitcode_dispatch::census_record("P2Framestack::NoCalleePjc");
         return TraceAction::Abort;
@@ -653,7 +650,7 @@ fn drive_bridge_framestack_walk(
         crate::jitcode_dispatch::census_record("P2Framestack::NoCalleeEntry");
         return TraceAction::Abort;
     };
-    let callee_w_globals = crate::state::recover_inline_callee_globals(recipe.w_code) as usize;
+    let callee_w_globals = crate::state::recover_inline_callee_globals(recipe.code_ptr) as usize;
     let nlocals = recipe.nlocals.min(recipe.concrete_r.len());
     let local_concretes = &recipe.concrete_r[..nlocals];
 
@@ -676,24 +673,24 @@ fn drive_bridge_framestack_walk(
         sym,
         root_pc,
         &callee_pjc,
-        recipe.w_code as usize,
+        recipe.code_ptr as usize,
         callee_w_globals,
         entry,
         &argboxes_r,
         local_concretes,
     );
     let subwalk_result = match &walk {
-        Some(Ok((
-            crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: Some(r) },
-            _,
-        ))) => Some(*r),
+        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: Some(r) }, _))) => {
+            Some(*r)
+        }
         _ => None,
     };
     if std::env::var_os("PYRE_P2_DIAG").is_some() {
         let pos_after_subwalk = ctx.get_trace_position();
         eprintln!(
             "[p2-fs] subwalk outcome={:?} result={subwalk_result:?} pos_after_subwalk={pos_after_subwalk:?}",
-            walk.as_ref().map(|r| r.as_ref().map(|(o, pc)| (format!("{o:?}"), *pc)))
+            walk.as_ref()
+                .map(|r| r.as_ref().map(|(o, pc)| (format!("{o:?}"), *pc)))
         );
         // Dump the ops the sub-walk recorded into `ctx` (pre_pos..now) to confirm
         // the returned SubReturn result traces to the boxed ADD of the two live
@@ -720,6 +717,24 @@ fn drive_bridge_framestack_walk(
     // fills the jitcode registers; the Python locals live in the rebuilt vable).
     // Until #41 lands, the clean abort re-interprets (correct result), so
     // `PYRE_P2_FRAMESTACK` is safe to enable (no SEGV).
+    // #41 continuous cross-frame walk (`PYRE_P2_FS_COMPILE`, off by default →
+    // safe-ON path unchanged): after the deepest callee sub-walk returns its
+    // result, continue the OUTER (root portal) frame forward from its resume pc
+    // WITHOUT cutting — appending to the sub-walk's `ctx` so the sub-walk's live
+    // `CALL_ASSEMBLER` continuation stays in the compiled bridge. The callee
+    // result is delivered into the outer's call-dst register
+    // (`make_result_of_lastop`), never a resume color, so the outer resumes with
+    // the 1st-call result live and records its 2nd call + ADD + return.
+    if let Some(result) = subwalk_result {
+        if carrier.recipes.len() == 1 && std::env::var_os("PYRE_P2_FS_COMPILE").is_some() {
+            if let Some(action) = drive_outer_continuation_and_map(
+                ctx, sym, w_code, root_pc, cf_addr, result, pre_pos,
+            ) {
+                return action;
+            }
+        }
+    }
+
     let _ = subwalk_result;
     ctx.cut_trace(pre_pos);
     crate::jitcode_dispatch::bool_box_truth_reset();
@@ -727,6 +742,136 @@ fn drive_bridge_framestack_walk(
     crate::jitcode_dispatch::fbw_store_journal_reset();
     crate::jitcode_dispatch::census_record("P2Framestack::SafeAbortReconstruction");
     TraceAction::Abort
+}
+
+/// #41: set up + drive the outer (root portal) continuation and map its outcome
+/// to a `TraceAction`.  Returns `Some(action)` when the continuation produced a
+/// compilable bridge (or a definite terminal decision), `None` when setup could
+/// not proceed so the caller falls through to its clean abort (which cuts the
+/// whole reconstruction).  Delivery is by physical call-dst register, decoded
+/// from the residual-call op whose `next_pc` is the outer resume entry.
+fn drive_outer_continuation_and_map(
+    ctx: &mut TraceCtx,
+    sym: &mut PyreSym,
+    w_code: *const (),
+    root_pc: usize,
+    _cf_addr: usize,
+    result: majit_ir::OpRef,
+    pre_pos: majit_metainterp::recorder::TracePosition,
+) -> Option<TraceAction> {
+    let root_pjc = crate::state::pyjitcode_for_code(w_code)?;
+    let entry = root_pjc.resume_jitcode_pc_for(root_pc)?;
+    // Decode the call-dst register: the op whose `next_pc == entry` is the
+    // residual call the outer resumes after; its `>r` dst is the last operand
+    // byte (`code[entry-1]`).
+    let code = root_pjc.jitcode.code.as_slice();
+    let call_dst_reg = {
+        let mut found = None;
+        for op in crate::jitcode_runtime::decoded_ops(code) {
+            if op.next_pc == entry {
+                if op.opname.starts_with("residual_call") && op.argcodes.ends_with(">r") {
+                    found = code.get(entry - 1).map(|&b| b as usize);
+                }
+                break;
+            }
+        }
+        found
+    }?;
+    let frame_reg = {
+        let r = root_pjc.metadata.portal_frame_reg;
+        if r != u16::MAX { r as usize } else { 1 }
+    };
+    let frame_box = ctx
+        .standard_virtualizable_box()
+        .unwrap_or_else(|| ctx.const_ref(_cf_addr as i64));
+    // `w_code` is the root frame's PyCode wrapper; `recover_inline_callee_globals`
+    // keys the `code_ptr → live wrapper` registry by RAW code identity, so resolve
+    // the raw pointer first.
+    let root_code_ptr =
+        unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
+    let root_w_globals = crate::state::recover_inline_callee_globals(root_code_ptr) as usize;
+
+    if std::env::var_os("PYRE_P2_DIAG").is_some() {
+        eprintln!(
+            "[p2-fs] outer-continuation entry(jit)={entry} call_dst_reg={call_dst_reg} frame_reg={frame_reg} result={result:?} frame_box={frame_box:?}"
+        );
+    }
+
+    let outcome = crate::jitcode_dispatch::drive_outer_frame_continuation(
+        ctx,
+        sym,
+        &root_pjc,
+        w_code as usize,
+        root_w_globals,
+        root_pc,
+        entry,
+        frame_box,
+        frame_reg,
+        result,
+        call_dst_reg,
+    );
+
+    if crate::state::take_trace_abort_requested() {
+        crate::jitcode_dispatch::census_record("P2Framestack::OuterTraceAbortRequested");
+        ctx.cut_trace(pre_pos);
+        return Some(TraceAction::Abort);
+    }
+    if std::env::var_os("PYRE_P2_DIAG").is_some() {
+        ctx.dump_trace_ops_diag("framestack-outer-walk-end");
+        eprintln!(
+            "[p2-fs] outer outcome={:?}",
+            outcome
+                .as_ref()
+                .map(|r| r.as_ref().map(|(o, pc)| (format!("{o:?}"), *pc)))
+        );
+    }
+
+    match outcome {
+        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::Terminate, _end_pc))) => {
+            match crate::jitcode_dispatch::fbw_finish_payload_take() {
+                Some((_, majit_ir::Type::Void)) => {
+                    let key = crate::driver::make_green_key(w_code, root_pc);
+                    ctx.set_green_key(key, (w_code as usize, root_pc));
+                    Some(TraceAction::Finish {
+                        finish_args: vec![],
+                        finish_arg_types: vec![],
+                        exit_with_exception: false,
+                    })
+                }
+                Some((finish_value, finish_type)) => {
+                    let key = crate::driver::make_green_key(w_code, root_pc);
+                    ctx.set_green_key(key, (w_code as usize, root_pc));
+                    crate::jitcode_dispatch::census_record("P2Framestack::OuterFinish");
+                    if std::env::var_os("PYRE_P2_DIAG").is_some() {
+                        eprintln!(
+                            "[p2-fs] COMPILE Finish finish_value={finish_value:?} type={finish_type:?}"
+                        );
+                    }
+                    Some(TraceAction::Finish {
+                        finish_args: vec![finish_value],
+                        finish_arg_types: vec![finish_type],
+                        exit_with_exception: false,
+                    })
+                }
+                None => {
+                    crate::jitcode_dispatch::census_record("P2Framestack::OuterNoFinishPayload");
+                    if std::env::var_os("PYRE_P2_DIAG").is_some() {
+                        eprintln!("[p2-fs] outer Terminate but NO finish payload -> abort");
+                    }
+                    ctx.cut_trace(pre_pos);
+                    Some(TraceAction::Abort)
+                }
+            }
+        }
+        other => {
+            if std::env::var_os("PYRE_P2_DIAG").is_some() {
+                eprintln!("[p2-fs] outer non-terminate outcome, aborting: {other:?}");
+            }
+            crate::jitcode_dispatch::census_record("P2Framestack::OuterNonTerminate");
+            ctx.cut_trace(pre_pos);
+            Some(TraceAction::Abort)
+        }
+    }
 }
 
 fn run_perfn_walk(

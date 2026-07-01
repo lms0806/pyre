@@ -5264,7 +5264,7 @@ fn reconstruct_inline_recipe(
         && reg_indices.ref_.contains(&pframe_reg)
         && reg_indices.ref_.contains(&pec_reg)
     {
-        use majit_ir::resumedata::{untag, RebuiltValue, TAGVIRTUAL, UNINITIALIZED_TAG};
+        use majit_ir::resumedata::{RebuiltValue, TAGVIRTUAL, UNINITIALIZED_TAG, untag};
         let frame_pos = reg_indices.ref_.iter().position(|&c| c == pframe_reg)?;
         let RebuiltValue::Virtual(frame_vidx) = &frame.values[frame_pos] else {
             return None;

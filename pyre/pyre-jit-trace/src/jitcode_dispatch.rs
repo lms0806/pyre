@@ -2775,6 +2775,178 @@ pub(crate) fn drive_bridge_carrier_subwalk(
     Some(outcome)
 }
 
+/// #41 continuous cross-frame walk: after the deepest callee sub-walk
+/// ([`drive_bridge_carrier_subwalk`]) returns the callee result, continue the
+/// OUTER (root portal) frame forward from its resume pc, APPENDING to the same
+/// `ctx` (no cut, no fresh `run_perfn_walk` — that resets the trace and
+/// discards the sub-walk's live `CALL_ASSEMBLER` continuation).
+///
+/// The outer resumes AFTER its residual call (`entry` = the jitcode pc of the
+/// `live/` marker following the call), so the callee `result` is delivered into
+/// the outer's call-dst register (`call_dst_reg`) — the physical slot the call
+/// op wrote, i.e. `make_result_of_lastop` (`pyjitpl.py:258-275`), NOT a resume
+/// color. The frame vable identity is seeded at `frame_reg` (the standard
+/// virtualizable box) so the outer's local reads (`getarrayitem_vable`) resolve
+/// off the paused root frame. `is_top_level=true`: the outer IS the portal, so
+/// its `*_return` surfaces the portal `Terminate`/finish, not a `SubReturn`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drive_outer_frame_continuation(
+    ctx: &mut TraceCtx,
+    root_sym: &crate::state::PyreSym,
+    root_pjc: &std::sync::Arc<crate::PyJitCode>,
+    root_code_key: usize,
+    root_w_globals: usize,
+    root_pc: usize,
+    entry: usize,
+    frame_box: OpRef,
+    frame_reg: usize,
+    result: OpRef,
+    call_dst_reg: usize,
+) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
+    use majit_metainterp::jitcode::RuntimeBhDescr;
+
+    let (done_void, done_int, done_ref, done_float, exit_exc_ref) = {
+        let sd = ctx.metainterp_sd();
+        match (
+            sd.done_with_this_frame_descr_void.clone(),
+            sd.done_with_this_frame_descr_int.clone(),
+            sd.done_with_this_frame_descr_ref.clone(),
+            sd.done_with_this_frame_descr_float.clone(),
+            sd.exit_frame_with_exception_descr_ref.clone(),
+        ) {
+            (Some(v), Some(i), Some(r), Some(f), Some(e)) => (v, i, r, f, e),
+            _ => return None,
+        }
+    };
+
+    let perfn_descrs: &'static [RuntimeBhDescr] =
+        unsafe { &*(root_pjc.jitcode.exec.descrs.as_slice() as *const [RuntimeBhDescr]) };
+    let perfn_descr_refs: Vec<majit_ir::DescrRef> = perfn_descrs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| match d {
+            RuntimeBhDescr::Descr(bh) => crate::descr::make_descr_from_bh(bh),
+            RuntimeBhDescr::JitCode(_)
+            | RuntimeBhDescr::Call(_)
+            | RuntimeBhDescr::AssemblerToken(_) => crate::descr::make_jitcode_descr(i),
+        })
+        .collect();
+    let sub_jitcode_lookup = |idx: usize| -> Option<SubJitCodeBody> {
+        perfn_descrs
+            .get(idx)
+            .and_then(|d| d.as_jitcode())
+            .map(|jc| SubJitCodeBody {
+                code: jc.code.as_slice(),
+                num_regs_r: jc.num_regs_r() as usize,
+                num_regs_i: jc.num_regs_i() as usize,
+                num_regs_f: jc.num_regs_f() as usize,
+                constants_i: jc.constants_i.as_slice(),
+                constants_r: jc.constants_r.as_slice(),
+                constants_f: jc.constants_f.as_slice(),
+            })
+    };
+
+    let jc = &root_pjc.jitcode;
+    let num_regs_r = jc.num_regs_r() as usize;
+    let num_regs_i = jc.num_regs_i() as usize;
+    let num_regs_f = jc.num_regs_f() as usize;
+    let total_r = num_regs_r + jc.constants_r.len();
+    let total_i = num_regs_i + jc.constants_i.len();
+    let total_f = num_regs_f + jc.constants_f.len();
+    let mut regs_r = vec![OpRef::NONE; total_r];
+    let mut regs_i = vec![OpRef::NONE; total_i];
+    let mut regs_f = vec![OpRef::NONE; total_f];
+    let mut concrete_r = vec![ConcreteValue::Null; total_r];
+    let mut concrete_i = vec![ConcreteValue::Null; total_i];
+    for (i, &v) in jc.constants_i.iter().enumerate() {
+        regs_i[num_regs_i + i] = ctx.const_int(v);
+        concrete_i[num_regs_i + i] = ConcreteValue::Int(v);
+    }
+    for (i, &v) in jc.constants_r.iter().enumerate() {
+        regs_r[num_regs_r + i] = ctx.const_ref(v);
+        if v != 0 {
+            concrete_r[num_regs_r + i] = ConcreteValue::Ref(v as pyre_object::PyObjectRef);
+        }
+    }
+    for (i, &v) in jc.constants_f.iter().enumerate() {
+        regs_f[num_regs_f + i] = ctx.const_float(v);
+    }
+
+    // Seed the standard virtualizable identity (frame) so the outer's vable
+    // reads hit the standard fast path, and the delivered callee result into the
+    // outer's call-dst register (`make_result_of_lastop`).
+    if frame_reg < regs_r.len() {
+        regs_r[frame_reg] = frame_box;
+        if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = ctx.box_value(frame_box) {
+            concrete_r[frame_reg] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
+        }
+    }
+    if call_dst_reg < regs_r.len() {
+        regs_r[call_dst_reg] = result;
+        if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = ctx.box_value(result) {
+            concrete_r[call_dst_reg] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
+        }
+    }
+
+    let root_frame = compute_bridge_root_parent_frame(root_sym, ctx, root_pc)?;
+    let outer_jitcode_index = root_frame.jitcode_index;
+    let outer_active_boxes = root_frame.boxes.clone();
+
+    let root_code = jc.code.as_slice();
+    let lookup_ref: &SubJitCodeLookup = &sub_jitcode_lookup;
+    let consts = InlineCalleeConsts {
+        w_globals: root_w_globals,
+        w_code: root_code_key,
+    };
+
+    let root_sym_ptr = root_sym as *const crate::state::PyreSym;
+    let _full_body_guard = FullBodySnapshotSymGuard::set(root_sym_ptr);
+
+    let outcome = {
+        let mut outer_wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut regs_f,
+            concrete_registers_r: &mut concrete_r,
+            concrete_registers_i: &mut concrete_i,
+            descr_refs: &perfn_descr_refs,
+            raw_descrs: RawDescrPool::PerFn(perfn_descrs),
+            is_authoritative_executor: true,
+            is_full_body_walk: true,
+            store_subscr_fn_addr: None,
+            pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
+            trace_ctx: ctx,
+            done_with_this_frame_descr_ref: done_ref,
+            done_with_this_frame_descr_int: done_int,
+            done_with_this_frame_descr_float: done_float,
+            done_with_this_frame_descr_void: done_void,
+            exit_frame_with_exception_descr_ref: exit_exc_ref,
+            is_top_level: true,
+            sub_jitcode_lookup: lookup_ref,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+            entry_py_pc: root_pc as u32,
+            outer_jitcode_index,
+            outer_active_boxes,
+        };
+        let _inline_boundary = InlineSubwalkCaptureGuard::enter();
+        let _recursion_frame = InlineRecursionGuard::enter(root_code_key);
+        let _callee_consts = InlineCalleeConstsGuard::enter(consts);
+        let _parent_frame_guard = InlineParentFrameGuard::enter(root_frame);
+        // The outer's own second self-recursive call folds to a live
+        // recursive-portal CALL_ASSEMBLER (same as the callee's), not a fresh
+        // unroll.
+        let _carrier_resume = CarrierResumeGuard::enter();
+        walk(root_code, entry, &mut outer_wc)
+    };
+    Some(outcome)
+}
+
 /// Orthodox entry: walk a per-opcode arm jitcode with
 /// **fresh per-jitcode register banks** sized to the entry jitcode's
 /// declared `num_regs_<i|r|f>() + len(constants_<i|r|f>)`, with `r0`
@@ -6760,7 +6932,11 @@ fn fbw_inline_recursion_count(w_code: usize) -> usize {
 /// resume snapshot.  Unset / `0` → `None` (disabled: the callee folds to a
 /// depth-0 CA tail, the prior behaviour).
 fn fbw_unroll_bound() -> Option<usize> {
-    let n: usize = std::env::var("PYRE_FBW_REC_UNROLL").ok()?.trim().parse().ok()?;
+    let n: usize = std::env::var("PYRE_FBW_REC_UNROLL")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
     (n > 0).then(|| n.min(FBW_MAX_MULTIFRAME_DEPTH))
 }
 
