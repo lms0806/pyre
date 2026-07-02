@@ -2109,36 +2109,73 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let last = *args.last().unwrap();
             is_dict(last) && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__")).is_some()
         };
-    let (positional, end, sep) = if is_kwargs {
+    let (positional, end, sep, file, flush) = if is_kwargs {
         let kwargs = *args.last().unwrap();
-        let end_key = w_str_new("end");
-        let sep_key = w_str_new("sep");
-        let end_val = unsafe { pyre_object::w_dict_lookup(kwargs, end_key) };
-        let sep_val = unsafe { pyre_object::w_dict_lookup(kwargs, sep_key) };
+        let end_val = unsafe { pyre_object::w_dict_lookup(kwargs, w_str_new("end")) };
+        let sep_val = unsafe { pyre_object::w_dict_lookup(kwargs, w_str_new("sep")) };
         // The type check is up front; the str() rendering happens at write
         // time so a raising `__str__` leaves the preceding output in place.
         let end_obj = print_sep_check(end_val, "end")?;
         let sep_obj = print_sep_check(sep_val, "sep")?;
-        (&args[..args.len() - 1], end_obj, sep_obj)
+        // `file=None` (or absent) uses the native stdout path; any other
+        // object is written through its `write` / `flush` methods.
+        let file_obj = match unsafe { pyre_object::w_dict_lookup(kwargs, w_str_new("file")) } {
+            Some(f) if !unsafe { pyre_object::is_none(f) } => Some(f),
+            _ => None,
+        };
+        let flush = match unsafe { pyre_object::w_dict_lookup(kwargs, w_str_new("flush")) } {
+            Some(f) => crate::baseobjspace::is_true(f)?,
+            None => false,
+        };
+        (&args[..args.len() - 1], end_obj, sep_obj, file_obj, flush)
     } else {
-        (args, None, None)
+        (args, None, None, None, false)
     };
 
     // `bltinmodule.c print_impl` writes incrementally: `str(arg)`, then the
-    // separator before each following arg, then `end`.  Each `str()` may
-    // raise, leaving the bytes already emitted on the stream.
+    // separator before each following arg, then `end`.  Each source is rendered
+    // at emit time so a raising `__str__` leaves the bytes already emitted on
+    // the stream.  With a `file`, `str(source)` is handed to `file.write` as a
+    // str object untouched (`PyFile_WriteObject`), so a lone surrogate is the
+    // sink's concern — a `StringIO` or custom writer accepts it.  The native
+    // stdout path renders through the strict utf-8 error handler in
+    // `print_render`.
+    let emit = |source: PyObjectRef| -> Result<(), crate::PyError> {
+        let Some(fp) = file else {
+            let s = unsafe { print_render(source)? };
+            crate::print_output(&s);
+            return Ok(());
+        };
+        let s_obj = pyre_object::w_str_from_wtf8(unsafe { crate::py_str_wtf8(source)? });
+        let r = crate::baseobjspace::call_method(fp, "write", &[s_obj]);
+        if r.is_null() {
+            return Err(crate::call::take_call_error()
+                .unwrap_or_else(|| crate::PyError::runtime_error("print: file.write() failed")));
+        }
+        Ok(())
+    };
     for (i, &obj) in positional.iter().enumerate() {
         if i > 0 {
-            match sep {
-                Some(s) => crate::print_output(&unsafe { print_render(s)? }),
-                None => crate::print_output(" "),
+            emit(sep.unwrap_or_else(|| w_str_new(" ")))?;
+        }
+        emit(obj)?;
+    }
+    emit(end.unwrap_or_else(|| w_str_new("\n")))?;
+    if flush {
+        match file {
+            None => {
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
+            Some(fp) => {
+                let r = crate::baseobjspace::call_method(fp, "flush", &[]);
+                if r.is_null() {
+                    return Err(crate::call::take_call_error().unwrap_or_else(|| {
+                        crate::PyError::runtime_error("print: file.flush() failed")
+                    }));
+                }
             }
         }
-        crate::print_output(&unsafe { print_render(obj)? });
-    }
-    match end {
-        Some(e) => crate::print_output(&unsafe { print_render(e)? }),
-        None => crate::print_output("\n"),
     }
     Ok(w_none())
 }
@@ -4381,8 +4418,12 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             // Python class in `w_class`; honor its `__str__` override before
             // returning the raw value.
             let tp = (*obj).ob_type;
-            if let Some(s) = crate::display::builtin_subclass_dunder(obj, tp, "__str__")? {
-                return Ok(w_str_new(&s));
+            // WTF-8-preserving so a `__str__` override returning a lone
+            // surrogate yields that str rather than panicking.
+            if let Some(r) = crate::display::builtin_subclass_dunder_obj(obj, tp, "__str__")? {
+                return Ok(pyre_object::w_str_from_wtf8(
+                    pyre_object::w_str_get_wtf8(r).to_owned(),
+                ));
             }
             // `str(s) is s` only for an exact `str`; a subclass with no
             // `__str__` override is copied to a fresh base `str`.
@@ -4406,8 +4447,10 @@ fn builtin_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    let s = unsafe { crate::py_repr(args[0])? };
-    Ok(w_str_new(&s))
+    // WTF-8-preserving so a `__repr__` override returning a lone surrogate
+    // yields that str rather than panicking in the `String` path.
+    let w = unsafe { crate::py_repr_wtf8(args[0])? };
+    Ok(pyre_object::w_str_from_wtf8(w))
 }
 
 /// `unicodeobject.c:unicode_repr` post-pass — take the repr of `obj`
@@ -5973,7 +6016,7 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// `id(obj)` — PyPy: baseobjspace.py id → object identity as int
 fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
+    if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "id() takes exactly one argument ({} given)",
             args.len()
@@ -6000,7 +6043,7 @@ fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// unhashables, recurses through tuple/frozenset contents, and
 /// propagates user `__hash__` errors.
 pub(crate) fn builtin_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
+    if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "hash() takes exactly one argument ({} given)",
             args.len()
@@ -8384,6 +8427,12 @@ fn builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() < 2 {
         return Err(crate::PyError::type_error(format!(
             "pow() takes at least two arguments ({} given)",
+            args.len()
+        )));
+    }
+    if args.len() > 3 {
+        return Err(crate::PyError::type_error(format!(
+            "pow() takes at most 3 arguments ({} given)",
             args.len()
         )));
     }
