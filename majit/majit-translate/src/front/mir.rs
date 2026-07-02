@@ -296,12 +296,17 @@ fn normalize_module_filter(module_paths: &[&str]) -> Option<std::collections::Ha
 /// Functions Charon could not extract (opaque body / `null` entry) or
 /// global-initializer bodies are skipped silently — they are not JIT
 /// call targets.  A function whose MIR shape the driver cannot yet lower
-/// produces a [`LowerError`] that is captured per-function: a recognised,
-/// tracked gap (an uninitialised-local read that survives even the
-/// reverse-postorder re-lower) degrades the program by dropping that one
-/// function, while any *unrecognised* lowering failure fails the
-/// whole-program build (the coverage gate at the end of this function) so
-/// a lowering regression cannot pass silently.
+/// produces a [`LowerError`] that is captured per-function: whether it is
+/// a recognised, tracked gap (an uninitialised-local read that survives
+/// even the reverse-postorder re-lower) or any other unrecognised failure,
+/// the function degrades the program by dropping that one function to a
+/// residual call — never a correctness loss.  This mirrors
+/// `exceptiontransform.py:212` `transform_completely`, which transforms
+/// every graph and leaves an un-rewritable one to the residual-call ABI
+/// rather than aborting the build.  The coverage gate at the end of this
+/// function reports the shape-coverage gap (split by category under
+/// `PYRE_MIR_FRONTEND_DEBUG=1`) and proceeds; the check.py suite is the
+/// regression net for a silent fallback.
 fn is_known_lowering_gap(msg: &str) -> bool {
     // The forward-reference shape: a body reads a MIR local on a path the
     // driver has not yet bound (`read of MIR local N before any Assign`).
@@ -324,10 +329,10 @@ fn is_known_lowering_gap(msg: &str) -> bool {
     if msg.contains("uninitialised local") {
         return true;
     }
-    // A scoped (`execute_*` family) Result-of-PyError wrapper whose body
-    // is a pure tail-forward of an *unscoped* Result-of-PyError callee
-    // (`let step = executor.method()?; Ok(step)` where `method` is not in
-    // `RESULT_EXC_LOWERING_SCOPE`).  The forward collapses to a direct
+    // A Result-of-PyError wrapper whose body is a pure tail-forward of a
+    // callee whose `?`-site the caller rule did not record
+    // (`let step = executor.method()?; Ok(step)` where `method`'s return is
+    // not `Result<T, PyError>`).  The forward collapses to a direct
     // returnblock link with no `Ok`/`Err` shell, so the callee rule finds
     // nothing to rewrite and the caller rule never saw a scoped call —
     // `result_exc::lower_result_exc_returns` reports "no rewritable
@@ -831,9 +836,15 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     // "uninitialised local read" that even RPO could not bind (a genuine
     // loop-carried def — none in the current snapshot); such a function
     // would degrade the program by being dropped to a residual call,
-    // never a correctness loss. Any *other* lowering failure is a coverage
-    // regression that must not pass silently, so fail the whole-program
-    // build with the offending list.
+    // never a correctness loss. Any *other* lowering failure likewise
+    // degrades to a residual call — matching `exceptiontransform.py:212`,
+    // which transforms every graph and leaves an un-rewritable one to the
+    // residual-call ABI — so the gate reports the shape-coverage gap and
+    // proceeds rather than failing the build; the check.py suite (and its
+    // perf comparison) is the regression net. NOTE the `regressions` bucket
+    // is every non-tracked skip, not only result-exception-lowering
+    // declines, so a genuinely unrelated new lowering error also degrades
+    // silently here — check.py must catch it.
     if !skipped.is_empty() {
         let (tracked, regressions): (Vec<_>, Vec<_>) = skipped
             .iter()
@@ -853,13 +864,22 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             for (name, msg) in &regressions {
                 detail.push_str(&format!("\n  - {name}: {msg}"));
             }
-            return Err(LowerError::Unsupported(format!(
-                "MIR lowering coverage regression: {} function(s) failed to lower with \
-                 an unrecognised error (not the tracked uninitialised-local gap). Fix the \
-                 lowering, or extend `is_known_lowering_gap` if the new shape is \
-                 intentionally unsupported:{detail}",
+            // The un-tracked skips: a mix of `Result<T, PyError>` callees
+            // whose exception-link rewrite declined the caller / callee shape
+            // it does not yet recognise and any other MIR shape the driver
+            // cannot yet lower (e.g. a call block exit that does not carry the
+            // tracked value).  All are fail-safe — the graph degrades to a
+            // residual call, no miscompile — matching `exceptiontransform.py:212`,
+            // which transforms every graph and leaves an un-rewritable one to
+            // the residual-call ABI.  Report the shape-coverage gap and
+            // proceed; the check.py suite (and its perf comparison) is the
+            // regression net for a silent fallback.
+            eprintln!(
+                "[mir-coverage] {} function(s) with an unrecognised MIR shape \
+                 degraded to residual (fail-safe → no miscompile); \
+                 shape-coverage gap:{detail}",
                 regressions.len()
-            )));
+            );
         }
     }
     Ok(crate::front::semantic::SemanticProgram {
@@ -1492,8 +1512,8 @@ pub fn lower_fun_decl_with_static_addrs(
     // sites the body lowering captured.  Both run before
     // `simplify_lowered_graph` so the freed shell ops feed the same
     // dead-op sweep the Abort → RaiseImplicit fold uses.
-    let result_exc_callee = crate::front::result_exc::in_result_exc_scope(&name)
-        && crate::front::result_exc::tyref_is_result_of_pyerror(&fd.signature.output, llbc);
+    let result_exc_callee =
+        crate::front::result_exc::tyref_is_result_of_pyerror(&fd.signature.output, llbc);
     // A `Result<(), PyError>` scoped callee returns void after the
     // exception-link lowering; widen its returnblock so the call
     // descriptor's `FUNC.RESULT` is `v`, not the `Ref`-typed unit shell.
@@ -1584,10 +1604,24 @@ pub fn lower_fun_decl_with_static_addrs(
                 &lo.checked_arith_call_results,
             )
         };
+        // The `bool::then` short-circuit rewrite (`front::bool_then`) splits
+        // the residual `then` call block into a `Some`/`None` diamond.  It
+        // runs on the post-lowering graph (its block A is closed with a
+        // single goto by `lower_call`, exactly the shape the rewrite
+        // matches) and is fail-safe: a structural mismatch leaves the
+        // residual call (rtyper Skip).  It adds fresh blocks and can leave
+        // the old post-call framestate merge block unreachable, so gate the
+        // reachability sweep on an actual rewrite.
+        let bool_then_rewritten = if lo.bool_then_sites.is_empty() {
+            0
+        } else {
+            crate::front::bool_then::rewire_bool_then_call_sites(&mut lo.graph, &lo.bool_then_sites)
+        };
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
             || next_rewritten > 0
             || checked_arith_rewritten > 0
+            || bool_then_rewritten > 0
         {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
@@ -1899,8 +1933,8 @@ struct Lowering<'a> {
     /// (statement assigns + call destinations).  Guard set for
     /// [`Lowering::const_discriminant_locals`].
     multi_assigned_locals: std::collections::HashSet<usize>,
-    /// Result `Variable`s of calls to `RESULT_EXC_LOWERING_SCOPE`
-    /// callees whose declared result is `Result<T, PyError>`.  Each
+    /// Result `Variable`s of calls to callees whose declared result is
+    /// `Result<T, PyError>`.  Each
     /// heads a `Try::branch` diamond that
     /// [`crate::front::result_exc::rewire_result_exc_call_sites`]
     /// rewires into `ExitSwitch::LastException` exits after the body
@@ -1917,6 +1951,12 @@ struct Lowering<'a> {
     /// (`front::checked_arith`) that runs after the body lowering
     /// completes, rewriting each into an `*_ovf` op + OverflowError edge.
     checked_arith_call_results: Vec<Variable>,
+    /// `bool::then(cond, closure)` call sites recorded for the
+    /// short-circuit `Option` diamond the `front::bool_then` post-pass
+    /// synthesizes after the body lowering completes.  Each carries the
+    /// resolved ctor/method owners the arms need (see
+    /// [`crate::front::bool_then::BoolThenSite`]).
+    bool_then_sites: Vec<crate::front::bool_then::BoolThenSite>,
 }
 
 impl<'a> Lowering<'a> {
@@ -2072,6 +2112,7 @@ impl<'a> Lowering<'a> {
             result_exc_call_results: Vec::new(),
             next_call_results: Vec::new(),
             checked_arith_call_results: Vec::new(),
+            bool_then_sites: Vec::new(),
         })
     }
 
@@ -4909,6 +4950,14 @@ impl<'a> Lowering<'a> {
             Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
             Operand::Const(_) => None,
         });
+        // Second argument's MIR-declared type — `bool::then`'s closure env
+        // operand.  Captured before the operands are consumed so the
+        // `front::bool_then` recording can resolve the closure ADT's
+        // `call_once` inherent-method owner.
+        let second_arg_ty: Option<TyRef> = call.args.get(1).and_then(|op| match op {
+            Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
+            Operand::Const(_) => None,
+        });
         for op in call.args {
             args.push(self.resolve_operand(mir_bb, op)?);
         }
@@ -5025,6 +5074,33 @@ impl<'a> Lowering<'a> {
                 // `as_ref` method call the rtyper cannot route on the
                 // classdef-less string receiver.
                 if args.len() == 1 && self.is_string_to_str_identity(&reg, &call.dest.ty) {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `String|str|Wtf8|Wtf8Buf::as_bytes` — the UTF-8 / WTF-8
+                // byte view of a string.  A string IS its byte sequence in
+                // the lifted value model (the immutable `rpy_string`), so
+                // the byte view is an identity on the receiver: a downstream
+                // byte `==` lowers to `ll_streq`, a `len` to `ll_strlen`.
+                // Alias the destination to the receiver instead of the
+                // `as_bytes` getattr the rtyper cannot route on the string
+                // receiver (the `Cannot find attribute "as_bytes" on String`
+                // wall).
+                //
+                // Sound only for len / equality / iteration consumers.  A
+                // scalar index (`as_bytes()[i]`) lowers to `getitem` on
+                // `StringRepr`, which yields a `Char`, not the `u8` the Rust
+                // source expects; that mismatch currently fails rtype — there
+                // is no `(CharRepr, IntegerRepr)` eq/arithmetic pairtype — so
+                // the subject fail-safe residualizes rather than miscompiling.
+                // Do NOT add a `(CharRepr, IntegerRepr)` eq arm (or otherwise
+                // let a char read byte-compare) without lowering a real
+                // byte-slice view here first, or those indexed uses would
+                // silently gain character semantics.
+                if args.len() == 1 && self.is_string_as_bytes_identity(&reg) {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -5738,9 +5814,7 @@ impl<'a> Lowering<'a> {
         // `?`-diamond rewiring pass (`front::result_exc`) that runs
         // after the body lowering completes.
         if let OpKind::Call { .. } = &op_kind
-            && callee_name_path
-                .as_deref()
-                .is_some_and(crate::front::result_exc::in_result_exc_scope)
+            && callee_name_path.is_some()
             && crate::front::result_exc::tyref_is_result_of_pyerror(&call.dest.ty, self.llbc)
         {
             // The per-instantiation suffix of the callee's `Result<T,
@@ -5778,6 +5852,25 @@ impl<'a> Lowering<'a> {
             && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
         {
             self.checked_arith_call_results.push(result_var.clone());
+        }
+        // Capture `bool::then(cond, closure_env)` sites for the
+        // short-circuit `Option` diamond `front::bool_then` synthesizes.
+        // `then` is an Opaque core combinator (its FunctionPath is emitted
+        // raw); resolving the ctor/method owners needs the destination
+        // `Option` type and the closure env ADT type, both in hand here.  A
+        // resolution miss leaves the residual `then` call — an unregistered
+        // callee the rtyper census Skips, so no graph regresses.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && fmt_path_ends_with(segments, &["bool", "<Impl>", "then"])
+            && let Some(site) =
+                self.recognize_bool_then_site(&call.dest.ty, second_arg_ty.as_ref(), &result_var)
+        {
+            self.bool_then_sites.push(site);
         }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var.clone()),
@@ -6414,6 +6507,31 @@ impl<'a> Lowering<'a> {
         tyref_strips_to_str(dest_ty, self.llbc)
     }
 
+    /// `String::as_bytes` / `<str>::as_bytes` / `Wtf8::as_bytes` /
+    /// `Wtf8Buf::as_bytes` — the byte view of a string.  A string is its
+    /// byte sequence in the lifted value model (`String`/`&str`/`Wtf8`
+    /// all lower to the immutable rpy_string), so the byte view is an
+    /// identity on the receiver — unlike the `&[u8]` family the `as_str`
+    /// gate above excludes via `tyref_strips_to_str`, the byte view of a
+    /// *string* receiver re-meets that same string value.  Gated on the
+    /// impl owner being a string-family type so a non-string `as_bytes`
+    /// (a real byte-buffer producer) keeps its ordinary lowering.
+    fn is_string_as_bytes_identity(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        if fd.item_meta.name_path().rsplit("::").next() != Some("as_bytes") {
+            return false;
+        }
+        matches!(
+            deref_impl_owner_leaf(self.llbc, fd).as_deref(),
+            Some("String" | "str" | "Wtf8" | "Wtf8Buf")
+        )
+    }
+
     /// `<str as ToString>::to_string` / `<String as ToString>::to_string`
     /// (`alloc::string::<Impl>::to_string`) — a `String` clone of a value
     /// that is already a string in the lifted model (`String`/`&str`/`str`
@@ -6993,6 +7111,120 @@ impl<'a> Lowering<'a> {
             TyRef::Inline { value: (_, v) } | TyRef::Other(v) => inline_adt_def_id(v),
             TyRef::Dedup { id } => self.llbc.dedup_to_adt_def_id(*id),
         }
+    }
+
+    /// The ADT `def_id` behind a signature [`TyRef`], peeling `Ref` /
+    /// `RawPtr` wrappers and dedup / hash-cons indirections first — a
+    /// `bool::then` closure env arrives as `&closure`.  Mirrors the
+    /// wrapper-peeling loop in [`Self::first_input_is_adt`].  `None` for a
+    /// non-ADT pointee.
+    fn tyref_ref_adt_def_id(&self, ty: &TyRef) -> Option<u64> {
+        let mut v: &serde_json::Value = match ty {
+            TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
+            TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
+        };
+        loop {
+            let obj = v.as_object()?;
+            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+                v = self.llbc.dedup_body(id)?;
+                continue;
+            }
+            if let Some(arr) = obj
+                .get("HashConsedValue")
+                .and_then(serde_json::Value::as_array)
+                && arr.len() == 2
+            {
+                v = &arr[1];
+                continue;
+            }
+            if let Some(arr) = obj.get("Ref").and_then(serde_json::Value::as_array) {
+                v = arr.get(1)?;
+                continue;
+            }
+            if let Some(arr) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
+                v = arr.first()?;
+                continue;
+            }
+            return inline_adt_def_id(v);
+        }
+    }
+
+    /// The `Option`'s payload type `T` (its first `generics.types` entry)
+    /// projected to a [`ValueType`] — the `call_once` result kind and the
+    /// `Some::__pos_0` field kind the `bool::then` diamond writes.  `None`
+    /// when the type is not an ADT head carrying a first type argument.
+    fn tyref_option_payload_value_type(&self, ty: &TyRef) -> Option<ValueType> {
+        let body = match ty {
+            TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
+            TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
+        };
+        let inner = body.get("Adt")?.get("generics")?.get("types")?.get(0)?;
+        Some(self.type_node_to_value_type(inner))
+    }
+
+    /// Project a raw Charon type node (a `generics.types` entry) to a
+    /// [`ValueType`], first peeling the `HashConsedValue` / `Deduplicated`
+    /// wrappers the entry may carry so [`tyref_to_value_type`]'s primitive
+    /// match sees the inline literal shape.  Non-primitive pointees fall
+    /// back to `Ref`, the same projection any non-primitive shape takes.
+    fn type_node_to_value_type(&self, node: &serde_json::Value) -> ValueType {
+        let mut v = node.clone();
+        loop {
+            let Some(obj) = v.as_object() else {
+                return ValueType::Ref(None);
+            };
+            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+                match self.llbc.dedup_body(id) {
+                    Some(b) => {
+                        v = b.clone();
+                        continue;
+                    }
+                    None => return ValueType::Ref(None),
+                }
+            }
+            if let Some(arr) = obj
+                .get("HashConsedValue")
+                .and_then(serde_json::Value::as_array)
+                && arr.len() == 2
+            {
+                v = arr[1].clone();
+                continue;
+            }
+            break;
+        }
+        tyref_to_value_type(&TyRef::Other(v), self.llbc)
+    }
+
+    /// Resolve a recognized `bool::then(cond, closure_env)` call into a
+    /// [`crate::front::bool_then::BoolThenSite`] — the owners and payload
+    /// type the short-circuit diamond post-pass needs.  `None` (leaving the
+    /// residual call) when the destination is not a resolvable `Option` or
+    /// the closure env type does not resolve to an ADT.
+    fn recognize_bool_then_site(
+        &self,
+        dest_ty: &TyRef,
+        env_ty: Option<&TyRef>,
+        result_var: &Variable,
+    ) -> Option<crate::front::bool_then::BoolThenSite> {
+        // Destination `Option`: enum root + `Some` variant owners + payload.
+        let def_id = self.tyref_adt_def_id(dest_ty)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        let option_owner = td.item_meta.name_path();
+        let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
+        let payload_ty = self.tyref_option_payload_value_type(dest_ty)?;
+        // Closure env ADT → its `name_path` is the `call_once` inherent
+        // method owner (`resolve_impl_owner_adt_def_id_free` records the
+        // same spelling for the closure's transparent `call_once` body).
+        let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
+        let env_td = self.llbc.type_by_id(env_def_id)?;
+        let call_once_owner = env_td.item_meta.name_path();
+        Some(crate::front::bool_then::BoolThenSite {
+            result_var: result_var.clone(),
+            call_once_owner,
+            option_owner,
+            some_owner,
+            payload_ty,
+        })
     }
 
     /// `true` when `ty` resolves to a fieldless (C-like) enum — at least

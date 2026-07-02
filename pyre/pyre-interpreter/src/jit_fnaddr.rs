@@ -454,6 +454,46 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::lookup_exc_class_for_kind",
         crate::opcode_ops::bh_lookup_exc_class_for_kind as *const (),
     );
+    // `pin_root` pushes onto the TLS `SHADOW_STACK` (the `shadow_stack_len`
+    // twin), `dereference` reads the weakref `w_obj_weak` slot
+    // (`@jit.dont_look_inside` upstream, the `proxy_type` twin), and
+    // `_obj_setdict` writes the per-instance `INSTANCE_DICT` side table —
+    // all through closures the tracer cannot model.  Their `#[dont_look_inside]`
+    // calls bind the Rust `fn` directly by qualified path (pointer / `-> ()`
+    // / `-> Result<(), PyError>` signatures are JIT-representable).
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_roots::pin_root",
+        "pyre_object::pin_root",
+        pyre_object::gc_roots::pin_root as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::module::_weakref::interp__weakref::dereference",
+        crate::module::_weakref::interp__weakref::dereference as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::std::mapdict::_obj_setdict",
+        crate::objspace::std::mapdict::_obj_setdict as *const (),
+    );
+    // `gc_interp::enabled` reads (and lazily inits) the `STATE` atomic and
+    // `longobject::bigint_gc_type_id` reads the init-assigned `BIGINT_GC_TYPE_ID`
+    // atomic — neither is a build-time constant, so both carry
+    // `#[dont_look_inside]` and bind their `-> bool` / `-> u32` Rust `fn`
+    // directly by qualified path.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_interp::enabled",
+        "pyre_object::enabled",
+        pyre_object::gc_interp::enabled as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::bigint_gc_type_id",
+        "pyre_object::bigint_gc_type_id",
+        pyre_object::longobject::bigint_gc_type_id as *const (),
+    );
 
     for (nargs, (module_path, root_path)) in CALLABLE_HELPER_PATHS.iter().enumerate() {
         if let Some(fnptr) = crate::runtime_ops::callable_call_helper(nargs) {
@@ -1117,6 +1157,7 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             bytearrayobject::BYTEARRAY_TYPE
         ),
         pytype_addr!("bytesobject::BYTES_TYPE", bytesobject::BYTES_TYPE),
+        pytype_addr!("interp_array::ARRAY_TYPE", interp_array::ARRAY_TYPE),
         pytype_addr!(
             "celldict::OBJECT_MUTABLE_CELL_TYPE",
             celldict::OBJECT_MUTABLE_CELL_TYPE
@@ -1516,6 +1557,13 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
         (
             "objectobject::W_OBJECT_OBJECT_SIZE",
             pyre_object::objectobject::W_OBJECT_OBJECT_SIZE as i64,
+        ),
+        // `pub const CAN_BE_TAGGED: bool` (tagged-int scaffolding, currently
+        // `false`); Charon emits the read as an opaque global rather than
+        // folding it, so bake the build-time value (`false as i64` == 0).
+        (
+            "tagged_int::CAN_BE_TAGGED",
+            pyre_object::tagged_int::CAN_BE_TAGGED as i64,
         ),
     ]
 }

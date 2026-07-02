@@ -4181,11 +4181,7 @@ fn make_exc_type_with_init(
                                 }
                                 None => {
                                     let fresh = pyre_object::w_list_new(Vec::new());
-                                    let _ = crate::baseobjspace::setattr_str(
-                                        w_self,
-                                        "__notes__",
-                                        fresh,
-                                    );
+                                    crate::baseobjspace::setattr_str(w_self, "__notes__", fresh)?;
                                     fresh
                                 }
                             };
@@ -7118,7 +7114,7 @@ fn init_file_wrapper_type(ns: &mut DictStorage) {
         "__exit__",
         make_builtin_function("__exit__", |args| {
             // Call close on exit.
-            let _ = file_method_close(&args[..1]);
+            file_method_close(&args[..1])?;
             Ok(w_none())
         }),
     );
@@ -7319,7 +7315,11 @@ fn file_get_pos(self_obj: PyObjectRef) -> usize {
 }
 
 fn file_set_pos(self_obj: PyObjectRef, pos: usize) {
-    let _ = crate::baseobjspace::setattr_str(self_obj, "__file_pos__", w_int_new(pos as i64));
+    // Private storage slot on a fresh hasdict file wrapper (no custom
+    // `__setattr__`, `__file_pos__` is not a descriptor), so the write is
+    // the infallible instance-dict store `W_Root.setdictvalue`
+    // (baseobjspace.py:51) that `setattr_str` would itself reach.
+    crate::baseobjspace::setdictvalue(self_obj, "__file_pos__", w_int_new(pos as i64));
 }
 
 /// The raw file descriptor for an fd-backed file object (`open(fd, ...)`),
@@ -7612,7 +7612,7 @@ fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             }
             #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
             let _ = fd;
-            let _ = crate::baseobjspace::setattr_str(args[0], "closed", w_bool_from(true));
+            crate::baseobjspace::setattr_str(args[0], "closed", w_bool_from(true))?;
         }
         return Ok(w_none());
     }
@@ -7655,7 +7655,7 @@ fn file_flush_dirty(obj: PyObjectRef) -> Result<(), crate::PyError> {
                 format!("{e}: '{name_s}'"),
             ));
         }
-        let _ = crate::baseobjspace::setattr_str(obj, "__file_dirty__", w_bool_from(false));
+        crate::baseobjspace::setattr_str(obj, "__file_dirty__", w_bool_from(false))?;
     }
     Ok(())
 }
@@ -7947,12 +7947,12 @@ fn textio_configure(
     let errors = str_arg(positional.get(2).copied())
         .or_else(|| str_arg(crate::builtins::kwarg_get(kwargs, "errors")))
         .unwrap_or_else(|| "strict".to_string());
-    let _ = crate::baseobjspace::setattr_str(self_obj, "__textio_buffer__", buffer);
-    let _ = crate::baseobjspace::setattr_str(self_obj, "closed", w_bool_from(false));
-    let _ = crate::baseobjspace::setattr_str(self_obj, "encoding", w_str_new(&encoding));
-    let _ = crate::baseobjspace::setattr_str(self_obj, "errors", w_str_new(&errors));
+    crate::baseobjspace::setattr_str(self_obj, "__textio_buffer__", buffer)?;
+    crate::baseobjspace::setattr_str(self_obj, "closed", w_bool_from(false))?;
+    crate::baseobjspace::setattr_str(self_obj, "encoding", w_str_new(&encoding))?;
+    crate::baseobjspace::setattr_str(self_obj, "errors", w_str_new(&errors))?;
     if let Ok(name) = crate::baseobjspace::getattr_str(buffer, "name") {
-        let _ = crate::baseobjspace::setattr_str(self_obj, "name", name);
+        crate::baseobjspace::setattr_str(self_obj, "name", name)?;
     }
     Ok(())
 }

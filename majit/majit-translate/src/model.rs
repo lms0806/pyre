@@ -3627,21 +3627,6 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
         fn absorb(&mut self, _other: Self) {}
     }
 
-    fn all_equal(args: &[LinkArg]) -> bool {
-        args.first()
-            .is_none_or(|first| args.iter().skip(1).all(|arg| arg == first))
-    }
-
-    fn isspecialvar(arg: &LinkArg) -> bool {
-        // simplify.py:538 `v._name in ('last_exception_', 'last_exc_value_')` —
-        // compare the bare `_name` prefix, not the suffix-appended `name()`.
-        matches!(
-            arg,
-            LinkArg::Value(var)
-                if matches!(var.name_prefix().as_str(), "last_exception_" | "last_exc_value_")
-        )
-    }
-
     let mut uf: UnionFind<LinkArg, Representative> =
         UnionFind::new(|arg: &LinkArg| Representative { rep: arg.clone() });
 
@@ -3693,16 +3678,30 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
                 .iter()
                 .map(|arg| uf.find_rep(arg.clone()))
                 .collect();
-            if all_equal(&new_args) && !isspecialvar(&new_args[0]) {
-                // The current model IR can only rename operation operands to
-                // Variables.  Leave all-constant phis alone until model ops
-                // can carry Constants in the same slots as flowspace Hlvalue.
-                if matches!(&new_args[0], LinkArg::Value(_)) {
-                    uf.union(new_args[0].clone(), LinkArg::Value(input.clone()));
-                    to_remove.push(i);
-                    continue;
-                }
-            }
+            // PRE-EXISTING-ADAPTATION: the all-equal phi collapse of
+            // `simplify.py:561-563` (`if all_equal(new_args):
+            // uf.union(new_args[0], input)`) is omitted here.  Upstream that
+            // collapse deliberately produces cross-block variable references
+            // — it removes a merge block's inputarg and leaves the body
+            // reading a value defined in a predecessor — and relies on the
+            // next `all_passes` entry, `SSA_to_SSI` (backendopt/ssa.py:135-196),
+            // to repair them by re-threading every used-but-undefined variable
+            // as a fresh inputarg through all incoming links.  pyre runs this
+            // pass on the `crate::model` front-end graph, which has no
+            // `SSA_to_SSI` (the faithful `ssa_to_ssi` port at
+            // translator/backendopt/ssa.rs operates on `crate::flowspace::model`,
+            // a distinct IR).  Without the repair the collapse strands the body
+            // reference and the flowspace adapter rejects it as an undefined
+            // operand.  `prune_dead_phis` (transform_dead_op_vars) has already
+            // dropped every dead inputarg, so each surviving column is used and
+            // `SSA_to_SSI` would re-thread it regardless — the collapse is a
+            // no-op net of the repair, and skipping it yields the same graph
+            // with the column left threaded.  The codewriter's phi-tuple
+            // equivalence (`simplify.py:565-568`) is the duplicate-column merge
+            // handled by `unique_phis` below, which is SSI-safe because both
+            // columns are inputargs of the same block.  Convergence path: port
+            // `SSA_to_SSI` to `crate::model` (or unify the two `FunctionGraph`
+            // IRs and run the standard `all_passes` including `ssa_to_ssi`).
             if let Some(existing) = unique_phis.get(&new_args).cloned() {
                 uf.union(LinkArg::Value(existing), LinkArg::Value(input.clone()));
                 to_remove.push(i);
@@ -5728,12 +5727,20 @@ mod tests {
     }
 
     #[test]
-    fn prune_dead_phis_collapses_single_source_phi_with_reader() {
+    fn prune_dead_phis_retains_live_single_source_phi_pending_ssa_to_ssi() {
         // entry -> merge(phi 'x' read by a BinOp whose result is the
         // function return value) -> returnblock(reads return value).
-        // RPython `remove_identical_vars_SSA` removes a phi when all incoming
-        // args are the same value and renames downstream readers to that
-        // representative, even when the reader itself is live.
+        // RPython `remove_identical_vars_SSA` (simplify.py:561-563) would
+        // collapse a phi whose incoming args are all the same value and rename
+        // downstream readers to that representative, even a live reader.
+        // `remove_duplicate_inputargs` omits that all-equal collapse
+        // (PRE-EXISTING-ADAPTATION): on `crate::model` there is no `SSA_to_SSI`
+        // repair pass, so the collapse would strand the reader on a value
+        // defined in the predecessor and the flowspace adapter would reject it
+        // as an undefined operand.  A *live* column is left threaded instead —
+        // `SSA_to_SSI` would re-thread it regardless, so the collapse is a net
+        // no-op.  This test pins the retained-phi shape; flip it back to the
+        // collapse assertions once `SSA_to_SSI` is ported to `crate::model`.
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
         let const_v_var = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
@@ -5761,14 +5768,14 @@ mod tests {
 
         assert_eq!(
             graph.block(merge).inputargs,
-            Vec::<crate::flowspace::model::Variable>::new(),
-            "single-source phi is removed and live readers are renamed"
+            vec![phi_x_var.clone()],
+            "live single-source phi is retained (all-equal collapse deferred pending SSA_to_SSI)"
         );
         let entry_exit = &graph.block(entry).exits[0];
         assert_eq!(
             entry_exit.args.len(),
-            0,
-            "predecessor link arg matching the removed phi must be removed"
+            1,
+            "the predecessor link arg feeding the retained phi is kept"
         );
         let binop = graph
             .block(merge)
@@ -5779,9 +5786,9 @@ mod tests {
         assert!(
             matches!(
                 &binop.kind,
-                OpKind::BinOp { lhs, rhs, .. } if lhs == &const_v_var && rhs == &const_v_var
+                OpKind::BinOp { lhs, rhs, .. } if lhs == &phi_x_var && rhs == &phi_x_var
             ),
-            "live reader must be renamed to the surviving representative"
+            "live reader keeps reading the retained phi (not renamed)"
         );
     }
 
