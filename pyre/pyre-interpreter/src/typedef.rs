@@ -9089,6 +9089,14 @@ fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     // descr_init shares bytesobject.newbytesdata_w); `encoding`/`errors`
     // are only valid with a str source.
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    // pos[0] is the class; `bytearray(source, encoding, errors)` accepts at
+    // most three further positional arguments.
+    if pos.len() > 4 {
+        return Err(crate::PyError::type_error(&format!(
+            "bytearray() takes at most 3 arguments ({} given)",
+            pos.len() - 1
+        )));
+    }
     crate::builtins::kwarg_reject_unknown(kwargs, &["source", "encoding", "errors"], "bytearray")?;
     let source =
         crate::builtins::resolve_pos_or_kw(pos.get(1).copied(), kwargs, "source", "bytearray", 1)?;
@@ -9144,44 +9152,78 @@ fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 type_name_of(arg)
             )));
         }
-        if pyre_object::is_int(arg) {
-            let n = pyre_object::w_int_get_value(arg);
+        // newbytesdata_w_tail: `getindex_w(source, OverflowError)` — any object
+        // exposing __index__ is a count of NUL bytes.  (bytearray does NOT
+        // honour __bytes__, so there is no invoke_bytes_method here.)
+        if pyre_object::pyobject::is_int_or_long(arg)
+            || crate::baseobjspace::lookup(arg, "__index__").is_some()
+        {
+            let n = match crate::baseobjspace::int_w(crate::baseobjspace::space_index(arg)?) {
+                Ok(n) => n,
+                Err(e) if e.kind == crate::PyErrorKind::OverflowError => {
+                    return Err(crate::PyError::new(
+                        crate::PyErrorKind::OverflowError,
+                        format!(
+                            "cannot fit '{}' into an index-sized integer",
+                            crate::baseobjspace::object_functionstr_type_name(arg)
+                        ),
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
             if n < 0 {
                 return Err(crate::PyError::value_error("negative count"));
             }
             return Ok(pyre_object::bytearrayobject::w_bytearray_new(n as usize));
         }
-        if pyre_object::bytesobject::is_bytes_like(arg) {
-            let data = pyre_object::bytesobject::bytes_like_data(arg);
-            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(data));
-        }
-        // `buffer_w` rejects a released memoryview before gathering its bytes.
-        if pyre_object::memoryview::is_w_memoryview(arg) {
-            crate::builtins::memoryview_check_released(arg)?;
-        }
-        if let Some(data) = crate::builtins::memoryview_as_bytes(arg) {
-            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&data));
+        // `_convert_from_buffer_or_iterable`: any buffer exporter — bytes,
+        // bytearray, `array.array`, memoryview — yields its raw buffer bytes
+        // (`buffer_w(BUF_FULL_RO).as_str()`) before the iterable path; a
+        // released memoryview raises first.
+        if let Some(b) = crate::typedef::buffer_as_bytes_like(arg)? {
+            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
+                pyre_object::bytesobject::bytes_like_data(b),
+            ));
         }
     }
-    // bytesobject.py:856 _from_byte_sequence_w
-    let items = crate::builtins::collect_iterable(arg)?;
-    let mut buf = Vec::with_capacity(items.len());
-    for item in items {
-        if !unsafe { pyre_object::is_int(item) } {
-            return Err(crate::PyError::type_error("an integer is required"));
+    // `_from_byte_sequence_loop`: stream the source through `byte_w` (honours
+    // __index__, "byte must be in range(0, 256)"; a non-index element → "'X'
+    // object cannot be interpreted as an integer").  A source with no __iter__
+    // → "cannot convert 'X' object to bytearray"; an error raised by
+    // __iter__/__next__ propagates unchanged.
+    unsafe {
+        let it = match crate::baseobjspace::iter(arg) {
+            Ok(it) => it,
+            Err(e) => {
+                if crate::baseobjspace::lookup(arg, "__iter__").is_none() {
+                    return Err(crate::PyError::type_error(format!(
+                        "cannot convert '{}' object to bytearray",
+                        crate::baseobjspace::object_functionstr_type_name(arg)
+                    )));
+                }
+                return Err(e);
+            }
+        };
+        let mut buf = Vec::new();
+        loop {
+            match crate::baseobjspace::next(it) {
+                Ok(item) => buf.push(crate::baseobjspace::byte_w(item, "byte")?),
+                Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+                Err(e) => return Err(e),
+            }
         }
-        let v = unsafe { pyre_object::w_int_get_value(item) };
-        if !(0..=255).contains(&v) {
-            return Err(crate::PyError::value_error("byte must be in range(0, 256)"));
-        }
-        buf.push(v as u8);
+        Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&buf))
     }
-    Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&buf))
 }
 
 /// PyPy: bytesobject.py W_BytesObject.typedef
 fn init_bytes_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(bytes_descr_new));
+    dict_storage_store(
+        ns,
+        "__bytes__",
+        make_builtin_function_with_arity("__bytes__", bytes_method_bytes, 1),
+    );
     dict_storage_store(
         ns,
         "decode",
@@ -11522,6 +11564,21 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
 }
 
 /// PyPy: bytesobject.py descr_repr — returns a quoted literal like `b'hello'`.
+fn bytes_method_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `W_BytesObject.descr_bytes` ("convert this value to exact type bytes"):
+    // an exact `bytes` returns itself; a subclass returns a fresh exact-bytes
+    // copy of its value.
+    crate::type_methods::require_receiver(args, "__bytes__")?;
+    let self_ = args[0];
+    if unsafe { pyre_object::pyobject::is_exact_type(self_, &pyre_object::bytesobject::BYTES_TYPE) }
+    {
+        return Ok(self_);
+    }
+    Ok(pyre_object::bytesobject::w_bytes_from_bytes(unsafe {
+        pyre_object::bytesobject::bytes_like_data(self_)
+    }))
+}
+
 fn bytes_method_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "__repr__")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
@@ -11572,6 +11629,14 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     // every parameter is positional-or-keyword (bytesobject.py descr_new);
     // `encoding`/`errors` are only valid with a str source.
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    // pos[0] is the class; `bytes(source, encoding, errors)` accepts at most
+    // three further positional arguments.
+    if pos.len() > 4 {
+        return Err(crate::PyError::type_error(&format!(
+            "bytes() takes at most 3 arguments ({} given)",
+            pos.len() - 1
+        )));
+    }
     crate::builtins::kwarg_reject_unknown(kwargs, &["source", "encoding", "errors"], "bytes")?;
     let source =
         crate::builtins::resolve_pos_or_kw(pos.get(1).copied(), kwargs, "source", "bytes", 1)?;
@@ -11621,9 +11686,47 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                 type_name_of(arg)
             )));
         }
-        if pyre_object::is_int(arg) {
+        // bytesobject.py:560 — `bytes(bytes_obj)` on an exact `bytes` source
+        // returns the argument unmodified (identity).  A subclass source falls
+        // through (its bytes are copied); a subclass *request* is retagged by
+        // `bytes_descr_new`, which copies before retagging.
+        if pyre_object::pyobject::is_exact_type(arg, &pyre_object::bytesobject::BYTES_TYPE) {
+            return Ok(arg);
+        }
+        // bytesobject.py:575 `invoke_bytes_method` — a `__bytes__` special
+        // method takes precedence over the count / buffer / iterable paths;
+        // its result is returned **unmodified** (even a bytes subclass), so the
+        // exact object identity is preserved.  (bytearray does NOT honour
+        // __bytes__.)
+        if let Some(method) = crate::baseobjspace::lookup(arg, "__bytes__") {
+            let w_bytes = crate::builtins::call_and_check(method, &[arg])?;
+            if !pyre_object::bytesobject::is_bytes(w_bytes) {
+                return Err(crate::PyError::type_error(format!(
+                    "__bytes__ returned non-bytes (type {})",
+                    type_name_of(w_bytes)
+                )));
+            }
+            return Ok(w_bytes);
+        }
+        // newbytesdata_w_tail: `getindex_w(source, OverflowError)` — any object
+        // exposing __index__ (not just an exact int) is a count of NUL bytes.
+        if pyre_object::pyobject::is_int_or_long(arg)
+            || crate::baseobjspace::lookup(arg, "__index__").is_some()
+        {
+            let n = match crate::baseobjspace::int_w(crate::baseobjspace::space_index(arg)?) {
+                Ok(n) => n,
+                Err(e) if e.kind == crate::PyErrorKind::OverflowError => {
+                    return Err(crate::PyError::new(
+                        crate::PyErrorKind::OverflowError,
+                        format!(
+                            "cannot fit '{}' into an index-sized integer",
+                            crate::baseobjspace::object_functionstr_type_name(arg)
+                        ),
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
             // bytesobject.py:797 — negative count raises ValueError
-            let n = pyre_object::w_int_get_value(arg);
             if n < 0 {
                 return Err(crate::PyError::value_error("negative count"));
             }
@@ -11631,33 +11734,45 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                 &vec![0u8; n as usize],
             ));
         }
-        if pyre_object::bytesobject::is_bytes_like(arg) {
-            let data = pyre_object::bytesobject::bytes_like_data(arg);
-            return Ok(new_bytes_like(args[0], data));
-        }
-        // `buffer_w` rejects a released memoryview before gathering its bytes.
-        if pyre_object::memoryview::is_w_memoryview(arg) {
-            crate::builtins::memoryview_check_released(arg)?;
-        }
-        if let Some(data) = crate::builtins::memoryview_as_bytes(arg) {
-            return Ok(new_bytes_like(args[0], &data));
-        }
-    }
-    // Iterable of ints — pypy/objspace/std/bytesobject.py _from_byte_sequence
-    // checks 0 <= val < 256 per element; out-of-range raises ValueError
-    // "bytes must be in range(0, 256)".
-    let items = crate::builtins::collect_iterable(arg)?;
-    let mut buf = Vec::with_capacity(items.len());
-    for item in items {
-        let val = unsafe { pyre_object::w_int_get_value(item) };
-        if !(0..=255).contains(&val) {
-            return Err(crate::PyError::value_error(
-                "bytes must be in range(0, 256)",
+        // `_convert_from_buffer_or_iterable`: any buffer exporter — bytes,
+        // bytearray, `array.array`, memoryview — yields its raw buffer bytes
+        // (`buffer_w(BUF_FULL_RO).as_str()`) before the iterable path; a
+        // released memoryview raises first.
+        if let Some(b) = crate::typedef::buffer_as_bytes_like(arg)? {
+            return Ok(new_bytes_like(
+                args[0],
+                pyre_object::bytesobject::bytes_like_data(b),
             ));
         }
-        buf.push(val as u8);
     }
-    Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
+    // `_from_byte_sequence_loop`: iterate the source, coercing each element
+    // with `byte_w` (honours __index__ and range-checks 0..256, "bytes must be
+    // in range(0, 256)"; a non-index element → "'X' object cannot be
+    // interpreted as an integer").  A source with no __iter__ is the "cannot
+    // convert" case; an error raised by __iter__/__next__ propagates unchanged.
+    unsafe {
+        let it = match crate::baseobjspace::iter(arg) {
+            Ok(it) => it,
+            Err(e) => {
+                if crate::baseobjspace::lookup(arg, "__iter__").is_none() {
+                    return Err(crate::PyError::type_error(format!(
+                        "cannot convert '{}' object to bytes",
+                        crate::baseobjspace::object_functionstr_type_name(arg)
+                    )));
+                }
+                return Err(e);
+            }
+        };
+        let mut buf = Vec::new();
+        loop {
+            match crate::baseobjspace::next(it) {
+                Ok(item) => buf.push(crate::baseobjspace::byte_w(item, "bytes")?),
+                Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
+    }
 }
 
 /// `space.byte_w` — extract a single byte (`0 <= v < 256`) from an int
@@ -12088,6 +12203,42 @@ fn init_bytearray_type(ns: &mut DictStorage) {
         ns,
         "copy",
         make_builtin_function("copy", bytearray_method_copy),
+    );
+    // Subscript slots exposed as callable dunders.  Each binds the direct
+    // slot body so a subclass override's `super().__getitem__` reaches the
+    // inherited builtin subscript instead of re-entering override dispatch.
+    dict_storage_store(
+        ns,
+        "__getitem__",
+        make_builtin_function_with_arity(
+            "__getitem__",
+            |args| crate::baseobjspace::getitem_slot(args[0], args[1]),
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__setitem__",
+        make_builtin_function_with_arity(
+            "__setitem__",
+            |args| {
+                crate::baseobjspace::setitem_slot(args[0], args[1], args[2])?;
+                Ok(pyre_object::w_none())
+            },
+            3,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__delitem__",
+        make_builtin_function_with_arity(
+            "__delitem__",
+            |args| {
+                crate::baseobjspace::delitem_slot(args[0], args[1])?;
+                Ok(pyre_object::w_none())
+            },
+            2,
+        ),
     );
     for (name, func) in [
         ("__eq__", bytearray_dunder_eq as DunderFn),

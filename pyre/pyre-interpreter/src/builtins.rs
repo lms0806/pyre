@@ -327,12 +327,17 @@ fn memoryview_pack_value(
             Err(bad_type())
         }
     };
-    let int_val = || -> Result<i64, crate::PyError> {
+    // Integer formats coerce via `__index__` (`pack_single`/`PyNumber_Index`),
+    // not an exact-int check; a value with no `__index__` is the format error.
+    let as_index = || -> Result<PyObjectRef, crate::PyError> {
         if unsafe { pyre_object::is_int_or_long(w_val) } {
-            crate::baseobjspace::int_w(w_val).map_err(|_| bad_type())
+            Ok(w_val)
         } else {
-            Err(bad_type())
+            unsafe { crate::baseobjspace::space_index(w_val) }.map_err(|_| bad_type())
         }
+    };
+    let int_val = || -> Result<i64, crate::PyError> {
+        crate::baseobjspace::int_w(as_index()?).map_err(|_| bad_type())
     };
     let bytes = match memoryview_format_code(fmt) {
         b'b' => {
@@ -370,10 +375,7 @@ fn memoryview_pack_value(
             v.to_ne_bytes().to_vec()
         }
         b'L' | b'Q' | b'N' | b'P' => {
-            if !unsafe { pyre_object::is_int_or_long(w_val) } {
-                return Err(bad_type());
-            }
-            let v = crate::baseobjspace::uint_w(w_val).map_err(|_| bad_type())?;
+            let v = crate::baseobjspace::uint_w(as_index()?).map_err(|_| bad_type())?;
             v.to_ne_bytes().to_vec()
         }
         b'f' => {
@@ -424,9 +426,11 @@ unsafe fn memoryview_values(mv: PyObjectRef) -> Vec<PyObjectRef> {
 }
 
 /// A live strided sub-view `m[start:stop:step]`, sharing the same backing.
-/// Item-space slice indices map to a byte `offset += start*parent_stride`
-/// with `stride *= step` and `shape = (slicelength,)`, so the result reads
-/// through to the original storage (`buffer.py` `BufferSlice`).
+/// Slicing operates on dimension 0 (`buffer.py BufferSlice`): the element
+/// count is `shape[0]`, the step rides `strides[0]`, and dimensions `1..ndim`
+/// are preserved, so slicing an N-D view keeps its dimensionality.  The byte
+/// `offset += start*strides[0]` and `strides[0] *= step` make the result read
+/// through to the original storage.
 unsafe fn memoryview_slice_view(
     mv: PyObjectRef,
     index: PyObjectRef,
@@ -434,9 +438,19 @@ unsafe fn memoryview_slice_view(
     use pyre_object::memoryview::*;
     unsafe {
         let itemsize = w_memoryview_itemsize(mv);
-        let length = w_memoryview_length(mv);
-        let count = if itemsize > 0 { length / itemsize } else { 0 };
-        let stride_p = w_memoryview_stride0(mv);
+        let ndim = w_memoryview_ndim(mv);
+        let parent_shape = w_memoryview_shape(mv);
+        let parent_strides = w_memoryview_strides(mv);
+        let count = if ndim >= 1 {
+            memoryview_dim_value(parent_shape, 0)
+        } else {
+            0
+        };
+        let stride_p = if ndim >= 1 {
+            memoryview_dim_value(parent_strides, 0)
+        } else {
+            itemsize
+        };
         let offset_p = w_memoryview_offset(mv);
         let (start, stop, step) = crate::baseobjspace::normalize_slice(index, count)?;
         let slicelength = if step > 0 {
@@ -452,8 +466,17 @@ unsafe fn memoryview_slice_view(
         };
         let new_offset = offset_p + start * stride_p;
         let new_stride = stride_p * step;
-        let shape = pyre_object::w_tuple_new(vec![w_int_new(slicelength)]);
-        let strides = pyre_object::w_tuple_new(vec![w_int_new(new_stride)]);
+        // Dimension 0 takes the slice's shape/stride; later dimensions ride
+        // along unchanged.
+        let mut shape_v = vec![slicelength];
+        let mut strides_v = vec![new_stride];
+        for d in 1..ndim {
+            shape_v.push(memoryview_dim_value(parent_shape, d));
+            strides_v.push(memoryview_dim_value(parent_strides, d));
+        }
+        let new_length = shape_v.iter().product::<i64>() * itemsize;
+        let shape = pyre_object::w_tuple_new(shape_v.iter().map(|&x| w_int_new(x)).collect());
+        let strides = pyre_object::w_tuple_new(strides_v.iter().map(|&x| w_int_new(x)).collect());
         Ok(w_memoryview_alloc(
             w_memoryview_obj(mv),
             w_memoryview_backing(mv),
@@ -461,9 +484,9 @@ unsafe fn memoryview_slice_view(
             shape,
             strides,
             itemsize,
-            1,
+            ndim.max(1),
             new_offset,
-            slicelength * itemsize,
+            new_length,
             w_memoryview_readonly(mv),
             false,
         ))
@@ -701,6 +724,11 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         // Slice assignment writes the rvalue's element bytes through to the
         // strided positions of the view (`_setitem_slice`).
         if pyre_object::is_slice(index) {
+            if w_memoryview_ndim(mv) != 1 {
+                return Err(crate::PyError::not_implemented(
+                    "memoryview slice assignments are currently restricted to ndim = 1",
+                ));
+            }
             let (start, stop, step) = crate::baseobjspace::normalize_slice(index, count)?;
             let mut indices = Vec::new();
             let mut i = start;
@@ -754,6 +782,11 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                 )));
             }
             let packed = memoryview_pack_value(&fmt, isz, value)?;
+            // memory_ass_sub: pack the value, then re-check release before the
+            // write — the value's `__index__`/`__float__` coercion may have
+            // released the view (`bytes_from_value` → `_check_released` →
+            // `setbytes`).
+            memoryview_check_released(mv)?;
             let start = memoryview_start_from_tuple(mv, index)?;
             let addr = (offset + start) as usize;
             let full =
@@ -774,6 +807,8 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             return Err(crate::PyError::index_error("index out of bounds"));
         }
         let packed = memoryview_pack_value(&fmt, isz, value)?;
+        // Re-check release after value coercion (see tuple path above).
+        memoryview_check_released(mv)?;
         let addr = (offset + i * stride0) as usize;
         let full = memoryview_backing_bytes_mut(backing).expect("writable backing checked above");
         full[addr..addr + isz].copy_from_slice(&packed);
@@ -801,27 +836,6 @@ fn memoryview_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     }
 }
 
-/// `memoryview.__contains__` — membership over the format-aware element
-/// values (value equality, so `1 in memoryview(array('i', [1]))`).
-fn memoryview_contains(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
-    let needle = args.get(1).copied().unwrap_or(w_none());
-    unsafe {
-        memoryview_check_released(mv)?;
-        for elem in memoryview_values(mv) {
-            let r = crate::objspace::descroperation::compare(
-                elem,
-                needle,
-                crate::objspace::descroperation::CompareOp::Eq,
-            )?;
-            if crate::baseobjspace::is_true(r)? {
-                return Ok(w_bool_from(true));
-            }
-        }
-        Ok(w_bool_from(false))
-    }
-}
-
 /// `memoryview.readonly` — true for a bytes / array (Stage-1) backing or a
 /// view explicitly made read-only via `toreadonly`.
 fn memoryview_readonly(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -840,6 +854,22 @@ fn memoryview_nbytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     unsafe {
         memoryview_check_released(mv)?;
         Ok(w_int_new(pyre_object::memoryview::w_memoryview_length(mv)))
+    }
+}
+
+/// `memoryview._pypy_raw_address` — the integer raw address of the view's
+/// backing store, base data pointer plus the view's byte offset
+/// (`descr_pypy_raw_address` → `get_raw_address`).  Every pyre backing
+/// (bytes / bytearray / array) is a contiguous in-heap store with a real
+/// data pointer, so the "no raw address" branch is structurally unreachable.
+fn memoryview_raw_address(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe {
+        memoryview_check_released(mv)?;
+        let backing = pyre_object::memoryview::w_memoryview_backing(mv);
+        let base = memoryview_backing_slice(backing).as_ptr() as usize;
+        let offset = pyre_object::memoryview::w_memoryview_offset(mv) as usize;
+        Ok(w_int_new((base + offset) as i64))
     }
 }
 
@@ -968,7 +998,11 @@ fn memoryview_tolist(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     unsafe {
         memoryview_check_released(mv)?;
         let ndim = pyre_object::memoryview::w_memoryview_ndim(mv);
-        if ndim <= 1 {
+        if ndim == 0 {
+            // `buffer.py w_tolist` raises for a 0-dim view.
+            return Err(crate::PyError::not_implemented(""));
+        }
+        if ndim == 1 {
             return Ok(w_list_new(memoryview_values(mv)));
         }
         let isz = pyre_object::memoryview::w_memoryview_itemsize(mv) as usize;
@@ -1215,7 +1249,23 @@ unsafe fn memoryview_operand_bytes(obj: PyObjectRef) -> Option<Vec<u8>> {
         if pyre_object::bytesobject::is_bytes_like(obj) {
             return Some(pyre_object::bytesobject::bytes_like_data(obj).to_vec());
         }
+        // `memory_richcompare` acquires any contiguous buffer of the operand
+        // (`space.buffer_w(w_other, BUF_CONTIG_RO)`), so an `array` compares by
+        // its element bytes too; a non-buffer operand yields NotImplemented.
+        if let Ok(Some(b)) = crate::typedef::buffer_as_bytes_like(obj) {
+            return Some(pyre_object::bytesobject::bytes_like_data(b).to_vec());
+        }
         None
+    }
+}
+
+/// True when `mv` or a memoryview `other` operand is released — either side
+/// then compares by identity instead of reading a buffer past `release()`.
+unsafe fn memoryview_released_either(mv: PyObjectRef, other: PyObjectRef) -> bool {
+    unsafe {
+        pyre_object::memoryview::w_memoryview_released(mv)
+            || (pyre_object::memoryview::is_w_memoryview(other)
+                && pyre_object::memoryview::w_memoryview_released(other))
     }
 }
 
@@ -1225,8 +1275,9 @@ fn memoryview_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
     let other = args.get(1).copied().unwrap_or(w_none());
     unsafe {
-        // A released view compares by identity (`view is None` branch).
-        if pyre_object::memoryview::w_memoryview_released(mv) {
+        // A released view (on either side) compares by identity (`view is None`
+        // branch); its backing must not be read after release.
+        if memoryview_released_either(mv, other) {
             return Ok(w_bool_from(mv == other));
         }
         let a = memoryview_gather_bytes(mv);
@@ -1242,7 +1293,7 @@ fn memoryview_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
     let other = args.get(1).copied().unwrap_or(w_none());
     unsafe {
-        if pyre_object::memoryview::w_memoryview_released(mv) {
+        if memoryview_released_either(mv, other) {
             return Ok(w_bool_from(mv != other));
         }
         let a = memoryview_gather_bytes(mv);
@@ -1285,7 +1336,17 @@ fn memoryview_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 }
 
 /// `memoryview.__delitem__` — memoryview does not support item deletion.
-fn memoryview_delitem(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+/// `memory_ass_sub` checks released, then read-only, before the delete
+/// rejection, so a released view reports the released error and a read-only
+/// view reports "cannot modify read-only memory".
+pub(crate) fn memoryview_delitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe {
+        memoryview_check_released(mv)?;
+        if pyre_object::memoryview::w_memoryview_readonly(mv) {
+            return Err(crate::PyError::type_error("cannot modify read-only memory"));
+        }
+    }
     Err(crate::PyError::type_error("cannot delete memory"))
 }
 
@@ -1337,7 +1398,7 @@ fn memoryview_is_f_contiguous(shape: &[i64], strides: &[i64], itemsize: i64) -> 
 
 /// `(c_contiguous, f_contiguous)` for a view, from `_init_flags` /
 /// `PyBuffer_isContiguous`.  A 0-dim (scalar) view is both.
-unsafe fn memoryview_contiguity(mv: PyObjectRef) -> (bool, bool) {
+pub(crate) unsafe fn memoryview_contiguity(mv: PyObjectRef) -> (bool, bool) {
     use pyre_object::memoryview::*;
     unsafe {
         let ndim = w_memoryview_ndim(mv);
@@ -1425,7 +1486,6 @@ pub(crate) fn init_memoryview_type(ns: &mut DictStorage) {
         ("__setitem__", memoryview_setitem, 3),
         ("__len__", memoryview_len, 1),
         ("__iter__", memoryview_iter, 1),
-        ("__contains__", memoryview_contains, 2),
         ("__repr__", memoryview_repr, 1),
         ("__eq__", memoryview_eq, 2),
         ("__ne__", memoryview_ne, 2),
@@ -1435,6 +1495,7 @@ pub(crate) fn init_memoryview_type(ns: &mut DictStorage) {
         ("release", memoryview_release, 1),
         ("__enter__", memoryview_enter, 1),
         ("__hash__", memoryview_hash, 1),
+        ("_pypy_raw_address", memoryview_raw_address, 1),
     ] {
         crate::dict_storage_store(ns, name, make_builtin_function_with_arity(name, f, arity));
     }

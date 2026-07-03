@@ -2321,8 +2321,43 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
     Ok(w_none())
 }
 
+/// Resolve a `bytearray` subscript index (`bytearray_ass_subscript`): honor
+/// `__index__`, raise the "indices must be integers or slices" TypeError for a
+/// non-index, non-slice key, and raise IndexError for a value too large to fit
+/// an index (`PyNumber_AsSsize_t(index, IndexError)`).
+unsafe fn bytearray_index(index: PyObjectRef) -> Result<i64, PyError> {
+    if !pyre_object::pyobject::is_int_or_long(index) && lookup(index, "__index__").is_none() {
+        return Err(index_type_error("bytearray", index));
+    }
+    match int_w(space_index(index)?) {
+        Ok(i) => Ok(i),
+        // `baseobjspace.py getindex_w` — an index that overflows a machine
+        // word reports the *source* object's type, `oefmt("cannot fit '%T'
+        // into an index-sized integer", w_obj)`, not the coerced `int`.
+        Err(e) if e.kind == PyErrorKind::OverflowError => Err(PyError::new(
+            PyErrorKind::IndexError,
+            format!(
+                "cannot fit '{}' into an index-sized integer",
+                object_functionstr_type_name(index)
+            ),
+        )),
+        Err(e) => Err(e),
+    }
+}
+
 #[inline(never)]
 unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
+    if is_slice(index) {
+        return setitem_bytearray_slice(obj, index, value);
+    }
+    // `descr_setitem`: getindex_w(index) → _fixindex(idx) → coerce value.  The
+    // index gate and byte coercion are inlined (not routed through the shared
+    // `bytearray_index`/`byte_w`) and the coercion is kept inside the in-bounds
+    // block: a shared-function result fails to bind a concrete Int repr in the
+    // rtyper (concretetype None), which the codewriter then mis-colors Ref
+    // against its Int provenance.  `__index__` index support and coercing before
+    // the bounds check (so `ba[oob] = bad` reports the value error ahead of
+    // IndexError) are deferred on that same kind-provenance gap.
     if !is_int(index) {
         return Err(PyError::type_error("bytearray indices must be integers"));
     }
@@ -2330,9 +2365,6 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
     let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual >= 0 && actual < len {
-        // bytearrayobject.py `_getbytevalue`: coerce via `space.index`
-        // (honoring `__index__`), then enforce the `0 <= v < 256` rule.
-        // The index bounds are checked first, matching `bytearray_ass_subscript`.
         let v = if is_int(value) {
             w_int_get_value(value)
         } else {
@@ -2340,13 +2372,11 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
             if is_int(indexed) {
                 w_int_get_value(indexed)
             } else {
-                // `space.index` may yield a long; one that overflows i64
-                // is necessarily outside 0..256 → the ValueError below.
-                let big = w_long_get_value(indexed);
-                if pyre_object::longobject::jit_bigint_to_i64_fits(big) != 0 {
-                    pyre_object::longobject::jit_bigint_to_i64_value(big)
-                } else {
-                    return Err(PyError::value_error("byte must be in range(0, 256)"));
+                match i64::try_from(w_long_get_value(indexed)) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Err(PyError::value_error("byte must be in range(0, 256)"));
+                    }
                 }
             }
         };
@@ -2360,6 +2390,145 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
         PyErrorKind::IndexError,
         "bytearray index out of range",
     ))
+}
+
+/// `space.byte_w` (`bytearrayobject.py _getbytevalue` / `bytesobject.py
+/// _from_byte_sequence_loop`) — coerce a value to a single byte: honor
+/// `__index__`, then enforce `0 <= v < 256`.  `noun` selects the divergent
+/// range-error text — "byte" for bytearray, "bytes" for the bytes constructor.
+pub(crate) unsafe fn byte_w(value: PyObjectRef, noun: &str) -> Result<u8, PyError> {
+    let v = if is_int(value) {
+        w_int_get_value(value)
+    } else {
+        let indexed = space_index(value)?;
+        if is_int(indexed) {
+            w_int_get_value(indexed)
+        } else {
+            // `space.index` may yield a long; one that overflows i64 is
+            // necessarily outside 0..256 → the ValueError below.
+            match i64::try_from(w_long_get_value(indexed)) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Err(PyError::value_error(format!(
+                        "{noun} must be in range(0, 256)"
+                    )));
+                }
+            }
+        }
+    };
+    if !(0..=255).contains(&v) {
+        return Err(PyError::value_error(format!(
+            "{noun} must be in range(0, 256)"
+        )));
+    }
+    Ok(v as u8)
+}
+
+/// `bytesobject.py makebytesdata_w` — coerce a slice-assignment source to
+/// raw bytes: a buffer (bytes/bytearray/array/memoryview) yields its bytes,
+/// otherwise an iterable of ints is range-checked element-wise.  A `str` or
+/// non-iterable source is rejected.
+unsafe fn bytearray_assign_source(value: PyObjectRef) -> Result<Vec<u8>, PyError> {
+    if let Some(src) = crate::typedef::buffer_as_bytes_like(value)? {
+        return Ok(pyre_object::bytesobject::bytes_like_data(src).to_vec());
+    }
+    // A `str` or index operand (`= "x"` / `= 5`) is the common mis-assignment
+    // → the "can assign only ..." hint; any other non-iterable is "cannot convert".
+    if is_str(value)
+        || pyre_object::pyobject::is_int_or_long(value)
+        || lookup(value, "__index__").is_some()
+    {
+        return Err(PyError::type_error(
+            "can assign only bytes, buffers, or iterables of ints in range(0, 256)",
+        ));
+    }
+    // `_from_byte_sequence` / `_from_byte_sequence_loop` — iterate the source,
+    // converting and range-checking each item as it is pulled
+    // (`builder.append(space.byte_w(w_item))` per element), so a bad byte or a
+    // raising `__next__` surfaces at once without draining the rest (an
+    // infinite iterator that yields a bad byte still fails immediately).  A
+    // source with no `__iter__` is the non-iterable "cannot convert" case; an
+    // error raised *by* `__iter__`/`__next__` propagates unchanged.
+    let it = match crate::baseobjspace::iter(value) {
+        Ok(it) => it,
+        Err(e) => {
+            if lookup(value, "__iter__").is_none() {
+                return Err(PyError::type_error(format!(
+                    "cannot convert '{}' object to bytearray",
+                    object_functionstr_type_name(value),
+                )));
+            }
+            return Err(e);
+        }
+    };
+    let mut out = Vec::new();
+    loop {
+        match crate::baseobjspace::next(it) {
+            Ok(w_item) => out.push(byte_w(w_item, "byte")?),
+            Err(e) if e.kind == PyErrorKind::StopIteration => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+
+/// `bytearrayobject.py descr_setitem` slice branch + `_setitem_slice_helper`
+/// — replace a (possibly extended) slice with the source bytes, resizing for
+/// step-1 slices and requiring equal length for extended slices.
+#[inline(never)]
+unsafe fn setitem_bytearray_slice(
+    obj: PyObjectRef,
+    index: PyObjectRef,
+    value: PyObjectRef,
+) -> PyResult {
+    // `descr_setitem`: materialize the source (`makebytesdata_w`) first, then
+    // `_unpack_slice` — evaluate the slice's `__index__` before reading the
+    // length, since both the source's `__iter__`/`__next__` and the slice
+    // components' `__index__` may mutate the bytearray, and the bounds must be
+    // clamped against the post-mutation length. (`x[:] = x` stays safe — the
+    // source is copied into `sequence2`.)
+    let sequence2 = bytearray_assign_source(value)?;
+    let (rs, rp, st) = crate::sliceobject::slice_unpack(
+        w_slice_get_start(index),
+        w_slice_get_stop(index),
+        w_slice_get_step(index),
+    )?;
+    let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
+    let (start, stop, step, _) = crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
+    let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
+    if step == 1 {
+        let cur = vec.len();
+        let s = (start.max(0) as usize).min(cur);
+        let e = (stop.max(start) as usize).min(cur).max(s);
+        vec.splice(s..e, sequence2.iter().copied());
+        return Ok(w_none());
+    }
+    // Extended slice: `descr_setitem` forbids resizing — the source length
+    // must equal the slice length; positions are written in order.
+    let mut indices = Vec::new();
+    let mut i = start;
+    while (step > 0 && i < stop) || (step < 0 && i > stop) {
+        if i >= 0 && i < len {
+            indices.push(i as usize);
+        }
+        i += step;
+    }
+    if sequence2.len() != indices.len() {
+        return Err(PyError::new(
+            PyErrorKind::ValueError,
+            format!(
+                "attempt to assign bytes of size {} to extended slice of size {}",
+                sequence2.len(),
+                indices.len()
+            ),
+        ));
+    }
+    for (k, &idx) in indices.iter().enumerate() {
+        if let Some(slot) = vec.get_mut(idx) {
+            *slot = sequence2[k];
+        }
+    }
+    Ok(w_none())
 }
 
 #[inline(never)]
@@ -11140,7 +11309,10 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
             }
         }
     }
-    // Fallback: try iterating with getitem(obj, i) for i=0,1,...
+    // Fallback: `space.sequence_contains` — scan via getitem(obj, i) for
+    // i = 0, 1, ….  An `IndexError` ends the scan (not found); any other
+    // error (e.g. a released/non-contiguous memoryview) propagates, matching
+    // `PySequence_Contains`.
     let mut i = 0i64;
     loop {
         match getitem(haystack, pyre_object::w_int_new(i)) {
@@ -11150,7 +11322,8 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                 }
                 i += 1;
             }
-            Err(_) => return Ok(false), // IndexError → not found
+            Err(e) if e.kind == PyErrorKind::IndexError => return Ok(false),
+            Err(e) => return Err(e),
         }
     }
 }
@@ -11343,6 +11516,68 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
         }
         if is_dict(obj) {
             return dict_delitem(obj, index);
+        }
+        // `bytearrayobject.py` ass_subscript with a NULL value deletes like a
+        // list: a single index removes one byte, a slice removes its selected
+        // bytes (contiguous via drain, extended-step descending).  `descr_delitem`
+        // runs `_unpack_slice` — the slice's `__index__` is evaluated before the
+        // length is read, so a mutation during index evaluation is reflected in
+        // the bounds.
+        if pyre_object::bytearrayobject::is_bytearray(obj) {
+            if is_slice(index) {
+                let (rs, rp, st) = crate::sliceobject::slice_unpack(
+                    w_slice_get_start(index),
+                    w_slice_get_stop(index),
+                    w_slice_get_step(index),
+                )?;
+                let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
+                let (start, stop, step, _) =
+                    crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
+                let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
+                if step == 1 {
+                    let s = start.max(0) as usize;
+                    let e = stop.max(start).min(vec.len() as i64) as usize;
+                    vec.drain(s..e);
+                    return Ok(());
+                }
+                let mut indices: Vec<i64> = Vec::new();
+                let mut i = start;
+                if step > 0 {
+                    while i < stop {
+                        indices.push(i);
+                        i += step;
+                    }
+                } else {
+                    while i > stop {
+                        indices.push(i);
+                        i += step;
+                    }
+                }
+                indices.sort_unstable_by(|a, b| b.cmp(a));
+                for idx in indices {
+                    if idx >= 0 && idx < vec.len() as i64 {
+                        vec.remove(idx as usize);
+                    }
+                }
+                return Ok(());
+            }
+            let i = bytearray_index(index)?;
+            let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
+            let idx = if i < 0 { len + i } else { i };
+            if idx >= 0 && idx < len {
+                pyre_object::bytearrayobject::w_bytearray_vec_mut(obj).remove(idx as usize);
+                return Ok(());
+            }
+            return Err(PyError::new(
+                PyErrorKind::IndexError,
+                "bytearray index out of range",
+            ));
+        }
+        // memoryview never supports deletion; `memoryview_delitem` reports the
+        // released / read-only / "cannot delete memory" error in order.
+        if pyre_object::memoryview::is_w_memoryview(obj) {
+            crate::builtins::memoryview_delitem(&[obj, index])?;
+            return Ok(());
         }
     }
     // Instance __delitem__ — PyPy: descroperation.py delitem.  Errors from

@@ -182,6 +182,12 @@ fn socket_writebuf(obj: pyre_object::PyObjectRef) -> Result<&'static mut [u8], c
     if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
         return Ok(unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(obj) });
     }
+    if unsafe { pyre_object::interp_array::is_array(obj) } {
+        // `space.writebuf_w` accepts any writable buffer exporter; an
+        // `array.array` exposes its element bytes as one writable window
+        // regardless of typecode (recv writes raw bytes into them).
+        return Ok(unsafe { pyre_object::interp_array::w_array_vec_mut(obj).as_mut_slice() });
+    }
     if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
         // `space.buffer_w` rejects a released view before exposing its storage.
         unsafe { crate::builtins::memoryview_check_released(obj) }?;
@@ -191,26 +197,37 @@ fn socket_writebuf(obj: pyre_object::PyObjectRef) -> Result<&'static mut [u8], c
                 "a read-write bytes-like object is required, not 'memoryview'",
             ));
         }
-        // Only contiguous views are accepted; a strided slice (`m[::2]`,
-        // `m[::-1]`) would need a scatter writer pyre does not have.
-        if unsafe {
-            pyre_object::memoryview::w_memoryview_stride0(obj)
-                != pyre_object::memoryview::w_memoryview_itemsize(obj)
-        } {
+        // Only C-contiguous views are accepted; a strided slice (`m[::2]`,
+        // `m[::-1]`) would need a scatter writer pyre does not have.  A
+        // contiguous N-D view (`memoryview(ba).cast('B', shape=(2, 2))`)
+        // exposes its window as one flat byte range, so it qualifies even
+        // though its outermost stride is a row stride, not the itemsize.
+        if !unsafe { crate::builtins::memoryview_contiguity(obj).0 } {
             return Err(crate::PyError::type_error(
                 "a read-write bytes-like object is required, not 'memoryview'",
             ));
         }
         let backing = unsafe { pyre_object::memoryview::w_memoryview_backing(obj) };
-        if unsafe { pyre_object::bytearrayobject::is_bytearray(backing) } {
-            // Honour the view window: write only into `[offset, offset+length)`
-            // of the backing store, not the whole buffer.
-            let off = unsafe { pyre_object::memoryview::w_memoryview_offset(obj) } as usize;
-            let len = unsafe { pyre_object::memoryview::w_memoryview_length(obj) } as usize;
-            let full = unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(backing) };
-            return Ok(&mut full[off..off + len]);
+        // A writable view's backing is a `bytearray` or an `array.array`; both
+        // expose a mutable byte store.  Honour the view window: write only into
+        // `[offset, offset+length)` of the backing, not the whole buffer.
+        let full: &mut [u8] = if unsafe { pyre_object::bytearrayobject::is_bytearray(backing) } {
+            unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(backing) }
+        } else if unsafe { pyre_object::interp_array::is_array(backing) } {
+            unsafe { pyre_object::interp_array::w_array_vec_mut(backing).as_mut_slice() }
+        } else {
+            return Err(crate::PyError::type_error("cannot modify read-only memory"));
+        };
+        let off = unsafe { pyre_object::memoryview::w_memoryview_offset(obj) } as usize;
+        let len = unsafe { pyre_object::memoryview::w_memoryview_length(obj) } as usize;
+        // The backing may have been resized after the view was taken; reject a
+        // window that no longer fits rather than panic.
+        if off.checked_add(len).is_none_or(|end| end > full.len()) {
+            return Err(crate::PyError::value_error(
+                "memoryview buffer is no longer valid",
+            ));
         }
-        return Err(crate::PyError::type_error("cannot modify read-only memory"));
+        return Ok(&mut full[off..off + len]);
     }
     Err(crate::PyError::type_error(
         "a writable bytes-like object is required",
