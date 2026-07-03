@@ -973,10 +973,10 @@ fn try_lower_inner_byte_fetch(
         return false;
     };
     let program_reg = prog.reg;
+    let descr_tok = env_array_descr_expr(lowerer.config);
     let Some(index_reg) = lower_array_index_expr(lowerer, &idx.index) else {
         return false;
     };
-    let descr_tok = quote! { __builder.add_gc_byte_array_descr() };
     lowerer.emit_op(
         OpMeta::linear(
             OpKind::Vable,
@@ -1410,16 +1410,14 @@ fn try_lower_opcode_fetch_stmt(lowerer: &mut Lowerer, stmt: &Stmt) -> bool {
                     return false;
                 };
                 let program_reg = prog.reg;
+                let descr_tok = env_array_descr_expr(lowerer.config);
                 // Compute the index register: `pc` returns pc_reg directly,
                 // `pc + N` emits load_const + int_add into a fresh reg.
                 let Some(index_reg) = lower_array_index_expr(lowerer, idx_expr) else {
                     return false;
                 };
-                // Allocate a fresh Int register for the byte fetch result.
+                // Allocate a fresh Int register for the fetch result.
                 let result_reg = lowerer.alloc_reg();
-                let descr_tok = quote::quote! {
-                    __builder.add_gc_byte_array_descr()
-                };
                 lowerer.emit_op(
                     OpMeta::linear(
                         OpKind::Vable,
@@ -1734,6 +1732,63 @@ pub(super) fn dispatch_arm_inline_call_tokens(
     }
 }
 
+/// pc-returning variant of [`dispatch_arm_inline_call_tokens`]: emits the
+/// `inline_call_<types>_i` form whose callee BC_INT_RETURN writes back into the
+/// caller's `return_i_reg` (the dispatch loop's green pc register).  Used by
+/// `split_dispatch` for pure forward-advancing arms so the heavy arm body lives
+/// in its own sub-JitCode yet still advances the green pc — the `next_instr =
+/// self.OPCODE(oparg, next_instr)` shape.
+pub(super) fn dispatch_arm_inline_call_tokens_i(
+    layout: &[CallerLocalLayout],
+    return_i_reg: u16,
+) -> proc_macro2::TokenStream {
+    use quote::quote;
+    let has_int = layout.iter().any(|l| matches!(l.kind, BindingKind::Int));
+    let has_float = layout.iter().any(|l| matches!(l.kind, BindingKind::Float));
+    let pair_tokens = |kind: BindingKind| -> Vec<proc_macro2::TokenStream> {
+        layout
+            .iter()
+            .filter(|l| l.kind == kind)
+            .map(|l| {
+                let parent = l.parent_reg;
+                let callee = l.callee_reg;
+                quote! { (#parent as u16, #callee as u16) }
+            })
+            .collect()
+    };
+    let args_i = pair_tokens(BindingKind::Int);
+    let args_r = pair_tokens(BindingKind::Ref);
+    let args_f = pair_tokens(BindingKind::Float);
+    if has_float {
+        quote! {
+            __builder.inline_call_irf_i(
+                __sub_idx,
+                &[#(#args_i),*],
+                &[#(#args_r),*],
+                &[#(#args_f),*],
+                Some(#return_i_reg as u16),
+            );
+        }
+    } else if has_int {
+        quote! {
+            __builder.inline_call_ir_i(
+                __sub_idx,
+                &[#(#args_i),*],
+                &[#(#args_r),*],
+                Some(#return_i_reg as u16),
+            );
+        }
+    } else {
+        quote! {
+            __builder.inline_call_r_i(
+                __sub_idx,
+                &[#(#args_r),*],
+                Some(#return_i_reg as u16),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod dispatch_arm_inline_call_tokens_tests {
     use super::*;
@@ -1822,6 +1877,30 @@ pub(super) fn pc_is_green(config: &LowererConfig) -> bool {
     })
 }
 
+/// Expression that mints the array descr for an `env` (`program[...]`) read,
+/// scaling the index by the env element size. `&[u8]` keeps the historical
+/// `add_gc_byte_array_descr()` (itemsize 1, unsigned — no `movsx` on bytes
+/// ≥ 0x80); a wider element (`&[i64]`) reads the element at byte offset
+/// `size_of::<elem>() * index`. The element size is unknowable to the
+/// proc-macro (it holds only the alias name), so emit a
+/// `size_of::<<Env as Index<usize>>::Output>()` const computed in the user
+/// crate. All three `program[...]` lowering sites (operand reads, opcode
+/// aliasing, inline-dispatch fetch) share this so an env's opcode AND its
+/// operands read at the same stride. Falls back to the byte descr when the
+/// env type name does not parse as a type.
+pub(super) fn env_array_descr_expr(config: Option<&LowererConfig>) -> proc_macro2::TokenStream {
+    let env_ty = config.and_then(|c| syn::parse_str::<syn::Type>(&c.env_type_name).ok());
+    match env_ty {
+        Some(env_ty) => quote::quote! {{
+            let __env_item = ::core::mem::size_of::<
+                <#env_ty as ::core::ops::Index<usize>>::Output,
+            >();
+            __builder.add_gc_int_array_descr(__env_item, __env_item != 1)
+        }},
+        None => quote::quote! { __builder.add_gc_byte_array_descr() },
+    }
+}
+
 /// Recognise a self-increment of `pc`: `pc += N` (BinOp::AddAssign) or
 /// `pc = pc + N` (Assign of `pc + N`), returning the literal `N`.  Mirrors
 /// `match_pc_increment_stmt` but operates on an `Expr` and is pc-specific —
@@ -1846,6 +1925,87 @@ fn pc_self_increment(expr: &Expr) -> Option<i64> {
         }
     }
     None
+}
+
+/// `Some(N)` if `body` is a pure forward-advancing dispatch arm: straight-line
+/// work followed by a single trailing `pc += N` (N > 0), with no back-edge
+/// (`can_enter_jit!` / `jit_merge_point!`), no early `return` / `continue` /
+/// `break`, no other `pc` write, and no function call.  Such an arm has no
+/// merge point of its own and takes no mid-body resume snapshot, so under
+/// `split_dispatch` it is lowered into a per-arm sub-JitCode that RETURNS the
+/// advanced pc (`next_instr = self.OPCODE(oparg, next_instr)`), keeping the
+/// dispatch JitCode's register/const footprint small.  Branch arms
+/// (`pc = target; continue;`) and `return` arms own a merge point / back-edge
+/// and are rejected so they stay force-inlined.
+///
+/// Arms that make a residual call are also rejected: a residual call records a
+/// GuardNoException resume snapshot whose canonical "all-live" liveness lists
+/// every int register `[0, num_regs_i)`, including the unused per-bank holes the
+/// caller-local layout leaves (e.g. int reg 1 when `pc` is the sole int
+/// caller-local but `program`/`state` occupy two ref regs); reading such a hole
+/// register at resume hits an uninitialized slot.  Such arms keep their heavy
+/// work out-of-line in the residual already, so force-inlining them costs the
+/// dispatch little — they do not need the split.
+fn arm_is_pure_pc_advance(body: &Expr) -> Option<i64> {
+    use syn::visit::Visit;
+    struct Forbid {
+        hit: bool,
+    }
+    impl<'ast> Visit<'ast> for Forbid {
+        fn visit_expr_return(&mut self, _: &'ast syn::ExprReturn) {
+            self.hit = true;
+        }
+        fn visit_expr_continue(&mut self, _: &'ast syn::ExprContinue) {
+            self.hit = true;
+        }
+        fn visit_expr_break(&mut self, _: &'ast syn::ExprBreak) {
+            self.hit = true;
+        }
+        // Residual-call arms ARE eligible to split: their GuardNoException
+        // resume snapshot's identity-slot references resolve through the
+        // sized rd_virtuals (negative virtual numbering) and the reserved
+        // sub-JitCode identity prefix, so they no longer read uninitialized
+        // holes. Only control-flow / loop-header constructs below disqualify.
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            if let Some(id) = m.path.get_ident() {
+                let n = id.to_string();
+                if n == "can_enter_jit" || n == "jit_merge_point" {
+                    self.hit = true;
+                }
+            }
+            syn::visit::visit_macro(self, m);
+        }
+    }
+    let mut forbid = Forbid { hit: false };
+    forbid.visit_expr(body);
+    if forbid.hit {
+        return None;
+    }
+
+    let stmts = extract_stmts(body);
+    let (last, work) = stmts.split_last()?;
+    let Stmt::Expr(last_expr, _) = last else {
+        return None;
+    };
+    let increment = pc_self_increment(last_expr)?;
+    if increment <= 0 {
+        return None;
+    }
+    // No earlier statement may write `pc` (the advance must be the sole, final
+    // pc mutation — a mid-body pc write would not be a straight-line advance).
+    for s in work {
+        if let Stmt::Expr(e, _) = s {
+            if pc_self_increment(e).is_some() {
+                return None;
+            }
+            if let Expr::Assign(a) = e {
+                if expr_single_ident(&a.left).as_deref() == Some("pc") {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(increment)
 }
 
 impl<'c> Lowerer<'c> {
@@ -2067,7 +2227,48 @@ pub(super) fn lower_dispatch_chain(
         _ => return default_label,
     };
 
-    for arm in classified_arms {
+    let mut switch_arm_labels: Vec<Option<syn::Ident>> = vec![None; classified_arms.len()];
+    if config.switch_dispatch {
+        let mut switch_case_emitters = Vec::new();
+        for (arm_idx, arm) in classified_arms.iter().enumerate() {
+            if matches!(arm.pat, Pat::Wild(_)) || is_lowercase_binding_pat(&arm.pat) {
+                continue;
+            }
+            let arm_label = lowerer.alloc_label();
+            lowerer.emit_aux(quote::quote! { let #arm_label = __builder.new_label(); });
+            match extract_pat_switch_case_tokens(&arm.pat, &arm_label) {
+                Some(mut emitters) => {
+                    switch_case_emitters.append(&mut emitters);
+                    switch_arm_labels[arm_idx] = Some(arm_label);
+                }
+                None => continue,
+            }
+        }
+        lowerer.emit_aux(quote::quote! {
+            let mut __switch_cases: Vec<(i64, u16)> = Vec::new();
+            #(#switch_case_emitters)*
+        });
+        let live_targets = switch_arm_labels
+            .iter()
+            .filter_map(|label| label.clone())
+            .collect::<Vec<_>>();
+        // RPython flatten.py:270-308 emits one `-live-` before `switch`;
+        // pyjitpl.py:598-617 records GuardValue on a hit and fallback guards
+        // on a miss. The marker keeps the opcode and all case targets live.
+        lowerer.emit_op(
+            OpMeta::live_marker_with(vec![Register::int(opcode_reg)], live_targets),
+            quote::quote! { let _ = __builder.live_placeholder(); },
+        );
+        lowerer.emit_op(
+            OpMeta::linear(OpKind::Aux, vec![Register::int(opcode_reg)], vec![]),
+            quote::quote! {
+                __builder.switch(#opcode_reg as u16, &__switch_cases);
+            },
+        );
+        lowerer.emit_jump(&default_label);
+    }
+
+    for (arm_idx, arm) in classified_arms.iter().enumerate() {
         // `_` wildcard: skip here; handled by the default GOTO below.
         // All other patterns (including Pat::Ident like `OP_NOP`) are
         // treated as constant tests and emitted as goto_if_not_int_eq.
@@ -2075,77 +2276,94 @@ pub(super) fn lower_dispatch_chain(
             continue;
         }
 
-        // Extract token expressions for each value in the pattern.
-        // extract_pat_value_tokens handles Pat::Lit, Pat::Path, Pat::Or.
-        let value_tokens = match extract_pat_value_tokens(&arm.pat) {
-            Some(v) => v,
-            None => continue, // unsupported pattern shape — skip
-        };
-
-        // Allocate a skip label: if opcode ≠ this arm's value, jump here.
-        // Task 1.6 will emit the arm body between the check and this label.
-        let skip_label = lowerer.alloc_label();
-        lowerer.emit_aux(quote::quote! { let #skip_label = __builder.new_label(); });
-
-        let matched_label = if value_tokens.len() > 1 {
-            let label = lowerer.alloc_label();
-            lowerer.emit_aux(quote::quote! { let #label = __builder.new_label(); });
-            Some(label)
+        let mut skip_label = None;
+        if let Some(match_label) = switch_arm_labels[arm_idx].as_ref() {
+            lowerer.emit_label_def(match_label);
+        } else if config.switch_dispatch {
+            continue;
         } else {
-            None
-        };
+            // Extract token expressions for each value in the pattern.
+            // extract_pat_value_tokens handles Pat::Lit, Pat::Path, Pat::Or.
+            let value_tokens = match extract_pat_value_tokens(&arm.pat) {
+                Some(v) => v,
+                None => {
+                    if pat_contains_range(&arm.pat) && !config.split_dispatch {
+                        lowerer.emit_aux(quote::quote! {
+                            compile_error!(
+                                "jit_interp dispatch range patterns require `switch_dispatch = true`"
+                            );
+                        });
+                    }
+                    continue; // unsupported pattern shape — skip
+                }
+            };
 
-        for (value_idx, val_tok) in value_tokens.iter().enumerate() {
-            // Load the pattern constant into a fresh int register.
-            let const_reg = lowerer.alloc_reg();
-            lowerer.emit_op(
-                OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(const_reg)]),
-                quote::quote! {
-                    __builder.load_const_i_value(#const_reg as u16, #val_tok);
-                },
-            );
-            let is_last_value = value_idx + 1 == value_tokens.len();
-            let miss_label = if is_last_value {
-                skip_label.clone()
-            } else {
+            // Allocate a skip label: if opcode ≠ this arm's value, jump here.
+            // Task 1.6 will emit the arm body between the check and this label.
+            let arm_skip_label = lowerer.alloc_label();
+            lowerer.emit_aux(quote::quote! { let #arm_skip_label = __builder.new_label(); });
+            skip_label = Some(arm_skip_label.clone());
+
+            let matched_label = if value_tokens.len() > 1 {
                 let label = lowerer.alloc_label();
                 lowerer.emit_aux(quote::quote! { let #label = __builder.new_label(); });
-                label
+                Some(label)
+            } else {
+                None
             };
-            // RPython flatten.py:258-260 emits `-live-` UNCONDITIONALLY ahead
-            // of every goto_if_not / goto_if_not_<cmp>; optimize_goto_if_not
-            // (jtransform.py:225) tags the fused compare `-live-before`. The
-            // tracer records this guard through record_state_guard →
-            // build_state_field_snapshot, which reads the LIVE marker at
-            // `guard_pc - SIZE_LIVE_OP`. Without a preceding `-live-` the
-            // snapshot mis-decodes the prior op's bytes as a liveness offset
-            // and indexes out of bounds. One marker per chained alternative so
-            // each goto_if_not_int_eq has its own preceding LIVE.
-            lowerer.emit_op(
-                OpMeta::live_marker(),
-                quote::quote! { let _ = __builder.live_placeholder(); },
-            );
-            // Fused goto_if_not_int_eq: branch to the next alternative (or the
-            // arm skip label) if opcode != const.
-            lowerer.emit_op(
-                OpMeta::conditional_guard_int_eq(
-                    Register::int(opcode_reg),
-                    Register::int(const_reg),
-                    miss_label.clone(),
-                ),
-                quote::quote! {
-                    __builder.goto_if_not_int_eq(#opcode_reg as u16, #const_reg as u16, #miss_label);
-                },
-            );
-            if let Some(matched_label) = matched_label.as_ref() {
-                lowerer.emit_jump(matched_label);
-                if !is_last_value {
-                    lowerer.emit_label_def(&miss_label);
+
+            for (value_idx, val_tok) in value_tokens.iter().enumerate() {
+                // Load the pattern constant into a fresh int register.
+                let const_reg = lowerer.alloc_reg();
+                lowerer.emit_op(
+                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(const_reg)]),
+                    quote::quote! {
+                        __builder.load_const_i_value(#const_reg as u16, #val_tok);
+                    },
+                );
+                let is_last_value = value_idx + 1 == value_tokens.len();
+                let miss_label = if is_last_value {
+                    arm_skip_label.clone()
+                } else {
+                    let label = lowerer.alloc_label();
+                    lowerer.emit_aux(quote::quote! { let #label = __builder.new_label(); });
+                    label
+                };
+                // RPython flatten.py:258-260 emits `-live-` UNCONDITIONALLY ahead
+                // of every goto_if_not / goto_if_not_<cmp>; optimize_goto_if_not
+                // (jtransform.py:225) tags the fused compare `-live-before`. The
+                // tracer records this guard through record_state_guard →
+                // build_state_field_snapshot, which reads the LIVE marker at
+                // `guard_pc - SIZE_LIVE_OP`. Without a preceding `-live-` the
+                // snapshot mis-decodes the prior op's bytes as a liveness offset
+                // and indexes out of bounds. One marker per chained alternative so
+                // each goto_if_not_int_eq has its own preceding LIVE.
+                lowerer.emit_op(
+                    OpMeta::live_marker(),
+                    quote::quote! { let _ = __builder.live_placeholder(); },
+                );
+                // Fused goto_if_not_int_eq: branch to the next alternative (or the
+                // arm skip label) if opcode != const.
+                lowerer.emit_op(
+                    OpMeta::conditional_guard_int_eq(
+                        Register::int(opcode_reg),
+                        Register::int(const_reg),
+                        miss_label.clone(),
+                    ),
+                    quote::quote! {
+                        __builder.goto_if_not_int_eq(#opcode_reg as u16, #const_reg as u16, #miss_label);
+                    },
+                );
+                if let Some(matched_label) = matched_label.as_ref() {
+                    lowerer.emit_jump(matched_label);
+                    if !is_last_value {
+                        lowerer.emit_label_def(&miss_label);
+                    }
                 }
             }
-        }
-        if let Some(matched_label) = matched_label.as_ref() {
-            lowerer.emit_label_def(matched_label);
+            if let Some(matched_label) = matched_label.as_ref() {
+                lowerer.emit_label_def(matched_label);
+            }
         }
 
         // Green-pc gated inline (Option A, #184): when `pc` is a declared
@@ -2174,7 +2392,27 @@ pub(super) fn lower_dispatch_chain(
         // makes a bare-path inferred-policy call — at which point the remedy is
         // either to lower that arm inline behind an abort guard, or to add an
         // explicit pc-writeback from the sub-JitCode into the caller's reg0.
-        let inlined = pc_is_green(config)
+        // `split_dispatch` opt-in: a pure forward-advancing green-pc arm is
+        // routed to the per-arm sub-JitCode path (below) with a pc-returning
+        // `inline_call_<types>_i` instead of being force-inlined here — this is
+        // what keeps the dispatch JitCode's register/const footprint small.
+        // `Some(N)` carries the arm's `pc += N` advance to the body generator.
+        // When `split_dispatch` is off this short-circuits to `None` before
+        // `arm_is_pure_pc_advance` runs, so the gate stays byte-identical.
+        let pc_return_increment = if config.split_dispatch
+            && pc_is_green(config)
+            && matches!(
+                arm.pattern,
+                crate::jit_interp::classify::ArmPattern::Lowerable
+            )
+            && !lowerer.arm_body_has_infer_call(&arm.original_body)
+        {
+            arm_is_pure_pc_advance(&arm.original_body)
+        } else {
+            None
+        };
+        let inlined = pc_return_increment.is_none()
+            && pc_is_green(config)
             && matches!(
                 arm.pattern,
                 crate::jit_interp::classify::ArmPattern::Lowerable
@@ -2227,12 +2465,35 @@ pub(super) fn lower_dispatch_chain(
                 crate::jit_interp::classify::ArmPattern::Lowerable => {
                     let caller_locals =
                         collect_arm_caller_locals(&arm.original_body, &arm.pat, &lowerer.bindings);
-                    match try_generate_jitcode_body_parts_with_caller_bindings(
-                        &arm.original_body,
-                        Some(config),
-                        &caller_locals,
-                    ) {
-                        Some((generated, layout)) => {
+                    let generated_parts = match pc_return_increment {
+                        // `split_dispatch` pure arm: lower into a sub-JitCode
+                        // that RETURNS pc + N; the third tuple slot carries the
+                        // caller pc register the `_i` writeback targets.
+                        Some(increment) => {
+                            try_generate_jitcode_pc_return_body_with_caller_bindings(
+                                &arm.original_body,
+                                Some(config),
+                                &caller_locals,
+                                increment,
+                            )
+                            .map(|(generated, layout)| {
+                                let pc_reg = layout
+                                    .iter()
+                                    .find(|e| e.name == "pc")
+                                    .map(|e| e.parent_reg)
+                                    .unwrap_or(0);
+                                (generated, layout, Some(pc_reg))
+                            })
+                        }
+                        None => try_generate_jitcode_body_parts_with_caller_bindings(
+                            &arm.original_body,
+                            Some(config),
+                            &caller_locals,
+                        )
+                        .map(|(generated, layout)| (generated, layout, None)),
+                    };
+                    match generated_parts {
+                        Some((generated, layout, pc_return_reg)) => {
                             let body = generated.body;
                             let liveness_prebuild = generated.liveness_prebuild;
                             lowerer.inline_liveness_prebuild.push(liveness_prebuild);
@@ -2244,19 +2505,34 @@ pub(super) fn lower_dispatch_chain(
                                 arm_inline_call_reads
                                     .push(Register::new(entry.kind, entry.parent_reg));
                             }
-                            let inline_call_emit = dispatch_arm_inline_call_tokens(&layout);
-                            let min_i_regs = layout
+                            let inline_call_emit = match pc_return_reg {
+                                Some(pc_reg) => dispatch_arm_inline_call_tokens_i(&layout, pc_reg),
+                                None => dispatch_arm_inline_call_tokens(&layout),
+                            };
+                            // Reserve the identity-slot prefix in the sub-JitCode
+                            // register file so int[int_identity_base..int_end) /
+                            // ref[ref_identity_base..ref_end) exist as real
+                            // registers — the arm body's state-field ops address
+                            // them and the resume path re-derives them at deopt.
+                            let (__split_int_end, __split_ref_end) = if config.split_dispatch {
+                                config.split_identity_reg_ends()
+                            } else {
+                                (0u16, 0u16)
+                            };
+                            let min_i_regs = (layout
                                 .iter()
                                 .filter(|e| matches!(e.kind, BindingKind::Int))
                                 .map(|e| e.callee_reg + 1)
                                 .max()
-                                .unwrap_or(0) as u16;
-                            let min_r_regs = layout
+                                .unwrap_or(0) as u16)
+                                .max(__split_int_end);
+                            let min_r_regs = (layout
                                 .iter()
                                 .filter(|e| matches!(e.kind, BindingKind::Ref))
                                 .map(|e| e.callee_reg + 1)
                                 .max()
-                                .unwrap_or(0) as u16;
+                                .unwrap_or(0) as u16)
+                                .max(__split_ref_end);
                             let min_f_regs = layout
                                 .iter()
                                 .filter(|e| matches!(e.kind, BindingKind::Float))
@@ -2394,13 +2670,17 @@ pub(super) fn lower_dispatch_chain(
 
         // Bind the skip label at the end of this arm's guard sequence.
         // Jumping here means "this arm did not match; proceed to next arm".
-        lowerer.emit_label_def(&skip_label);
+        if let Some(skip_label) = skip_label.as_ref() {
+            lowerer.emit_label_def(skip_label);
+        }
     }
 
     // After all arm guards, the default/exit path: unconditional GOTO.
     // default_label is bound at the typed-return emission site in
     // lower_dispatch_body (Task 1.7).
-    lowerer.emit_jump(&default_label);
+    if !config.switch_dispatch {
+        lowerer.emit_jump(&default_label);
+    }
     default_label
 }
 
@@ -2416,6 +2696,14 @@ fn is_lowercase_binding_pat(pat: &Pat) -> bool {
         .chars()
         .next()
         .is_some_and(|c| c.is_ascii_lowercase())
+}
+
+fn pat_contains_range(pat: &Pat) -> bool {
+    match pat {
+        Pat::Range(_) => true,
+        Pat::Or(pat_or) => pat_or.cases.iter().any(pat_contains_range),
+        _ => false,
+    }
 }
 
 /// A.3.5 — emit a `-live-` + `<kind>_guard_value` pair for each declared green.

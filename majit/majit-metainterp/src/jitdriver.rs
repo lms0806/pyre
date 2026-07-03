@@ -14,6 +14,54 @@ thread_local! {
     static TRACE_CONTINUATION_SUSPENDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+thread_local! {
+    /// Per-thread pool for the structured back-edge blackhole resume.
+    /// `build_inline_call_only_bh_builder` wires ~100 string-keyed insns and
+    /// their handlers — a fixed dispatch table independent of any trace — so
+    /// rebuilding it on every guard failure is pure waste (the dominant
+    /// per-deopt cost). Built once, lent via [`BackEdgeBhBuilder`], and
+    /// re-pooled on drop, mirroring `call_jit.rs`'s `BH_BUILDER_RD`.
+    static BACK_EDGE_BH_BUILDER: std::cell::RefCell<Option<crate::blackhole::BlackholeInterpBuilder>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII lease of the thread-local back-edge blackhole builder. Takes the
+/// pooled builder out for the duration of one resume and returns it on drop,
+/// so every early `return` in the resume path re-pools it. If the slot is
+/// empty — first use, or a re-entrant resume already holds it — a fresh
+/// builder is constructed; the surplus is simply dropped when re-pooling.
+struct BackEdgeBhBuilder(Option<crate::blackhole::BlackholeInterpBuilder>);
+
+impl BackEdgeBhBuilder {
+    fn lease() -> Self {
+        let builder = BACK_EDGE_BH_BUILDER
+            .with(|c| c.borrow_mut().take())
+            .unwrap_or_else(crate::blackhole::build_inline_call_only_bh_builder);
+        Self(Some(builder))
+    }
+}
+
+impl Drop for BackEdgeBhBuilder {
+    fn drop(&mut self) {
+        if let Some(builder) = self.0.take() {
+            BACK_EDGE_BH_BUILDER.with(|c| *c.borrow_mut() = Some(builder));
+        }
+    }
+}
+
+impl std::ops::Deref for BackEdgeBhBuilder {
+    type Target = crate::blackhole::BlackholeInterpBuilder;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("builder leased")
+    }
+}
+
+impl std::ops::DerefMut for BackEdgeBhBuilder {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().expect("builder leased")
+    }
+}
+
 /// Whether re-entrant trace continuation is currently suspended — see
 /// [`TRACE_CONTINUATION_SUSPENDED`].
 pub fn trace_continuation_suspended() -> bool {
@@ -782,11 +830,103 @@ pub struct JitDriver<S: JitState> {
     /// RPython parity: `metainterp_sd.jitcodes[portal_jd.index]` global
     /// registry slot, scoped to the per-`#[jit_interp]` driver.
     dispatch_jitcode: Option<std::sync::Arc<crate::jitcode::JitCode>>,
+    /// Flat global jitcode registry, indexed by each jitcode's absolute
+    /// index (`JitCode::index`). Slot 0 = the dispatch JitCode; slots
+    /// 1..N = every sub-JitCode reachable through the descr pools. Built
+    /// at `register_dispatch_jitcode`. resume.py:1050/1338 `jitcode =
+    /// jitcodes[jitcode_pos]` — every resume frame resolves its jitcode
+    /// from this table by the self-describing index the snapshot stamped,
+    /// with no parent-relative walk or root/sub bookkeeping.
+    jitcode_registry: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
+}
+
+thread_local! {
+    /// Per-thread publication of the currently-installed state-field JIT's
+    /// flat jitcode registry + packed liveness, read by the stateless global
+    /// `frame_value_count` callback below. Mirrors pyre-jit-trace's
+    /// thread-local `METAINTERP_SD` (`jitcodes` + `liveness_info` + `op_live`).
+    static STATE_FIELD_FVC: std::cell::RefCell<Option<StateFieldFvcData>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct StateFieldFvcData {
+    jitcodes: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
+    all_liveness: Vec<u8>,
+    op_live: u8,
+}
+
+/// resume.py:1050/1338 `jitcode = metainterp_sd.jitcodes[jitcode_pos]` parity
+/// for the state-field JIT compile-time multi-frame decode
+/// (`rebuild_from_numbering`). Resolves each frame's jitcode STATELESSLY from
+/// the flat global registry by its self-describing absolute index, then
+/// derives the per-frame box count from that jitcode's liveness at pc
+/// (jitcode.py:147 `enumerate_vars` → `length_i + length_r + length_f`).
+/// Structural mirror of `pyre-jit-trace::state::frame_value_count_at`.
+fn state_field_frame_value_count(jitcode_index: i32, pc: i32, _carried_jitcode_pc: i32) -> usize {
+    STATE_FIELD_FVC.with(|cell| {
+        let data = cell.borrow();
+        let Some(data) = data.as_ref() else {
+            return 0;
+        };
+        let Some(jc) = data.jitcodes.get(jitcode_index as usize) else {
+            return 0;
+        };
+        // The rd_numb pc word may carry the after-residual-call marker; strip
+        // it to the plain JitCode position before the liveness lookup.
+        let real_pc = majit_ir::resumedata::decode_resume_pc(pc).0;
+        let off = jc.get_live_vars_info(real_pc as usize, data.op_live);
+        let all_liveness = &data.all_liveness;
+        if off + 2 < all_liveness.len() {
+            all_liveness[off] as usize
+                + all_liveness[off + 1] as usize
+                + all_liveness[off + 2] as usize
+        } else {
+            0
+        }
+    })
+}
+
+/// Publish the driver's flat jitcode registry + packed liveness for the
+/// stateless global `frame_value_count` decode. Both compile-time decoders
+/// (`compile.rs` build_guard_metadata and the cranelift backend) read the
+/// callback via `get_frame_value_count_fn`, so this single registration
+/// serves both. Registers the callback once (process-global slot), then
+/// refreshes the thread-local payload for the installing driver.
+fn install_state_field_fvc(
+    jitcodes: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
+    all_liveness: Vec<u8>,
+    op_live: u8,
+) {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        majit_ir::resumedata::set_frame_value_count_fn(state_field_frame_value_count);
+    });
+    STATE_FIELD_FVC.with(|cell| {
+        *cell.borrow_mut() = Some(StateFieldFvcData {
+            jitcodes,
+            all_liveness,
+            op_live,
+        });
+    });
 }
 
 impl<S: JitState> JitDriver<S> {
     /// Create a new JitDriver with the given hot-counting threshold.
     pub fn new(threshold: u32) -> Self {
+        Self::with_options(threshold, true)
+    }
+
+    /// Create a new JitDriver, optionally skipping the background timer that
+    /// periodically invalidates all compiled loops.
+    ///
+    /// The periodic invalidation is a portable stand-in for RPython's
+    /// GC/signal-triggered invalidation, used by quasi-immutable-bearing
+    /// consumers (a Python JIT). A consumer with no quasi-immutable state — e.g.
+    /// a fixed-bytecode interpreter over plain integer reds — has nothing to
+    /// invalidate; for it the timer only forces pointless re-tracing (and
+    /// exercises the GUARD_NOT_INVALIDATED resume path needlessly), so it should
+    /// pass `periodic_invalidation = false`.
+    pub fn with_options(threshold: u32, periodic_invalidation: bool) -> Self {
         let mut meta = MetaInterp::new(threshold);
         if let Some(info) = S::__build_virtualizable_info() {
             meta.set_virtualizable_info(info);
@@ -797,9 +937,9 @@ impl<S: JitState> JitDriver<S> {
         // RPython uses GC/signal-triggered invalidation; we use a timer as
         // a portable equivalent. Period matches PyPy's checkinterval (~10ms).
         #[cfg(not(target_arch = "wasm32"))]
-        let invalidation_thread = {
+        let invalidation_thread = if periodic_invalidation {
             let qmut = epoch_qmut.clone();
-            std::thread::spawn(move || {
+            Some(std::thread::spawn(move || {
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     if let Ok(mut qmut) = qmut.lock() {
@@ -808,7 +948,9 @@ impl<S: JitState> JitDriver<S> {
                         }
                     }
                 }
-            })
+            }))
+        } else {
+            None
         };
         JitDriver {
             meta,
@@ -822,12 +964,13 @@ impl<S: JitState> JitDriver<S> {
             is_recursive: false,
             epoch_qmut,
             #[cfg(not(target_arch = "wasm32"))]
-            _invalidation_thread: Some(invalidation_thread),
+            _invalidation_thread: invalidation_thread,
             #[cfg(target_arch = "wasm32")]
             _invalidation_thread: None,
             blackhole_allocator: None,
             portal_runner: None,
             dispatch_jitcode: None,
+            jitcode_registry: Vec::new(),
             shared_asm: std::sync::Arc::new(std::sync::Mutex::new(
                 majit_translate::codewriter::assembler::Assembler::new(),
             )),
@@ -916,7 +1059,37 @@ impl<S: JitState> JitDriver<S> {
         // Production-active — `warmspot.py:660-666
         // make_args_specification` translation-time assert parity.
         validate_dispatch_jitcode_payload(self, &jitcode);
-        self.dispatch_jitcode = Some(std::sync::Arc::new(jitcode));
+        // Assign the dispatch JitCode the root global index 0, then flatten
+        // every reachable sub-JitCode into one flat registry, assigning each
+        // its own absolute index (resume.py:1050 `metainterp_sd.jitcodes`).
+        // The worklist enumeration is depth-agnostic, so a future nested
+        // inline helper stays correctly indexed without a parent-relative walk.
+        jitcode.set_index(0);
+        let dispatch_arc = std::sync::Arc::new(jitcode);
+        let mut registry: Vec<std::sync::Arc<crate::jitcode::JitCode>> = vec![dispatch_arc.clone()];
+        let mut cursor = 0;
+        while cursor < registry.len() {
+            let current = registry[cursor].clone();
+            cursor += 1;
+            for descr in &current.exec.descrs {
+                if let Some(sub) = descr.as_jitcode() {
+                    if registry.iter().any(|j| std::sync::Arc::ptr_eq(j, sub)) {
+                        continue;
+                    }
+                    let idx = registry.len();
+                    sub.set_index(idx);
+                    registry.push(sub.clone());
+                }
+            }
+        }
+        self.dispatch_jitcode = Some(dispatch_arc);
+        self.jitcode_registry = registry.clone();
+        // Publish the registry + packed liveness for the stateless global
+        // `frame_value_count` decode. `install_canonical_liveness` ran just
+        // before this call, so staticdata carries the final liveness buffer.
+        let all_liveness = self.meta_interp().staticdata.liveness_info.clone();
+        let op_live = self.meta_interp().staticdata.op_live as u8;
+        install_state_field_fvc(registry, all_liveness, op_live);
     }
 
     /// Access the registered dispatch JitCode. Returns `None` until
@@ -2252,60 +2425,18 @@ impl<S: JitState> JitDriver<S> {
             // `resume_in_blackhole`; the two are mutually exclusive and
             // neither returns. majit adapts by returning the interpreter
             // resume pc.
-            if should_bridge {
-                // Reconstruct the concrete interpreter state from storage
-                // BEFORE tracing the bridge: a guard failure leaves `state`'s
-                // delta-tracked / carried reds (e.g. a `stacksize` recomputed
-                // from `selected_ref.size`) at their stale pre-run values, so
-                // recording the bridge body from the raw `state` bakes the
-                // wrong loop-control branch. `recover_after_compiled_run`
-                // (the macro's `recover` fn) re-derives them from the live
-                // storage so `build_meta(resume_pc)` and the recorded bridge
-                // see the post-guard-failure values.
-                state.recover_after_compiled_run();
-                // compile.py:704-709: _trace_and_compile_from_bridge
-                let bridge_ok =
-                    self.start_bridge_tracing(&descr_arc, state, env, &raw_values, guard_resume_pc);
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[bridge] start_bridge_tracing key={} trace={} fail={} resume_pc={} ok={}",
-                        green_key, trace_id, fail_index, guard_resume_pc, bridge_ok
-                    );
-                }
-                if bridge_ok {
-                    // The bridge tracing session is now active
-                    // (`begin_trace_session`). Resume the interpreter at the
-                    // guard's resume pc and let the mainloop record the bridge
-                    // body; it closes into a bridge attached to the failing
-                    // guard (`compile_bridge`), so the guard-failure case stops
-                    // re-tracing the loop. Do NOT tear the loop down — the
-                    // bridge attaches to it. (`back_edge_internal` is the macro
-                    // `#[jit_interp]`-only back edge; pyre-jit-trace forms
-                    // bridges through its own eval.rs path, so this does not
-                    // touch the rustpython JIT.)
-                    if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[jit-run] guard failure (bridge-record) fail_index={}, resume_pc={}, target_pc={}, key={}",
-                            fail_index, guard_resume_pc, target_pc, green_key
-                        );
-                    }
-                    return Some(guard_resume_pc);
-                }
-                // start_bridge_tracing declined (dead jct / non-traceable /
-                // resume-decode gap): crude loop teardown + interpreter resume
-                // (status-quo fallback).
-                state.recover_after_compiled_run();
-                self.meta.invalidate_loop(green_key);
-                self.meta.remove_compiled_loop(green_key);
-                self.meta.warm_state_mut().abort_tracing(green_key, true);
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[jit-run] guard failure (bridge-decline) fail_index={}, resume_pc={}, target_pc={}, key={}",
-                        fail_index, guard_resume_pc, target_pc, green_key
-                    );
-                }
-                return Some(guard_resume_pc);
-            }
+            // Bridge tracing is deferred until AFTER the blackhole resume below
+            // computes the *green* resume pc. `guard_resume_pc`
+            // (`get_merge_point_pc`) is the guard's recovery `header_pc`, which
+            // for a `#[jit_interp]` state-field consumer is a byte offset into
+            // the dispatch *jitcode*, not an index into the interpreter's green
+            // `program`. Resuming the macro mainloop at that jitcode offset
+            // indexes `program[]` out of bounds. The blackhole walk re-derives
+            // the real green pc (the merge point the resumed jitcode reaches),
+            // and the bridge must be recorded from THAT pc — see `should_bridge`
+            // at the `ContinueRunningNormally` arm below. `back_edge_structured`
+            // is the macro-only back edge; pyre-jit-trace bridges via its own
+            // eval.rs path, so this does not touch the rustpython JIT.
 
             // compile.py:711 resume_in_blackhole
             // compile.py:853 `ResumeGuardDescr` storage — borrow
@@ -2349,41 +2480,16 @@ impl<S: JitState> JitDriver<S> {
                 // the dispatch singleton is registered — the closure
                 // ignores it and clones `self.dispatch_jitcode`.
                 let _ = env;
-                let dispatch_jitcode = self.dispatch_jitcode.clone();
-                let last_resolved: std::cell::RefCell<
-                    Option<std::sync::Arc<majit_metainterp::JitCode>>,
-                > = std::cell::RefCell::new(None);
+                // resume.py:1338-1340 `jitcode = jitcodes[jitcode_pos]` —
+                // resolve every frame statelessly from the flat global
+                // registry by its self-describing absolute index (no root/sub
+                // branch, no parent-relative descrs walk, no last-frame state).
+                let jitcode_registry = self.jitcode_registry.clone();
                 let resolve_jitcode = |jitcode_index: i32,
                                        pc: i32,
                                        _carried_jitcode_pc: i32|
                  -> Option<crate::resume::ResolvedJitCode> {
-                    let resolved_jitcode = if last_resolved.borrow().is_none() {
-                        // Root frame: clone the dispatch JitCode
-                        // singleton registered at install time
-                        // (`register_dispatch_jitcode`).  Returns
-                        // None only when the proc-macro lowerer
-                        // rejected the dispatch body shape and
-                        // install skipped registration.
-                        dispatch_jitcode.as_ref()?.clone()
-                    } else {
-                        // Sub-frame: index into the parent's
-                        // `descrs` array.  Mirrors RPython
-                        // `BC_INLINE_CALL` operand decoding
-                        // (`blackhole.py:150-157`) where the `j`
-                        // argcode resolves through `descrs[idx]`.
-                        let parent = last_resolved
-                            .borrow()
-                            .as_ref()
-                            .expect("parent exists")
-                            .clone();
-                        parent
-                            .exec
-                            .descrs
-                            .get(jitcode_index as usize)
-                            .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode)?
-                            .clone()
-                    };
-                    *last_resolved.borrow_mut() = Some(resolved_jitcode.clone());
+                    let resolved_jitcode = jitcode_registry.get(jitcode_index as usize)?.clone();
                     Some(crate::resume::ResolvedJitCode::new(
                         resolved_jitcode,
                         pc as usize,
@@ -2406,7 +2512,7 @@ impl<S: JitState> JitDriver<S> {
                 // BC_LIVE/BC_CATCH_EXCEPTION/BC_RVMPROF_CODE defaults so
                 // the values match the metainterp's actual byte
                 // assignments.
-                let mut bh_builder = crate::blackhole::build_inline_call_only_bh_builder();
+                let mut bh_builder = BackEdgeBhBuilder::lease();
                 bh_builder.setup_cached_control_opcodes(
                     self.meta_interp().staticdata.op_live,
                     self.meta_interp().staticdata.op_catch_exception,
@@ -2414,7 +2520,7 @@ impl<S: JitState> JitDriver<S> {
                 );
                 let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
                 let bh = crate::resume::blackhole_from_resumedata(
-                    &mut bh_builder,
+                    &mut *bh_builder,
                     &resolve_jitcode,
                     rd_numb,
                     rd_consts_slice,
@@ -2446,6 +2552,26 @@ impl<S: JitState> JitDriver<S> {
                     // layout before it runs.
                     let sf_layout = state.state_field_layout();
                     bh.state_field_layout = sf_layout.clone();
+                    // [FR] Seed the reconstructed blackhole chain with the
+                    // registered virtualizable info so an inlined portal
+                    // callee's vable-array opcodes (getarrayitem_vable_*) can
+                    // resolve their vinfo during resume. Gated behind the
+                    // experiment flag: the default state-field path never runs
+                    // vable-array ops in the blackhole, and seeding a non-null
+                    // vinfo would flip the `!vinfo.is_null()` branches in the
+                    // field handlers for existing consumers.
+                    let portal_vinfo_ptr =
+                        if crate::pyjitpl::dispatch::portal_inline_experiment_enabled() {
+                            self.meta
+                                .virtualizable_info()
+                                .map(std::sync::Arc::as_ptr)
+                                .unwrap_or(std::ptr::null())
+                        } else {
+                            std::ptr::null()
+                        };
+                    if !portal_vinfo_ptr.is_null() {
+                        bh.virtualizable_info = portal_vinfo_ptr;
+                    }
                     let exc = crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(
                         guard_exc,
                     );
@@ -2470,6 +2596,9 @@ impl<S: JitState> JitDriver<S> {
                             Ok(next_exc) => match bh.nextblackholeinterp.take() {
                                 Some(mut caller) => {
                                     caller.state_field_layout = sf_layout.clone();
+                                    if !portal_vinfo_ptr.is_null() {
+                                        caller.virtualizable_info = portal_vinfo_ptr;
+                                    }
                                     bh_builder.release_interp(bh);
                                     bh = *caller;
                                     cur_exc = next_exc;
@@ -2570,6 +2699,25 @@ impl<S: JitState> JitDriver<S> {
                     };
                     bh_builder.release_interp(bh);
                     if let Some(pc) = resume_pc {
+                        // compile.py:702-709 _trace_and_compile_from_bridge,
+                        // deferred to here so the bridge records from the GREEN
+                        // resume pc the blackhole reported (`pc`), not the
+                        // jitcode-space `guard_resume_pc`. `pc == usize::MAX`
+                        // means the frame ran to completion in the blackhole
+                        // (DoneWithThisFrame) with no forward green pc to trace
+                        // from — nothing to bridge, just exit. The blackhole has
+                        // already recovered `state` to the resume point, so the
+                        // bridge sees the post-guard-failure values.
+                        if should_bridge && pc != usize::MAX {
+                            let bridge_ok =
+                                self.start_bridge_tracing(&descr_arc, state, env, &raw_values, pc);
+                            if crate::majit_log_enabled() {
+                                eprintln!(
+                                    "[bridge] start_bridge_tracing (green resume) key={} trace={} fail={} resume_pc={} ok={}",
+                                    green_key, trace_id, fail_index, pc, bridge_ok
+                                );
+                            }
+                        }
                         return Some(pc);
                     }
                 }
@@ -4332,36 +4480,16 @@ impl<S: JitState> JitDriver<S> {
                 // index into the parent's `descrs` array per
                 // `BC_INLINE_CALL`'s `j` argcode (`blackhole.py:150-157`).
                 let _ = env;
-                let dispatch_jitcode = self.dispatch_jitcode.clone();
-                let last_resolved: std::cell::RefCell<
-                    Option<std::sync::Arc<majit_metainterp::JitCode>>,
-                > = std::cell::RefCell::new(None);
+                // resume.py:1338-1340 `jitcode = jitcodes[jitcode_pos]` —
+                // resolve every frame statelessly from the flat global
+                // registry by its self-describing absolute index (no root/sub
+                // branch, no parent-relative descrs walk, no last-frame state).
+                let jitcode_registry = self.jitcode_registry.clone();
                 let resolve_jitcode = |jitcode_index: i32,
                                        pc: i32,
                                        _carried_jitcode_pc: i32|
                  -> Option<crate::resume::ResolvedJitCode> {
-                    let resolved_jitcode = if last_resolved.borrow().is_none() {
-                        // Root frame: clone the dispatch JitCode
-                        // singleton registered at install time
-                        // (`register_dispatch_jitcode`).  Returns
-                        // None only when the proc-macro lowerer
-                        // rejected the dispatch body shape and
-                        // install skipped registration.
-                        dispatch_jitcode.as_ref()?.clone()
-                    } else {
-                        let parent = last_resolved
-                            .borrow()
-                            .as_ref()
-                            .expect("parent exists")
-                            .clone();
-                        parent
-                            .exec
-                            .descrs
-                            .get(jitcode_index as usize)
-                            .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode)?
-                            .clone()
-                    };
-                    *last_resolved.borrow_mut() = Some(resolved_jitcode.clone());
+                    let resolved_jitcode = jitcode_registry.get(jitcode_index as usize)?.clone();
                     Some(crate::resume::ResolvedJitCode::new(
                         resolved_jitcode,
                         pc as usize,
@@ -4384,7 +4512,7 @@ impl<S: JitState> JitDriver<S> {
                 // BC_LIVE/BC_CATCH_EXCEPTION/BC_RVMPROF_CODE defaults so
                 // the values match the metainterp's actual byte
                 // assignments.
-                let mut bh_builder = crate::blackhole::build_inline_call_only_bh_builder();
+                let mut bh_builder = BackEdgeBhBuilder::lease();
                 bh_builder.setup_cached_control_opcodes(
                     self.meta_interp().staticdata.op_live,
                     self.meta_interp().staticdata.op_catch_exception,
@@ -4392,7 +4520,7 @@ impl<S: JitState> JitDriver<S> {
                 );
                 let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
                 let bh = crate::resume::blackhole_from_resumedata(
-                    &mut bh_builder,
+                    &mut *bh_builder,
                     &resolve_jitcode,
                     rd_numb,
                     rd_consts_slice,
@@ -4423,7 +4551,7 @@ impl<S: JitState> JitDriver<S> {
                         result_exc,
                     );
                     let jit_exc = crate::blackhole::run_forever_with_portal(
-                        &mut bh_builder,
+                        &mut *bh_builder,
                         bh,
                         exc,
                         self.portal_runner.as_ref().map(|r| {

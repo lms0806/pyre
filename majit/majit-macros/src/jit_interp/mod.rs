@@ -124,6 +124,19 @@ pub struct JitInterpConfig {
     /// loop entry and the short preamble can re-emit it.  Empty for
     /// interpreters with no pool-array indexing.
     pub pool_arrays: Vec<Ident>,
+    /// Opt-in: route pure forward-advancing dispatch arms (those whose body
+    /// only does work then `pc += N`, with no back-edge / `can_enter_jit!` /
+    /// early return) through the per-arm sub-JitCode path with a pc-returning
+    /// `inline_call_<types>_i`, instead of force-inlining them into the
+    /// dispatch JitCode.  This keeps the dispatch JitCode's register/const
+    /// footprint small (the heavy arm bodies move into their own sub-JitCodes,
+    /// each with its own ≤256 budget) — mirrors `next_instr = self.OPCODE(...)`.
+    /// Off by default, so kernels that do not set it are byte-identical.
+    pub split_dispatch: bool,
+    /// Opt-in: lower the top-level opcode dispatch discrimination as one
+    /// `switch/id` op instead of a `goto_if_not_int_eq` guard chain. Off by
+    /// default so existing interpreters keep byte-identical dispatch JitCode.
+    pub switch_dispatch: bool,
 }
 
 /// Virtualizable frame field declaration for `#[jit_interp]`.
@@ -452,6 +465,8 @@ impl Parse for JitInterpConfig {
         let mut recursive_entry: Option<Path> = None;
         let mut residual_writes: Vec<ResidualWriteEntry> = Vec::new();
         let mut pool_arrays: Vec<Ident> = Vec::new();
+        let mut split_dispatch = false;
+        let mut switch_dispatch = false;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -508,6 +523,12 @@ impl Parse for JitInterpConfig {
                         content.parse_terminated(Ident::parse, Token![,])?;
                     pool_arrays = idents.into_iter().collect();
                 }
+                "split_dispatch" => {
+                    split_dispatch = input.parse::<LitBool>()?.value;
+                }
+                "switch_dispatch" => {
+                    switch_dispatch = input.parse::<LitBool>()?.value;
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -553,6 +574,8 @@ impl Parse for JitInterpConfig {
             recursive_entry,
             residual_writes,
             pool_arrays,
+            split_dispatch,
+            switch_dispatch,
         })
     }
 }
@@ -897,8 +920,144 @@ fn parse_helpers_list(input: ParseStream) -> syn::Result<Vec<CallEntry>> {
         .collect())
 }
 
+/// Reject a plain `[int]` state-array that is stored-to inside the traced
+/// loop. Such an array is *loop-carried*: its elements live only in trace
+/// registers and are NOT restored to the array on a guard deopt — they read
+/// back as the pre-loop value, silently producing a wrong result. The
+/// supported mechanism for a mutated, loop-carried array is `[int; virt]`,
+/// whose stores write through to the heap-backing `Vec` that the deopt path
+/// reads directly. A plain `[int]` array that is only *read* in the loop (or
+/// only written before it) is loop-invariant and stays valid, so the check
+/// fires solely on stores reached by the dispatch loop the lowerer traces.
+fn validate_state_fields(config: &JitInterpConfig, func: &ItemFn) -> syn::Result<()> {
+    let Some(sf) = &config.state_fields else {
+        return Ok(());
+    };
+    let plain_arrays: std::collections::HashSet<String> = sf
+        .fields
+        .iter()
+        .filter(|f| matches!(f.kind, StateFieldKind::Array(_)))
+        .map(|f| f.name.to_string())
+        .collect();
+    if plain_arrays.is_empty() {
+        return Ok(());
+    }
+    // Only stores reached by the traced dispatch loop are a hazard; init
+    // stores before the loop are not traced.
+    let Some(loop_body) = find_traced_loop_body(&func.block) else {
+        return Ok(());
+    };
+    let mut finder = PlainArrayStoreFinder {
+        plain_arrays: &plain_arrays,
+        offender: None,
+    };
+    syn::visit::Visit::visit_block(&mut finder, loop_body);
+    if let Some((name, span)) = finder.offender {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "state field `{name}` is a plain `[int]` array stored inside the traced loop, \
+                 so it is loop-carried. A plain `[int]` element is held in a trace register and \
+                 is not restored to the array when a guard deopts (it reads back as the pre-loop \
+                 value, silently miscompiling). Declare it as `[int; virt]`: a virtualizable \
+                 array writes through to the heap-backing Vec that the deopt path reads directly."
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The `loop {}` / `while {}` body that contains the `jit_merge_point!()`
+/// marker — the region the lowerer traces.
+fn find_traced_loop_body(block: &syn::Block) -> Option<&syn::Block> {
+    for stmt in &block.stmts {
+        let syn::Stmt::Expr(expr, _) = stmt else {
+            continue;
+        };
+        let body = match expr {
+            Expr::Loop(l) => &l.body,
+            Expr::While(w) => &w.body,
+            _ => continue,
+        };
+        let has_merge_point = body
+            .stmts
+            .iter()
+            .any(|s| matches!(s, syn::Stmt::Macro(m) if m.mac.path.is_ident("jit_merge_point")));
+        if has_merge_point {
+            return Some(body);
+        }
+    }
+    None
+}
+
+struct PlainArrayStoreFinder<'a> {
+    plain_arrays: &'a std::collections::HashSet<String>,
+    offender: Option<(String, proc_macro2::Span)>,
+}
+
+impl<'a> PlainArrayStoreFinder<'a> {
+    /// `state.<field>[_]` with `<field>` a plain array → the field name.
+    fn plain_array_index_target(&self, left: &Expr) -> Option<String> {
+        let Expr::Index(idx) = left else {
+            return None;
+        };
+        let Expr::Field(f) = &*idx.expr else {
+            return None;
+        };
+        if !matches!(&*f.base, Expr::Path(p) if p.qself.is_none() && p.path.is_ident("state")) {
+            return None;
+        }
+        let syn::Member::Named(member) = &f.member else {
+            return None;
+        };
+        let name = member.to_string();
+        self.plain_arrays.contains(&name).then_some(name)
+    }
+
+    fn check_assign_target(&mut self, left: &Expr) {
+        if self.offender.is_some() {
+            return;
+        }
+        if let Some(name) = self.plain_array_index_target(left) {
+            use syn::spanned::Spanned as _;
+            self.offender = Some((name, left.span()));
+        }
+    }
+}
+
+impl<'ast, 'a> syn::visit::Visit<'ast> for PlainArrayStoreFinder<'a> {
+    fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
+        self.check_assign_target(&node.left);
+        syn::visit::visit_expr_assign(self, node);
+    }
+
+    fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
+        // Compound assignment (`state.regs[i] += 1`) is a store too.
+        use syn::BinOp::*;
+        if matches!(
+            node.op,
+            AddAssign(_)
+                | SubAssign(_)
+                | MulAssign(_)
+                | DivAssign(_)
+                | RemAssign(_)
+                | BitXorAssign(_)
+                | BitAndAssign(_)
+                | BitOrAssign(_)
+                | ShlAssign(_)
+                | ShrAssign(_)
+        ) {
+            self.check_assign_target(&node.left);
+        }
+        syn::visit::visit_expr_binary(self, node);
+    }
+}
+
 /// Main entry point: transform the function with JIT support.
 pub fn transform_jit_interp(config: JitInterpConfig, func: ItemFn) -> TokenStream {
+    if let Err(err) = validate_state_fields(&config, &func) {
+        return err.to_compile_error();
+    }
     let trace_fn = codegen_trace::generate_trace_fn(&config, &func);
     let state_impl = codegen_state::generate_jit_state(&config, &func);
     let merge_wrapper = generate_merge_wrapper(&config, &func);
@@ -2126,5 +2285,90 @@ mod tests {
                 panic!("expected embedded array layout");
             }
         }
+    }
+
+    fn validate(config_tokens: proc_macro2::TokenStream, func: ItemFn) -> syn::Result<()> {
+        let config: JitInterpConfig = syn::parse2(config_tokens).unwrap();
+        validate_state_fields(&config, &func)
+    }
+
+    /// A plain `[int]` array stored inside the traced loop must be rejected:
+    /// the loop-carried element is lost on a guard deopt.
+    #[test]
+    fn validate_rejects_loop_carried_plain_array() {
+        let func: ItemFn = parse_quote! {
+            fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
+                let mut state = S { regs: vec![0; 3] };
+                let mut pc: usize = 0;
+                loop {
+                    jit_merge_point!();
+                    let op = program[pc];
+                    match op {
+                        0 => { state.regs[0] = state.regs[0] + 1; pc += 1; }
+                        _ => return state.regs[0],
+                    }
+                }
+            }
+        };
+        let err = validate(
+            quote! { state = S, env = Bytecode, greens = [pc, program],
+            state_fields = { regs: [int] } },
+            func,
+        )
+        .expect_err("loop-carried plain [int] store must be rejected");
+        assert!(err.to_string().contains("[int; virt]"));
+        assert!(err.to_string().contains("regs"));
+    }
+
+    /// `[int; virt]` is the supported loop-carried form — accepted.
+    #[test]
+    fn validate_accepts_virt_array() {
+        let func: ItemFn = parse_quote! {
+            fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
+                let mut state = S { regs: vec![0; 3] };
+                let mut pc: usize = 0;
+                loop {
+                    jit_merge_point!();
+                    let op = program[pc];
+                    match op {
+                        0 => { state.regs[0] = state.regs[0] + 1; pc += 1; }
+                        _ => return state.regs[0],
+                    }
+                }
+            }
+        };
+        validate(
+            quote! { state = S, env = Bytecode, greens = [pc, program],
+            state_fields = { regs: [int; virt] } },
+            func,
+        )
+        .expect("virt array must be accepted");
+    }
+
+    /// A plain `[int]` array only *read* in the loop is loop-invariant and
+    /// stays valid — no false positive.
+    #[test]
+    fn validate_accepts_read_only_plain_array() {
+        let func: ItemFn = parse_quote! {
+            fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
+                let mut state = S { regs: vec![0; 3] };
+                let mut pc: usize = 0;
+                let mut acc: i64 = 0;
+                loop {
+                    jit_merge_point!();
+                    let op = program[pc];
+                    match op {
+                        0 => { acc += state.regs[0]; pc += 1; }
+                        _ => return acc,
+                    }
+                }
+            }
+        };
+        validate(
+            quote! { state = S, env = Bytecode, greens = [pc, program],
+            state_fields = { regs: [int] } },
+            func,
+        )
+        .expect("read-only plain [int] array must be accepted");
     }
 }
