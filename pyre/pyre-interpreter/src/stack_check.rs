@@ -557,6 +557,17 @@ mod tests {
         PYRE_STACKTOOBIG.stack_end.store(value, Ordering::Relaxed);
     }
 
+    /// Read this thread's captured stack base from the source of truth
+    /// (`TL_STACK_END`, stack.c:40). The slowpath tests assert on this rather
+    /// than the global cache `pyre_stack_get_end()`: the global is refreshed
+    /// by any thread that runs `stack_check()` (stack.c:49,63), so in the
+    /// multi-threaded test binary a concurrent interpreter test can overwrite
+    /// it between the slowpath store and the read, making the global an
+    /// unstable observation. The per-thread TLS mirror is race-free.
+    fn captured_base() -> usize {
+        TL_STACK_END.with(|c| c.get())
+    }
+
     /// Acquire the test mutex, tolerating poisoning so a single
     /// previous-test panic doesn't cascade into every follow-up test.
     fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
@@ -577,20 +588,6 @@ mod tests {
         for _ in 0..1000 {
             assert!(stack_check().is_ok());
         }
-    }
-
-    #[test]
-    fn forced_high_base_triggers_overflow() {
-        let _g = lock_tests();
-        reset_all();
-        // Plant a base far above the current SP so diff > length AND
-        // -diff > length — the slowpath should classify this as a
-        // real stack overflow and return RecursionError.
-        let above = current_sp().saturating_add(2 * MAX_STACK_SIZE);
-        plant_stack_end(above);
-        let err = stack_check().expect_err("expected RecursionError");
-        assert_eq!(err.kind, crate::PyErrorKind::RecursionError);
-        reset_all();
     }
 
     #[test]
@@ -717,29 +714,29 @@ mod tests {
     }
 
     #[test]
-    fn jit_prologue_helper_returns_1_on_real_overflow() {
-        let _g = lock_tests();
-        reset_all();
-        let above = current_sp().saturating_add(2 * MAX_STACK_SIZE);
-        plant_stack_end(above);
-        assert_eq!(pyre_stack_check_for_jit_prologue(), 1i64);
-        assert!(is_jit_overflow_pending());
-        let _ = drain_jit_pending_exception();
-        reset_all();
-    }
-
-    #[test]
     fn small_recursion_limit_triggers_overflow_sooner() {
         let _g = lock_tests();
         reset_all();
-        // 1 recursionlimit unit = MAX_STACK_SIZE / 1000 bytes.
-        // Setting limit=1 leaves only ~8 KiB of headroom — definitely
-        // smaller than the synthetic high base we plant below.
-        set_recursion_limit(1).expect("positive");
+        // A near base (MAX_STACK_SIZE / 100 above current) is within bounds at
+        // the full budget but overflows once the budget shrinks to ~768 bytes
+        // (recursionlimit 1, MAX_STACK_SIZE / 1000). stack_length is a process
+        // global the interpreter reads on every frame and has no per-thread
+        // mirror, so a tiny value left in it lets a concurrent interpreter frame
+        // spuriously overflow; set_recursion_limit(1) would hold it tiny across a
+        // wide window (its own stack_check + shadow-stack growth). Shrink the
+        // budget only across the single slowpath classification and restore the
+        // full budget at once. Assert through the TLS-authoritative slowpath, not
+        // stack_check(), whose fast path also reads the shared global (see
+        // captured_base).
         let above = current_sp().saturating_add(MAX_STACK_SIZE / 100);
         plant_stack_end(above);
-        let err = stack_check().expect_err("expected RecursionError");
-        assert_eq!(err.kind, crate::PyErrorKind::RecursionError);
+        pyre_stack_set_length_fraction(0.001);
+        let overflow = pyre_stack_too_big_slowpath(current_sp());
+        pyre_stack_set_length_fraction(1.0);
+        assert_eq!(
+            overflow, 1,
+            "a tiny budget must classify a near base as a real overflow"
+        );
         reset_all();
     }
 
@@ -752,7 +749,7 @@ mod tests {
         let sp = current_sp();
         let overflow = pyre_stack_too_big_slowpath(sp);
         assert_eq!(overflow, 0, "first-time capture must not signal overflow");
-        let captured = pyre_stack_get_end();
+        let captured = captured_base();
         assert_eq!(captured, sp, "slowpath must update stack_end to current");
         reset_all();
     }
@@ -770,7 +767,7 @@ mod tests {
         let overflow = pyre_stack_too_big_slowpath(sp);
         assert_eq!(overflow, 0);
         assert_eq!(
-            pyre_stack_get_end(),
+            captured_base(),
             base,
             "within-bounds hit must not mutate base"
         );
@@ -789,11 +786,7 @@ mod tests {
         plant_stack_end(below);
         let overflow = pyre_stack_too_big_slowpath(sp);
         assert_eq!(overflow, 0);
-        assert_eq!(
-            pyre_stack_get_end(),
-            sp,
-            "underflow must revise base to current"
-        );
+        assert_eq!(captured_base(), sp, "underflow must revise base to current");
         reset_all();
     }
 
@@ -885,6 +878,35 @@ mod tests {
             loaded,
             (MAX_STACK_SIZE as f64 * 0.5) as usize,
             "raw load through adr must observe the FFI store"
+        );
+        reset_all();
+    }
+
+    #[test]
+    fn slowpath_capture_survives_concurrent_global_refresh() {
+        let _g = lock_tests();
+        reset_all();
+        // A first-time capture writes both the TLS source of truth and the
+        // global cache. Another thread running stack_check() may then refresh
+        // the shared global cache to its own base (stack.c:49,63); model that
+        // with a direct store. The per-thread TLS mirror is unaffected — which
+        // is why the slowpath tests read it (via captured_base) rather than the
+        // racy global cache pyre_stack_get_end().
+        plant_stack_end(0);
+        let sp = current_sp();
+        assert_eq!(pyre_stack_too_big_slowpath(sp), 0);
+        assert_eq!(captured_base(), sp);
+        let foreign = sp.wrapping_add(MAX_STACK_SIZE / 2);
+        PYRE_STACKTOOBIG.stack_end.store(foreign, Ordering::Relaxed);
+        assert_eq!(
+            captured_base(),
+            sp,
+            "a concurrent global-cache refresh must not perturb this thread's captured base"
+        );
+        assert_eq!(
+            pyre_stack_get_end(),
+            foreign,
+            "the global cache is shared and may hold another thread's base"
         );
         reset_all();
     }

@@ -833,6 +833,9 @@ fn stack_effects(
         | Instruction::StoreGlobal { .. }
         | Instruction::StoreDeref { .. }
         | Instruction::EndSend
+        // SET_FUNCTION_ATTRIBUTE pops the attribute value (TOS) and leaves the
+        // function (TOS1) it was applied to.
+        | Instruction::SetFunctionAttribute { .. }
         | Instruction::PopIter => (d - 1, d - 1),
         // YieldValue: sends TOS to caller, receives new value back. Net 0.
         Instruction::YieldValue { .. } => (d, d),
@@ -936,8 +939,11 @@ fn stack_effects(
         | Instruction::PopJumpIfFalse { .. }
         | Instruction::PopJumpIfNone { .. }
         | Instruction::PopJumpIfNotNone { .. } => (d - 1, d - 1),
-        // ForIter: fallthrough pushes TOS_next (+1); branch pops iterator (-1)
-        Instruction::ForIter { .. } => (d + 1, d - 1),
+        // ForIter: fallthrough pushes TOS_next (+1); the exhaustion branch
+        // keeps the iterator on the value stack (net 0) — it stays at TOS
+        // through END_FOR until the following POP_ITER pops it, so the
+        // branch-target depth still counts the iterator slot.
+        Instruction::ForIter { .. } => (d + 1, d),
         // Return
         Instruction::ReturnValue => (d - 1, d - 1),
         // Build collections: pop count, push 1

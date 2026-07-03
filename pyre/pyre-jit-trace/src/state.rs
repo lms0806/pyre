@@ -3436,6 +3436,22 @@ pub(crate) fn flush_walk_end_state_to_frame(
     frame: usize,
     resume_py_pc: usize,
 ) -> bool {
+    flush_walk_end_state_to_frame_with_item(ctx, frame, resume_py_pc, None)
+}
+
+/// `flush_walk_end_state_to_frame` plus an optional in-flight FOR_ITER item
+/// delivery (#32 S2).  When `push` is `Some((item, body_pc))` and the flush at
+/// `resume_py_pc` (a FOR_ITER header) commits, the consumed `item` is pushed
+/// one slot above the flushed operand stack and `last_instr` is repositioned to
+/// `body_pc - 1` so `next_instr()` re-enters the FOR_ITER body — delivering the
+/// already-advanced iteration exactly once (the FOR_ITER itself is NOT re-run).
+/// `push = None` is byte-identical to the plain flush.
+pub(crate) fn flush_walk_end_state_to_frame_with_item(
+    ctx: &TraceCtx,
+    frame: usize,
+    resume_py_pc: usize,
+    push: Option<(PyObjectRef, usize)>,
+) -> bool {
     if frame == 0 {
         return false;
     }
@@ -3495,7 +3511,23 @@ pub(crate) fn flush_walk_end_state_to_frame(
     // Validation pass first: it allocates nothing, so entry presence
     // cannot change under it.  Commit only when every live slot resolves.
     for abs in 0..live {
-        if ctx.virtualizable_entry_at(base + abs).is_none() {
+        let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
+            return false;
+        };
+        // An operand-STACK slot (`abs >= nlocals`) that resolves to a NULL Ref
+        // is an UNPOPULATED shadow slot, not a live value: the virtualizable
+        // shadow tracks locals/cells faithfully but its stack region is only
+        // valid at a merge point (loop header) where the walk's stack effects
+        // have settled.  At an arbitrary mid-opcode resume pc (an
+        // `abort_permanent` marker reached partway through an opcode's stack
+        // build — e.g. a MAKE_FUNCTION whose LOAD_CONST'd code object the walk
+        // tracked symbolically, never writing it to the shadow) those slots
+        // read back NULL.  Writing NULL into a live operand-stack slot and
+        // resuming there faults the interpreter (it pops NULL where a real
+        // object is expected).  Decline so the legacy replay reconstructs the
+        // frame from its start state instead.  A local slot may legitimately
+        // be NULL (an unbound local), so this only guards the stack region.
+        if abs >= nlocals && matches!(value, Value::Ref(r) if r.0 == 0) {
             return false;
         }
     }
@@ -3503,7 +3535,11 @@ pub(crate) fn flush_walk_end_state_to_frame(
         *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
             as *const *mut pyre_object::FixedObjectArray)
     };
-    if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < live {
+    // A pushed in-flight item (#32 S2) needs one slot above the `live` flushed
+    // slots; require the capacity up front so a decline happens BEFORE any
+    // frame mutation (all-or-nothing).
+    let need = if push.is_some() { live + 1 } else { live };
+    if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < need {
         return false;
     }
     // Commit one slot at a time, re-reading the shadow entry per slot:
@@ -3525,6 +3561,23 @@ pub(crate) fn flush_walk_end_state_to_frame(
         let pf = &mut *(frame as *mut PyFrame);
         pf.valuestackdepth = end_vsd;
         pf.last_instr = resume_py_pc as isize - 1;
+    }
+    // #32 S2: deliver the in-flight FOR_ITER item.  The flush wrote the
+    // FOR_ITER-header operand stack (the iterator on TOS) into slots
+    // `0..end_vsd`; the continue arm keeps the iterator and pushes the
+    // consumed item above it (codewriter FOR_ITER continue arm,
+    // `opcode_for_iter` never pops the iterator), so a single write at
+    // `end_vsd` lands the item where the body's first opcode expects TOS.
+    // `body_pc` is the FOR_ITER `orgpc + 1`; resume there so the FOR_ITER is
+    // not re-executed (which would re-advance the iterator).  The slot at
+    // `end_vsd` is within capacity (the early `need = live + 1` validation).
+    if let Some((item, body_pc)) = push {
+        unsafe {
+            (*arr_ptr).as_mut_slice()[end_vsd] = item;
+            let pf = &mut *(frame as *mut PyFrame);
+            pf.valuestackdepth = end_vsd + 1;
+            pf.last_instr = body_pc as isize - 1;
+        }
     }
     true
 }
@@ -7245,6 +7298,77 @@ impl JitState for PyreJitState {
         } else {
             self.expanded_virtualizable_live_values_with_extra_reds(meta, &[])
         }
+    }
+
+    fn close_loop_live_values(
+        ctx: &majit_metainterp::TraceCtx,
+        sym: &Self::Sym,
+        _meta: &Self::Meta,
+        live_arg_boxes: &[OpRef],
+    ) -> Option<Vec<Value>> {
+        let mut values = Vec::with_capacity(live_arg_boxes.len());
+        let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        let num_vable_scalars = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+
+        let frame_addr = if sym.live_vable_frame_addr != 0 {
+            sym.live_vable_frame_addr
+        } else {
+            sym.concrete_vable_ptr as usize
+        };
+        let frame_value = if frame_addr != 0 {
+            Value::Ref(majit_ir::GcRef(frame_addr))
+        } else {
+            ctx.box_value(*live_arg_boxes.first()?)?
+        };
+        values.push(frame_value);
+
+        if crate::virtualizable_gen::NUM_EXTRA_REDS == 1 {
+            let ec_addr = sym.concrete_execution_context as usize;
+            let ec_value = if ec_addr != 0 {
+                Value::Ref(majit_ir::GcRef(ec_addr))
+            } else {
+                ctx.box_value(*live_arg_boxes.get(1)?)?
+            };
+            values.push(ec_value);
+        }
+
+        let vable_start = 1 + crate::virtualizable_gen::NUM_EXTRA_REDS;
+        for i in 0..num_vable_scalars {
+            let slot = vable_start + i;
+            let value = ctx
+                .virtualizable_entry_at(i)
+                .map(|(_, value)| value)
+                .or_else(|| {
+                    live_arg_boxes
+                        .get(slot)
+                        .and_then(|opref| ctx.box_value(*opref))
+                })?;
+            values.push(value);
+        }
+
+        let array_slots = live_arg_boxes.len().saturating_sub(num_scalars);
+        for slot in 0..array_slots {
+            let concrete = if slot < sym.nlocals {
+                sym.concrete_locals
+                    .get(slot)
+                    .copied()
+                    .unwrap_or(ConcreteValue::Ref(PY_NULL))
+            } else {
+                let stack_idx = slot - sym.nlocals;
+                let live_stack = sym.valuestackdepth.saturating_sub(sym.nlocals);
+                if stack_idx < live_stack {
+                    sym.concrete_stack
+                        .get(stack_idx)
+                        .copied()
+                        .unwrap_or(ConcreteValue::Ref(PY_NULL))
+                } else {
+                    ConcreteValue::Ref(PY_NULL)
+                }
+            };
+            values.push(Value::Ref(majit_ir::GcRef(concrete.to_pyobj() as usize)));
+        }
+
+        Some(values)
     }
 
     // virtualizable.py:86 read_boxes() + warmstate.py:73 wrap() parity:
