@@ -3607,6 +3607,46 @@ impl Repr for InstanceRepr {
             let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
             return Ok(hop.genop("ptr_iszero", vlist, GenopResult::LLType(LowLevelType::Bool)));
         }
+        if method_name == "to_exc_object" {
+            let is_pyerror = self.classdef.as_ref().is_some_and(|classdef| {
+                classdef.borrow().name.rsplit('.').next() == Some("PyError")
+            });
+            if is_pyerror {
+                use crate::translator::rtyper::lltypesystem::lltype::{
+                    self, FuncType, functionptr_with_external_name,
+                };
+
+                // Pyre's `PyError::to_exc_object` materializes the trace-level
+                // exception value (`error.rs`), matching the
+                // `exceptiontransform.py:347-354` decision point where RPython
+                // raises the normalized exception object.  It is an interpreter
+                // impl method, not an rtyper-minted helper, so keep it as a
+                // residual `direct_call` keyed by
+                // `CallPath::for_impl_method("PyError", "to_exc_object")`.
+                let r_result = hop.r_result.borrow().clone().ok_or_else(|| {
+                    TyperError::message("InstanceRepr.rtype_method_to_exc_object: r_result missing")
+                })?;
+                let arg_lltype = self.lowleveltype().clone();
+                let result_lltype = r_result.lowleveltype().clone();
+                let funcptr = functionptr_with_external_name(
+                    FuncType {
+                        args: vec![arg_lltype],
+                        result: result_lltype,
+                    },
+                    "PyError::to_exc_object",
+                    Some("PyError.to_exc_object".to_string()),
+                );
+                let funcptr_lltype = LowLevelType::Ptr(Box::new(lltype::typeOf(&funcptr)));
+                let v_func = HighLevelOp::inputconst(
+                    &funcptr_lltype,
+                    &ConstValue::LLPtr(Box::new(funcptr)),
+                )?;
+                let mut vlist = vec![Hlvalue::Constant(v_func)];
+                vlist.extend(hop.inputargs(vec![ConvertedTo::Repr(self)])?);
+                hop.exception_cannot_occur()?;
+                return Ok(hop.genop("direct_call", vlist, GenopResult::Repr(r_result)));
+            }
+        }
         Err(TyperError::message(format!(
             "missing {}.rtype_method_{method_name}",
             self.class_name()
@@ -3737,6 +3777,10 @@ impl Repr for InstanceRepr {
     ///     return self.convert_const_exact(value)
     /// ```
     ///
+    /// For the root `object` repr, `self.classdef` is `None`.
+    /// RPython `rclass.py:786-790` delegates in that arm because
+    /// `classdesc.py:251` makes `classdef.commonbase(None) == None`.
+    ///
     /// The `classdef == self.classdef` exact-match arm dispatches into
     /// [`InstanceRepr::convert_const_exact`] (rclass.py:794-802) via
     /// [`getinstancerepr`], which recovers the owning `Arc<Self>` from
@@ -3812,26 +3856,21 @@ impl Repr for InstanceRepr {
             //              self.classdef: raise TyperError(...)`.
             //   Subclass-relationship check; self must be a base of the
             //   value's class.
-            let self_cd = self.classdef.as_ref().ok_or_else(|| {
-                TyperError::message(format!(
-                    "InstanceRepr.convert_const: cannot delegate via root \
-                     InstanceRepr (classdef=None) to {:?}",
-                    classdef.borrow().name
-                ))
-            })?;
-            let common = ClassDef::commonbase(&classdef, self_cd).ok_or_else(|| {
-                TyperError::message(format!(
-                    "not an instance of {:?}: {:?}",
-                    self_cd.borrow().name,
-                    host_obj.qualname()
-                ))
-            })?;
-            if !Rc::ptr_eq(&common, self_cd) {
-                return Err(TyperError::message(format!(
-                    "not an instance of {:?}: {:?}",
-                    self_cd.borrow().name,
-                    host_obj.qualname()
-                )));
+            if let Some(self_cd) = self.classdef.as_ref() {
+                let common = ClassDef::commonbase(&classdef, self_cd).ok_or_else(|| {
+                    TyperError::message(format!(
+                        "not an instance of {:?}: {:?}",
+                        self_cd.borrow().name,
+                        host_obj.qualname()
+                    ))
+                })?;
+                if !Rc::ptr_eq(&common, self_cd) {
+                    return Err(TyperError::message(format!(
+                        "not an instance of {:?}: {:?}",
+                        self_cd.borrow().name,
+                        host_obj.qualname()
+                    )));
+                }
             }
             // upstream: `rinstance = getinstancerepr(rtyper, classdef);
             //            result = rinstance.convert_const(value);
@@ -5278,6 +5317,76 @@ mod tests {
         Repr::setup(&repr).expect("setup classdef=None path");
     }
 
+    #[test]
+    fn instance_repr_pyerror_to_exc_object_emits_residual_direct_call() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::{SomeInstance, SomeObject, SomeValue};
+        use crate::flowspace::model::{HostObject, SpaceOperation};
+        use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
+        use std::cell::RefCell as StdRef;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let host = HostObject::new_class("pyre_interpreter.error.PyError", vec![]);
+        let entry = ann.bookkeeper.getdesc(&host).unwrap();
+        let crate::annotator::description::DescEntry::Class(rc) = &entry else {
+            unreachable!();
+        };
+        let cd = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(rc).unwrap();
+        let repr = getinstancerepr(&rtyper, Some(&cd), Flavor::Gc).unwrap();
+        Repr::setup(repr.as_ref()).unwrap();
+
+        let v_self = Variable::new();
+        v_self.set_concretetype(Some(repr.lowleveltype().clone()));
+        let v_self_h = Hlvalue::Variable(v_self);
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(OBJECTPTR.clone()));
+        let spaceop = SpaceOperation::new(
+            "simple_call",
+            vec![v_self_h.clone()],
+            Hlvalue::Variable(v_result),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_self_h);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Instance(SomeInstance {
+                base: SomeObject::default(),
+                classdef: Some(cd),
+                can_be_none: false,
+                flags: Default::default(),
+            }));
+        hop.args_r.borrow_mut().push(Some(repr.clone()));
+        let r_result = getinstancerepr(&rtyper, None, Flavor::Gc).unwrap() as Arc<dyn Repr>;
+        *hop.r_result.borrow_mut() = Some(r_result);
+
+        let out = repr
+            .rtype_method("to_exc_object", &hop)
+            .expect("PyError.to_exc_object rtypes")
+            .expect("direct_call returns PyObjectRef");
+        assert!(matches!(out, Hlvalue::Variable(_)));
+
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        let op = &ops.ops[0];
+        assert_eq!(op.opname, "direct_call");
+        assert_eq!(op.args.len(), 2);
+        let Hlvalue::Constant(c_func) = &op.args[0] else {
+            panic!("direct_call arg0 must be a function pointer constant");
+        };
+        let ConstValue::LLPtr(ptr) = &c_func.value else {
+            panic!("direct_call arg0 must carry LLPtr");
+        };
+        let Ok(_ptr_obj::Func(func)) = ptr._obj() else {
+            panic!("direct_call arg0 must point to a function");
+        };
+        assert_eq!(func._name, "PyError::to_exc_object");
+    }
+
     // -----------------------------------------------------------------
     // R2-A — ClassRepr scaffold + getclassrepr(classdef != None).
     // -----------------------------------------------------------------
@@ -5483,6 +5592,49 @@ mod tests {
             panic!("convert_const(None) must produce LLPtr, got {:?}", c.value);
         };
         assert!(!ptr.nonzero(), "null_instance must be a null pointer");
+    }
+
+    #[test]
+    fn instance_repr_root_convert_const_delegates_and_upcasts() {
+        // rclass.py:786-790 delegates mismatched classdefs through the
+        // concrete InstanceRepr and upcasts. For the root repr,
+        // classdesc.py:251 makes `classdef.commonbase(None) == None`,
+        // so the guard is vacuously satisfied.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::HostObject;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("init exceptiondata");
+        let host = HostObject::new_class("RootDelegated", vec![]);
+        let entry = ann.bookkeeper.getdesc(&host).unwrap();
+        let DescEntry::Class(rc) = &entry else {
+            unreachable!()
+        };
+        let cd = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(rc).unwrap();
+        let concrete = getinstancerepr(&rtyper, Some(&cd), Flavor::Gc).expect("concrete repr");
+        Repr::setup(concrete.as_ref() as &dyn Repr).expect("setup concrete InstanceRepr");
+        let root = getinstancerepr(&rtyper, None, Flavor::Gc).expect("root repr");
+        assert!(root.classdef.is_none(), "test must exercise the root repr");
+        Repr::setup(root.as_ref() as &dyn Repr).expect("setup root InstanceRepr");
+        rtyper.call_all_setups().expect("call_all_setups");
+        crate::translator::rtyper::normalizecalls::assign_inheritance_ids(&ann);
+
+        let prebuilt = HostObject::new_instance(host.clone(), vec![]);
+        let c = (root.as_ref() as &dyn Repr)
+            .convert_const(&ConstValue::HostObject(prebuilt))
+            .expect("root convert_const delegates");
+        assert_eq!(c.concretetype.as_ref(), Some(root.lowleveltype()));
+        let ConstValue::LLPtr(ptr) = &c.value else {
+            panic!("convert_const must produce LLPtr, got {:?}", c.value);
+        };
+        assert!(ptr.nonzero());
+        assert_eq!(
+            concrete.iprebuiltinstances.borrow().len(),
+            1,
+            "root conversion must route through the concrete InstanceRepr"
+        );
     }
 
     #[test]

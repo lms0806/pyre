@@ -2342,11 +2342,11 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
             } else {
                 // `space.index` may yield a long; one that overflows i64
                 // is necessarily outside 0..256 → the ValueError below.
-                match i64::try_from(w_long_get_value(indexed)) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        return Err(PyError::value_error("byte must be in range(0, 256)"));
-                    }
+                let big = w_long_get_value(indexed);
+                if pyre_object::longobject::jit_bigint_to_i64_fits(big) != 0 {
+                    pyre_object::longobject::jit_bigint_to_i64_value(big)
+                } else {
+                    return Err(PyError::value_error("byte must be in range(0, 256)"));
                 }
             }
         };
@@ -5229,8 +5229,10 @@ pub fn int_w(obj: PyObjectRef) -> Result<i64, PyError> {
     // OverflowError if the bigint does not fit in a machine word. Fast path.
     if unsafe { pyre_object::pyobject::is_long(obj) } {
         let big = unsafe { pyre_object::longobject::w_long_get_value(obj) };
-        return i64::try_from(big)
-            .map_err(|_| PyError::overflow_error("int too large to convert to int"));
+        if pyre_object::longobject::jit_bigint_to_i64_fits(big) != 0 {
+            return Ok(pyre_object::longobject::jit_bigint_to_i64_value(big));
+        }
+        return Err(PyError::overflow_error("int too large to convert to int"));
     }
     // baseobjspace.py:284 `w_obj = space.int(self)` — __int__ or __index__.
     let w_obj = space_int(obj)?;
@@ -5241,8 +5243,10 @@ pub fn int_w(obj: PyObjectRef) -> Result<i64, PyError> {
     }
     if unsafe { pyre_object::pyobject::is_long(w_obj) } {
         let big = unsafe { pyre_object::longobject::w_long_get_value(w_obj) };
-        return i64::try_from(big)
-            .map_err(|_| PyError::overflow_error("int too large to convert to int"));
+        if pyre_object::longobject::jit_bigint_to_i64_fits(big) != 0 {
+            return Ok(pyre_object::longobject::jit_bigint_to_i64_value(big));
+        }
+        return Err(PyError::overflow_error("int too large to convert to int"));
     }
     // Unreachable: space_int returns W_AbstractIntObject or errors.
     Err(PyError::type_error("__int__ returned non-int"))
@@ -8249,9 +8253,9 @@ pub fn float_w(obj: PyObjectRef) -> Result<f64, PyError> {
             // longobject.py:131-135 `tofloat` — `rbigint.tofloat()` raises
             // OverflowError "int too large to convert to float" when the
             // value does not fit a C double.
-            let f = pyre_object::longobject::w_long_get_value(obj)
-                .to_f64()
-                .unwrap_or(f64::INFINITY);
+            let f = pyre_object::longobject::jit_bigint_to_f64_or_inf(
+                pyre_object::longobject::w_long_get_value(obj),
+            );
             if !f.is_finite() {
                 return Err(PyError::overflow_error("int too large to convert to float"));
             }

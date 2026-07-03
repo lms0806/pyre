@@ -556,6 +556,36 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::jit_list_reverse",
         pyre_object::jit_list_reverse as *const (),
     );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_to_i64_fits",
+        "pyre_object::jit_bigint_to_i64_fits",
+        pyre_object::jit_bigint_to_i64_fits as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_to_i64_value",
+        "pyre_object::jit_bigint_to_i64_value",
+        pyre_object::jit_bigint_to_i64_value as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_sign_i64",
+        "pyre_object::jit_bigint_sign_i64",
+        pyre_object::jit_bigint_sign_i64 as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_to_f64_or_inf",
+        "pyre_object::jit_bigint_to_f64_or_inf",
+        pyre_object::jit_bigint_to_f64_or_inf as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_to_f64_or_nan",
+        "pyre_object::jit_bigint_to_f64_or_nan",
+        pyre_object::jit_bigint_to_f64_or_nan as *const (),
+    );
     // The #171 object-append fold descends `w_list_append` and folds the
     // store leaves to native ops, leaving `list_write_barrier(l)` as a
     // residual call (the off-GC ItemsBlock is reached by the collector only
@@ -645,6 +675,24 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::dict_eq_hook::hash_str_hooked",
         "pyre_object::hash_str_hooked",
         pyre_object::dict_eq_hook::hash_str_hooked as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_float_abs",
+        "pyre_interpreter::jit_float_abs",
+        crate::objspace::descroperation::jit_float_abs as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::call::pyre_debug_call_enabled",
+        "pyre_interpreter::pyre_debug_call_enabled",
+        crate::call::pyre_debug_call_enabled as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::executioncontext::execution_context_builtin_cache_get",
+        "pyre_interpreter::execution_context_builtin_cache_get",
+        crate::executioncontext::execution_context_builtin_cache_get as *const (),
     );
     push_alias_pair(
         &mut entries,
@@ -994,6 +1042,180 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         var_nums_to_second_index as *const (),
     );
 
+    // Opcode oparg decode helpers for two-phase lifting. These wrap
+    // RustPython's generic `Arg::get` and `CodeUnits::deref` surfaces
+    // behind first-party residual calls whose return values are the
+    // scalar/enum values consumed by the opcode handlers.
+    let label_arg_to_usize: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::Label>,
+        crate::bytecode::OpArg,
+    ) -> usize = crate::pyopcode::label_arg_to_usize;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::label_arg_to_usize",
+        "pyre_interpreter::label_arg_to_usize",
+        label_arg_to_usize as *const (),
+    );
+
+    let jump_target_forward_decoded: fn(
+        &crate::CodeObject,
+        usize,
+        crate::bytecode::Arg<crate::bytecode::oparg::Label>,
+        crate::bytecode::OpArg,
+    ) -> usize = crate::pyopcode::jump_target_forward_decoded;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::jump_target_forward_decoded",
+        "pyre_interpreter::jump_target_forward_decoded",
+        jump_target_forward_decoded as *const (),
+    );
+
+    let jump_target_forward_from_oparg: fn(
+        &crate::CodeObject,
+        usize,
+        crate::bytecode::OpArg,
+    ) -> usize = crate::pyopcode::jump_target_forward_from_oparg;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::jump_target_forward_from_oparg",
+        "pyre_interpreter::jump_target_forward_from_oparg",
+        jump_target_forward_from_oparg as *const (),
+    );
+
+    let jump_target_backward_decoded: fn(
+        &crate::CodeObject,
+        usize,
+        crate::bytecode::Arg<crate::bytecode::oparg::Label>,
+        crate::bytecode::OpArg,
+    ) -> usize = crate::pyopcode::jump_target_backward_decoded;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::jump_target_backward_decoded",
+        "pyre_interpreter::jump_target_backward_decoded",
+        jump_target_backward_decoded as *const (),
+    );
+
+    let binary_op_arg: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::BinaryOperator>,
+        crate::bytecode::OpArg,
+    ) -> crate::bytecode::BinaryOperator = crate::pyopcode::binary_op_arg;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::binary_op_arg",
+        "pyre_interpreter::binary_op_arg",
+        binary_op_arg as *const (),
+    );
+
+    let comparison_op_arg: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::ComparisonOperator>,
+        crate::bytecode::OpArg,
+    ) -> crate::bytecode::ComparisonOperator = crate::pyopcode::comparison_op_arg;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::comparison_op_arg",
+        "pyre_interpreter::comparison_op_arg",
+        comparison_op_arg as *const (),
+    );
+
+    let invert_arg: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::Invert>,
+        crate::bytecode::OpArg,
+    ) -> crate::bytecode::Invert = crate::pyopcode::invert_arg;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::invert_arg",
+        "pyre_interpreter::invert_arg",
+        invert_arg as *const (),
+    );
+
+    let build_slice_arg: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::BuildSliceArgCount>,
+        crate::bytecode::OpArg,
+    ) -> crate::bytecode::BuildSliceArgCount = crate::pyopcode::build_slice_arg;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::build_slice_arg",
+        "pyre_interpreter::build_slice_arg",
+        build_slice_arg as *const (),
+    );
+
+    let common_constant_arg: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::CommonConstant>,
+        crate::bytecode::OpArg,
+    ) -> crate::bytecode::CommonConstant = crate::pyopcode::common_constant_arg;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::common_constant_arg",
+        "pyre_interpreter::common_constant_arg",
+        common_constant_arg as *const (),
+    );
+
+    let convert_value_arg: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::ConvertValueOparg>,
+        crate::bytecode::OpArg,
+    ) -> crate::bytecode::ConvertValueOparg = crate::pyopcode::convert_value_arg;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::convert_value_arg",
+        "pyre_interpreter::convert_value_arg",
+        convert_value_arg as *const (),
+    );
+
+    let special_method_arg: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::SpecialMethod>,
+        crate::bytecode::OpArg,
+    ) -> crate::bytecode::SpecialMethod = crate::pyopcode::special_method_arg;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::special_method_arg",
+        "pyre_interpreter::special_method_arg",
+        special_method_arg as *const (),
+    );
+
+    let make_function_flag_arg: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::MakeFunctionFlag>,
+        crate::bytecode::OpArg,
+    ) -> crate::bytecode::MakeFunctionFlag = crate::pyopcode::make_function_flag_arg;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::make_function_flag_arg",
+        "pyre_interpreter::make_function_flag_arg",
+        make_function_flag_arg as *const (),
+    );
+
+    let intrinsic_function_1_arg: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::IntrinsicFunction1>,
+        crate::bytecode::OpArg,
+    ) -> crate::bytecode::IntrinsicFunction1 = crate::pyopcode::intrinsic_function_1_arg;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::intrinsic_function_1_arg",
+        "pyre_interpreter::intrinsic_function_1_arg",
+        intrinsic_function_1_arg as *const (),
+    );
+
+    let intrinsic_function_2_arg: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::IntrinsicFunction2>,
+        crate::bytecode::OpArg,
+    ) -> crate::bytecode::IntrinsicFunction2 = crate::pyopcode::intrinsic_function_2_arg;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::intrinsic_function_2_arg",
+        "pyre_interpreter::intrinsic_function_2_arg",
+        intrinsic_function_2_arg as *const (),
+    );
+
+    let raise_kind_arg_as_usize: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::RaiseKind>,
+        crate::bytecode::OpArg,
+    ) -> usize = crate::pyopcode::raise_kind_arg_as_usize;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::raise_kind_arg_as_usize",
+        "pyre_interpreter::raise_kind_arg_as_usize",
+        raise_kind_arg_as_usize as *const (),
+    );
+
     // `PyError::type_error` — invoked by `stack_underflow_error`'s body
     // (`shared_opcode.rs:181-183`). The codewriter resolves it to the
     // 2-segment CallPath `["PyError", "type_error"]` (impl-method shape:
@@ -1005,6 +1227,18 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         &mut entries,
         "pyre_interpreter::PyError::type_error",
         pyerror_type_error as *const (),
+    );
+
+    // `PyError::to_exc_object` — residual exception materialization emitted by
+    // the two-phase rtyper for `PyError.to_exc_object()` call sites.  This uses
+    // the same impl-method CallPath shape as `type_error`, resolving to
+    // `["PyError", "to_exc_object"]` after the crate segment is stripped.
+    let pyerror_to_exc_object: fn(&crate::PyError) -> pyre_object::PyObjectRef =
+        crate::PyError::to_exc_object;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::PyError::to_exc_object",
+        pyerror_to_exc_object as *const (),
     );
 
     // RPython convention (cross-reference `support.py:255-271` for
@@ -1559,6 +1793,10 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
             "tagged_int::CAN_BE_TAGGED",
             pyre_object::tagged_int::CAN_BE_TAGGED as i64,
         ),
+        // `i64::MAX` reached as `core::num::<Impl>::MAX` in `getindex_w`'s
+        // overflow clamp. Charon leaves the associated const as a global
+        // accessor path, so bake the native signed max value.
+        ("core::num::<Impl>::MAX", i64::MAX),
     ]
 }
 
