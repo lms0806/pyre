@@ -234,6 +234,15 @@ impl MetaInterpStaticData {
         if code.is_null() {
             return None;
         }
+        // A raw `CodeObject*` IS the canonical key (jitcodes compare
+        // `raw_code()` identity).  Post-#16 callers pass the raw code
+        // identity directly (`ReconstructRecipe.code_ptr`); recognize it via
+        // the live-wrapper registry — keyed by raw code identity — before
+        // dereferencing `code` as a `PyCode` wrapper, which would read a
+        // garbage field out of a raw `CodeObject`.
+        if !pyre_interpreter::live_code_wrapper(code).is_null() {
+            return Some(code as usize);
+        }
         let raw = unsafe { pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef) };
         if raw.is_null() {
             None
@@ -1375,6 +1384,22 @@ pub fn result_color_at_pc_at(jitcode_index: i32, pc: usize) -> Option<usize> {
         let jc = sd.jitcodes.get(jitcode_index as usize)?;
         let c = jc.payload.metadata.result_color_at_pc.get(pc).copied()?;
         (c != u16::MAX).then_some(c as usize)
+    })
+}
+
+/// Whether `pcdep_color_slots[pc]` maps register color `color` to a semantic
+/// frame slot — i.e. the register allocator assigned this color to a real
+/// local/stack value at `pc`, so the color does NOT carry its force-alived
+/// portal-red meaning there (`collect_outer_active_boxes` scratch gate /
+/// `setup_bridge_sym` ec-seed gate).
+pub fn pcdep_color_names_frame_slot_at(jitcode_index: i32, pc: usize, color: u16) -> bool {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        sd.jitcodes
+            .get(jitcode_index as usize)
+            .and_then(|jc| jc.payload.metadata.pcdep_color_slots.get(pc))
+            .is_some_and(|entries| entries.iter().any(|&(c, _)| c == color))
     })
 }
 
@@ -7872,16 +7897,32 @@ impl JitState for PyreJitState {
         // value), so read it from the color-indexed decode `bridge_registers_r`
         // — `sym.registers_r` is now the slot-indexed mirror and does not carry
         // portal-red colors.
+        //
+        // At PCs where the register allocator reuses the ec color for a real
+        // frame slot (a call result live across a later call), the snapshot
+        // encoder recorded the SLOT value in this register, not the ec
+        // (`collect_outer_active_boxes` portal-red scratch gate); seeding
+        // `sym.execution_context` from it would hand a frame value to every
+        // downstream ec consumer.  Detect the collision through the same
+        // per-PC color→slot table the encoder consulted and leave ec to the
+        // `ensure_execution_context` frame-field recovery instead.
         let (_pfr, portal_ec_reg) = crate::state::portal_red_regs_at(frame0.jitcode_index);
         if portal_ec_reg != u16::MAX {
-            let slot = portal_ec_reg as usize;
-            assert!(
-                slot < bridge_registers_r.len(),
-                "setup_bridge_sym: portal_ec_reg={} out of bridge_registers_r range (len={})",
-                slot,
-                bridge_registers_r.len(),
+            let ec_color_names_frame_slot = crate::state::pcdep_color_names_frame_slot_at(
+                frame0.jitcode_index,
+                frame0.pc as usize,
+                portal_ec_reg,
             );
-            sym.execution_context = bridge_registers_r[slot];
+            if !ec_color_names_frame_slot {
+                let slot = portal_ec_reg as usize;
+                assert!(
+                    slot < bridge_registers_r.len(),
+                    "setup_bridge_sym: portal_ec_reg={} out of bridge_registers_r range (len={})",
+                    slot,
+                    bridge_registers_r.len(),
+                );
+                sym.execution_context = bridge_registers_r[slot];
+            }
         }
         // pyjitpl.py:3400-3430 rebuild_state_after_failure parity: after
         // a guard failure the tracing-time `virtualizable_boxes` mirror
@@ -8118,35 +8159,50 @@ impl JitState for PyreJitState {
                 resume_data.frames.len()
             );
         }
-        if (p2_drain_enabled() || p2_framestack_enabled())
-            && resume_data.frames.len() > 1
-            && resume_data.frames[0].pc >= 0
-        {
-            let root_pc = resume_data.frames[0].pc as usize;
+        if (p2_drain_enabled() || p2_framestack_enabled()) && resume_data.frames.len() > 1 {
+            let root_pc_valid = resume_data.frames[0].pc >= 0;
+            let root_pc = if root_pc_valid {
+                resume_data.frames[0].pc as usize
+            } else {
+                0
+            };
             let mut recipes: Vec<ReconstructRecipe> =
                 Vec::with_capacity(resume_data.frames.len() - 1);
-            let mut ok = true;
-            for frame in &resume_data.frames[1..] {
-                match reconstruct_inline_recipe(
-                    ctx,
-                    frame,
-                    rd_virtuals,
-                    resume_data,
-                    fail_values,
-                    fail_types,
-                    backend,
-                    &mut virtuals_cache,
-                ) {
-                    Some(recipe) => recipes.push(recipe),
-                    None => {
-                        ok = false;
-                        break;
+            let mut ok = root_pc_valid;
+            if root_pc_valid {
+                for frame in &resume_data.frames[1..] {
+                    match reconstruct_inline_recipe(
+                        ctx,
+                        frame,
+                        rd_virtuals,
+                        resume_data,
+                        fail_values,
+                        fail_types,
+                        backend,
+                        &mut virtuals_cache,
+                    ) {
+                        Some(recipe) => recipes.push(recipe),
+                        None => {
+                            ok = false;
+                            break;
+                        }
                     }
                 }
             }
-            if ok && !recipes.is_empty() {
-                ctx.set_bridge_inline_carrier(BridgeInlineCarrier { root_pc, recipes });
+            if !ok {
+                // A multi-frame resume whose callee chain cannot be
+                // reconstructed must still be MARKED as multi-frame: without a
+                // carrier the trace-start routing treats the resume as a
+                // single-frame bridge and walks the ROOT frame's code at the
+                // INNERMOST frame's pc, compiling a degenerate bridge that
+                // finishes with a root resume slot as the call result
+                // (dropping the whole in-flight callee continuation — wrong
+                // values, or a SEGV when the slot is not an int box).  An
+                // empty-recipe carrier routes the walk to its NoRecipes abort
+                // instead, degrading to the blackhole re-interpret.
+                recipes.clear();
             }
+            ctx.set_bridge_inline_carrier(BridgeInlineCarrier { root_pc, recipes });
         }
     }
 
