@@ -5,7 +5,6 @@ use majit_ir::{EffectInfo, OopSpecIndex, Op, OpCode, OpRef, Value};
 
 use crate::optimizeopt::info::{PtrInfo, PtrInfoExt, VStringVariant};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
-use majit_ir::box_ref::BoxRef;
 
 pub use crate::optimizeopt::info::{
     StrPtrInfo, VStringConcatInfo, VStringPlainInfo, VStringSliceInfo,
@@ -96,7 +95,7 @@ pub fn copy_str_content(
     // vstring.py:341-347: determine inline threshold M using intbound
     // A producer-less operand has no forwarded bound; getintbound returns
     // unbounded for it, so resolve-or-unbounded matches the prior
-    // materialize_box_at (mint synthetic → unbounded) behavior without minting.
+    // materialize_operand_at (mint synthetic → unbounded) behavior without minting.
     let srcoffset_bound = ctx
         .resolve_operand_operand_opt(srcoffsetbox)
         .map(|b| ctx.getintbound_handle(&b).borrow().clone())
@@ -341,7 +340,7 @@ impl OptString {
     }
 
     /// Run `f` against the VStringPlainInfo of `op`, auto-mirroring the
-    /// BoxRef snapshot after mutation via OptContext::with_ptr_info_mut.
+    /// operand snapshot after mutation via OptContext::with_ptr_info_mut.
     /// Returns `None` if the box has no PtrInfo, is not Str, or its variant
     /// is not Plain.
     fn with_plain_info_mut<R>(
@@ -1056,7 +1055,7 @@ impl OptString {
         // fall back to its canonical materialized stand-in rather than the
         // total resolver's position-only panic.
         let args: Vec<Operand> = op
-            .getarglist_operand()
+            .getarglist()
             .iter()
             .map(|a| match ctx.resolve_operand_operand_opt(a) {
                 Some(resolved) => resolved,
@@ -1590,7 +1589,7 @@ impl OptString {
                 if did_shrink {
                     // vstring.py:849: self.make_equal_to(op, op.getarg(1))
                     let b_old = Operand::from_bound_op(op_rc);
-                    let b_arg1 = arg1_box.expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_arg1 = arg1_box.expect("body-namespace OpRef must have an operand slot");
                     ctx.make_equal_to(&b_old, &b_arg1);
                     return OptimizationResult::Remove;
                 }
@@ -1757,7 +1756,7 @@ mod tests {
         // operands are leaf values with no producing op in this fixture slice;
         // without a registered producer, a later force/emit resolves such an
         // arg to a position-only `from_opref` box that mints `Operand::Box`.
-        // `materialize_box_at` binds a `SameAs*` synthetic at the same position
+        // `materialize_operand_at` binds a `SameAs*` synthetic at the same position
         // (oparser's leaf-var wiring), so resolution sheds to `Operand::Op`.
         // Positions produced by a trace op are skipped — materializing a
         // synthetic there would shadow the real producer and defeat
@@ -1768,7 +1767,7 @@ mod tests {
             for i in 0..op.num_args() {
                 let r = op.arg(i).to_opref();
                 if !r.is_none() && !r.is_constant() && !produced.contains(&r) {
-                    ctx.materialize_box_at(r);
+                    ctx.materialize_operand_at(r);
                 }
             }
         }
@@ -1826,7 +1825,7 @@ mod tests {
         // producer in `resop_refs`. A later force/emit then resolves the char
         // arg to that bound box (sheds to `Operand::Op`) instead of a
         // position-only `from_opref` box (which would mint `Operand::Box`).
-        // `materialize_box_at` keeps the box's `to_opref()` at the same
+        // `materialize_operand_at` keeps the box's `to_opref()` at the same
         // position, so the char-identity assertions still hold.
         let char_boxes: Vec<Option<Operand>> = chars
             .into_iter()
@@ -1850,7 +1849,7 @@ mod tests {
         let b = ctx.materialize_operand_at(opref);
         // Materialize the child refs so they carry a bound synthetic producer; a
         // residual emit then sheds them to `Operand::Op` instead of panicking on
-        // a position-only `from_opref` box. `materialize_box_at` keeps each
+        // a position-only `from_opref` box. `materialize_operand_at` keeps each
         // box's `to_opref()` at the same position, so identity assertions hold.
         let vleft_box = ctx.materialize_operand_at(vleft);
         let vright_box = ctx.materialize_operand_at(vright);
@@ -1877,7 +1876,7 @@ mod tests {
         // Materialize the source/start/length refs so they carry a bound
         // synthetic producer; a residual emit then sheds them to `Operand::Op`
         // instead of panicking on a position-only `from_opref` box.
-        // `materialize_box_at` keeps each box's `to_opref()` at the same
+        // `materialize_operand_at` keeps each box's `to_opref()` at the same
         // position, so identity assertions hold.
         let s_box = ctx.materialize_operand_at(s);
         let start_box = ctx.materialize_operand_at(start);
@@ -2142,7 +2141,7 @@ mod tests {
         // slice can't resolve the char statically and falls to the residual.
         // Materialize so the residual re-emits start as a bound box.
         let start_ref = OpRef::int_op(300);
-        ctx.materialize_box_at(start_ref);
+        ctx.materialize_operand_at(start_ref);
         let b = ctx.materialize_operand_at(OpRef::int_op(301));
         ctx.make_constant_box(&b, Value::Int(2)); // length
 
@@ -2225,10 +2224,10 @@ mod tests {
         // STRGETITEM (and its INT_ADD index) re-emit them as bound boxes
         // (`Operand::Op`) rather than position-only `from_opref` boxes.
         let src_ref = OpRef::ref_op(10);
-        ctx.materialize_box_at(src_ref);
+        ctx.materialize_operand_at(src_ref);
         // Non-constant start so the static fold misses → residual path.
         let start_ref = OpRef::int_op(300);
-        ctx.materialize_box_at(start_ref);
+        ctx.materialize_operand_at(start_ref);
         let b = ctx.materialize_operand_at(OpRef::int_op(301));
         ctx.make_constant_box(&b, Value::Int(3)); // slice length
 
@@ -2237,7 +2236,7 @@ mod tests {
 
         // STRGETITEM(slice, index) with a non-constant index.
         let index_ref = OpRef::int_op(302);
-        ctx.materialize_box_at(index_ref);
+        ctx.materialize_operand_at(index_ref);
         let pos = ctx.alloc_op_position_typed(majit_ir::Type::Int);
         let mut getitem = Op::new(OpCode::Strgetitem, &[rop(11), iop(302)]);
         getitem.pos.set(pos);
@@ -2275,7 +2274,7 @@ mod tests {
         // it as a bound box rather than a position-only `from_opref` box.
         let vleft_ref = OpRef::ref_op(10);
         let vright_ref = OpRef::ref_op(11);
-        ctx.materialize_box_at(vright_ref);
+        ctx.materialize_operand_at(vright_ref);
         set_vstring_plain(&mut ctx, vleft_ref, vec![None; 2]);
         let concat_ref = OpRef::ref_op(12);
         set_vstring_concat(&mut ctx, concat_ref, vleft_ref, vright_ref);
@@ -2358,7 +2357,7 @@ mod tests {
         // vstring.py:452 make_nonnull_str(op, mode_unicode) installs a
         // non-virtual StrPtrInfo with `mode = 1` so that later getstrlen
         // selects UNICODELEN instead of STRLEN.
-        // Synthetic-OpRef test fixture: lazy-allocate BoxRef for the unicode_ref slot.
+        // Synthetic-OpRef test fixture: lazy-allocate the operand for the unicode_ref slot.
         let unicode_box = ctx.materialize_operand_at(unicode_ref);
         ctx.make_nonnull_str(&unicode_box, 1);
 

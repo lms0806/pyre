@@ -458,7 +458,7 @@ impl VecScheduleState {
     /// producer box we look the position up among the ops already emitted
     /// into `oplist` / `invariant_oplist` (SSA guarantees a producer is
     /// emitted before its consumers). A hit binds to that exact producer
-    /// `Rc` (`BoxRef::from_bound_op` → `Operand::Op`, no mint); a constant
+    /// `Rc` (`Operand::from_bound_op` → `Operand::Op`, no mint); a constant
     /// sheds to `Operand::Const`. A miss for a ResOp/InputArg position
     /// (an inputarg, or a scalar not yet emitted as a vector op) is bound
     /// to a renamer-rooted producer box carrying the same `pos`
@@ -658,7 +658,7 @@ impl VecScheduleState {
         if !self.invariant_vector_vars.is_empty() || !loop_.prefix.is_empty() {
             // schedule.py:769-773: prefix_label.
             //   args = loop.label.getarglist_copy() + self.invariant_vector_vars
-            let mut args = loop_.label.getarglist_operand();
+            let mut args = loop_.label.getarglist();
             // invariant_vector_vars is a VecSet (insertion-ordered re-export of
             // vecmap_rs::VecSet), so iterating reproduces RPython's list-append
             // order. RPython's list may hold dups but expand() only appends fresh
@@ -690,7 +690,7 @@ impl VecScheduleState {
             loop_.prefix_label = Some(prefix_label); // schedule.py:773
 
             // schedule.py:775-779: jump.
-            let mut args = loop_.jump.getarglist_operand();
+            let mut args = loop_.jump.getarglist();
             for r in &inv_vars {
                 args.push(bound_boxref_in(
                     *r,

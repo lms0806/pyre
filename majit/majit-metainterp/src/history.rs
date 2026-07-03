@@ -234,24 +234,25 @@ impl majit_ir::LoopTargetDescr for LoopTargetDescr {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    //! Shared test helpers for constructing bound BoxRefs. Production
-    //! recorder->TreeLoop handoff binds every input argument and result op
-    //! to its producer identity, so optimizer tests that seed boxes directly
-    //! must do the same.
-    use majit_ir::box_ref::BoxRef;
+    //! Shared test helpers for constructing producer-bound operands.
+    //! Production recorder->TreeLoop handoff binds every input argument and
+    //! result op to its producer identity, so optimizer tests that seed
+    //! operands directly must do the same.
     use majit_ir::operand::Operand;
     use majit_ir::resoperation::{Op, OpCode, OpRc};
     use majit_ir::{InputArg, InputArgRc, OpRef, Type, Value};
 
-    pub(crate) fn bound_inputarg_box(tp: Type, index: u32) -> (BoxRef, InputArgRc) {
-        let b = BoxRef::new_inputarg(tp, index);
+    /// Bind a header input to a rooted `InputArg` producer: the operand IS the
+    /// producer handle, so forwarding asserts read the same canonical
+    /// `InputArg` host the operand routes writes to.
+    pub(crate) fn bound_inputarg_operand(tp: Type, index: u32) -> (Operand, InputArgRc) {
         let ia = std::rc::Rc::new(InputArg::from_type(tp, index));
-        b.bind_inputarg(&ia);
-        (b, ia)
+        (Operand::from_bound_inputarg(&ia), ia)
     }
 
-    pub(crate) fn bound_resop_box(tp: Type, position: u32) -> (BoxRef, OpRc) {
-        let b = BoxRef::new_resop(tp, position);
+    /// Bind a position to a fresh rooted `SameAs*` producer op, yielding the
+    /// operand plus the producer `Rc` the caller roots.
+    pub(crate) fn bound_resop_operand(tp: Type, position: u32) -> (Operand, OpRc) {
         let opcode = match tp {
             Type::Int => OpCode::SameAsI,
             Type::Float => OpCode::SameAsF,
@@ -260,8 +261,7 @@ pub(crate) mod test_support {
         };
         let op = std::rc::Rc::new(Op::new(opcode, &[]));
         op.pos.set(OpRef::op_typed(position, tp));
-        b.bind_op(&op);
-        (b, op)
+        (Operand::from_bound_op(&op), op)
     }
 
     thread_local! {
@@ -269,56 +269,38 @@ pub(crate) mod test_support {
             const { std::cell::RefCell::new(Vec::new()) };
     }
 
-    pub(crate) fn rooted_resop_box(tp: Type, position: u32) -> BoxRef {
-        let (b, op) = bound_resop_box(tp, position);
-        let rooted: std::rc::Rc<dyn std::any::Any> = op;
-        PRODUCER_ROOTS.with(|p| p.borrow_mut().push(rooted));
-        b
-    }
-
-    pub(crate) fn rooted_inputarg_box(tp: Type, index: u32) -> BoxRef {
-        let (b, ia) = bound_inputarg_box(tp, index);
-        let rooted: std::rc::Rc<dyn std::any::Any> = ia;
-        PRODUCER_ROOTS.with(|p| p.borrow_mut().push(rooted));
-        b
-    }
-
-    /// `Operand` form of [`rooted_resop_box`] for op-arg / fail-arg sites that
-    /// want the producer directly (the `from_boxref(&rooted_resop_box(..))`
-    /// round-trip collapsed). The synthetic producer is rooted in the
-    /// thread-local pool — like [`rooted_resop_box`] — so a position-only
-    /// re-resolution of this op (`to_opref()` stored, the `Operand` dropped,
-    /// the position later re-bound through `box_cache`) still finds the live
-    /// producer instead of a dangling `Weak`.
+    /// Rooted producer operand for op-arg / fail-arg sites that want the
+    /// producer directly. The synthetic producer is rooted in the thread-local
+    /// pool so a position-only re-resolution of this op (`to_opref()` stored,
+    /// the `Operand` dropped, the position later re-bound through `box_cache`)
+    /// still finds the live producer instead of a dangling `Weak`.
     pub(crate) fn rooted_resop_operand(tp: Type, position: u32) -> Operand {
-        let (_b, op) = bound_resop_box(tp, position);
-        let operand = Operand::from_bound_op(&op);
+        let (operand, op) = bound_resop_operand(tp, position);
         let rooted: std::rc::Rc<dyn std::any::Any> = op;
         PRODUCER_ROOTS.with(|p| p.borrow_mut().push(rooted));
         operand
     }
 
-    /// `Operand` form of [`rooted_inputarg_box`]; the producer is rooted in the
-    /// thread-local pool so a dropped-`Operand`, position-only re-resolution
-    /// stays bound.
+    /// InputArg sibling of [`rooted_resop_operand`]; the producer is rooted
+    /// in the thread-local pool so a dropped-`Operand`, position-only
+    /// re-resolution stays bound.
     pub(crate) fn rooted_inputarg_operand(tp: Type, index: u32) -> Operand {
-        let (_b, ia) = bound_inputarg_box(tp, index);
-        let operand = Operand::from_bound_inputarg(&ia);
+        let (operand, ia) = bound_inputarg_operand(tp, index);
         let rooted: std::rc::Rc<dyn std::any::Any> = ia;
         PRODUCER_ROOTS.with(|p| p.borrow_mut().push(rooted));
         operand
     }
 
-    pub(crate) fn rooted_box_from_opref(a: OpRef) -> BoxRef {
+    pub(crate) fn rooted_operand_from_opref(a: OpRef) -> Operand {
         if a.is_none() || a.is_constant() {
-            return BoxRef::from_opref(a);
+            return Operand::from_opref(a);
         }
         let ty = a.ty().unwrap_or(Type::Void);
         match a {
             OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
-                rooted_inputarg_box(ty, a.raw())
+                rooted_inputarg_operand(ty, a.raw())
             }
-            _ => rooted_resop_box(ty, a.raw()),
+            _ => rooted_resop_operand(ty, a.raw()),
         }
     }
 
@@ -337,29 +319,25 @@ pub(crate) mod test_support {
             }
         }
 
-        pub(crate) fn input(&mut self, tp: Type, index: u32) -> BoxRef {
+        pub(crate) fn input(&mut self, tp: Type, index: u32) -> Operand {
             let idx = index as usize;
             if idx >= self.inputs.len() {
                 self.inputs.resize(idx + 1, Type::Int);
             }
             self.inputs[idx] = tp;
-            rooted_inputarg_box(tp, index)
+            rooted_inputarg_operand(tp, index)
         }
 
-        pub(crate) fn const_int(&self, v: i64) -> BoxRef {
-            BoxRef::new_const(Value::Int(v))
+        pub(crate) fn const_int(&self, v: i64) -> Operand {
+            Operand::const_from_value(Value::Int(v))
         }
 
-        pub(crate) fn op(&mut self, opcode: OpCode, args: &[BoxRef]) -> BoxRef {
-            let op_args: Vec<majit_ir::operand::Operand> = args
-                .iter()
-                .map(majit_ir::operand::Operand::from_boxref)
-                .collect();
-            let op = std::rc::Rc::new(Op::new(opcode, &op_args));
+        pub(crate) fn op(&mut self, opcode: OpCode, args: &[Operand]) -> Operand {
+            let op = std::rc::Rc::new(Op::new(opcode, args));
             op.pos
                 .set(OpRef::op_typed(self.next_pos, opcode.result_type()));
             self.next_pos += 1;
-            let result = BoxRef::from_bound_op(&op);
+            let result = Operand::from_bound_op(&op);
             self.ops.push(op);
             result
         }
@@ -367,18 +345,14 @@ pub(crate) mod test_support {
         pub(crate) fn op_with_descr(
             &mut self,
             opcode: OpCode,
-            args: &[BoxRef],
+            args: &[Operand],
             descr: majit_ir::DescrRef,
-        ) -> BoxRef {
-            let op_args: Vec<majit_ir::operand::Operand> = args
-                .iter()
-                .map(majit_ir::operand::Operand::from_boxref)
-                .collect();
-            let op = std::rc::Rc::new(Op::with_descr(opcode, &op_args, descr));
+        ) -> Operand {
+            let op = std::rc::Rc::new(Op::with_descr(opcode, args, descr));
             op.pos
                 .set(OpRef::op_typed(self.next_pos, opcode.result_type()));
             self.next_pos += 1;
-            let result = BoxRef::from_bound_op(&op);
+            let result = Operand::from_bound_op(&op);
             self.ops.push(op);
             result
         }
@@ -1059,7 +1033,6 @@ mod tests {
     use majit_ir::Type;
 
     use crate::history::test_support::{rooted_inputarg_operand, rooted_resop_operand};
-    use majit_ir::box_ref::BoxRef;
     use majit_ir::operand::Operand;
 
     #[derive(Debug)]
@@ -1082,7 +1055,7 @@ mod tests {
     }
 
     // Bound-box drop-ins for op-arg / fail-arg sites. Each binds a rooted
-    // synthetic producer (box_ref.rs `test_support`) so the arg sheds to
+    // synthetic producer (forwarding.rs `test_support`) so the arg sheds to
     // `Operand::InputArg` / `Operand::Op` (never the position-only
     // `Operand::Box`); `to_opref()` is preserved, so position-keyed
     // assertions still hold.

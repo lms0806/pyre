@@ -4,7 +4,7 @@
 //! a `majit-metainterp → majit-ir` circular dep.
 //!
 //! Pure data + leaf methods only. Methods that need `Op` / `OptContext`
-//! / `BoxRef` from `majit-metainterp` live as extension traits in
+//! from `majit-metainterp` live as extension traits in
 //! `metainterp::optimizeopt::info`.
 
 use crate::field_entry::{FieldEntry, PreambleOp};
@@ -1421,7 +1421,7 @@ impl PtrInfo {
     /// (`FieldDescr::field_type`) so ref / float fields land as
     /// `GetfieldGcR` / `GetfieldGcF`; otherwise the short preamble would
     /// reconstruct non-int virtual fields with the wrong result type.
-    pub fn produce_short_preamble_ops(&self, structbox: crate::box_ref::BoxRef) -> Vec<Op> {
+    pub fn produce_short_preamble_ops(&self, structbox: crate::operand::Operand) -> Vec<Op> {
         let mut result = Vec::new();
         let field_descrs = self.all_fielddescrs_from_descr();
         let push_for = |result: &mut Vec<Op>, field_idx: u32, missing_msg: &str| {
@@ -1431,11 +1431,7 @@ impl PtrInfo {
                 .map(|fd| fd.field_type())
                 .unwrap_or(Type::Int);
             let opcode = OpCode::getfield_for_type(tp);
-            result.push(Op::with_descr(
-                opcode,
-                &[crate::operand::Operand::from_boxref(&structbox)],
-                descr,
-            ));
+            result.push(Op::with_descr(opcode, &[structbox.clone()], descr));
         };
         if let PtrInfo::Virtual(v) = self {
             for (field_idx, value) in &v.fields {

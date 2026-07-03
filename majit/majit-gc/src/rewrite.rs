@@ -2741,7 +2741,7 @@ impl GcRewriterImpl {
         // rewrite.py:672-683 — store each arg at _ll_initial_locs[i] with
         // per-arg itemsize from getarraydescr_for_frame(arg.type).
         let arglist: Vec<Operand> = op
-            .getarglist_operand()
+            .getarglist()
             .iter()
             .map(|a| st.resolve(a.clone()))
             .collect();
@@ -3266,7 +3266,7 @@ mod tests {
         op
     }
 
-    use majit_ir::box_ref::bound_operand_from_opref as ro;
+    use majit_ir::forwarding::bound_operand_from_opref as ro;
 
     fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: DescrRef) -> Op {
         let args: Vec<Operand> = args.iter().map(|a| ro(*a)).collect();

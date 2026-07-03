@@ -61,7 +61,7 @@ pub struct OptRewrite {
     /// Convergence: retire this cache and route the bool lookups through the pure
     /// optimizer's get_pure_result / pure_from_args2 (both already present at
     /// pure.rs:498/492) keyed off the pure-op table — coupled to the pure-optimizer
-    /// subsystem. NOT a box-identity rekey target: rekeying the OpRef pair to BoxRef
+    /// subsystem. NOT a box-identity rekey target: rekeying the OpRef pair to operand
     /// would entrench a structure upstream does not have.
     bool_result_cache: majit_ir::VecMap<(OpCode, OpRef, OpRef), OpRef>,
     /// rewrite.py:39: loop_invariant_results — cache for CALL_LOOPINVARIANT results.
@@ -2069,14 +2069,13 @@ impl Optimization for OptRewrite {
                             // info seeded at result_opref's slot per the
                             // dual-slot rule (mod.rs:1817 replay_pos).
                             let replay_pos = ctx.get_replacement_opref(source);
-                            let source_box = ctx.materialize_box_at(source);
-                            let mut replay =
-                                Op::new(OpCode::SameAsI, &[Operand::from_boxref(&source_box)]);
+                            let source_op = ctx.materialize_operand_at(source);
+                            let mut replay = Op::new(OpCode::SameAsI, &[source_op.clone()]);
                             replay.pos.set(replay_pos);
                             self.loop_invariant_results.insert(
                                 func_val,
                                 LoopInvariantEntry::Preamble(PreambleOp {
-                                    op: source_box,
+                                    op: source_op,
                                     invented_name: false,
                                     preamble_op: std::rc::Rc::new(replay),
                                     // Non-invented loop-invariant producer: the
@@ -2338,11 +2337,10 @@ mod tests {
     use super::*;
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::GcRef;
-    use majit_ir::box_ref::BoxRef;
 
     /// Producer-position trace spec. A consumer's `args` name the result
     /// positions of earlier producers in the same spec slice, so no op-arg
-    /// is constructed as a position-only `BoxRef::from_opref(...)` box;
+    /// is constructed as a position-only `Operand::from_opref(...)` box;
     /// [`build_specs`] later binds each arg to its producing `OpRc`.
     #[derive(Clone)]
     struct OpSpec {
@@ -2486,7 +2484,7 @@ mod tests {
     fn resolve_op_args_in_ctx(op: &mut Op, ctx: &mut OptContext) {
         // optimizer.py:651-652 setarg loop parity. Direct unit tests that
         // bypass Optimizer::propagate_from_pass_range still need the same
-        // canonical BoxRef args that production passes receive.
+        // canonical operand args that production passes receive.
         for i in 0..op.num_args() {
             let arg = op.arg(i);
             let resolved = match ctx.resolve_operand_operand_opt(&arg) {
@@ -3484,9 +3482,9 @@ mod tests {
         // Bound oparser graph: i0/i1 are header InputArgs, v = IntGt(i0, i1)
         // a live producer, and GUARD_VALUE's expected operand is the literal
         // ConstInt(0) — so every arg sheds to Operand::{InputArg,Op,Const}.
-        use crate::history::test_support::bound_inputarg_box;
-        let (_i0, i0_rc) = bound_inputarg_box(majit_ir::Type::Int, 0);
-        let (_i1, i1_rc) = bound_inputarg_box(majit_ir::Type::Int, 1);
+        use crate::history::test_support::bound_inputarg_operand;
+        let (_i0, i0_rc) = bound_inputarg_operand(majit_ir::Type::Int, 0);
+        let (_i1, i1_rc) = bound_inputarg_operand(majit_ir::Type::Int, 1);
         // A live producer for v (IntGt result) at int_op(2); the OpRc is held
         // in `int_gt` so the from_bound_op box's Weak upgrade stays live.
         let int_gt = std::rc::Rc::new(Op::new(
@@ -3559,7 +3557,7 @@ mod tests {
         // x * (-1.0) → FLOAT_NEG(x)
         let mut b = crate::history::test_support::TraceBuilder::new();
         let x = b.input(majit_ir::Type::Float, 0);
-        let neg_one = BoxRef::new_const(Value::Float(-1.0));
+        let neg_one = Operand::const_from_value(Value::Float(-1.0));
         let prod = b.op(OpCode::FloatMul, &[x, neg_one]);
         b.op(OpCode::Finish, &[prod]);
         let (ops, inputs) = b.build();
@@ -3579,7 +3577,7 @@ mod tests {
     fn test_cond_call_n_zero_removes() {
         // COND_CALL_N(0, func, args...) → removed (condition is false)
         let mut b = crate::history::test_support::TraceBuilder::new();
-        let cond = BoxRef::new_const(Value::Int(0));
+        let cond = Operand::const_from_value(Value::Int(0));
         let func = b.input(majit_ir::Type::Int, 0);
         let arg = b.input(majit_ir::Type::Int, 1);
         b.op(OpCode::CondCallN, &[cond, func, arg]);
@@ -3603,7 +3601,7 @@ mod tests {
     fn test_cond_call_n_nonzero_converts() {
         // COND_CALL_N(1, func, args...) → CALL_N(func, args...)
         let mut b = crate::history::test_support::TraceBuilder::new();
-        let cond = BoxRef::new_const(Value::Int(1));
+        let cond = Operand::const_from_value(Value::Int(1));
         let func = b.input(majit_ir::Type::Int, 0);
         let arg = b.input(majit_ir::Type::Int, 1);
         b.op(OpCode::CondCallN, &[cond, func, arg]);

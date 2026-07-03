@@ -458,17 +458,11 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                     // type-shaped descr): reconstruct per-arg from the
                     // failarg variant tag (`opref.ty()`). Production FINISH
                     // always matches the descr arity.
-                    op.getarglist_operand()
-                        .iter()
-                        .map(finish_arg_type)
-                        .collect()
+                    op.getarglist().iter().map(finish_arg_type).collect()
                 }
             } else {
                 // No descr — synthetic test FINISH only.
-                op.getarglist_operand()
-                    .iter()
-                    .map(finish_arg_type)
-                    .collect()
+                op.getarglist().iter().map(finish_arg_type).collect()
             }
         } else if let Some(fail_args) = op.getfailargs() {
             // `store_final_boxes_in_guard` (resume.py:397) writes the
@@ -1705,7 +1699,7 @@ pub(crate) fn normalize_closing_jump_args(
         .iter()
         .rev()
         .find(|op| op.opcode == OpCode::Label)
-        .map(|op| op.getarglist_operand())
+        .map(|op| op.getarglist())
     else {
         return ops;
     };
@@ -2612,7 +2606,6 @@ pub fn compile_tmp_callback(
 mod tests {
     use super::*;
     use crate::compile::make_fail_descr_with_index;
-    use crate::history::test_support::rooted_inputarg_box;
     use crate::history::test_support::rooted_inputarg_operand;
     use crate::resume::{ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotFrame};
     use majit_ir::{ArrayFlag, Op, OpCode, OpRef};

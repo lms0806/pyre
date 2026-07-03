@@ -788,14 +788,14 @@ pub struct OptHeap {
     /// heapcache.py:493-494 `_check_flag(box, HF_IS_UNESCAPED)` — the set of
     /// unescaped (freshly-allocated, not-yet-escaped) boxes. RPython stores the
     /// flag on the box (`box._heapc_flags`); pyre keeps an OptHeap-owned set
-    /// keyed by `BoxRef` identity (`Rc::ptr_eq`) — box identity, not the retired
+    /// keyed by operand identity (`Rc::ptr_eq`) — box identity, not the retired
     /// `opref.raw()` slot index. OptHeap ownership preserves `setup()`'s per-run
     /// reset, which a per-box flag on a shared `Box` could not bulk-clear.
     unescaped: majit_ir::vec_set::VecSet<Operand>,
     /// heapcache.py:209/298-307/453-455 `box._heapc_deps` — per-Box
     /// dependency list. RPython attaches `_heapc_deps: list | None`
     /// as an attribute on the `RefFrontendOp` Box object itself;
-    /// pyre keeps a side-table keyed by `BoxRef` identity for the same effect.
+    /// pyre keeps a side-table keyed by operand identity for the same effect.
     /// When an unescaped value is stored into an unescaped container,
     /// the value is recorded as a dependency of the container instead
     /// of being immediately escaped. When the container escapes later,
@@ -955,7 +955,7 @@ impl OptHeap {
         // container still escapes a non-constant value.
         //
         // heapcache operates on box objects; resolve both operands to their
-        // canonical `BoxRef` (memoized producer host) so set membership is by
+        // canonical operand (memoized producer host) so set membership is by
         // box identity. A position with no canonical box is not a tracked
         // allocation, so there is nothing to escape or depend on.
         let Some(value_box) = ctx.get_box_replacement_operand_opt(value) else {
@@ -3801,11 +3801,9 @@ mod tests {
     use majit_ir::operand::Operand;
 
     use super::OptHeap;
-    use crate::history::test_support::{
-        rooted_inputarg_operand, rooted_resop_box, rooted_resop_operand,
-    };
+    use crate::history::test_support::{rooted_inputarg_operand, rooted_resop_operand};
 
-    /// oparser-faithful drop-in for `BoxRef::from_opref(o)` at op-arg /
+    /// oparser-faithful drop-in for `Operand::from_opref(o)` at op-arg /
     /// fail-arg sites where `o` is a bound-at-runtime `OpRef`. Constants shed
     /// to `Operand::Const` (no producer), so they keep the bare `from_opref`
     /// path; `InputArg*` / `{Int,Float,Ref}Op` position-only refs bind to a
@@ -4115,7 +4113,7 @@ mod tests {
             info.set_preamble_field(
                 OptHeap::field_slot_index(descr),
                 PreambleOp {
-                    op: bound_arg(source).to_boxref(),
+                    op: bound_arg(source),
                     invented_name: false,
                     preamble_op: std::rc::Rc::new(preamble_op),
                     same_as_source: None,
@@ -4352,7 +4350,7 @@ mod tests {
         op.setarg(
             0,
             ctx.resolve_operand_operand_opt(&op.arg(0))
-                .expect("constant receiver resolves to a BoxRef"),
+                .expect("constant receiver resolves to an operand"),
         );
 
         let _ = heap.optimize_getfield(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
@@ -4604,14 +4602,14 @@ mod tests {
     fn test_getarrayitem_non_pure_invalidated_by_setarrayitem() {
         let d = descr(0);
         let idx = OpRef::int_op(50);
-        let new_val_box = rooted_resop_box(Type::Ref, 102);
+        let new_val_box = rooted_resop_operand(Type::Ref, 102);
         let mut ops = vec![
             // r1 = getarrayitem_gc_r(p0, i_idx)
             Op::with_descr(
                 OpCode::GetarrayitemGcR,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Ref, 100)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
+                    rooted_resop_operand(Type::Ref, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
                 ],
                 d.clone(),
             ),
@@ -4619,9 +4617,9 @@ mod tests {
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Ref, 100)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
-                    Operand::from_boxref(&new_val_box),
+                    rooted_resop_operand(Type::Ref, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
+                    new_val_box.clone(),
                 ],
                 d.clone(),
             ),
@@ -4629,8 +4627,8 @@ mod tests {
             Op::with_descr(
                 OpCode::GetarrayitemGcR,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Ref, 100)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
+                    rooted_resop_operand(Type::Ref, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
                 ],
                 d.clone(),
             ),
@@ -4643,7 +4641,7 @@ mod tests {
         let mut ctx = OptContext::new(ops.len());
         let cidx = ctx.materialize_operand_at(idx);
         ctx.make_constant_box(&cidx, majit_ir::Value::Int(3));
-        ctx.materialize_box_at(OpRef::ref_op(100));
+        ctx.materialize_operand_at(OpRef::ref_op(100));
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -4659,9 +4657,7 @@ mod tests {
                         if __ar.is_none() {
                             arg.clone()
                         } else {
-                            Operand::from_boxref(
-                                &ctx.materialize_box_at(__ar).get_box_replacement(false),
-                            )
+                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
                         }
                     }
                 };
@@ -4768,7 +4764,7 @@ mod tests {
         // Register a producer for the rhs operand position so the forced
         // lazy setarrayitem resolves it to a bound `Operand::Op` producer
         // rather than minting a position-only `Operand::Box`.
-        ctx.materialize_box_at(OpRef::int_op(101));
+        ctx.materialize_operand_at(OpRef::int_op(101));
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -5085,9 +5081,9 @@ mod tests {
         // Register producers for the external operand positions so the
         // forced lazy setarrayitem resolves its args to bound `Operand::Op`
         // producers rather than minting a position-only `Operand::Box`.
-        ctx.materialize_box_at(OpRef::int_op(100));
-        ctx.materialize_box_at(OpRef::int_op(101));
-        ctx.materialize_box_at(OpRef::int_op(102));
+        ctx.materialize_operand_at(OpRef::int_op(100));
+        ctx.materialize_operand_at(OpRef::int_op(101));
+        ctx.materialize_operand_at(OpRef::int_op(102));
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -5800,7 +5796,7 @@ mod tests {
         // Register a producer for the stored rhs operand position so the
         // call-forced lazy setarrayitem resolves it to a bound `Operand::Op`
         // producer rather than minting a position-only `Operand::Box`.
-        ctx.materialize_box_at(OpRef::int_op(10));
+        ctx.materialize_operand_at(OpRef::int_op(10));
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -6385,7 +6381,7 @@ mod tests {
         // Bind the variable index input box before the pass: post-resolver
         // op.arg(1) must be bound for getintbound to install its IntBound on
         // `_forwarded` (the real recorder binds input args).
-        ctx.materialize_box_at(idx);
+        ctx.materialize_operand_at(idx);
 
         for op in &ops {
             let mut resolved = op.clone();
@@ -6484,7 +6480,7 @@ mod tests {
         // Bind the variable index input box before the pass: post-resolver
         // op.arg(1) must be bound for getintbound to install its IntBound on
         // `_forwarded` (the real recorder binds input args).
-        ctx.materialize_box_at(idx);
+        ctx.materialize_operand_at(idx);
 
         for op in &ops {
             let mut resolved = op.clone();
@@ -6799,8 +6795,8 @@ mod tests {
         // Register producers for the external operand positions so the
         // forced lazy setarrayitem resolves its args to bound `Operand::Op`
         // producers rather than minting a position-only `Operand::Box`.
-        ctx.materialize_box_at(OpRef::int_op(100));
-        ctx.materialize_box_at(OpRef::int_op(101));
+        ctx.materialize_operand_at(OpRef::int_op(100));
+        ctx.materialize_operand_at(OpRef::int_op(101));
 
         let mut pass = OptHeap::new();
         pass.setup();

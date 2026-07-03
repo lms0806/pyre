@@ -310,11 +310,11 @@ pub struct OptPure {
     /// Postponed OVF operation: INT_ADD_OVF, INT_SUB_OVF, INT_MUL_OVF.
     /// pure.py: postponed_op — deferred until GUARD_NO_OVERFLOW is seen.
     postponed_op: Option<Op>,
-    /// Bound `BoxRef` of `postponed_op`, captured from the live `OpRc` at
+    /// Bound operand of `postponed_op`, captured from the live `OpRc` at
     /// postponement. The OVF op is `Remove`d before emit, so its head box
     /// is never bound by the emit path; capturing it here (where the op
     /// object is live) gives `make_equal_to` a bound receiver without an
-    /// `materialize_box_at` round-trip through the opref.
+    /// `materialize_operand_at` round-trip through the opref.
     postponed_box: Option<Operand>,
     /// Indices into new_operations of emitted CALL_PURE ops.
     /// pure.py: call_pure_positions — tracked for short preamble generation.
@@ -790,7 +790,7 @@ impl Default for OptPure {
 
 impl OptPure {
     fn force_box(&mut self, op: &Operand, ctx: &mut OptContext) -> OpRef {
-        // Single resolve through the BoxRef terminal; the OpRef view is the
+        // Single resolve through the operand terminal; the OpRef view is the
         // terminal's `to_opref()` (keystone equivalence, #113), so the prior
         // paired `get_box_replacement` + `get_box_replacement_box` of the
         // same operand was a redundant double walk.
@@ -1259,7 +1259,7 @@ impl Optimization for OptPure {
             // (shortpreamble.py:425 — the replay op carries the same Box
             // objects); reuse them instead of re-deriving position-only
             // echoes from the OpRef table.
-            let imported_args = entry.pop.preamble_op.getarglist_operand();
+            let imported_args = entry.pop.preamble_op.getarglist();
             let mut imported_op = Op::new(entry.opcode, &imported_args);
             imported_op.pos.set(entry.result);
             if let Some(d) = entry.descr.clone() {
@@ -1304,7 +1304,6 @@ impl Optimization for OptPure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_ir::box_ref::BoxRef;
 
     fn initialize_imported_short_pure_builder(
         ctx: &mut OptContext,
@@ -1337,7 +1336,7 @@ mod tests {
             // Production threads the builder's replay Rc into the pop
             // (produce_op family); mirror that here so use_box receives
             // the same object the builder entry carries. The builder keys by
-            // its entry res (`materialize_box_at(pos)`); `source_box` is the
+            // its entry res (`materialize_operand_at(pos)`); `source_box` is the
             // memoized box for the same position, so the lookup hits.
             let replay = ctx
                 .imported_short_preamble_builder
@@ -1350,7 +1349,7 @@ mod tests {
                     std::rc::Rc::new(same_as)
                 });
             let pop = crate::optimizeopt::info::PreambleOp {
-                op: ctx.materialize_box_at(source),
+                op: ctx.materialize_operand_at(source),
                 invented_name: false,
                 preamble_op: replay,
                 // Non-invented imported pure re-export: no SameAs alias.
@@ -1377,18 +1376,18 @@ mod tests {
 
     /// One argument of an [`OpSpec`] in the oparser-faithful bound DAG
     /// (`rpython/jit/tool/oparser.py`). Each variant resolves to a *bound*
-    /// `BoxRef` at [`build_trace`] time so the arg sheds to
+    /// `Operand` at [`build_trace`] time so the arg sheds to
     /// `Operand::{InputArg,Op,Const}` — never the position-only
-    /// `Operand::Box` minted by `BoxRef::from_opref`.
+    /// `Operand::Box`.
     #[derive(Clone)]
     enum Arg {
-        /// Header input var (oparser `[i0]`): `BoxRef::new_inputarg` bound
-        /// to a rooted `InputArg`, sheds to `Operand::InputArg`.
+        /// Header input var (oparser `[i0]`): a rooted `InputArg`-bound
+        /// operand, sheds to `Operand::InputArg`.
         In(u32),
         /// Earlier producer's result, referenced by the producing op's
         /// index in the spec slice (`from_bound_op`, sheds to `Operand::Op`).
         Prod(usize),
-        /// Const literal arg (`BoxRef::new_const`, sheds to `Operand::Const`).
+        /// Const literal arg (`const_from_value`, sheds to `Operand::Const`).
         Const(Value),
     }
 
@@ -1431,9 +1430,9 @@ mod tests {
         let mut input_types = vec![Type::Int; num_inputs as usize];
         let mut ops: Vec<OpRc> = Vec::new();
         // Lazily bind a header input box, recording its type from first use.
-        let mut input_boxes: Vec<Option<BoxRef>> = vec![None; num_inputs as usize];
+        let mut input_boxes: Vec<Option<Operand>> = vec![None; num_inputs as usize];
         for (i, spec) in specs.iter().enumerate() {
-            let args: Vec<BoxRef> = spec
+            let arg_ops: Vec<Operand> = spec
                 .args
                 .iter()
                 .map(|a| match a {
@@ -1441,15 +1440,17 @@ mod tests {
                         let slot = *idx as usize;
                         input_boxes[slot]
                             .get_or_insert_with(|| {
-                                crate::history::test_support::rooted_inputarg_box(Type::Int, *idx)
+                                crate::history::test_support::rooted_inputarg_operand(
+                                    Type::Int,
+                                    *idx,
+                                )
                             })
                             .clone()
                     }
-                    Arg::Prod(pos) => BoxRef::from_bound_op(&ops[*pos]),
-                    Arg::Const(v) => BoxRef::new_const(*v),
+                    Arg::Prod(pos) => Operand::from_bound_op(&ops[*pos]),
+                    Arg::Const(v) => Operand::const_from_value(*v),
                 })
                 .collect();
-            let arg_ops: Vec<Operand> = args.iter().map(Operand::from_boxref).collect();
             let op = match &spec.descr {
                 Some(d) => std::rc::Rc::new(Op::with_descr(spec.opcode, &arg_ops, d.clone())),
                 None => std::rc::Rc::new(Op::new(spec.opcode, &arg_ops)),
@@ -1484,7 +1485,7 @@ mod tests {
         }
         opt.add_pass(Box::new(OptPure::new()));
         // `producers` is held to the end of the call so every `from_bound_op`
-        // arg box's `Weak<Op>` upgrade stays live (box_ref.rs:788). The
+        // arg box's `Weak<Op>` upgrade stays live (forwarding.rs). The
         // guard-snapshot path wraps the seeded `Vec<Op>` in fresh Rcs whose
         // args still point at `producers`, so those originals must outlive the
         // run.
@@ -2660,7 +2661,7 @@ mod tests {
         );
         // Production threads the builder's replay Rc into the pop
         // (produce_pure); mirror it so use_box sees one object. #146/S8: the
-        // builder keys by the entry res box (`materialize_box_at(pos)`); the
+        // builder keys by the entry res box (`materialize_operand_at(pos)`); the
         // memoized box for the same position hits.
         let src1 = ctx.materialize_operand_at(OpRef::int_op(1));
         if let Some(p) = ctx

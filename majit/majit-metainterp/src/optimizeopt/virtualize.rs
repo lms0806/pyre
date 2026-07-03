@@ -1754,7 +1754,7 @@ impl OptVirtualize {
         // virtualize.py:151: `CONST_NULL.same_constant(objbox)` — only a
         // Ref-typed null constant matches; a plain ConstInt(0) does not.
         // `get_box_replacement` resolves const-namespace OpRefs to their
-        // on-demand `BoxRef::new_const` and walks the chain terminal;
+        // on-demand `Forwarded::Const` and walks the chain terminal;
         // `is_const_null` reads `const_value()` and tolerates an unbound
         // terminal (non-const -> false), so the null check is read-only.
         let obj_box = ctx
@@ -1918,7 +1918,7 @@ impl OptVirtualize {
         let b_old = Operand::from_bound_op(op_rc);
         let b_forced = ctx
             .get_box_replacement_operand_opt(forced_resolved)
-            .expect("forced virtual terminal must resolve to a BoxRef");
+            .expect("forced virtual terminal must resolve to a bound operand");
         ctx.make_equal_to(&b_old, &b_forced);
         // self.last_emitted_operation = REMOVED
         self.last_emitted_was_removed = true;
@@ -2858,7 +2858,7 @@ mod tests {
     /// Canonicalize an op's args the way the production driver does in
     /// `Optimizer::propagate_forward` (optimizer.py:651-652 setarg loop):
     /// resolve each arg through the box environment so the op carries the
-    /// canonical BoxRef that the handlers read via
+    /// canonical operand that the handlers read via
     /// `op.arg(i).get_box_replacement(false)`. Tests that drive a pass's
     /// `propagate_forward` directly bypass that loop, so they must
     /// canonicalize explicitly before invoking the handler.
@@ -2866,7 +2866,7 @@ mod tests {
         for i in 0..op.num_args() {
             // Mirror the production driver's `None` arm (optimizer.rs:3687):
             // an unbound operand whose root is not a sentinel is minted and
-            // registered via `materialize_box_at`, then walked to its
+            // registered via `materialize_operand_at`, then walked to its
             // terminal — cloning the orig arg would skip canonicalization.
             let canonical = match ctx.resolve_operand_operand_opt(&op.arg(i)) {
                 Some(b) => b,
@@ -3020,7 +3020,7 @@ mod tests {
         );
         let v_box = ctx
             .get_box_replacement_operand_opt(OpRef::input_arg_ref(0))
-            .expect("standard virtualizable BoxRef populated");
+            .expect("standard virtualizable operand populated");
         assert!(
             ctx.is_virtualizable(&v_box),
             "Virtualizable PtrInfo must survive force_box"
@@ -3258,7 +3258,7 @@ mod tests {
 
         let vbox = ctx
             .get_box_replacement_operand_opt(OpRef::input_arg_ref(0))
-            .expect("standard virtualizable BoxRef populated");
+            .expect("standard virtualizable operand populated");
         let Some(PtrInfo::Virtualizable(vstate)) = ctx.peek_ptr_info(&vbox) else {
             panic!("expected standard virtualizable ptr info on OpRef::input_arg_ref(0)");
         };
@@ -3772,7 +3772,7 @@ mod tests {
 
         let inputarg_box = ctx
             .get_box_replacement_operand_opt(OpRef::ref_op(0))
-            .expect("inputarg BoxRef populated");
+            .expect("inputarg operand populated");
         let info = ctx
             .peek_ptr_info(&inputarg_box)
             .expect("virtual info missing");

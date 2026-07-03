@@ -25,12 +25,12 @@ use crate::OpRef;
 #[derive(Clone, Debug)]
 pub struct PreambleOp {
     /// RPython `PreambleOp.op` — the carried Box (= `self.res` from the
-    /// short_op). For non-invented entries this resolves to the
-    /// body-visible position directly; for invented entries (CompoundOp
-    /// alternates) `op` forwards to the carried Box via
-    /// `make_equal_to(source, op)` so resolving `op` reaches the
-    /// body-visible position.
-    pub op: crate::box_ref::BoxRef,
+    /// short_op), a producer-bound / const [`Operand`](crate::operand::Operand).
+    /// For non-invented entries this resolves to the body-visible position
+    /// directly; for invented entries (CompoundOp alternates) `op` forwards
+    /// to the carried Box via `make_equal_to(source, op)` so resolving `op`
+    /// reaches the body-visible position.
+    pub op: crate::operand::Operand,
     /// RPython: PreambleOp.invented_name
     pub invented_name: bool,
     /// RPython: PreambleOp.preamble_op — the actual replay operation
@@ -43,7 +43,7 @@ pub struct PreambleOp {
     /// instead of `same_as(invented_name)` (a self-alias). `None` for
     /// non-invented entries (`invented_name == false`), where the SameAs
     /// arm is never taken.
-    pub same_as_source: Option<crate::box_ref::BoxRef>,
+    pub same_as_source: Option<crate::operand::Operand>,
 }
 
 /// RPython _fields[] element — either a concrete value or a PreambleOp sentinel.
@@ -103,18 +103,15 @@ impl FieldEntry {
     }
 
     /// Box analog of [`as_seen_opref`](Self::as_seen_opref): the carried
-    /// `BoxRef` rather than its resolved `OpRef` position. Used where the
-    /// caller keys a box-identity (`Rc::ptr_eq`) map by the field's Phase 1
-    /// box — `_expand_infos_from_virtual` (export) and
-    /// `setinfo_from_preamble_list` (import) read the same shared virtual
-    /// info, so the returned boxes coincide by identity. A bound `Value`
-    /// operand resolves to its canonical box (memoized on the producer), so
-    /// export and import return the same `Rc`; a `Const` operand mints a
-    /// fresh box, but consts never enter the `Rc::ptr_eq` map (they carry no
-    /// exported info), so the fresh mint is never compared.
-    pub fn as_seen_box(&self) -> crate::box_ref::BoxRef {
+    /// box object ([`Operand`](crate::operand::Operand)) rather than its
+    /// resolved `OpRef` position. Used where the caller keys a box-identity
+    /// map by the field's Phase 1 box — `_expand_infos_from_virtual` (export)
+    /// and `setinfo_from_preamble_list` (import) read the same shared virtual
+    /// info, so the returned operands coincide by identity (clones of the
+    /// same stored handle).
+    pub fn as_seen_operand(&self) -> crate::operand::Operand {
         match self {
-            FieldEntry::Value(b) => b.to_boxref(),
+            FieldEntry::Value(b) => b.clone(),
             FieldEntry::Preamble(pop) => pop.op.clone(),
         }
     }

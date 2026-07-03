@@ -26,7 +26,7 @@ use majit_ir::operand::Operand;
 pub struct Renamer {
     rename_map: VecMap<OpRef, Operand>,
     /// Producer `Rc`s minted by [`Renamer::bound_box`] to back the bound map
-    /// values. The bound `BoxRef` holds only a `Weak<Op>` / `Weak<InputArg>`,
+    /// values. The bound operand holds only a `Weak<Op>` / `Weak<InputArg>`,
     /// so its producer must be rooted for the upgrade to stay live. The
     /// vectorizer's op buffers are `Vec<Op>` (value, not `Rc`), so no live
     /// producer `Rc` is reachable for a renamed-to ResOp position; the renamer
@@ -70,11 +70,11 @@ impl Renamer {
     /// rooting a synthetic producer so the bound box's `Weak` stays live.
     ///
     /// Const / None positions shed to `Operand::Const` / none through
-    /// `BoxRef::from_opref` (no `Operand::Box` mint). ResOp / InputArg positions
+    /// `Operand::from_opref` (no `Operand::Box` mint). ResOp / InputArg positions
     /// bind to a freshly-minted, rooted producer `Rc` carrying the same `pos`,
     /// so they shed to `Operand::Op` / `Operand::InputArg`. This is the
-    /// production analogue of the test fixtures' `rooted_resop_box` /
-    /// `rooted_inputarg_box`: a real producer `Rc` is unavailable because the
+    /// production analogue of the test fixtures' `rooted_resop_operand` /
+    /// `rooted_inputarg_operand`: a real producer `Rc` is unavailable because the
     /// vectorizer's buffers hold `Op` values, not `OpRc`.
     pub fn bound_box(&mut self, r: OpRef) -> Operand {
         if r.is_none() || r.is_constant() {

@@ -57,10 +57,10 @@ pub enum EnsuredPtrInfo {
         /// Optional runtime hook for `getstrlen1(mode)` lookups.
         string_length_resolver: Option<StringLengthResolver>,
     },
-    /// `arg0.get_forwarded()` — BoxRef-routed mutable handle. Each
+    /// `arg0.get_forwarded()` — operand-routed mutable handle. Each
     /// `as_mut()` call re-borrows the inner `RefCell`. Produced when the
     /// opref resolves to a bound `Op`/`InputArg`.
-    ForwardedBox(majit_ir::box_ref::BoxRef),
+    Forwarded(majit_ir::operand::Operand),
 }
 
 impl EnsuredPtrInfo {
@@ -118,25 +118,23 @@ impl EnsuredPtrInfo {
                     Some(IntBound::from_constant(length))
                 }
             }
-            EnsuredPtrInfo::ForwardedBox(bx) => {
-                bx.ptr_info_mut().and_then(|mut p| p.getlenbound(mode))
-            }
+            EnsuredPtrInfo::Forwarded(o) => o.ptr_info_mut().and_then(|mut p| p.getlenbound(mode)),
         }
     }
 
     /// Mutable access to the underlying `PtrInfo`. Returns `None` for the
     /// `Constant` variant — PyPy's `ConstPtrInfo.setfield/setitem` route
     /// through `optheap.const_infos`, not through the constant box's own
-    /// info slot (info.py:738-752). The `ForwardedBox` variant returns
-    /// `None` if the BoxRef's `_forwarded` slot does not currently hold
+    /// info slot (info.py:738-752). The `Forwarded` variant returns
+    /// `None` if the operand's `_forwarded` slot does not currently hold
     /// `Forwarded::Info(OpInfo::Ptr(_))`. The returned guard owns an `Rc`
     /// clone of the live `Rc<RefCell<PtrInfo>>` cell and an exclusive
     /// `RefCell` borrow — drop it before any sibling write to the same
     /// box's `_forwarded` slot.
-    pub fn as_mut(&mut self) -> Option<majit_ir::box_ref::PtrInfoBorrowMut> {
+    pub fn as_mut(&mut self) -> Option<majit_ir::forwarding::PtrInfoBorrowMut> {
         match self {
             EnsuredPtrInfo::Constant { .. } => None,
-            EnsuredPtrInfo::ForwardedBox(bx) => bx.ptr_info_mut(),
+            EnsuredPtrInfo::Forwarded(o) => o.ptr_info_mut(),
         }
     }
 
@@ -860,7 +858,7 @@ impl PtrInfoExt for PtrInfo {
                 // construction order and the second box does not exist when the
                 // first is sealed. Convergence path if a prebuilt cyclic
                 // immutable virtual ever reaches here: thread a
-                // `memo: &mut Vec<BoxRef>` keyed on the receiver box (BoxRef
+                // `memo: &mut Vec<Operand>` keyed on the receiver box (operand
                 // Rc-identity) mirroring info.py:282-284.
                 if let Some(info) = resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
                     if info.is_virtual() && info.is_immutable_and_filled_with_constants(ctx) {
@@ -884,7 +882,7 @@ fn force_box_impl(
     // `op` is the bound operand of the virtual being forced (callers resolve to
     // the chain terminal before delegating). The OpRef view drives op identity
     // (pos, logging, alloc-vs-original comparisons); the operand drives every
-    // make_equal_to / set_ptr_info receiver, so no `materialize_box_at` round-trip is
+    // make_equal_to / set_ptr_info receiver, so no `materialize_operand_at` round-trip is
     // needed for the forwarding writes.
     let opref = op.to_opref();
 
@@ -1590,7 +1588,6 @@ pub use majit_ir::ptr_info::{
 mod tests {
     use super::*;
     use crate::optimizeopt::OptContext;
-    use majit_ir::box_ref::BoxRef;
     use majit_ir::{Descr, OpCode, Value};
     use std::sync::Arc;
 
@@ -1599,7 +1596,7 @@ mod tests {
     impl Descr for TestDescr {}
 
     /// Bound-producer `Operand` at position `int_op(pos)` / `ref_op(pos)`,
-    /// the field-value analog of the old `BoxRef::from_opref` test stand-ins.
+    /// the field-value analog of the old `from_opref` test stand-ins.
     fn field_op(tp: Type, pos: u32) -> Operand {
         crate::history::test_support::rooted_resop_operand(tp, pos)
     }
@@ -1931,7 +1928,7 @@ mod tests {
         );
         replay.pos.set(OpRef::int_op(88));
         let pop = PreambleOp {
-            op: BoxRef::from_opref(OpRef::int_op(88)),
+            op: majit_ir::operand::Operand::bound_from_opref(OpRef::int_op(88)),
             invented_name: false,
             preamble_op: std::rc::Rc::new(replay),
             same_as_source: None,
@@ -1964,7 +1961,7 @@ mod tests {
             )],
         );
         let pop = PreambleOp {
-            op: BoxRef::from_opref(OpRef::int_op(88)),
+            op: majit_ir::operand::Operand::bound_from_opref(OpRef::int_op(88)),
             invented_name: false,
             preamble_op: std::rc::Rc::new(replay),
             same_as_source: None,

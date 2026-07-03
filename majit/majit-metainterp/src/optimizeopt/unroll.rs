@@ -26,7 +26,6 @@ use crate::optimizeopt::{
     SnapshotFrameSizes, next_snapshot_pos, snapshot_get, snapshot_insert,
 };
 use crate::resume::SnapshotBox;
-use majit_ir::box_ref::BoxRef;
 
 /// `unroll.py:119-123`:
 ///
@@ -86,14 +85,14 @@ fn is_trace_runtime_ref(opref: OpRef, constants: &majit_ir::VecMap<u32, majit_ir
 /// (`PtrInfo::Instance.known_class` is an immortal vtable integer, not a
 /// traced ref, so it is not rooted.)
 fn root_forwarded_gcref(
-    forwarded: &majit_ir::box_ref::Forwarded,
+    forwarded: &majit_ir::forwarding::Forwarded,
     info_constant_field: ExportedGcRefField,
     const_ref_field: ExportedGcRefField,
-    dummy_key: BoxRef,
-    rooted_refs: &mut Vec<(BoxRef, ExportedGcRefField, usize)>,
+    dummy_key: Operand,
+    rooted_refs: &mut Vec<(Operand, ExportedGcRefField, usize)>,
 ) {
     use crate::optimizeopt::info::{OpInfo, PtrInfo};
-    if let majit_ir::box_ref::Forwarded::Info(OpInfo::Ptr(rc)) = forwarded {
+    if let majit_ir::forwarding::Forwarded::Info(OpInfo::Ptr(rc)) = forwarded {
         let info = rc.borrow();
         match &*info {
             PtrInfo::Constant(gcref) if !gcref.is_null() => {
@@ -104,7 +103,7 @@ fn root_forwarded_gcref(
             // (ConstInt), never a traced ref — no rooting needed.
             _ => {}
         }
-    } else if let majit_ir::box_ref::Forwarded::Const(majit_ir::Const::Ref(gcref)) = forwarded
+    } else if let majit_ir::forwarding::Forwarded::Const(majit_ir::Const::Ref(gcref)) = forwarded
         && !gcref.is_null()
     {
         let ss_idx = majit_gc::shadow_stack::push(*gcref);
@@ -117,12 +116,12 @@ fn root_forwarded_gcref(
 /// post-GC GcRef. Matches PyPy `_forwarded` Python object reference
 /// semantics — the cell stays, only its content updates.
 fn refresh_forwarded_ptrinfo_constant(
-    forwarded: &std::cell::RefCell<majit_ir::box_ref::Forwarded>,
+    forwarded: &std::cell::RefCell<majit_ir::forwarding::Forwarded>,
     updated: majit_ir::GcRef,
 ) {
     use crate::optimizeopt::info::{OpInfo, PtrInfo};
     let rc = match &*forwarded.borrow() {
-        majit_ir::box_ref::Forwarded::Info(OpInfo::Ptr(rc))
+        majit_ir::forwarding::Forwarded::Info(OpInfo::Ptr(rc))
             if matches!(&*rc.borrow(), PtrInfo::Constant(_)) =>
         {
             Some(rc.clone())
@@ -138,16 +137,16 @@ fn refresh_forwarded_ptrinfo_constant(
 /// post-GC GcRef. Matches PyPy `_forwarded` Python object reference
 /// semantics — the chain terminal stays a Const, only its GcRef updates.
 fn refresh_forwarded_const_ref(
-    forwarded: &std::cell::RefCell<majit_ir::box_ref::Forwarded>,
+    forwarded: &std::cell::RefCell<majit_ir::forwarding::Forwarded>,
     updated: majit_ir::GcRef,
 ) {
     let is_const_ref = matches!(
         &*forwarded.borrow(),
-        majit_ir::box_ref::Forwarded::Const(majit_ir::Const::Ref(_))
+        majit_ir::forwarding::Forwarded::Const(majit_ir::Const::Ref(_))
     );
     if is_const_ref {
         *forwarded.borrow_mut() =
-            majit_ir::box_ref::Forwarded::Const(majit_ir::Const::Ref(updated));
+            majit_ir::forwarding::Forwarded::Const(majit_ir::Const::Ref(updated));
     }
 }
 
@@ -299,9 +298,9 @@ impl UnrollOptimizer {
             for slot in map.iter_mut() {
                 if let Some(boxes) = slot {
                     for sb in boxes {
-                        if let Some(majit_ir::Value::Ref(gcref)) = sb.opref_box.const_value() {
+                        if let majit_ir::OpRef::ConstPtr(gcref) = sb.opref {
                             if !gcref.is_null() {
-                                slots.push((&sb.opref_box as *const BoxRef) as usize);
+                                slots.push((&mut sb.opref as *mut majit_ir::OpRef) as usize);
                             }
                         }
                     }
@@ -590,14 +589,14 @@ impl UnrollOptimizer {
                 .rfind(|op| op.opcode == OpCode::Jump)
                 .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
                 .unwrap_or_default();
-            // Hand opt_p1 the per-iter BoxRef pool that p1_iter
+            // Hand opt_p1 the per-iter operand pool that p1_iter
             // allocated (slice 77b.A). trace.get_iter() per-call
             // inputarg_from_tp(...) / cls() — each phase optimizes against a
             // fresh Box identity set so _forwarded mutations cannot alias
             // across phases.
             //
-            // Const BoxRefs are NOT cached: `get_box_replacement_box`
-            // allocates `BoxRef::new_const(value)` per call from `const_pool`
+            // Const operands are NOT cached: `get_box_replacement_box`
+            // allocates a fresh const operand per call from `const_pool`
             // (`history.py:220` ConstInt(value) per-call-site parity).
             // opt_p1's entry path seeds `const_pool` from the shared
             // `constants` map (`optimizer.rs:1944`).
@@ -619,7 +618,7 @@ impl UnrollOptimizer {
                 opt_p1.run_optimize_from_inputs(&p1_ops_in, &mut consts_p1, num_inputs, false)?;
             // RPython parity: Phase 1 optimizer may discover new constants
             // via make_constant (e.g., constant-folded heap reads, guard
-            // class pointers). These live on the BoxRef forwarded chain
+            // class pointers). These live on the operand's forwarded chain
             // (and in `ctx.const_pool` for const-namespace OpRefs) but
             // not in `consts_p1` (which was only seeded from the input
             // constants). Merge them back so
@@ -984,14 +983,14 @@ impl UnrollOptimizer {
         // reference these via `imported_label_args`. They are NOT in the
         // `p2_cache` (only raw trace positions are), so leave
         // `phase1_emit_ops` untranslated.
-        // Hand opt_p2 the per-iter BoxRef pool that the Phase 2
+        // Hand opt_p2 the per-iter operand pool that the Phase 2
         // iter allocated. Disjoint from opt_p1's pool — _forwarded mutations
         // recorded against Phase 1 boxes do not alias Phase 2 boxes for the
         // same OpRef raw index, fixing the Rc<Box> split-brain that broke
         // the first 77b attempt.
         //
-        // Const BoxRefs: see opt_p1 plumb above — fresh per-call from
-        // `const_pool` via `BoxRef::new_const(value)`, no dedup.
+        // Const operands: see opt_p1 plumb above — fresh per-call from
+        // `const_pool`, no dedup.
         // unroll.py:119-123 — Phase 2 (peeled loop) raises
         // SpeculativeError on speculative-fold paths; convert
         // to InvalidLoop so the caller's catch handles it.
@@ -1899,8 +1898,11 @@ impl Default for UnrollOptimizer {
 pub struct ExportedState {
     /// Label args at the end of the preamble (after forcing).
     pub end_args: Vec<OpRef>,
-    /// Args for the next iteration (before forcing).
-    pub next_iteration_args: Vec<BoxRef>,
+    /// Args for the next iteration (before forcing). unroll.py:467
+    /// `next_iteration_args = end_args` — the SAME canonical box objects
+    /// (producer-bound / const [`Operand`]s) used as `exported_infos` keys,
+    /// so the import-state lookup is an identity hit.
+    pub next_iteration_args: Vec<Operand>,
     /// Types of end_args as determined by Phase 1 optimization.
     /// Used by Phase 2 import_state to propagate unboxed types.
     pub end_arg_types: Vec<Type>,
@@ -1912,8 +1914,10 @@ pub struct ExportedState {
     /// RPython stores one of `PtrInfo` / `IntBound` / `FloatConstInfo` per box,
     /// dispatched via `isinstance` in `setinfo_from_preamble` (unroll.py:53-98).
     /// Majit uses the existing `OpInfo` enum (info.rs:137) as the discriminated
-    /// union of these three cases.
-    pub exported_infos: majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo>,
+    /// union of these three cases. Keyed by box object identity ([`Operand`]
+    /// `Eq` = producer / const-cell `Rc::ptr_eq`), matching RPython's plain
+    /// box-keyed dict.
+    pub exported_infos: majit_ir::VecMap<Operand, crate::optimizeopt::info::OpInfo>,
     /// RPython shortpreamble.py: produced short boxes in preamble order.
     /// This preserves the original preamble ops so the active path can build
     /// short preambles without re-extracting them from the peeled trace.
@@ -1974,7 +1978,7 @@ pub struct ExportedState {
     pub patchguardop: Option<majit_ir::Op>,
     /// `OptContext::next_pos` at end of Phase 1 — strict upper bound of
     /// every OpRef Phase 1 allocated, including intermediates folded /
-    /// forwarded away. `reserve_pos_typed` skips `materialize_box_at` on the
+    /// forwarded away. `reserve_pos_typed` skips `materialize_operand_at` on the
     /// zero-inputarg / retrace baselines (`optimizeopt/mod.rs:2026`),
     /// so capturing `ctx.next_pos` at export is the only reliable
     /// floor. Phase 2 / retrace seed their TraceIterator namespace
@@ -2002,18 +2006,18 @@ pub struct ExportedState {
     /// exported short-box `res` is bound to (`res.bound_op()`) alive into
     /// Phase 2. A short-box `res` carries only a `Weak<Op>`; the Phase-1
     /// OptContext that owns the strong `OpRc` drops at the peel boundary, so
-    /// without this carry `Operand::from_boxref(res)` upgrades a dead Weak →
-    /// None and panics (operand.rs:253). Populated at export from
+    /// without this carry `res` (a `Weak<Op>`) upgrades to a dead producer at
+    /// Phase 2 and its accessors panic. Populated at export from
     /// `res.bound_op()` while still alive; InputArg-kind res (`bound_inputarg`,
     /// not `bound_op`) contributes nothing here and is rooted via
     /// `short_inputarg_refs` instead.
     pub(crate) short_box_producer_roots: Vec<majit_ir::OpRc>,
     /// Shadow stack rooting for GcRef values in exported_infos.
-    /// (BoxRef key, field kind, shadow stack index). The key is the
-    /// `exported_infos` BoxRef key for `InfoPtrInfoConstant` entries; other
-    /// field kinds carry the `BoxRef::none()` sentinel since they never key
+    /// (operand key, field kind, shadow stack index). The key is the
+    /// `exported_infos` operand key for `InfoPtrInfoConstant` entries; other
+    /// field kinds carry the none/empty operand sentinel since they never key
     /// back into `exported_infos`.
-    rooted_refs: Vec<(BoxRef, ExportedGcRefField, usize)>,
+    rooted_refs: Vec<(Operand, ExportedGcRefField, usize)>,
     /// Shadow stack slots for every inline `ConstPtr.value` reachable from
     /// this ExportedState's Rust object graph. RPython traces these fields as
     /// normal Const object attributes; pyre records the walk order and copies
@@ -2056,9 +2060,9 @@ impl ExportedState {
     /// unroll.py: ExportedState.__init__
     pub fn new(
         end_args: Vec<OpRef>,
-        next_iteration_args: Vec<BoxRef>,
+        next_iteration_args: Vec<Operand>,
         virtual_state: crate::optimizeopt::virtualstate::VirtualState,
-        exported_infos: majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: majit_ir::VecMap<Operand, crate::optimizeopt::info::OpInfo>,
         exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
         renamed_inputargs: Vec<OpRef>,
         short_inputargs: Vec<OpRef>,
@@ -2127,9 +2131,9 @@ impl ExportedState {
             }
         }
 
-        fn visit_boxrefs(boxes: &[BoxRef], visitor: &mut dyn FnMut(&mut GcRef)) {
-            for b in boxes {
-                b.walk_const_ptr_refs(visitor);
+        fn visit_operands(operands: &[Operand], visitor: &mut dyn FnMut(&mut GcRef)) {
+            for o in operands {
+                o.walk_const_ptr_refs(visitor);
             }
         }
 
@@ -2156,13 +2160,15 @@ impl ExportedState {
         }
 
         fn visit_forwarded(
-            forwarded: &std::cell::RefCell<majit_ir::box_ref::Forwarded>,
+            forwarded: &std::cell::RefCell<majit_ir::forwarding::Forwarded>,
             visitor: &mut dyn FnMut(&mut GcRef),
         ) {
             let mut forwarded = forwarded.borrow_mut();
             match &mut *forwarded {
-                majit_ir::box_ref::Forwarded::Info(info) => visit_op_info(info, visitor),
-                majit_ir::box_ref::Forwarded::Const(majit_ir::Const::Ref(gcref)) => visitor(gcref),
+                majit_ir::forwarding::Forwarded::Info(info) => visit_op_info(info, visitor),
+                majit_ir::forwarding::Forwarded::Const(majit_ir::Const::Ref(gcref)) => {
+                    visitor(gcref)
+                }
                 _ => {}
             }
         }
@@ -2190,7 +2196,7 @@ impl ExportedState {
         }
 
         visit_oprefs(&mut self.end_args, visitor);
-        visit_boxrefs(&self.next_iteration_args, visitor);
+        visit_operands(&self.next_iteration_args, visitor);
         self.virtual_state.walk_const_ptr_refs_mut(visitor);
         for (key, info) in self.exported_infos.iter_entries_mut() {
             key.walk_const_ptr_refs(visitor);
@@ -2203,8 +2209,8 @@ impl ExportedState {
             visit_opref(key, visitor);
             visit_produced_short_op(produced, visitor);
         }
-        // The key stays an `OpRef`, not a `BoxRef` (unlike the migrated #108
-        // sites): this is a value-keyed const lookup, and `BoxRef` is ordered
+        // The key stays an `OpRef`, not an `Operand` (unlike the migrated #108
+        // sites): this is a value-keyed const lookup, and an operand is ordered
         // and compared by `Rc` identity (no `Ord`, `Eq` via `Rc::ptr_eq`), so
         // two `ConstPtr` boxes carrying the same gcref would be distinct keys
         // and the dedup the map relies on would break. `visit_opref` already
@@ -2367,7 +2373,7 @@ impl ExportedState {
         self.release_roots();
         self.shadow_stack_base = majit_gc::shadow_stack::depth();
         // ── exported_infos GcRef fields ──
-        let mut keys: Vec<BoxRef> = self.exported_infos.keys().cloned().collect();
+        let mut keys: Vec<Operand> = self.exported_infos.keys().cloned().collect();
         // Sort for determinism via the key's resolved OpRef position. Const
         // variants (history.py:189-220) sort separately via the inline
         // payload — `.raw()` would panic on inline-Const OpRefs.
@@ -2401,8 +2407,8 @@ impl ExportedState {
         // VirtualStateInfo::KnownClass, Virtual{known_class}, Constant(Ref)
         // The rooted_refs `key` slot here just tags the field origin;
         // these entries dispatch on the field kind and never key back into
-        // `exported_infos`, so use the producer-less `BoxRef::none()` sentinel.
-        let dummy_key = BoxRef::none();
+        // `exported_infos`, so use the `Operand::None` sentinel.
+        let dummy_key = Operand::None;
         for (i, entry) in self.virtual_state.state.iter().enumerate() {
             match &entry.info {
                 // KnownClass.class_ptr and Virtual.known_class are immortal
@@ -2433,7 +2439,7 @@ impl ExportedState {
             {
                 let ss_idx = majit_gc::shadow_stack::push(*gcref);
                 self.rooted_refs.push((
-                    BoxRef::none(),
+                    Operand::None,
                     ExportedGcRefField::ShortBoxConstValue(key),
                     ss_idx,
                 ));
@@ -2722,25 +2728,26 @@ impl OptUnroll {
         // the same post-force, post-flush state RPython feeds in.
         let virtual_state = crate::optimizeopt::virtualstate::export_state(&end_args, ctx);
         // unroll.py:459-461: infos = {}; for arg in end_args: _expand_info(arg, infos)
-        let mut infos: majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo> =
+        let mut infos: majit_ir::VecMap<Operand, crate::optimizeopt::info::OpInfo> =
             majit_ir::VecMap::new();
         // Resolve the ONE canonical box per end_arg up front: it is the
         // exported_infos key AND (unroll.py:467 next_iteration_args = end_args)
         // the carried import key, so they are the identical Rc and import_state's
-        // lookup is a ptr_eq hit for const / inputarg / resop alike. Computing it
-        // once is load-bearing for Const: get_box_replacement_box mints a fresh
-        // Const box per call, so two calls would NOT be ptr_eq.
-        let end_arg_boxes: Vec<BoxRef> = end_args
+        // lookup is an identity hit for const / inputarg / resop alike. Computing
+        // it once keeps a single canonical Const cell per arg (Operand::Const
+        // compares by cell identity, so re-resolving is tolerable but one cell
+        // mirrors RPython's single Const box object).
+        let end_arg_boxes: Vec<Operand> = end_args
             .iter()
             .map(|&a| match ctx.get_box_replacement_operand_opt(a) {
-                Some(o) => o.to_boxref(),
+                Some(o) => o,
                 // The None arm fires only for an unregistered ResOp position
                 // (Const / InputArg always resolve); #157 drained those fires
-                // to zero. materialize_box_at mints+registers a canonical
-                // synthetic so this key is ptr-stable and a later resolve hits
-                // the same host — not a producer-less from_opref box that would
-                // miss the exported_infos / next_iteration_args ptr_eq carry.
-                None => ctx.materialize_box_at(a),
+                // to zero. materialize_operand_at mints+registers a canonical
+                // synthetic so this key is identity-stable and a later resolve
+                // hits the same host — preserving the exported_infos /
+                // next_iteration_args identity carry.
+                None => ctx.materialize_operand_at(a),
             })
             .collect();
         for (arg, arg_box) in end_args.iter().zip(end_arg_boxes.iter()) {
@@ -2754,12 +2761,12 @@ impl OptUnroll {
         // unroll.py:464-465: for arg in label_args: _expand_info(arg, infos)
         for &arg in &label_args {
             let arg_box = match ctx.get_box_replacement_operand_opt(arg) {
-                Some(o) => o.to_boxref(),
+                Some(o) => o,
                 // Same canonical-key fallback as end_arg_boxes above: an
                 // unregistered ResOp position (drained to zero by #157) mints a
-                // canonical synthetic instead of a producer-less from_opref box,
-                // keeping the exported_infos key ptr-stable.
-                None => ctx.materialize_box_at(arg),
+                // canonical registered synthetic, keeping the exported_infos
+                // key identity-stable.
+                None => ctx.materialize_operand_at(arg),
             };
             self.expand_info(arg, &arg_box, ctx, exported_int_bounds, &mut infos);
         }
@@ -2855,17 +2862,11 @@ impl OptUnroll {
         for (_, produced_op) in &short_boxes_for_info {
             let op = produced_op.res.to_opref();
             if !op.is_constant() {
-                // `expand_info` keys the BoxRef-keyed `exported_infos`
-                // (#158) on the producer-bound `res`; re-mint its box
-                // (`to_boxref` is `Rc::ptr_eq`-stable on the producer, so
-                // the import lookup still hits).
-                self.expand_info(
-                    op,
-                    &produced_op.res.to_boxref(),
-                    ctx,
-                    exported_int_bounds,
-                    &mut infos,
-                );
+                // `expand_info` keys the operand-keyed `exported_infos`
+                // (#158) on the producer-bound `res`, which is
+                // `Rc::ptr_eq`-stable on the producer, so the import lookup
+                // still hits.
+                self.expand_info(op, &produced_op.res, ctx, exported_int_bounds, &mut infos);
             }
         }
 
@@ -2891,7 +2892,7 @@ impl OptUnroll {
         // import lookup is a ptr_eq hit. Each box's `.to_opref()` yields the
         // resolved (post-forwarding) position, so consumers that read `.to_opref()`
         // see the same value the prior `get_replacement_opref` form produced.
-        let resolved_next_iteration_args: Vec<BoxRef> = end_arg_boxes;
+        let resolved_next_iteration_args: Vec<Operand> = end_arg_boxes;
         // Phase B B1: `produced_short_boxes` is derived from
         // `exported_short_boxes` lazily at the consumer site
         // (`build_short_preamble_from_produced_boxes` in `import_state`)
@@ -2914,7 +2915,7 @@ impl OptUnroll {
         // `OptContext::next_pos` is the strict upper bound on raw OpRefs
         // Phase 1 allocated, including intermediates folded / forwarded
         // away before any structure-stored field could observe them.
-        // `reserve_pos_typed` skips `materialize_box_at` on the zero-inputarg /
+        // `reserve_pos_typed` skips `materialize_operand_at` on the zero-inputarg /
         // retrace baselines (`optimizeopt/mod.rs:2026`), so capturing
         // `ctx.next_pos` at export is the only reliable floor for
         // `opref_high_water()` to feed retrace's `start_fresh`.
@@ -2951,7 +2952,7 @@ impl OptUnroll {
                 }
                 // S-0.C: `box_pool[*ia_opref].bound_inputarg()` resolves
                 // to the same `InputArgRc` as `inputarg_refs[idx]` after
-                // `ensure_inputarg_bindings` / `materialize_box_at`'s InputArg
+                // `ensure_inputarg_bindings` / `materialize_operand_at`'s InputArg
                 // placeholder arm have run (both write the canonical
                 // `InputArgRc` matching the OpRef's type). Drop the
                 // box_pool fallback — fall through to a fresh `InputArg`
@@ -3009,12 +3010,12 @@ impl OptUnroll {
     fn expand_info(
         &self,
         arg: OpRef,
-        arg_box: &BoxRef,
+        arg_box: &Operand,
         ctx: &OptContext,
         exported_int_bounds: Option<
             &majit_ir::VecMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
         >,
-        infos: &mut majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo>,
+        infos: &mut majit_ir::VecMap<Operand, crate::optimizeopt::info::OpInfo>,
     ) {
         // unroll.py:438-443 `_expand_info`:
         //     if arg in infos:
@@ -3027,7 +3028,7 @@ impl OptUnroll {
         // Keyed by `arg_box`, the ONE canonical Phase-1 box the caller resolved
         // for this arg (shared verbatim with the `next_iteration_args` carry so
         // the import lookup is a ptr_eq hit). The dual OpRef-key insert is gone:
-        // a ptr-stable BoxRef key tracks its position through the shared
+        // a ptr-stable operand key tracks its position through the shared
         // set_position Cell across compaction, so there is no resolved-vs-original
         // OpRef drift left to bridge.
         if infos.contains_key(arg_box) {
@@ -3044,7 +3045,7 @@ impl OptUnroll {
         // `arg_box` is the canonical Phase-1 box, which can be position-only
         // (a virtual field box), so read its PtrInfo directly off the box —
         // exactly what `peek_ptr_info` does (`get_box_replacement(false)
-        // .ptr_info()`, `self`-independent) — without the `from_boxref`
+        // .ptr_info()`, `self`-independent) — without the `from_opref`
         // position-only panic.
         let arg_pi = arg_box
             .get_box_replacement(false)
@@ -3068,7 +3069,7 @@ impl OptUnroll {
         exported_int_bounds: Option<
             &majit_ir::VecMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
         >,
-        infos: &mut majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo>,
+        infos: &mut majit_ir::VecMap<Operand, crate::optimizeopt::info::OpInfo>,
     ) {
         let opref_box = ctx.get_box_replacement_operand_opt(opref);
         // unroll.py:445-450 `_expand_infos_from_virtual`:
@@ -3089,7 +3090,7 @@ impl OptUnroll {
             return;
         };
         for (_, entry) in info.all_items() {
-            let field_box = entry.as_seen_box();
+            let field_box = entry.as_seen_operand();
             if field_box.to_opref().is_none() {
                 continue;
             }
@@ -3922,7 +3923,7 @@ impl OptUnroll {
             // minting here.
             let b_source = ctx
                 .get_box_replacement_operand_opt(source)
-                .expect("import_state source must have a materialized BoxRef slot");
+                .expect("import_state source must have a materialized operand slot");
             // `target` is a Phase-1 next-iteration ref whose producer may not
             // be carried into this rebuilt context; materialize its canonical
             // host instead of fabricating a position-only box (`make_equal_to`
@@ -4238,7 +4239,10 @@ impl OptUnroll {
         &self,
         opref: OpRef,
         info: &crate::optimizeopt::info::OpInfo,
-        exported_infos: &majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: &majit_ir::VecMap<
+            majit_ir::operand::Operand,
+            crate::optimizeopt::info::OpInfo,
+        >,
         ctx: &mut OptContext,
     ) {
         ctx.setinfo_from_preamble_item(opref, info, exported_infos);
@@ -4876,7 +4880,8 @@ fn assemble_peeled_trace_with_jump_args(
     let mut emitted_at: majit_ir::VecMap<OpRef, majit_ir::OpRc> = majit_ir::VecMap::new();
     for (op_idx, op) in p2_ops.iter().enumerate() {
         let mut new_op = (**op).clone();
-        let mut original_args = op.getarglist_copy();
+        let mut original_args: Vec<OpRef> =
+            op.getarglist_copy().iter().map(|a| a.to_opref()).collect();
         if let Some(&mapped_pos) = body_result_remap.get(&op.pos.get()) {
             new_op.pos.set(mapped_pos);
         }
@@ -4921,7 +4926,7 @@ fn assemble_peeled_trace_with_jump_args(
                 // "box always exists" materializer (parity with the start_label
                 // / jump_source / extended_label_arg sites above) so the arg
                 // carries a bound `Operand::Op`/`InputArg` instead of a
-                // position-only box. `materialize_box_at(mapped).to_opref() ==
+                // position-only box. `materialize_operand_at(mapped).to_opref() ==
                 // mapped`, so the rewritten arg is OpRef-identical.
                 let boxed = match emitted_at.get(&mapped) {
                     Some(rc) => majit_ir::operand::Operand::from_bound_op(rc),
@@ -4936,7 +4941,7 @@ fn assemble_peeled_trace_with_jump_args(
             let mut extra_inner_set = majit_ir::vec_set::VecSet::new();
             let label_arg_set: majit_ir::vec_set::VecSet<OpRef> = original_args
                 .iter()
-                .map(|a| a.to_opref())
+                .copied()
                 .filter(|arg| !arg.is_none())
                 .collect();
             for later_op in p2_ops.iter().skip(op_idx + 1) {
@@ -5014,7 +5019,7 @@ fn assemble_peeled_trace_with_jump_args(
                     &visible_before_label,
                 );
                 extended_args.push(mapped_arg);
-                original_args.push(BoxRef::from_opref(source_arg));
+                original_args.push(source_arg);
             }
             let mut extended_args_box: smallvec::SmallVec<[majit_ir::operand::Operand; 3]> =
                 smallvec::SmallVec::with_capacity(extended_args.len());
@@ -5113,11 +5118,10 @@ fn assemble_peeled_trace_with_jump_args(
                     if seen_body_defs.contains(&a.to_opref())
                         && !visible_before_label.contains(&a.to_opref())
                     {
-                        let boxed = match emitted_at.get(&mapped) {
-                            Some(rc) => BoxRef::from_bound_op(rc),
-                            None => BoxRef::from_opref(mapped),
+                        *a = match emitted_at.get(&mapped) {
+                            Some(rc) => majit_ir::operand::Operand::from_bound_op(rc),
+                            None => majit_ir::operand::Operand::from_opref(mapped),
                         };
-                        *a = majit_ir::operand::Operand::from_boxref(&boxed);
                     }
                 }
             }
@@ -5519,9 +5523,7 @@ impl Optimization for OptUnroll {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::test_support::{
-        rooted_inputarg_operand, rooted_resop_box, rooted_resop_operand,
-    };
+    use crate::history::test_support::{rooted_inputarg_operand, rooted_resop_operand};
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::GcRef;
     use majit_ir::operand::Operand;
@@ -5539,8 +5541,8 @@ mod tests {
         let exported = ExportedState::new(
             vec![OpRef::int_op(52)],
             vec![
-                rooted_resop_box(Type::Int, 109),
-                BoxRef::from_opref(OpRef::const_int(3)),
+                rooted_resop_operand(Type::Int, 109),
+                Operand::from_opref(OpRef::const_int(3)),
             ],
             crate::optimizeopt::virtualstate::VirtualState::new(Vec::new()),
             majit_ir::VecMap::new(),
@@ -5769,7 +5771,7 @@ mod tests {
         let new_ref = OpRef::const_ptr(new);
         let mut exported_infos = majit_ir::VecMap::new();
         exported_infos.insert(
-            BoxRef::from_opref(old_ref),
+            Operand::from_opref(old_ref),
             OpInfo::ptr(PtrInfo::Constant(old)),
         );
         let mut short_box_const_values = majit_ir::VecMap::new();
@@ -5779,7 +5781,7 @@ mod tests {
 
         let mut state = ExportedState::new(
             vec![old_ref],
-            vec![BoxRef::from_opref(old_ref)],
+            vec![Operand::from_opref(old_ref)],
             VirtualState::new(vec![VirtualStateInfo::Constant(Value::Ref(old))]),
             exported_infos,
             vec![PreambleOp {
@@ -6432,7 +6434,7 @@ mod tests {
         // Use optimize_trace_with_constants_and_inputs to properly set
         // num_inputs so input args don't collide with op positions. Args
         // address inputarg slots via `InputArg*` OpRef variants so the
-        // BoxRef shape (`with_inputarg_types` plants `BoxRef::new_inputarg`)
+        // operand shape (`with_inputarg_types` plants the inputarg operands)
         // and the orthodox `_forwarded` mirror agree on the namespace.
         let mut ops = vec![
             Op::new(
@@ -6480,9 +6482,9 @@ mod tests {
         // Bind the export-input position at its source (a forced end-arg is a
         // bound box in production); virtualstate.py:711-720 create_state
         // receives real AbstractValues.
-        ctx.materialize_box_at(OpRef::int_op(21));
+        ctx.materialize_operand_at(OpRef::int_op(21));
         // Key by the canonical box identity the consumer resolves `int_op(21)`
-        // to, so the BoxRef-keyed lookup hits by `Rc::ptr_eq`.
+        // to, so the operand-keyed lookup hits by `Rc::ptr_eq`.
         let box21 = ctx
             .get_box_replacement_operand_opt(OpRef::int_op(21))
             .expect("int_op(21) bound to a box");
@@ -6541,7 +6543,7 @@ mod tests {
         // position at its source so every value reaching export_single_value
         // has a canonical box (virtualstate.py:711-720 create_state receives
         // real AbstractValues, never bare positions).
-        ctx.materialize_box_at(OpRef::int_op(21));
+        ctx.materialize_operand_at(OpRef::int_op(21));
         ctx.preamble_end_args = Some(vec![OpRef::int_op(21)]);
 
         let exported = export_state(&[OpRef::int_op(0)], &[], &mut optimizer, &mut ctx, None);
@@ -6574,11 +6576,11 @@ mod tests {
         // (optimizer.rs:2937/2942 set `exported_short_inputargs` and
         // `exported_short_inputarg_refs` in lockstep); the context channel
         // stores their positions.
-        let (si0, ia0) = crate::history::test_support::bound_inputarg_box(
+        let (si0, ia0) = crate::history::test_support::bound_inputarg_operand(
             Type::Int,
             ctx.alloc_op_position_typed(Type::Int).raw(),
         );
-        let (si1, ia1) = crate::history::test_support::bound_inputarg_box(
+        let (si1, ia1) = crate::history::test_support::bound_inputarg_operand(
             Type::Int,
             ctx.alloc_op_position_typed(Type::Int).raw(),
         );
@@ -6587,11 +6589,8 @@ mod tests {
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
-                    let mut op = Op::with_descr(
-                        OpCode::GetfieldGcI,
-                        &[Operand::from_boxref(&si0)],
-                        field_descr.clone(),
-                    );
+                    let mut op =
+                        Op::with_descr(OpCode::GetfieldGcI, &[si0.clone()], field_descr.clone());
                     op.pos.set(OpRef::int_op(11));
                     std::rc::Rc::new(op)
                 },
@@ -6603,10 +6602,10 @@ mod tests {
             });
         // Bind export-input positions at their source: the GETFIELD receiver
         // and result are bound boxes in production (label arg / ProducedShortOp.res
-        // = materialize_box_at, shortpreamble.rs:436). virtualstate.py:711-720
+        // = materialize_operand_at, shortpreamble.rs:436). virtualstate.py:711-720
         // create_state receives real AbstractValues, never bare positions.
-        ctx.materialize_box_at(OpRef::int_op(10));
-        ctx.materialize_box_at(OpRef::int_op(11));
+        ctx.materialize_operand_at(OpRef::int_op(10));
+        ctx.materialize_operand_at(OpRef::int_op(11));
 
         let exported = export_state(
             &[OpRef::int_op(10), OpRef::int_op(11)],
@@ -6671,10 +6670,10 @@ mod tests {
                 same_as_source: None,
             });
         // Bind export-input positions at their source (label arg /
-        // ProducedShortOp.res = materialize_box_at, shortpreamble.rs:436);
+        // ProducedShortOp.res = materialize_operand_at, shortpreamble.rs:436);
         // virtualstate.py:711-720 create_state receives real AbstractValues.
-        ctx.materialize_box_at(OpRef::int_op(12));
-        ctx.materialize_box_at(OpRef::int_op(11));
+        ctx.materialize_operand_at(OpRef::int_op(12));
+        ctx.materialize_operand_at(OpRef::int_op(11));
 
         let exported = export_state(
             &[OpRef::int_op(12), OpRef::int_op(11)],
@@ -6737,10 +6736,10 @@ mod tests {
             });
 
         // Bind export-input positions at their source (label arg /
-        // ProducedShortOp.res = materialize_box_at, shortpreamble.rs:436);
+        // ProducedShortOp.res = materialize_operand_at, shortpreamble.rs:436);
         // virtualstate.py:711-720 create_state receives real AbstractValues.
-        ctx.materialize_box_at(OpRef::int_op(10));
-        ctx.materialize_box_at(OpRef::int_op(11));
+        ctx.materialize_operand_at(OpRef::int_op(10));
+        ctx.materialize_operand_at(OpRef::int_op(11));
 
         let exported = export_state(
             &[OpRef::int_op(10), OpRef::int_op(11)],
@@ -6781,7 +6780,7 @@ mod tests {
         let func_ptr = 0xBEEF;
         let func = OpRef::const_int(func_ptr);
         let source = OpRef::int_op(11);
-        let source_box = rooted_resop_box(Type::Int, 11);
+        let source_box = rooted_resop_operand(Type::Int, 11);
         let phase2_result = OpRef::int_op(3);
         let exported = ExportedState::new(
             vec![source],
@@ -6794,7 +6793,7 @@ mod tests {
                     op.pos.set(source);
                     std::rc::Rc::new(op)
                 },
-                res: Operand::from_boxref(&source_box),
+                res: source_box.clone(),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant,
                 label_arg_idx: Some(0),
                 invented_name: false,
@@ -6869,9 +6868,9 @@ mod tests {
             .produced_short_op(&src20)
             .unwrap();
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: rooted_resop_box(Type::Int, 20),
+            op: rooted_resop_operand(Type::Int, 20),
             invented_name: produced.invented_name,
-            same_as_source: produced.same_as_source.as_ref().map(|o| o.to_boxref()),
+            same_as_source: produced.same_as_source.clone(),
             preamble_op: produced.preamble_op,
         };
         let forced = ctx.force_op_from_preamble_op(&pop);
@@ -6961,15 +6960,15 @@ mod tests {
         // make_equal_to, but the test still walks the get_box_replacement
         // chain inside force_box's add_preamble_op, so install a manual
         // forwarding to the body-visible OpRef to exercise that path.
-        let b_src = ctx.materialize_box_at(OpRef::ref_op(19));
+        let b_src = ctx.materialize_operand_at(OpRef::ref_op(19));
         let b_tgt = ctx
             .get_box_replacement_operand_opt(OpRef::ref_op(14))
             .unwrap_or_else(|| ctx.materialize_operand_at(OpRef::ref_op(14)));
-        ctx.make_equal_to(&Operand::from_boxref(&b_src), &b_tgt);
+        ctx.make_equal_to(&b_src, &b_tgt);
         let pop = crate::optimizeopt::info::PreambleOp {
             op: b_src.clone(),
             invented_name: produced.invented_name,
-            same_as_source: produced.same_as_source.as_ref().map(|o| o.to_boxref()),
+            same_as_source: produced.same_as_source.clone(),
             preamble_op: produced.preamble_op,
         };
         let forced = ctx.force_op_from_preamble_op(&pop);
@@ -7029,15 +7028,15 @@ mod tests {
         // pool, matching production (optimizer.rs:2937/2942 set
         // `exported_short_inputargs` / `exported_short_inputarg_refs` in
         // lockstep); the context channel stores their positions.
-        let (si0, ia0) = crate::history::test_support::bound_inputarg_box(
+        let (si0, ia0) = crate::history::test_support::bound_inputarg_operand(
             Type::Int,
             ctx.alloc_op_position_typed(Type::Int).raw(),
         );
-        let (si1, ia1) = crate::history::test_support::bound_inputarg_box(
+        let (si1, ia1) = crate::history::test_support::bound_inputarg_operand(
             Type::Int,
             ctx.alloc_op_position_typed(Type::Int).raw(),
         );
-        let (si2, ia2) = crate::history::test_support::bound_inputarg_box(
+        let (si2, ia2) = crate::history::test_support::bound_inputarg_operand(
             Type::Int,
             ctx.alloc_op_position_typed(Type::Int).raw(),
         );
@@ -7046,10 +7045,7 @@ mod tests {
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
-                    let mut op = Op::new(
-                        OpCode::IntAdd,
-                        &[Operand::from_boxref(&si0), Operand::from_boxref(&si1)],
-                    );
+                    let mut op = Op::new(OpCode::IntAdd, &[si0.clone(), si1.clone()]);
                     op.pos.set(OpRef::int_op(30));
                     std::rc::Rc::new(op)
                 },
@@ -7062,9 +7058,9 @@ mod tests {
         // Bind export-input positions at their source (IntAdd operands /
         // same-as alias are bound boxes in production); virtualstate.py:711-720
         // create_state receives real AbstractValues, never bare positions.
-        ctx.materialize_box_at(OpRef::int_op(12));
-        ctx.materialize_box_at(OpRef::int_op(13));
-        ctx.materialize_box_at(OpRef::int_op(14));
+        ctx.materialize_operand_at(OpRef::int_op(12));
+        ctx.materialize_operand_at(OpRef::int_op(13));
+        ctx.materialize_operand_at(OpRef::int_op(14));
 
         let exported = export_state(
             &[OpRef::int_op(12), OpRef::int_op(13), OpRef::int_op(14)],

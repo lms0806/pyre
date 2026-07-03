@@ -471,7 +471,7 @@ pub struct Optimizer {
     /// set of ops the optimizer has emitted (or that `replace_guard_op`
     /// substituted in place of an emitted op). RPython keys this set by
     /// the op object (`op in self._emittedoperations` is identity-keyed);
-    /// pyre keys by the emitted op's canonical box (`BoxRef`, `Rc::ptr_eq`).
+    /// pyre keys by the emitted op's canonical operand (`Rc::ptr_eq`).
     /// Populated at:
     /// - `emit_operation` after `ctx.emit` (optimizer.py:674
     ///   `self._emittedoperations[op] = None` inside _emit_operation).
@@ -559,7 +559,7 @@ pub(crate) fn merge_backend_constants_from_ctx(
 
     // Iterate every bound ResOp across the canonical `_forwarded` hosts
     // (`new_operations` ∪ `phase1_emit_ops` ∪ `resop_refs`) rather than the
-    // `box_pool` side-table. `BoxRef::write_forwarded`'s bound-precondition
+    // `box_pool` side-table. The forwarded-write's bound-precondition
     // forbids a forwarded write to an unbound box, so every
     // position carrying `Forwarded::Const` has a bound producer `Op`
     // reachable through one of these stores. Body-namespace producers are
@@ -574,7 +574,7 @@ pub(crate) fn merge_backend_constants_from_ctx(
         }
         let idx = pos.raw() as usize;
         let value = match op.forwarded.borrow().clone() {
-            majit_ir::box_ref::Forwarded::Const(c) => c.to_value(),
+            majit_ir::forwarding::Forwarded::Const(c) => c.to_value(),
             _ => return,
         };
         // A ref constant is never resolved from this backend pool: a referenced
@@ -652,7 +652,7 @@ impl Optimizer {
         let Some(forwarded) = ctx.read_forwarded(op.pos.get()) else {
             return false;
         };
-        if !matches!(forwarded, majit_ir::box_ref::Forwarded::Const(_)) {
+        if !matches!(forwarded, majit_ir::forwarding::Forwarded::Const(_)) {
             return false;
         }
         op.num_args() == 0 || op.getarglist().iter().all(|arg| arg.is_none())
@@ -736,11 +736,11 @@ impl Optimizer {
                     // ob_type (offset 0) class pointers — the exporter at
                     // virtualstate.rs:1989 already encodes these as
                     // `Value::Ref(GcRef)`, so `field_ref` is already a
-                    // typed `RefOp` variant carrying `Box(BoxRef::new_const(
-                    // Value::Ref(class_gcref)))` on its `_forwarded` slot
+                    // typed `RefOp` variant carrying a `Value::Ref(class_gcref)`
+                    // const forwarding step on its `_forwarded` slot
                     // (via `make_constant` in the `VirtualStateInfo::Constant`
                     // arm of `apply_imported_virtual_state`). The typed
-                    // variant tag + BoxRef Ref-typed const forwarding are
+                    // variant tag + Ref-typed const forwarding are
                     // the authoritative shape; no extra type marker is
                     // needed at the import side.
                     let _ = (field_descrs, known_class, field_idx);
@@ -1368,7 +1368,7 @@ impl Optimizer {
                 // label slot and write the imported state through it. An
                 // unresolvable slot (`OpRef::NONE`, e.g. the MISS fallback
                 // above) yields `None` and the write no-ops — matching the
-                // prior `materialize_box_at(OpRef::NONE) -> None` behavior.
+                // prior `materialize_operand_at(OpRef::NONE) -> None` behavior.
                 if let Some(box_) = ctx.get_box_replacement_operand_opt(opref) {
                     Self::apply_imported_virtual_state(info, &box_, ctx);
                 }
@@ -1553,7 +1553,7 @@ impl Optimizer {
         // populated with the canonical box, so this matches iff the raw op is the
         // canonical op — exactly PyPy's `op in _emittedoperations`.
         // A constant is never an emitted op; short-circuit before resolving so
-        // `from_boxref` never mints a throwaway Const key (which would harmlessly
+        // resolving never mints a throwaway Const key (which would harmlessly
         // miss anyway, since no Const is ever inserted into the emit set).
         if opref.is_constant() {
             return None;
@@ -2127,7 +2127,7 @@ impl Optimizer {
             .unwrap_or(false);
         if !updated_existing {
             // optimizer.py:142-148: preserve last_guard_pos from old info.
-            // BoxRef-direct read mirrors `info.py:100-103 get_last_guard_pos`
+            // operand-direct read mirrors `info.py:100-103 get_last_guard_pos`
             // — drops the `last_guard_pos(opref)` bridge.
             let old_guard_pos = resolved
                 .ptr_info()
@@ -2423,7 +2423,7 @@ impl Optimizer {
         // fresh per-iteration inputarg set whose TreeLoop-owned strong
         // `InputArgRc`s were dropped, so re-bind them here.
         ctx.ensure_inputarg_bindings();
-        // Bind every input op's resop BoxRef so chain-walker
+        // Bind every input op's resop operand so chain-walker
         // terminals are guaranteed bound before any `&self` reader
         // (e.g. `OptIntBounds::getintbound_box`) reaches a
         // `set_forwarded_*` write. `TraceIterator::next()`
@@ -2657,7 +2657,7 @@ impl Optimizer {
                         let (fresh, b_fresh) = ctx.reserve_virtual_box(tp);
                         let b_source = ctx
                             .get_box_replacement_operand_opt(source)
-                            .expect("Phase 2 source inputarg must have a materialized BoxRef slot");
+                            .expect("Phase 2 source inputarg must have a materialized operand slot");
                         ctx.make_equal_to(&b_source, &b_fresh);
                         fresh
                     } else {
@@ -2857,7 +2857,7 @@ impl Optimizer {
                 let forced = self.force_box(original.to_opref(), &mut ctx);
                 // Operand writes carry the canonical box: resolve the chain
                 // terminal, materializing the host when the forced position
-                // has no producer yet (mirrors the materialize_box_at arm
+                // has no producer yet (mirrors the materialize_operand_at arm
                 // above; never a position-only fabrication).
                 let b_forced = match ctx.get_box_replacement_operand_opt(forced) {
                     Some(b) => b,
@@ -2902,7 +2902,7 @@ impl Optimizer {
         // via `partial_trace.operations`.
         //
         // pyre's per-iter `TraceIterator::next()` (opencoder.rs:500)
-        // pushes a fresh `BoxRef::new_resop` slot for every visited op
+        // pushes a fresh resop operand slot for every visited op
         // BEFORE the optimizer pipeline decides whether to emit. Two
         // categories of slot escape the `new_operations` carry above
         // and need explicit handling so `Forwarded::Op(Weak<Op>)`
@@ -2911,8 +2911,8 @@ impl Optimizer {
         //   - Unbound orphan: the pipeline folded/dropped the op so
         //     `ctx.emit` never ran. Synthesize a `SameAs` stand-in
         //     and bind the slot.
-        //   - Synthetic-bound: a forward reference reached `materialize_box_at`
-        //     first; `materialize_box_at` minted a `SameAs` stand-in into
+        //   - Synthetic-bound: a forward reference reached `materialize_operand_at`
+        //     first; `materialize_operand_at` minted a `SameAs` stand-in into
         //     `ctx.resop_refs[idx]` and `bind_op`'ed it. When `emit`
         //     never arrived to upgrade the binding to a real producer,
         //     the stand-in itself is the chain target carrier.
@@ -3138,17 +3138,17 @@ impl Optimizer {
                         // operand, so each `bound_from_opref` fallback returns a
                         // distinct Rc (ptr-Eq-unstable) and `export_single_value` logs it as an
                         // unbound export key. Bind the canonical `_forwarded` host
-                        // once via `materialize_box_at` (a `SameAs*` synthetic in
-                        // `resop_refs`, memoized through `Op::box_cache`) so the
+                        // once via `materialize_operand_at` (a `SameAs*` synthetic
+                        // in `resop_refs`) so the
                         // export key resolves to one ptr-stable host — the identity
-                        // the #188 `OpRef`→`BoxRef` `ExportCache` rekey requires. The
+                        // the #188 `OpRef`→operand `ExportCache` rekey requires. The
                         // returned `OpRef` is unchanged (synthetic and orphan share
                         // the position), so the exported state is byte-identical.
                         if !resolved.is_none()
                             && !resolved.is_constant()
                             && ctx.get_box_replacement_operand_opt(resolved).is_none()
                         {
-                            ctx.materialize_box_at(resolved);
+                            ctx.materialize_operand_at(resolved);
                         }
                         resolved
                     })
@@ -3279,7 +3279,7 @@ impl Optimizer {
                         for i in 0..preamble_op.num_args() {
                             let arg = preamble_op.arg(i);
                             // The `OpRef::none()` sentinel has no producer box
-                            // (`materialize_box_at` doc) — routing it through the
+                            // (`materialize_operand_at` doc) — routing it through the
                             // producer lookup is meaningless and trips the
                             // `get_box_replacement` "box must exist" debug tripwire.
                             if arg.is_none() {
@@ -3528,7 +3528,7 @@ impl Optimizer {
             }
 
             // Constant-folded operations that were removed from the trace still
-            // have their box._forwarded = Box(constbox) BoxRef forwarding from
+            // have their box._forwarded = constbox forwarding step from
             // make_constant/seed_constant. If we leave them at their old
             // positions, they can collide with the freshly compacted op
             // positions above (for example old constant v71 vs new live op v71),
@@ -3557,7 +3557,7 @@ impl Optimizer {
                 }
                 if !matches!(
                     op.forwarded.borrow().clone(),
-                    majit_ir::box_ref::Forwarded::Const(_)
+                    majit_ir::forwarding::Forwarded::Const(_)
                 ) {
                     return;
                 }
@@ -3662,46 +3662,13 @@ impl Optimizer {
                         *opref = opref.with_raw(new_pos);
                     }
                 };
-                let remap_boxref = |arg: &mut majit_ir::box_ref::BoxRef| {
-                    // A bound box live-tracks its producer's `op.pos`, already
-                    // moved to the new dense slot by the main loop above, so it
-                    // needs no rewrite — and a `from_opref` re-mint would sever
-                    // the bound carry into a stale position-only box. Only
-                    // position-only boxes (test fixtures) carry a pre-remap
-                    // position the table must rewrite.
-                    if arg.bound_op().is_some() || arg.bound_inputarg().is_some() {
-                        return;
-                    }
-                    let mut opref = arg.to_opref();
-                    remap_opref(&mut opref);
-                    *arg = majit_ir::box_ref::BoxRef::from_opref(opref);
-                };
-                // next_iteration_args now carries the canonical Phase-1 boxes that
-                // double as exported_infos keys. Remap by `set_position` (as
-                // short_inputargs below) to preserve box identity across
-                // compaction: a `from_opref` re-mint would sever the ptr_eq carry
-                // that import_state's exported_infos lookup depends on.
-                for arg in &state.next_iteration_args {
-                    // A bound arg live-tracks its producer's `op.pos`, already
-                    // remapped by the main loop, so it needs no `set_position`;
-                    // its Rc identity (the exported_infos key) is preserved
-                    // untouched. Only position-only args (test fixtures) carry a
-                    // pre-remap position the table must rewrite.
-                    if arg.bound_op().is_some() || arg.bound_inputarg().is_some() {
-                        continue;
-                    }
-                    let opref = arg.to_opref();
-                    // Const args carry their value inline (no body position):
-                    // `set_position` is a Const no-op and `opref.raw()` panics on
-                    // an inline-Const OpRef, so skip them. Their Rc identity (the
-                    // exported_infos key) is preserved untouched.
-                    if opref.is_constant() {
-                        continue;
-                    }
-                    let mut opref = opref;
-                    remap_opref(&mut opref);
-                    arg.set_position(opref.raw());
-                }
+                // next_iteration_args carries the canonical Phase-1 operands
+                // that double as exported_infos keys. They need NO remap: a
+                // bound operand live-tracks its producer's `op.pos` (already
+                // moved to the new dense slot by the main loop above), a Const
+                // carries its value inline (no body position), and Operand has
+                // no position-only form — so every carried identity (the
+                // exported_infos key) is preserved untouched.
                 for arg in &mut state.end_args {
                     remap_opref(arg);
                 }
@@ -4023,7 +3990,7 @@ impl Optimizer {
             if !front_target_tokens.is_empty() {
                 let mut ctx = self.final_ctx.take().unwrap_or_else(|| {
                     // opencoder.py:259 inputarg_from_tp parity — seed inputarg
-                    // BoxRefs with the producer-side types when available; the
+                    // operands with the producer-side types when available; the
                     // Ref fallback covers the rare case the recorder hasn't
                     // populated `trace_inputargs` (e.g. test-only entry
                     // paths) and matches the historical Type::Void behaviour
@@ -4349,7 +4316,7 @@ impl Optimizer {
         ctx: &mut OptContext,
     ) -> Result<(), crate::optimize::InvalidLoop> {
         // The canonical `OpRc` is threaded in so callers can resolve the
-        // producer directly when they need a bound BoxRef. For this pass the
+        // producer directly when they need a bound operand. For this pass the
         // body reads through this `&Op` view (Deref), behaviour-identical.
         let op: &Op = op_rc;
         // Box.type lives intrinsically on `OpRef.ty()` (variant
@@ -4382,7 +4349,7 @@ impl Optimizer {
             // producer is registered yet — a short-preamble / bridge operand
             // dispatched mid-pass through `send_extra_operation`, whose
             // producer is neither emitted nor in `resop_refs` —
-            // `resolve_box_box_opt` returns None. `materialize_box_at`
+            // `resolve_box_box_opt` returns None. `materialize_operand_at`
             // then mints and registers the canonical `_forwarded` host (the
             // "Box always exists" invariant, resoperation.py:233) and we walk
             // it to its terminal, so the stored arg is BOUND on every dispatch
@@ -4747,7 +4714,7 @@ impl Optimizer {
         if op.opcode.returns_bool() {
             let bound_box = ctx
                 .get_box_replacement_operand_opt(emitted)
-                .expect("just-emitted op resolves to a bound BoxRef");
+                .expect("just-emitted op resolves to a bound operand");
             ctx.with_intbound_mut(&bound_box, |bound| bound.make_bool());
         }
         // optimizer.py:603-611: after emit, promote IntBound→Const.
@@ -4758,7 +4725,7 @@ impl Optimizer {
         //           op.set_forwarded(ConstInt(opinfo.get_constant_int()))
         if op.result_type() == majit_ir::Type::Int {
             let replaced = ctx.get_replacement_opref(emitted);
-            // BoxRef shim — peek_intbound_box takes &BoxRef per optimizer.py:99-113.
+            // operand shim — peek_intbound_box takes an operand per optimizer.py:99-113.
             let bound = ctx
                 .get_box_replacement_operand_opt(emitted)
                 .as_ref()
@@ -4810,7 +4777,7 @@ impl Optimizer {
             // `optimizer.py:137-151` where `isinstance(opinfo,
             // InstancePtrInfo)` mutates in place.
             // optimizer.py:137-152 `make_constant_class` always updates
-            // `_forwarded` — `materialize_box_at` materializes the Box so the
+            // `_forwarded` — `materialize_operand_at` materializes the Box so the
             // write is never silently skipped. Same materializer feeds
             // the `last_guard_pos` read; `info.py:91-103
             // get_last_guard_pos` reads the PtrInfo field (None if no
@@ -5339,7 +5306,7 @@ impl Default for Optimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::test_support::{rooted_resop_box, rooted_resop_operand};
+    use crate::history::test_support::rooted_resop_operand;
     use majit_ir::Type;
     use majit_ir::descr::make_size_descr;
     use majit_ir::descr::{CallDescr, EffectInfo, ExtraEffect, OopSpecIndex};
@@ -5899,17 +5866,16 @@ mod tests {
             majit_ir::Type::Ref,
         ];
 
-        // Position-only op-args / fail-args replaced by the `rooted_resop_box`
-        // drop-in (box_ref.rs test_support: a bound ResOp box whose synthetic
-        // producer is rooted in the thread-local pool; sheds to `Operand::Op`,
-        // `to_opref`s to the same `(type, position)` so position-keyed
-        // resolution is unchanged). CallMayForceR's result is consumed as a Ref
-        // by the getfields/fail-args, so its result refs are `Type::Ref` at the
-        // call position; the resume-only free fail-vars (2000..3003) and the
-        // dangling positions stay `Type::Int` exactly as the fixture wired them.
-        // Detached fail-arg synthetics resolve to themselves (the `same_box`
-        // arm, mod.rs:4637), deferring to the OpRef store — no `Operand::Box`.
-        use crate::history::test_support::rooted_resop_box;
+        // Position-only op-args / fail-args replaced by the `rooted_resop_operand`
+        // drop-in (a bound ResOp operand whose synthetic producer is rooted in
+        // the thread-local pool; sheds to `Operand::Op`, `to_opref`s to the same
+        // `(type, position)` so position-keyed resolution is unchanged).
+        // CallMayForceR's result is consumed as a Ref by the getfields/fail-args,
+        // so its result refs are `Type::Ref` at the call position; the resume-only
+        // free fail-vars (2000..3003) and the dangling positions stay `Type::Int`
+        // exactly as the fixture wired them. Detached fail-arg synthetics resolve
+        // to themselves (the `same_box` arm, mod.rs:4637), deferring to the OpRef
+        // store — no `Operand::Box`.
         let mut call_a = Op::with_descr(
             OpCode::CallMayForceR,
             &[
@@ -5987,7 +5953,7 @@ mod tests {
         // get_b_type) rather than the original fixture's dangling position 8
         // (the void guard_b): a bound synthetic at a void position has no
         // forwardable result box, so IntBounds' getintbound would write
-        // forwarded onto an unbound box (box_ref.rs:788). The add result is
+        // forwarded onto an unbound box (forwarding.rs). The add result is
         // unused either way — this only keeps its operands resolvable.
         let add = Op::new(
             OpCode::IntAdd,
@@ -6934,7 +6900,7 @@ mod tests {
         ctx.set_potential_extra_op(
             OpRef::int_op(14),
             crate::optimizeopt::info::PreambleOp {
-                op: rooted_resop_box(Type::Int, 14),
+                op: rooted_resop_operand(Type::Int, 14),
                 invented_name: false,
                 preamble_op: {
                     let mut op = majit_ir::Op::new(
@@ -6979,7 +6945,7 @@ mod tests {
         let (ops, inputs) = b.build();
         // The GuardTrue (ops[1]) keeps both header inputs as fail args; bind
         // them to the same canonical InputArg boxes the header threads.
-        ops[1].setfailargs(vec![Operand::from_boxref(&x), Operand::from_boxref(&y)].into());
+        ops[1].setfailargs(vec![x.clone(), y.clone()].into());
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         let num_inputs = inputs.len();
         opt.snapshot_boxes = seed_guard_snapshots_with_oprc(&ops, |_| vec![x_ref, y_ref]);

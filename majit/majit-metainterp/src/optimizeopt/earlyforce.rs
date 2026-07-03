@@ -89,11 +89,11 @@ impl Optimization for OptEarlyForce {
                 // when no extra op is queued for this arg.
                 if let Some(tracked) = ctx.take_potential_extra_op(arg) {
                     // shortpreamble.py:434: the resolved Box is handed
-                    // to the builder; fall back to the operand's own box.
+                    // to the builder; fall back to the operand itself.
                     let arg_b = arg_opnd
                         .as_ref()
-                        .map(|o| o.to_boxref())
-                        .unwrap_or_else(|| op.arg(i).to_boxref());
+                        .cloned()
+                        .unwrap_or_else(|| op.arg(i).clone());
                     if let Some(builder) = ctx.active_short_preamble_producer_mut() {
                         builder.add_preamble_op_from_pop(&tracked, arg_b);
                     } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {
@@ -107,8 +107,8 @@ impl Optimization for OptEarlyForce {
                 let arg_is_virtual = ctx.is_virtual(&op.arg(i));
                 if arg_is_virtual {
                     // A virtual resolves to a bound alloc op, so the native
-                    // resolver yields its terminal operand with no from_boxref
-                    // bridge; force_box reads the operand's own opref and
+                    // resolver yields its terminal operand directly (no box
+                    // round-trip); force_box reads the operand's own opref and
                     // drives every make_equal_to / set_ptr_info receiver off it.
                     let arg_op = ctx
                         .resolve_operand_operand_opt(&op.arg(i))

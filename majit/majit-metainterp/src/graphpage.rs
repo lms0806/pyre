@@ -5,8 +5,7 @@
 //! Pyre does not embed `dotviewer`, so this port preserves the module and
 //! symbol surface while returning DOT source for callers/tests to inspect.
 
-use majit_ir::box_ref::BoxRef;
-use majit_ir::{DescrRef, Op, OpCode, Type, Value, descr_identity};
+use majit_ir::{DescrRef, Op, OpCode, OpRef, Type, Value, descr_identity};
 
 const BOX_COLOR: (u8, u8, u8) = (128, 0, 96);
 
@@ -18,43 +17,28 @@ struct LinkInfo {
 
 #[derive(Default)]
 struct ResOpMemo {
-    names: Vec<(ResOpMemoKey, String)>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ResOpMemoKey {
-    BoundOp(usize),
-    BoundInputArg(usize),
-    BoxRef(usize),
-}
-
-impl ResOpMemoKey {
-    fn from_box(box_: &BoxRef) -> Self {
-        // graphpage.py uses an object-keyed dict. A bound BoxRef is only a Rust
-        // wrapper around the real PyPy-equivalent object, so use the producer
-        // pointer there; unbound boxes and constants keep wrapper identity.
-        if let Some(op) = box_.bound_op() {
-            return ResOpMemoKey::BoundOp(std::rc::Rc::as_ptr(&op) as *const () as usize);
-        }
-        if let Some(inputarg) = box_.bound_inputarg() {
-            return ResOpMemoKey::BoundInputArg(
-                std::rc::Rc::as_ptr(&inputarg) as *const () as usize
-            );
-        }
-        ResOpMemoKey::BoxRef(box_.as_ptr() as usize)
-    }
+    names: Vec<(OpRef, String)>,
 }
 
 impl ResOpMemo {
-    pub fn get(&self, box_: &BoxRef) -> Option<&str> {
-        let key = ResOpMemoKey::from_box(box_);
+    // graphpage.py:69 keys `memo` by box object (resoperation.py:373-381 names
+    // by object identity). This viewer runs post-optimization on owned `Op`
+    // values, where args are `Operand`s but a result is only its `op.pos`
+    // `OpRef` (no producer `Rc` to key on). `OpRef` is the identity both sides
+    // share: a producer position is unique to one op, and bound inputargs /
+    // constants shed to their canonical `OpRef`, so a result named `iN` and its
+    // downstream arg uses all resolve to the same key — reproducing upstream's
+    // one-name-per-box sharing in pyre's position-threaded representation.
+    // Two distinct producers can never share a position, so the only inputs
+    // `OpRef`-keying collapses (distinct position-only boxes at one position)
+    // cannot arise in a real trace — the deviation is unobservable.
+    pub fn get(&self, key: OpRef) -> Option<&str> {
         self.names
             .iter()
             .find_map(|(k, v)| (*k == key).then_some(v.as_str()))
     }
 
-    pub fn set(&mut self, box_: &BoxRef, value: String) {
-        let key = ResOpMemoKey::from_box(box_);
+    pub fn set(&mut self, key: OpRef, value: String) {
         if let Some((_, old)) = self.names.iter_mut().find(|(k, _)| *k == key) {
             *old = value;
         } else {
@@ -84,13 +68,13 @@ impl ResOpProcedure for &[Op] {
 }
 
 pub struct SubGraph {
-    failargs: Vec<BoxRef>,
-    subinputargs: Vec<BoxRef>,
+    failargs: Vec<OpRef>,
+    subinputargs: Vec<OpRef>,
     suboperations: Vec<Op>,
 }
 
 impl SubGraph {
-    pub fn new(failargs: Vec<BoxRef>, subinputargs: Vec<BoxRef>, suboperations: Vec<Op>) -> Self {
+    pub fn new(failargs: Vec<OpRef>, subinputargs: Vec<OpRef>, suboperations: Vec<Op>) -> Self {
         Self {
             failargs,
             subinputargs,
@@ -106,8 +90,8 @@ impl ResOpProcedure for SubGraph {
 
     fn get_display_text(&self, memo: &mut ResOpMemo) -> Option<String> {
         for (failarg, inputarg) in self.failargs.iter().zip(self.subinputargs.iter()) {
-            if let Some(name) = memo.get(failarg).map(str::to_string) {
-                memo.set(inputarg, name);
+            if let Some(name) = memo.get(*failarg).map(str::to_string) {
+                memo.set(*inputarg, name);
             }
         }
         None
@@ -397,22 +381,17 @@ impl<'a> ResOpGen<'a> {
             let operations = self.graphs[graphindex].procedure.get_operations();
             for op in operations {
                 for arg in op.getarglist() {
-                    self.add_link_for_box(&mut links, &arg);
+                    self.add_link_for_box(&mut links, arg.to_opref());
                 }
                 if op.result_type() != Type::Void && !op.pos.get().is_none() {
-                    let result = BoxRef::from_opref(op.pos.get());
-                    self.add_link_for_box(&mut links, &result);
+                    self.add_link_for_box(&mut links, op.pos.get());
                 }
             }
         }
         links
     }
 
-    fn add_link_for_box(
-        &mut self,
-        links: &mut Vec<(String, (String, (u8, u8, u8)))>,
-        box_: &BoxRef,
-    ) {
+    fn add_link_for_box(&mut self, links: &mut Vec<(String, (String, (u8, u8, u8)))>, box_: OpRef) {
         let short = self.repr_short(box_);
         if short.len() > 1
             && matches!(short.as_bytes()[0], b'i' | b'r' | b'f')
@@ -427,32 +406,29 @@ impl<'a> ResOpGen<'a> {
         }
     }
 
-    fn repr_short(&mut self, box_: &BoxRef) -> String {
+    fn repr_short(&mut self, box_: OpRef) -> String {
         if let Some(name) = self.memo.get(box_) {
             return name.to_string();
         }
-        let name = match box_.const_value() {
+        let name = match const_value_of(box_) {
             Some(value) => format_value(value),
             None if box_.is_none() => "_".to_string(),
             None => {
-                let prefix = match box_.type_() {
-                    Type::Int => "i",
-                    Type::Ref => "r",
-                    Type::Float => "f",
-                    Type::Void => "v",
+                let prefix = match box_.ty() {
+                    Some(Type::Int) => "i",
+                    Some(Type::Ref) => "r",
+                    Some(Type::Float) => "f",
+                    _ => "v",
                 };
-                match box_.position() {
-                    Some(pos) => format!("{prefix}{pos}"),
-                    None => "_".to_string(),
-                }
+                format!("{prefix}{}", box_.raw())
             }
         };
         self.memo.set(box_, name.clone());
         name
     }
 
-    fn repr_box(&mut self, box_: &BoxRef) -> String {
-        match box_.const_value() {
+    fn repr_box(&mut self, box_: OpRef) -> String {
+        match const_value_of(box_) {
             Some(value) => format_value(value),
             None => self.repr_short(box_),
         }
@@ -584,6 +560,16 @@ fn escape_attr(value: &str) -> String {
         .replace('\n', r"\n")
 }
 
+/// Extract a constant `Value` from a const-namespace `OpRef`, else `None`.
+fn const_value_of(r: OpRef) -> Option<Value> {
+    match r {
+        OpRef::ConstInt(v) => Some(Value::Int(v)),
+        OpRef::ConstFloat(v) => Some(Value::Float(v)),
+        OpRef::ConstPtr(v) => Some(Value::Ref(v)),
+        _ => None,
+    }
+}
+
 fn format_value(value: Value) -> String {
     match value {
         Value::Int(v) => v.to_string(),
@@ -611,7 +597,7 @@ fn safename(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::history::test_support::rooted_resop_operand;
-    use majit_ir::{Op, OpCode, OpRef, Type, box_ref::BoxRef, operand::Operand, value::InputArg};
+    use majit_ir::{Op, OpCode, OpRef, Type, operand::Operand, value::InputArg};
 
     #[test]
     fn display_procedures_returns_dot_source() {
@@ -658,39 +644,28 @@ mod tests {
 
     #[test]
     fn subgraph_copies_parent_failarg_names() {
-        let failarg = BoxRef::new_inputarg(Type::Int, 7);
-        let subinputarg = BoxRef::new_inputarg(Type::Int, 0);
-        let subgraph = SubGraph::new(vec![failarg.clone()], vec![subinputarg.clone()], vec![]);
+        let failarg = OpRef::input_arg_int(7);
+        let subinputarg = OpRef::input_arg_int(0);
+        let subgraph = SubGraph::new(vec![failarg], vec![subinputarg], vec![]);
         let mut memo = ResOpMemo::default();
-        memo.set(&failarg, "i7".to_string());
+        memo.set(failarg, "i7".to_string());
 
         subgraph.get_display_text(&mut memo);
 
-        assert_eq!(memo.get(&subinputarg), Some("i7"));
+        assert_eq!(memo.get(subinputarg), Some("i7"));
     }
 
     #[test]
-    fn memo_keeps_position_only_boxes_with_same_opref_distinct() {
-        let first = BoxRef::from_opref(OpRef::int_op(3));
-        let second = BoxRef::from_opref(OpRef::int_op(3));
-        let mut memo = ResOpMemo::default();
-
-        memo.set(&first, "first".to_string());
-        memo.set(&second, "second".to_string());
-
-        assert_eq!(memo.get(&first), Some("first"));
-        assert_eq!(memo.get(&second), Some("second"));
-    }
-
-    #[test]
-    fn memo_shares_bound_boxes_for_the_same_producer() {
+    fn memo_shares_boxes_for_the_same_opref() {
+        // A bound inputarg and its position-only `OpRef` view share the same
+        // canonical `OpRef` key, so the viewer names them identically.
         let producer = InputArg::new_int_rc(4);
-        let first = BoxRef::from_bound_inputarg(&producer);
-        let second = BoxRef::from_bound_inputarg(&producer);
+        let first = Operand::from_bound_inputarg(&producer).to_opref();
+        let second = OpRef::input_arg_int(4);
         let mut memo = ResOpMemo::default();
 
-        memo.set(&first, "i4".to_string());
+        memo.set(first, "i4".to_string());
 
-        assert_eq!(memo.get(&second), Some("i4"));
+        assert_eq!(memo.get(second), Some("i4"));
     }
 }
