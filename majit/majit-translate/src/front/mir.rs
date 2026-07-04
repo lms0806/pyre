@@ -1647,6 +1647,16 @@ pub fn lower_fun_decl_with_static_addrs(
                 &lo.unwrap_or_sites,
             )
         };
+        // The `Option::unwrap` guard rewrite (`front::option_unwrap`) splits the
+        // residual `unwrap` call block into a `__discriminant` guard whose
+        // `Some` arm extracts `__pos_0` and whose `None` arm raises the implicit
+        // `AssertionError`; same fail-safe contract as `unwrap_or`, gate the
+        // reachability sweep on an actual rewrite.
+        let unwrap_rewritten = if lo.unwrap_sites.is_empty() {
+            0
+        } else {
+            crate::front::option_unwrap::rewire_unwrap_call_sites(&mut lo.graph, &lo.unwrap_sites)
+        };
         // The `Option::map_or` closure-select rewrite (`front::option_map_or`)
         // splits the residual `map_or` call block into a `__discriminant`
         // diamond whose `Some` arm calls the closure, same post-lowering shape
@@ -1680,6 +1690,19 @@ pub fn lower_fun_decl_with_static_addrs(
                 &lo.closure_select_sites,
             )
         };
+        // The `bigint::BigInt::div_rem()` producer rewrite
+        // (`front::bigint_div_rem`) splices the residual `div_rem` call in
+        // place with `jit_bigint_div` / `jit_bigint_rem` residuals + a
+        // synthetic-`Tuple` `(quotient, remainder)` aggregate.  It touches no
+        // control flow (no fresh blocks, no detached edges), so it does not
+        // gate the reachability sweep; fail-safe, so a structural mismatch
+        // leaves the residual call (rtyper Skip).
+        if !lo.bigint_div_rem_sites.is_empty() {
+            crate::front::bigint_div_rem::rewire_bigint_div_rem_call_sites(
+                &mut lo.graph,
+                &lo.bigint_div_rem_sites,
+            );
+        }
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
             || next_rewritten > 0
@@ -1687,6 +1710,7 @@ pub fn lower_fun_decl_with_static_addrs(
             || option_try_stats.rewritten > 0
             || bool_then_rewritten > 0
             || unwrap_or_rewritten > 0
+            || unwrap_rewritten > 0
             || map_or_rewritten > 0
             || closure_select_rewritten > 0
         {
@@ -2028,12 +2052,21 @@ struct Lowering<'a> {
     /// resolved ctor/method owners the arms need (see
     /// [`crate::front::bool_then::BoolThenSite`]).
     bool_then_sites: Vec<crate::front::bool_then::BoolThenSite>,
+    /// `bigint::BigInt::div_rem()` call sites recorded for the modeled
+    /// `(quotient, remainder)` tuple producer the `front::bigint_div_rem`
+    /// post-pass synthesizes (see
+    /// [`crate::front::bigint_div_rem::BigIntDivRemSite`]).
+    bigint_div_rem_sites: Vec<crate::front::bigint_div_rem::BigIntDivRemSite>,
     /// `Option::unwrap_or(opt, default)` call sites recorded for the
     /// discriminant value-select the `front::option_unwrap_or` post-pass
     /// synthesizes after the body lowering completes.  Each carries the
     /// resolved `Option` owners the arms' field reads need (see
     /// [`crate::front::option_unwrap_or::UnwrapOrSite`]).
     unwrap_or_sites: Vec<crate::front::option_unwrap_or::UnwrapOrSite>,
+    /// `Option::unwrap(opt)` call sites recorded for the discriminant guard the
+    /// `front::option_unwrap` post-pass synthesizes (see
+    /// [`crate::front::option_unwrap::UnwrapSite`]).
+    unwrap_sites: Vec<crate::front::option_unwrap::UnwrapSite>,
     /// `Option::map_or(opt, default, closure)` call sites recorded for the
     /// discriminant closure-select the `front::option_map_or` post-pass
     /// synthesizes (see [`crate::front::option_map_or::MapOrSite`]).
@@ -2204,7 +2237,9 @@ impl<'a> Lowering<'a> {
             checked_arith_call_results: Vec::new(),
             option_try_sites: Vec::new(),
             bool_then_sites: Vec::new(),
+            bigint_div_rem_sites: Vec::new(),
             unwrap_or_sites: Vec::new(),
+            unwrap_sites: Vec::new(),
             map_or_sites: Vec::new(),
             is_none_sites: Vec::new(),
             closure_select_sites: Vec::new(),
@@ -2991,7 +3026,7 @@ impl<'a> Lowering<'a> {
                 // consumes the rvalue, so `.N` reads of the local can
                 // later emit a symmetric `FieldRead __pos_<N>` carrying
                 // the same owner (see `resolve_place`).
-                let positional_owner = self.positional_aggregate_owner(&rvalue);
+                let positional_owner = self.positional_aggregate_owner(&rvalue, &dest_ty);
                 let (op, result_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
                 // The destination local takes on the freshly-minted
                 // result Variable. Subsequent reads of the local
@@ -3727,10 +3762,27 @@ impl<'a> Lowering<'a> {
                         (owner_path, ctor_name, field_names)
                     }
                     None => {
-                        let leaf = aggregate_ctor_name(&kind);
                         // Synthetic placeholders for non-Adt aggregates
                         // (`Tuple`, `Array`, `Closure`) — they have no
-                        // user-defined class to resolve into.
+                        // user-defined class to resolve into.  A non-empty
+                        // tuple carries its per-shape `<…>` suffix (gate) so
+                        // its `__pos_N` attrs do not collide with other-shape
+                        // tuples on one global class; the suffix matches
+                        // `positional_aggregate_owner` (Site-A reads) and
+                        // `tyref_tuple_suffix` (Site-B reads).
+                        // The per-shape `<…>` suffix is rendered from the
+                        // destination place type, not the `AggregateKind` head:
+                        // Charon's `AggregateKind::Adt(Tuple, …)` carries no
+                        // element `types`, so keying off it would spell a bare
+                        // `Tuple` on the write while the `.N` projection reads
+                        // (which do see `place.ty`'s element types) spell the
+                        // suffixed owner — a write/read owner split.  `dest_ty`
+                        // is that same `place.ty`, so both sides agree.
+                        let leaf = format!(
+                            "{}{}",
+                            aggregate_ctor_name(&kind),
+                            tyref_tuple_suffix(dest_ty, self.llbc)
+                        );
                         let positional =
                             (0..arg_vars.len()).map(|i| format!("__pos_{i}")).collect();
                         (Vec::new(), leaf, positional)
@@ -4175,6 +4227,13 @@ impl<'a> Lowering<'a> {
                         }
                         // idx == 0: fall through to the base-collapse below.
                     } else {
+                        // Same spelling the construction-side FieldWrite
+                        // chain records for builtin tuple aggregates
+                        // (`aggregate_ctor_name` id atom + the per-shape
+                        // `<…>` suffix rendered from this tuple's element
+                        // types), so read and write attrs key under one
+                        // owner.
+                        let owner = format!("Tuple{}", tyref_tuple_suffix(&inner.ty, self.llbc));
                         let base = self.resolve_place(mir_bb, *inner)?;
                         let bb_id = self.block_id[mir_bb];
                         let ty = tyref_to_value_type(&place_ty, self.llbc);
@@ -4185,15 +4244,7 @@ impl<'a> Lowering<'a> {
                             result: Some(res.clone()),
                             kind: OpKind::FieldRead {
                                 base,
-                                field: FieldDescriptor::new(
-                                    format!("__pos_{idx}"),
-                                    // Same spelling the construction-side
-                                    // FieldWrite chain records for builtin
-                                    // tuple aggregates (`aggregate_ctor_name`
-                                    // id atom), so read and write attrs key
-                                    // under one owner.
-                                    Some("Tuple".to_string()),
-                                ),
+                                field: FieldDescriptor::new(format!("__pos_{idx}"), Some(owner)),
                                 ty,
                                 pure: false,
                             },
@@ -4337,10 +4388,18 @@ impl<'a> Lowering<'a> {
     /// Returns `None` for Adt aggregates: their `.field` reads already
     /// take the typed [`Self::resolve_adt_field`] path and never reach
     /// the collapse fallback.
-    fn positional_aggregate_owner(&self, rvalue: &Rvalue) -> Option<String> {
+    fn positional_aggregate_owner(&self, rvalue: &Rvalue, dest_ty: &TyRef) -> Option<String> {
         match rvalue {
             Rvalue::Aggregate(kind, _) if self.resolve_aggregate_adt(kind).is_none() => {
-                Some(aggregate_ctor_name(kind))
+                // Suffix from `dest_ty` (the tuple `place.ty`, element types
+                // present), matching the construction-side `build_rvalue`
+                // owner and the Site-B projection read; the `AggregateKind`
+                // head carries no element `types`.
+                Some(format!(
+                    "{}{}",
+                    aggregate_ctor_name(kind),
+                    tyref_tuple_suffix(dest_ty, self.llbc)
+                ))
             }
             _ => None,
         }
@@ -5966,6 +6025,72 @@ impl<'a> Lowering<'a> {
             op_kind
         };
 
+        // Retarget a foreign BigInt binary-operator call (`<BigInt as
+        // BitAnd>::bitand`, …) to its `#[dont_look_inside]` `jit_bigint_*`
+        // residual.  The malachite operator body is Opaque, and both operands
+        // and the result are the classdef-less `*mut BigInt` GcRef the front
+        // models a `BigInt` as, so the i64-ABI residual is a faithful pointer
+        // pass.  Guarded on both operands resolving to the opaque `BigInt` ADT
+        // so a same-named operator on another type is never mis-retargeted; a
+        // pure target swap (args + result var unchanged), fail-safe by
+        // construction (a non-BigInt / unlisted operator leaves the residual
+        // `<Impl>` call the census Skips).
+        let op_kind = if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|t| tyref_is_opaque_bigint(t, self.llbc))
+            && second_arg_ty
+                .as_ref()
+                .is_some_and(|t| tyref_is_opaque_bigint(t, self.llbc))
+            && let Some(residual) = crate::front::bigint_binop::bigint_binop_residual_path(segments)
+        {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments: residual },
+                args: args.clone(),
+                result_ty: ValueType::Ref(None),
+            }
+        } else {
+            op_kind
+        };
+
+        // Retarget a foreign BigInt shift call (`<BigInt as Shl<usize>>::shl`,
+        // …) to its `jit_bigint_{shl,shr}` residual.  Split from the binary
+        // retarget above because the shift amount is a machine integer, not a
+        // `BigInt`: the guard requires the first operand to be the opaque
+        // `BigInt` ADT and the second to be an integer, so the residual reads
+        // `b` as the shift count rather than as a `*mut BigInt` pointer.  Same
+        // pure-target-swap, fail-safe contract.
+        let op_kind = if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|t| tyref_is_opaque_bigint(t, self.llbc))
+            && second_arg_ty.as_ref().is_some_and(|t| {
+                matches!(
+                    tyref_to_value_type(t, self.llbc),
+                    ValueType::Int | ValueType::Unsigned
+                )
+            })
+            && let Some(residual) = crate::front::bigint_binop::bigint_shift_residual_path(segments)
+        {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments: residual },
+                args: args.clone(),
+                result_ty: ValueType::Ref(None),
+            }
+        } else {
+            op_kind
+        };
+
         // Allocate the result Variable and bind it to the destination
         // local before pushing the op, so subsequent reads see the
         // freshly-minted Variable.
@@ -6051,17 +6176,35 @@ impl<'a> Lowering<'a> {
         {
             self.bool_then_sites.push(site);
         }
-        // Capture `Option::unwrap_or(opt, default)` sites for the
-        // discriminant value-select `front::option_unwrap_or` synthesizes.
-        // `unwrap_or`'s body is Opaque (foreign `core`), but its receiver is
-        // the `Option` ADT, so `first_is_self` routes it to a
-        // `CallTarget::Method` (receiver in `args[0]`, default in `args[1]`),
-        // NOT a raw FunctionPath.  Resolving the `Option` field owners needs
-        // the receiver's `Option` type (`first_arg_ty`), in hand here;
-        // `recognize_unwrap_or_site` also confirms the receiver is an `Option`
-        // (not `Result`, whose variant tags differ).  A resolution miss
-        // leaves the residual call — an unregistered callee the rtyper census
-        // Skips, so no graph regresses.
+        // Capture `bigint::BigInt::div_rem()` sites for the modeled
+        // `(quotient, remainder)` tuple producer `front::bigint_div_rem`
+        // synthesizes.  Opaque foreign 2-arg FunctionPath (numerator,
+        // denominator); the `(BigInt, BigInt)` tuple owner is the synthetic
+        // `"Tuple"` constant, so only the result var is recorded.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && fmt_path_ends_with(segments, &["bigint", "BigInt", "div_rem"])
+        {
+            self.bigint_div_rem_sites
+                .push(crate::front::bigint_div_rem::BigIntDivRemSite {
+                    result_var: result_var.clone(),
+                });
+        }
+        // Capture `Option::unwrap_or(opt, default)` /
+        // `Result::unwrap_or(res, default)` sites for the discriminant
+        // value-select `front::option_unwrap_or` synthesizes.  `unwrap_or`'s
+        // body is Opaque (foreign `core`), but its receiver is the enum ADT, so
+        // `first_is_self` routes it to a `CallTarget::Method` (receiver in
+        // `args[0]`, default in `args[1]`), NOT a raw FunctionPath.  Resolving
+        // the enum field owners needs the receiver's type (`first_arg_ty`), in
+        // hand here; `recognize_unwrap_or_site` classifies `Option` vs `Result`
+        // (their `Some`=1 / `Ok`=0 payload tags differ) and records the
+        // polarity.  A resolution miss leaves the residual call — an
+        // unregistered callee the rtyper census Skips, so no graph regresses.
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,
@@ -6072,6 +6215,24 @@ impl<'a> Lowering<'a> {
             && let Some(site) = self.recognize_unwrap_or_site(first_arg_ty.as_ref(), &result_var)
         {
             self.unwrap_or_sites.push(site);
+        }
+        // Capture `Option::unwrap(opt)` sites for the discriminant guard
+        // `front::option_unwrap` synthesizes.  Like `unwrap_or`, `unwrap`'s body
+        // is Opaque (foreign `core`) and its receiver is the `Option` ADT, so
+        // `first_is_self` routes it to a `CallTarget::Method` (receiver in
+        // `args[0]`, the sole argument).  `recognize_unwrap_site` confirms the
+        // receiver is an `Option` (not `Result`).  A resolution miss leaves the
+        // residual call — an unregistered callee the rtyper census Skips.
+        if let OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 1
+            && name == "unwrap"
+            && let Some(site) = self.recognize_unwrap_site(first_arg_ty.as_ref(), &result_var)
+        {
+            self.unwrap_sites.push(site);
         }
         // Capture `Option::map_or(opt, default, closure)` sites for the
         // discriminant closure-select `front::option_map_or` synthesizes.
@@ -7509,33 +7670,51 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// Resolve a recognized `Option::unwrap_or(opt, default)` call into an
-    /// [`crate::front::option_unwrap_or::UnwrapOrSite`] — the `Option` enum
-    /// root + `Some` variant owners and the payload type the value-select
-    /// post-pass needs.  `None` (leaving the residual call) when the receiver
-    /// type is not a resolvable `Option`.
+    /// Resolve a recognized `Option::unwrap_or(opt, default)` /
+    /// `Result::unwrap_or(res, default)` call into an
+    /// [`crate::front::option_unwrap_or::UnwrapOrSite`] — the enum root +
+    /// payload-variant owners and the payload type the value-select post-pass
+    /// needs.  `None` (leaving the residual call) when the receiver type is not
+    /// a resolvable `Option` or `Result`.  The payload variant differs by enum:
+    /// `Option::Some = 1` (`None = 0`), `Result::Ok = 0` (`Err = 1`) — recorded
+    /// in `payload_on_disc_true` so the post-pass branches to the right arm.
     fn recognize_unwrap_or_site(
         &self,
         recv_ty: Option<&TyRef>,
         result_var: &Variable,
     ) -> Option<crate::front::option_unwrap_or::UnwrapOrSite> {
-        // Receiver `Option`: enum root + `Some` variant owners + payload.
-        // Guard on `Option` specifically — `Result::unwrap_or` shares the
-        // method name but its `Ok`/`Err` tags do not match `Some`=1/`None`=0.
         let recv_ty = recv_ty?;
-        if !crate::front::result_exc::tyref_is_option(recv_ty, self.llbc) {
-            return None;
-        }
+        // The payload variant discriminant (`Some`=1 / `Ok`=0) both classifies
+        // the receiver enum and picks the value-select polarity.  `Result<_,
+        // PyError>` is excluded — that instantiation is the exception-transform's
+        // domain (`front::result_exc` rewrites its `Ok`/`Err` into exception
+        // edges, not a switchable discriminant value), so its `unwrap_or` is
+        // left residual (Skip) rather than risk a value-select on an
+        // exception-form value.  Only `Option` and plain-error `Result` (e.g.
+        // `io::Result`) select here.
+        let (payload_disc, payload_on_disc_true) =
+            if crate::front::result_exc::tyref_is_option(recv_ty, self.llbc) {
+                (1, true)
+            } else if crate::front::result_exc::tyref_is_result(recv_ty, self.llbc)
+                && !crate::front::result_exc::tyref_is_result_of_pyerror(recv_ty, self.llbc)
+            {
+                (0, false)
+            } else {
+                return None;
+            };
         let def_id = self.tyref_adt_def_id(recv_ty)?;
         let td = self.llbc.type_by_id(def_id)?;
-        let option_owner = td.item_meta.name_path();
-        let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
+        let enum_owner = td.item_meta.name_path();
+        let payload_owner = Self::tagged_pair_payload_owner(td, &enum_owner, payload_disc)?;
+        // The payload `T` is the first type arg for both `Option<T>` and
+        // `Result<T, E>`.
         let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
         Some(crate::front::option_unwrap_or::UnwrapOrSite {
             result_var: result_var.clone(),
-            option_owner,
-            some_owner,
+            enum_owner,
+            payload_owner,
             payload_ty,
+            payload_on_disc_true,
         })
     }
 
@@ -7561,6 +7740,35 @@ impl<'a> Lowering<'a> {
             result_var: result_var.clone(),
             option_owner,
             is_some,
+        })
+    }
+
+    /// Resolve a recognized `Option::unwrap(opt)` call into an
+    /// [`crate::front::option_unwrap::UnwrapSite`] — the `Option` enum root +
+    /// `Some` variant owners and the payload type the discriminant-guard
+    /// post-pass needs.  `None` (leaving the residual call) when the receiver
+    /// type is not a resolvable `Option`.  Guards on `Option` specifically —
+    /// `Result::unwrap` shares the method name but its `Ok`/`Err` tags do not
+    /// match `Some`=1/`None`=0.
+    fn recognize_unwrap_site(
+        &self,
+        recv_ty: Option<&TyRef>,
+        result_var: &Variable,
+    ) -> Option<crate::front::option_unwrap::UnwrapSite> {
+        let recv_ty = recv_ty?;
+        if !crate::front::result_exc::tyref_is_option(recv_ty, self.llbc) {
+            return None;
+        }
+        let def_id = self.tyref_adt_def_id(recv_ty)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        let option_owner = td.item_meta.name_path();
+        let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
+        let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
+        Some(crate::front::option_unwrap::UnwrapSite {
+            result_var: result_var.clone(),
+            option_owner,
+            some_owner,
+            payload_ty,
         })
     }
 
@@ -10289,6 +10497,22 @@ fn dont_look_inside_return_token(output: &TyRef, llbc: &Llbc) -> Option<String> 
     Some(token.to_string())
 }
 
+/// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to the
+/// foreign opaque `malachite_bigint::bigint::BigInt` ADT.  Guards the
+/// BigInt binary-operator retarget (`front::bigint_binop`) so a same-named
+/// operator (`BitAnd`/`Sub`/`Mul`/…) on any other type is never redirected to
+/// a `jit_bigint_*` residual that would misread its non-BigInt pointer.
+fn tyref_is_opaque_bigint(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+        .and_then(adt_node_def_id)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| {
+            matches!(td.kind, TypeDeclKind::Opaque)
+                && td.item_meta.name_path().ends_with("bigint::BigInt")
+        })
+}
+
 /// Classify a struct field [`TyRef`] into the RPython `lltype` register
 /// class the annotator pre-fills into `FORCE_ATTRIBUTES_INTO_CLASSES`.
 ///
@@ -11400,6 +11624,66 @@ fn render_adt_type_args(
                 .filter(|s| s != "Global" && s != "RandomState")
                 .collect()
         })
+        .unwrap_or_default()
+}
+
+/// A non-empty synthetic tuple aggregate's classdef carries a `<T0,T1,…>`
+/// suffix rendered from its element types, so `(BigInt,BigInt)` and `(f64,f64)`
+/// get distinct classdefs instead of colliding on the shared `__pos_N`
+/// attributes of one global `Tuple` class — the `generalize_attr` UnionError
+/// that walls every graph mixing tuple element categories (`bigint_truediv`,
+/// …) off the two-phase rtyper.  On by default; `PYRE_TUPLE_PER_SHAPE_CLASSDEF=0`
+/// is the kill switch that restores the single global `Tuple` classdef.
+fn tuple_per_shape_enabled() -> bool {
+    !matches!(
+        std::env::var("PYRE_TUPLE_PER_SHAPE_CLASSDEF").as_deref(),
+        Ok("0") | Ok("false")
+    )
+}
+
+/// The per-shape `<…>` suffix for a synthetic tuple whose Charon ADT
+/// descriptor is `adt` (`{"id":"Tuple","generics":{"types":[…]}}`), or `""`
+/// when the gate is off, `adt` is not a `"Tuple"`, or the tuple is the unit
+/// `()` (empty type list — kept bare `"Tuple"` so the unit-value special-cases
+/// in `jtransform` / `unit_variant_fold` still match).  Rendered via the same
+/// [`render_adt_type_args`] both the construction and the projection derive
+/// from the tuple's `place.ty` node (NOT the element-type-less `AggregateKind`
+/// head), so the `__pos_N` read and write owners agree.
+fn tuple_shape_suffix(adt: &serde_json::Map<String, serde_json::Value>, llbc: &Llbc) -> String {
+    if !tuple_per_shape_enabled() {
+        return String::new();
+    }
+    if adt.get("id").and_then(serde_json::Value::as_str) != Some("Tuple") {
+        return String::new();
+    }
+    let args = render_adt_type_args(adt, llbc, 0);
+    if args.is_empty() {
+        return String::new();
+    }
+    format!("<{}>", args.join(","))
+}
+
+/// The per-shape tuple suffix for a place/operand [`TyRef`] — used by BOTH the
+/// construction side (the aggregate's destination `place.ty`) and the
+/// projection side (the read place's `.ty`), where the tuple type is `ty`'s
+/// `{"Adt": {"id":"Tuple", …}}` node.  Keying both off the same `place.ty`
+/// source (rather than the element-type-less `AggregateKind` head) makes the
+/// `__pos_N` write and read owners agree.  `""` for non-tuple / gate-off /
+/// unit; see [`tuple_shape_suffix`].
+fn tyref_tuple_suffix(ty: &TyRef, llbc: &Llbc) -> String {
+    let value = match ty {
+        TyRef::Inline { value: (_, v) } => v,
+        TyRef::Other(v) => v,
+        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
+            Some(v) => v,
+            None => return String::new(),
+        },
+    };
+    value
+        .as_object()
+        .and_then(|m| m.get("Adt"))
+        .and_then(serde_json::Value::as_object)
+        .map(|adt| tuple_shape_suffix(adt, llbc))
         .unwrap_or_default()
 }
 

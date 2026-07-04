@@ -67,6 +67,8 @@
 //! the only extraction gap is std `thread_local!` accessor stubs,
 //! treated as opaque ops.
 
+pub(crate) mod bigint_binop;
+pub(crate) mod bigint_div_rem;
 pub(crate) mod bool_then;
 pub(crate) mod checked_arith;
 pub(crate) mod iter_next;
@@ -78,6 +80,7 @@ pub(crate) mod option_closure_select;
 pub(crate) mod option_is_none;
 pub(crate) mod option_map_or;
 pub(crate) mod option_try;
+pub(crate) mod option_unwrap;
 pub(crate) mod option_unwrap_or;
 pub(crate) mod result_exc;
 pub mod semantic;
