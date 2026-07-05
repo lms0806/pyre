@@ -33,22 +33,25 @@ fn make_guard(opcode: OpCode, args: &[OpRef], fail_args: &[OpRef]) -> Op {
     op
 }
 
-#[test]
-fn test_empty_trace() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
-    let ops = vec![{
-        let op = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]);
-        op.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
-        op
-    }];
-    let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
+/// Calls `codegen::build_wasm_module` with the fixed test defaults (no
+/// classptr map, no allocator/nursery, zero chaining slots, CA off) and
+/// returns just the emitted bytes and guard exits — the only outputs the
+/// tests assert on. `vtable_offset` and `gc_info` stay explicit because a
+/// few tests vary them.
+fn build_module(
+    inputargs: &[InputArg],
+    ops: &[Op],
+    constants: &majit_ir::VecMap<u32, i64>,
+    vtable_offset: Option<usize>,
+    gc_info: &codegen::GuardGcTypeInfo,
+) -> (Vec<u8>, Vec<codegen::GuardExit>) {
     let (bytes, guards, _, _, _) = codegen::build_wasm_module(
-        &inputargs,
-        &ops,
-        &constants,
-        Some(0),
+        inputargs,
+        ops,
+        constants,
+        vtable_offset,
         &HashMap::new(),
-        &codegen::GuardGcTypeInfo::default(),
+        gc_info,
         0,
         0,
         0,
@@ -59,6 +62,35 @@ fn test_empty_trace() {
         codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
+    (bytes, guards)
+}
+
+/// `build_module` with the most common variant: entry vtable_offset `Some(0)`
+/// and a default (disabled) `GuardGcTypeInfo`.
+fn build_module_default(
+    inputargs: &[InputArg],
+    ops: &[Op],
+    constants: &majit_ir::VecMap<u32, i64>,
+) -> (Vec<u8>, Vec<codegen::GuardExit>) {
+    build_module(
+        inputargs,
+        ops,
+        constants,
+        Some(0),
+        &codegen::GuardGcTypeInfo::default(),
+    )
+}
+
+#[test]
+fn test_empty_trace() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let ops = vec![{
+        let op = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]);
+        op.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
+        op
+    }];
+    let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
     assert!(guards[0].is_finish);
@@ -105,23 +137,7 @@ fn test_int_add_loop() {
         Op::new(OpCode::Jump, &[rb(OpRef::int_op(3)), rb(OpRef::int_op(2))]),
     ];
 
-    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
-        &inputargs,
-        &ops,
-        &constants,
-        Some(0),
-        &HashMap::new(),
-        &codegen::GuardGcTypeInfo::default(),
-        0,
-        0,
-        0,
-        None, // nursery
-        0,    // fail_index_base
-        0,    // external_jump_slot
-        0,    // external_jump_key
-        codegen::CaParams::default(),
-    )
-    .expect("wasm codegen should succeed");
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1); // one guard
     assert!(!guards[0].is_finish);
@@ -170,23 +186,7 @@ fn test_float_ops() {
     ];
 
     let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
-    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
-        &inputargs,
-        &ops,
-        &constants,
-        Some(0),
-        &HashMap::new(),
-        &codegen::GuardGcTypeInfo::default(),
-        0,
-        0,
-        0,
-        None, // nursery
-        0,    // fail_index_base
-        0,    // external_jump_slot
-        0,    // external_jump_key
-        codegen::CaParams::default(),
-    )
-    .expect("wasm codegen should succeed");
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 }
@@ -211,23 +211,7 @@ fn test_call_generates_import() {
         },
     ];
 
-    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
-        &inputargs,
-        &ops,
-        &constants,
-        Some(0),
-        &HashMap::new(),
-        &codegen::GuardGcTypeInfo::default(),
-        0,
-        0,
-        0,
-        None, // nursery
-        0,    // fail_index_base
-        0,    // external_jump_slot
-        0,    // external_jump_key
-        codegen::CaParams::default(),
-    )
-    .expect("wasm codegen should succeed");
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 
@@ -309,23 +293,7 @@ fn test_guard_types() {
     ];
 
     let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
-    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
-        &inputargs,
-        &ops,
-        &constants,
-        Some(0),
-        &HashMap::new(),
-        &codegen::GuardGcTypeInfo::default(),
-        0,
-        0,
-        0,
-        None, // nursery
-        0,    // fail_index_base
-        0,    // external_jump_slot
-        0,    // external_jump_key
-        codegen::CaParams::default(),
-    )
-    .expect("wasm codegen should succeed");
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 7);
 }
@@ -357,23 +325,7 @@ fn test_exception_guards() {
     ];
 
     let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
-    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
-        &inputargs,
-        &ops,
-        &constants,
-        Some(0),
-        &HashMap::new(),
-        &codegen::GuardGcTypeInfo::default(),
-        0,
-        0,
-        0,
-        None, // nursery
-        0,    // fail_index_base
-        0,    // external_jump_slot
-        0,    // external_jump_key
-        codegen::CaParams::default(),
-    )
-    .expect("wasm codegen should succeed");
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 2);
 }
@@ -401,23 +353,7 @@ fn test_guard_gc_type_uses_immediate_typeid() {
         Op::new(OpCode::Jump, &[rb(OpRef::input_arg_int(0))]),
     ];
 
-    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
-        &inputargs,
-        &ops,
-        &constants,
-        Some(0),
-        &HashMap::new(),
-        &codegen::GuardGcTypeInfo::default(),
-        0,
-        0,
-        0,
-        None, // nursery
-        0,    // fail_index_base
-        0,    // external_jump_slot
-        0,    // external_jump_key
-        codegen::CaParams::default(),
-    )
-    .expect("wasm codegen should succeed");
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 }
@@ -467,23 +403,13 @@ fn test_guard_is_object_lowers_to_typeinfo_test() {
     ];
 
     let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
-    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
+    let (bytes, guards) = build_module(
         &inputargs,
         &ops,
         &constants,
         Some(0),
-        &HashMap::new(),
         &enabled_guard_gc_type_info(),
-        0,
-        0,
-        0,
-        None, // nursery
-        0,    // fail_index_base
-        0,    // external_jump_slot
-        0,    // external_jump_key
-        codegen::CaParams::default(),
-    )
-    .expect("wasm codegen should succeed when supports_guard_gc_type=true");
+    );
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 }
@@ -521,44 +447,12 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
     info.subclass_ranges.insert(0xCAFE, (10, 20));
 
     // gcremovetypeptr branch: vtable_offset = None.
-    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
-        &inputargs,
-        &ops,
-        &constants,
-        None,
-        &HashMap::new(),
-        &info,
-        0,
-        0,
-        0,
-        None, // nursery
-        0,    // fail_index_base
-        0,    // external_jump_slot
-        0,    // external_jump_key
-        codegen::CaParams::default(),
-    )
-    .expect("wasm codegen should succeed when supports_guard_gc_type=true");
+    let (bytes, guards) = build_module(&inputargs, &ops, &constants, None, &info);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 
     // vtable-load branch: vtable_offset = Some(...).
-    let (bytes2, _, _, _, _) = codegen::build_wasm_module(
-        &inputargs,
-        &ops,
-        &constants,
-        Some(8),
-        &HashMap::new(),
-        &info,
-        0,
-        0,
-        0,
-        None, // nursery
-        0,    // fail_index_base
-        0,    // external_jump_slot
-        0,    // external_jump_key
-        codegen::CaParams::default(),
-    )
-    .expect("wasm codegen should succeed when vtable_offset is set");
+    let (bytes2, _) = build_module(&inputargs, &ops, &constants, Some(8), &info);
     validate_wasm(&bytes2);
 }
 
@@ -612,23 +506,7 @@ fn test_sameas_and_conversions() {
     ];
 
     let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
-    let (bytes, _, _, _, _) = codegen::build_wasm_module(
-        &inputargs,
-        &ops,
-        &constants,
-        Some(0),
-        &HashMap::new(),
-        &codegen::GuardGcTypeInfo::default(),
-        0,
-        0,
-        0,
-        None, // nursery
-        0,    // fail_index_base
-        0,    // external_jump_slot
-        0,    // external_jump_key
-        codegen::CaParams::default(),
-    )
-    .expect("wasm codegen should succeed");
+    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
     validate_wasm(&bytes);
 }
 
@@ -668,23 +546,7 @@ fn test_overflow_ops() {
     ];
 
     let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
-    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
-        &inputargs,
-        &ops,
-        &constants,
-        Some(0),
-        &HashMap::new(),
-        &codegen::GuardGcTypeInfo::default(),
-        0,
-        0,
-        0,
-        None, // nursery
-        0,    // fail_index_base
-        0,    // external_jump_slot
-        0,    // external_jump_key
-        codegen::CaParams::default(),
-    )
-    .expect("wasm codegen should succeed");
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 3); // 2 GuardNoOverflow + 1 Finish
 }
@@ -728,23 +590,7 @@ fn test_single_label_peeled_loop_validates() {
     // Must be classified as single-label peeled (exercises the dispatch wrapper).
     assert!(codegen::is_single_label_peeled(&ops));
 
-    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
-        &inputargs,
-        &ops,
-        &constants,
-        Some(0),
-        &HashMap::new(),
-        &codegen::GuardGcTypeInfo::default(),
-        0,
-        0,
-        0,
-        None, // nursery
-        0,    // fail_index_base
-        0,    // external_jump_slot
-        0,    // external_jump_key
-        codegen::CaParams::default(),
-    )
-    .expect("wasm codegen should succeed");
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
     assert!(!guards[0].is_finish);
@@ -795,23 +641,7 @@ fn test_multi_label_peeled_resumes_at_last_label_validates() {
     assert!(!codegen::is_single_label_peeled(&ops));
     assert!(codegen::is_resumable_peeled(&ops));
 
-    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
-        &inputargs,
-        &ops,
-        &constants,
-        Some(0),
-        &HashMap::new(),
-        &codegen::GuardGcTypeInfo::default(),
-        0,
-        0,
-        0,
-        None, // nursery
-        0,    // fail_index_base
-        0,    // external_jump_slot
-        0,    // external_jump_key
-        codegen::CaParams::default(),
-    )
-    .expect("wasm codegen should succeed");
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
     assert!(!guards[0].is_finish);
