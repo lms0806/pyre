@@ -2107,7 +2107,11 @@ impl IterOpcodeHandler for PyFrame {
     /// PyPy: space.next() → StopIteration means exhausted.
     fn iter_next(&mut self, iter: Self::Value) -> Result<Option<Self::Value>, PyError> {
         // baseobjspace::next walks the iterator protocol and raises
-        // StopIteration for exhaustion.
+        // StopIteration for exhaustion.  All iterator kinds dispatch uniformly
+        // through space.next here (pyopcode.py:1289 `w_nextitem =
+        // self.space.next(w_iterator)`); the JIT specialises range/long-range/
+        // seq by inlining this dispatch during tracing (trace_opcode.rs
+        // iter_next), not by branching the interpreter opcode implementation.
         match crate::baseobjspace::next(iter) {
             Ok(result) => Ok(Some(result)),
             Err(e) if e.kind == PyErrorKind::StopIteration => Ok(None),

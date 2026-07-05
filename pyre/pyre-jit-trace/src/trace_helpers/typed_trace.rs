@@ -1993,3 +1993,67 @@ unsafe fn detect_list_setitem_strategy(
         None
     }
 }
+
+/// Trace range iterator next: read fields → step sign guard → continues guard
+/// → advance current → setfield.
+///
+/// RPython jitcode for range.__next__:
+///   getfield(current) → getfield(remaining) → getfield(step) →
+///   remaining > 0 guard → int_add(current,step) →
+///   setfield(current, next) → setfield(remaining, remaining - 1)
+///
+/// Returns (current_opref, concrete_current) or None if should fall back.
+#[inline]
+pub fn generated_iter_next_value(
+    frame: &mut crate::state::MIFrame,
+    ctx: &mut majit_metainterp::TraceCtx,
+    iter: majit_ir::OpRef,
+    concrete_continues: bool,
+    concrete_step: i64,
+    concrete_current: i64,
+) -> Option<(majit_ir::OpRef, i64)> {
+    use majit_ir::OpCode;
+
+    frame.guard_range_iter(ctx, iter);
+
+    let current =
+        crate::state::opimpl_getfield_gc_i(ctx, iter, crate::descr::range_iter_current_descr());
+    let remaining =
+        crate::state::opimpl_getfield_gc_i(ctx, iter, crate::descr::range_iter_remaining_descr());
+    let step = crate::state::opimpl_getfield_gc_i(ctx, iter, crate::descr::range_iter_step_descr());
+    let zero = ctx.const_int(0);
+
+    // pyjitpl.py:1877 opimpl_goto_if_not: boolean guards.
+    let continues = ctx.record_op(OpCode::IntGt, &[remaining, zero]);
+    if concrete_continues {
+        frame.generate_guard(ctx, OpCode::GuardTrue, &[continues]);
+    } else {
+        frame.generate_guard(ctx, OpCode::GuardFalse, &[continues]);
+    }
+
+    if !concrete_continues {
+        return Some((zero, 0));
+    }
+
+    // The cursor advance mirrors `w_range_iter_next`'s `current + step` (a
+    // plain wrapping add, not `ovfcheck`) — RPython `W_IntRangeIterator.next`
+    // uses `int_add` for the cursor write too, so emit `IntAdd` rather than
+    // `int_add_ovf`/`guard_no_overflow`.
+    let next_current = ctx.record_op(OpCode::IntAdd, &[current, step]);
+    let ri_descr = crate::descr::range_iter_current_descr();
+    let ri_descr_idx = ri_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[iter, next_current], ri_descr);
+    let one = ctx.const_int(1);
+    let next_remaining = ctx.record_op(OpCode::IntSub, &[remaining, one]);
+    let remaining_descr = crate::descr::range_iter_remaining_descr();
+    let remaining_descr_idx = remaining_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[iter, next_remaining], remaining_descr);
+    let next_current_value = majit_ir::Value::Int(concrete_current.wrapping_add(concrete_step));
+    // Stamp the `IntAdd` result so downstream `box_value` consumers
+    // see the runtime concrete (matches RPython Box propagation
+    // through arithmetic ops).
+    ctx.set_opref_concrete(next_current, next_current_value);
+    ctx.heapcache_setfield_cached(iter, ri_descr_idx, next_current);
+    ctx.heapcache_setfield_cached(iter, remaining_descr_idx, next_remaining);
+    Some((current, concrete_current))
+}
