@@ -259,9 +259,34 @@ pub(crate) struct DictDefInner {
 }
 
 /// RPython `class DictDef` (dictdef.py:75-117).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DictDef {
     pub(crate) inner: Rc<DictDefInner>,
+}
+
+impl std::fmt::Debug for DictDef {
+    /// Parity with `DictDef.__repr__` (dictdef.py:116):
+    /// `'<{%r: %r}>'`, recursion-guarded (shared [`ReprGuard`]) so a
+    /// self-referential key/value type elides instead of overflowing.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let id = Rc::as_ptr(&self.inner) as usize;
+        let Some(_guard) = super::repr_guard::ReprGuard::enter(id) else {
+            return f.write_str("<{...}>");
+        };
+        let Ok(k) = self.inner.dictkey.try_borrow() else {
+            return f.write_str("<{...}>");
+        };
+        let Ok(key) = k.try_borrow() else {
+            return f.write_str("<{...}>");
+        };
+        let Ok(v) = self.inner.dictvalue.try_borrow() else {
+            return f.write_str("<{...}>");
+        };
+        let Ok(val) = v.try_borrow() else {
+            return f.write_str("<{...}>");
+        };
+        write!(f, "<{{{:?}: {:?}}}>", key.s_value, val.s_value)
+    }
 }
 
 impl DictDef {

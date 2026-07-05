@@ -35,7 +35,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
+use std::fmt;
 use std::rc::{Rc, Weak};
+
+use super::repr_guard::ReprGuard;
 
 use super::bookkeeper::{Bookkeeper, PositionKey};
 use super::model::{AnnotatorError, SomeList, SomeValue, UnionError};
@@ -512,9 +515,36 @@ pub(crate) struct ListDefInner {
 }
 
 /// RPython `class ListDef` (listdef.py:120-204).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ListDef {
     pub(crate) inner: Rc<ListDefInner>,
+}
+
+impl fmt::Debug for ListDef {
+    /// Parity with `ListDef.__repr__` (listdef.py:175):
+    /// `'<[%r]%s%s%s%s>'`, recursion-guarded so a self-referential
+    /// element type elides instead of overflowing the stack.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let id = Rc::as_ptr(&self.inner) as usize;
+        let Some(_guard) = ReprGuard::enter(id) else {
+            return f.write_str("<[...]>");
+        };
+        let Ok(li) = self.inner.listitem.try_borrow() else {
+            return f.write_str("<[...]>");
+        };
+        let Ok(item) = li.try_borrow() else {
+            return f.write_str("<[...]>");
+        };
+        write!(
+            f,
+            "<[{:?}]{}{}{}{}>",
+            item.s_value,
+            if item.mutated { "m" } else { "" },
+            if item.resized { "r" } else { "" },
+            if item.immutable { "I" } else { "" },
+            if item.must_not_resize { "!R" } else { "" },
+        )
+    }
 }
 
 impl ListDef {
@@ -598,13 +628,13 @@ impl ListDef {
     ///
     /// Records a read location for eventual `notify_update()` reflow,
     /// then returns the current element annotation. `position_key` is
-    /// `Option` — upstream's `bookkeeper.position_key` is `None`
-    /// outside of a reflow frame, and stashing that `None` in
-    /// `listitem.read_locations` is legal (Python dict keys accept
-    /// `None`). The Rust port's `HashSet<PositionKey>` can only hold
-    /// `Some` values, so `None` is dropped from the read-locations set
-    /// — the subsequent `s_value.clone()` return still matches
-    /// upstream behaviour.
+    /// `Option` because some callers (list builtins) have no reflow
+    /// position and pass `None`. Dropping that `None` is faithful, not a
+    /// divergence: `read_locations` is consumed by `reflowfromposition`
+    /// (annrpython.py:338-340), which unpacks `graph, block, index =
+    /// position_key` — a `None` member would crash the reflow loop, so
+    /// upstream's set only ever holds real positions. The Rust port's
+    /// `HashSet<PositionKey>` encodes that invariant in the type.
     pub(crate) fn read_item(&self, position_key: Option<PositionKey>) -> SomeValue {
         let li = self.inner.listitem.borrow().clone();
         let mut li_mut = li.borrow_mut();
@@ -791,6 +821,21 @@ mod tests {
 
     fn bk() -> Rc<Bookkeeper> {
         Rc::new(Bookkeeper::new())
+    }
+
+    #[test]
+    fn debug_of_self_referential_list_terminates() {
+        use super::super::model::SomeList;
+        // A list whose element type is itself (RPython `l = []; l.append(l)`)
+        // is a legal, self-referential annotation. Formatting it must break
+        // the cycle instead of recursing forever, mirroring the reprdict
+        // recursion guard in `SomeObject.__repr__` (model.py:68).
+        let ld = ListDef::new(None, SomeValue::Impossible, false, false);
+        // Close the cycle: listitem.s_value := SomeList(ld).
+        ld.listitem_rc().borrow_mut().s_value = SomeValue::List(SomeList::new(ld.clone()));
+        // Must terminate (no stack overflow) and mark the elided cycle.
+        let rendered = format!("{:?}", SomeValue::List(SomeList::new(ld.clone())));
+        assert!(rendered.contains("..."), "cycle not elided: {rendered}");
     }
 
     #[test]

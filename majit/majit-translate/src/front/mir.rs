@@ -7129,6 +7129,18 @@ impl<'a> Lowering<'a> {
     /// length, read through the `len` op (`arraylen_gc`), not a user
     /// attribute.  Recognising the call retargets it to `__len` so the
     /// body is never entered, the same treatment `Vec::len` gets.
+    ///
+    /// The `len` op lowers through the resized list repr's `ll_length`,
+    /// `getfield(l, "length")` on `GcStruct("list", ("length", Signed),
+    /// ("items", Ptr(GcArray(item))))` (`rtyper/rlist.rs`), so a receiver
+    /// is only sound here if it is projected to a `SomeList` AND laid out
+    /// length-first like that GcStruct.  `FixedObjectArray {len, _items}`
+    /// qualifies (projected at `bookkeeper.rs` / `flowspace_adapter.rs`).
+    /// The sibling `IntArray` / `FloatArray` do NOT: their layout is
+    /// `{block: Ptr, len}` (items-pointer first, field named `len`), so
+    /// `getfield "length"` would read the block pointer — they are left as
+    /// residual `len()` reads (`self.len`) until they are reordered to the
+    /// RPython list layout and projected as lists.
     fn is_container_len(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
