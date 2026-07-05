@@ -1477,6 +1477,11 @@ fn full_body_walk_trace(
     // same outcome the reactive in-walk `abort_permanent` decline reaches,
     // minus the frame corruption.
     if loop_body_has_abort_permanent(w_code) {
+        // Tag the decline so `PYRE_FBW_DEBUG_ABORT` census attributes it to the
+        // up-front `abort_permanent` scan, not the trait retry fall-through
+        // (`Trait::DeclinedAbort`).  Without this the real declining class is
+        // invisible to the census.
+        crate::jitcode_dispatch::census_record("FullBodyWalk::LoopBodyAbortPermanent");
         fbw_decline(crate::driver::make_green_key(w_code, start_pc));
         return TraceAction::Abort;
     }
