@@ -186,6 +186,16 @@ pub struct LowererConfig {
     /// whose arg0 is the `base` lowers to `getarrayitem_gc_r` instead of a
     /// residual CALL_R.  Source: `JitInterpConfig.pool_arrays`.
     pub(super) pool_arrays: Vec<(String, Vec<String>)>,
+    /// Ref-kind struct field declarations.  Key = `"StructType::field"`,
+    /// value = `(struct_path, field_ident, pointee_path)`.  When the lowerer
+    /// encounters a field access and the `(struct, field)` pair matches, it
+    /// emits `getfield_gc_r` / `setfield_gc_r` (ref-kind) instead of `_gc_i`.
+    pub(super) ref_fields: HashMap<String, (syn::Path, Ident, syn::Path)>,
+    /// Return struct type for ref-returning calls.  Key = canonical func
+    /// path segments, value = struct type path.  When a `residual_ref` call
+    /// result is bound, the lowerer sets `Binding.struct_type` from this map
+    /// so subsequent `result.field` accesses resolve through `ref_fields`.
+    pub(super) call_returns: HashMap<Vec<String>, syn::Path>,
     /// Source: `JitInterpConfig.split_dispatch`.  When set, the dispatch lowerer
     /// routes pure forward-advancing green-pc arms through the per-arm
     /// sub-JitCode path with a pc-returning `inline_call_<types>_i` instead of
@@ -415,6 +425,7 @@ pub(super) fn call_policy_effect_slot(
         | K::ResidualVoidWrapped
         | K::ResidualInt
         | K::ResidualIntWrapped
+        | K::ResidualRef
         | K::ResidualRefWrapped
         | K::ResidualFloatWrapped => Some(CondCallEffectSlot::CanRaise),
 
@@ -517,7 +528,8 @@ pub(super) fn call_policy_result_kind(
         | K::InlineInt
         | K::InlinePipelineInt => Some(CallResultKind::Int),
 
-        K::ResidualRefWrapped
+        K::ResidualRef
+        | K::ResidualRefWrapped
         | K::ResidualRefCannotRaiseWrapped
         | K::MayForceRefWrapped
         | K::LoopInvariantRefWrapped
@@ -557,6 +569,7 @@ pub(super) fn call_policy_is_wrapped(kind: crate::jit_interp::CallPolicyKind) ->
             | K::ElidableIntWrapped
             | K::ElidableIntCannotRaiseWrapped
             | K::ElidableIntOrMemerrorWrapped
+            | K::ResidualRef
             | K::ResidualRefWrapped
             | K::ResidualRefCannotRaiseWrapped
             | K::MayForceRefWrapped
@@ -797,6 +810,8 @@ impl LowererConfig {
         env_type: &Ident,
         residual_writes: &[crate::jit_interp::ResidualWriteEntry],
         pool_arrays: &[crate::jit_interp::PoolArrayEntry],
+        ref_fields: &[crate::jit_interp::RefFieldEntry],
+        call_returns: &[(Path, Path)],
         split_dispatch: bool,
         switch_dispatch: bool,
     ) -> Self {
@@ -937,6 +952,28 @@ impl LowererConfig {
                 })
             })
             .collect();
+        // Build the ref_fields lookup: key = "StructLastSegment::field",
+        // value = (struct_path, field_ident, pointee_path).
+        let ref_fields_map: HashMap<String, (syn::Path, Ident, syn::Path)> = ref_fields
+            .iter()
+            .map(|entry| {
+                let struct_name = entry
+                    .struct_type
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                let key = format!("{}::{}", struct_name, entry.field);
+                (
+                    key,
+                    (
+                        entry.struct_type.clone(),
+                        entry.field.clone(),
+                        entry.pointee_type.clone(),
+                    ),
+                )
+            })
+            .collect();
         Self {
             io_shims,
             calls,
@@ -955,6 +992,11 @@ impl LowererConfig {
             state_type_name: state_type.to_string(),
             env_type_name: env_type.to_string(),
             residual_writes,
+            ref_fields: ref_fields_map,
+            call_returns: call_returns
+                .iter()
+                .map(|(func, ret_type)| (canonical_path_segments(func), ret_type.clone()))
+                .collect(),
             pool_arrays: pool_arrays
                 .iter()
                 .map(|entry| {
@@ -1047,6 +1089,11 @@ pub(super) struct Binding {
     pub(super) reg: u16,
     pub(super) kind: BindingKind,
     pub(super) depends_on_stack: bool,
+    /// When this binding is a Ref pointing to a known struct, tracks the
+    /// struct type so that subsequent field access (`binding.field`) can
+    /// resolve `offset_of!` and `ref_fields` without the `state.<ref>`
+    /// two-level pattern.
+    pub(super) struct_type: Option<syn::Path>,
 }
 
 /// Mirror of RPython `rpython/jit/codewriter/flatten.py:Register(kind, index)`.
@@ -1862,6 +1909,7 @@ mod tests {
             reg,
             kind,
             depends_on_stack: false,
+            struct_type: None,
         }
     }
 

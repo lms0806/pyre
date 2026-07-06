@@ -39,6 +39,11 @@ impl<'c> Lowerer<'c> {
         if let Some(binding) = self.lower_state_ref_field_getfield(expr) {
             return Some(binding);
         }
+        // Field read on a local ref binding with known struct type:
+        // `<binding>.<field>` → getfield_gc_i/getfield_gc_r.
+        if let Some(binding) = self.lower_ref_binding_getfield(expr) {
+            return Some(binding);
+        }
         if let Some(binding) = self.lower_state_array_read(expr) {
             return Some(binding);
         }
@@ -94,6 +99,7 @@ impl<'c> Lowerer<'c> {
                     reg,
                     kind: BindingKind::Int,
                     depends_on_stack: false,
+                    struct_type: None,
                 })
             }
             // Bool comparisons (`stackok == false`) ride the int channel:
@@ -112,6 +118,7 @@ impl<'c> Lowerer<'c> {
                     reg,
                     kind: BindingKind::Int,
                     depends_on_stack: false,
+                    struct_type: None,
                 })
             }
             Expr::Path(ExprPath { path, .. }) => {
@@ -246,6 +253,7 @@ impl<'c> Lowerer<'c> {
             reg: result_reg,
             kind: BindingKind::Ref,
             depends_on_stack,
+            struct_type: Some(struct_path.clone()),
         })
     }
 
@@ -653,6 +661,34 @@ impl<'c> Lowerer<'c> {
                             #call_stmt
                         },
                     );
+                }
+                // Non-wrapped ref-returning call (value position).
+                crate::jit_interp::CallPolicyKind::ResidualRef => {
+                    let typed_args = typed_call_arg_tokens(&arg_bindings);
+                    let reg = self.alloc_reg();
+                    let __arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
+                    self.emit_op(
+                        OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(reg)]),
+                        quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            let __typed_args = #typed_args;
+                            __builder.residual_call_ref_canonical_via_target(__fn_idx, __typed_args, #reg);
+                        },
+                    );
+                    // Check `call_returns` config for a declared return
+                    // struct type, enabling subsequent `result.field`
+                    // access to resolve through `ref_fields`.
+                    let func_segments = canonical_expr_segments(func);
+                    let struct_type = func_segments.and_then(|segs| {
+                        self.config.and_then(|c| c.call_returns.get(&segs).cloned())
+                    });
+                    return Some(Binding {
+                        reg,
+                        kind: BindingKind::Ref,
+                        depends_on_stack: false,
+                        struct_type,
+                    });
                 }
                 crate::jit_interp::CallPolicyKind::ResidualIntWrapped
                 | crate::jit_interp::CallPolicyKind::ResidualIntCannotRaiseWrapped
@@ -1148,6 +1184,7 @@ impl<'c> Lowerer<'c> {
             reg,
             kind: result_kind,
             depends_on_stack,
+            struct_type: None,
         })
     }
 
@@ -1266,6 +1303,7 @@ impl<'c> Lowerer<'c> {
             reg,
             kind: result_kind,
             depends_on_stack,
+            struct_type: None,
         })
     }
 
@@ -1339,6 +1377,7 @@ impl<'c> Lowerer<'c> {
             depends_on_stack: cond.depends_on_stack
                 || then_binding.depends_on_stack
                 || else_binding.depends_on_stack,
+            struct_type: None,
         })
     }
 
@@ -1370,6 +1409,7 @@ impl<'c> Lowerer<'c> {
                     reg,
                     kind: BindingKind::Int,
                     depends_on_stack: cond.depends_on_stack,
+                    struct_type: None,
                 })
             }
             _ => None,
@@ -1397,6 +1437,7 @@ impl<'c> Lowerer<'c> {
                     reg,
                     kind: BindingKind::Int,
                     depends_on_stack: inner.depends_on_stack,
+                    struct_type: None,
                 })
             }
             _ => None,
@@ -1425,6 +1466,7 @@ impl<'c> Lowerer<'c> {
             reg,
             kind: BindingKind::Int,
             depends_on_stack: lhs.depends_on_stack || rhs.depends_on_stack,
+            struct_type: None,
         })
     }
 
@@ -1508,6 +1550,7 @@ impl<'c> Lowerer<'c> {
             reg: result_reg,
             kind: BindingKind::Int,
             depends_on_stack,
+            struct_type: None,
         })
     }
 
@@ -1601,6 +1644,7 @@ mod tests {
             reg,
             kind,
             depends_on_stack: false,
+            struct_type: None,
         }
     }
 

@@ -126,6 +126,28 @@ pub struct JitInterpConfig {
     /// identity (not the arg shape alone).  Empty for interpreters with no
     /// pool-array indexing.
     pub pool_arrays: Vec<PoolArrayEntry>,
+    /// Struct field type declarations for ref-kind field access through
+    /// `ref(T)` state scalars and non-state ref bindings.  Declared as
+    /// `ref_fields = { Struct::field => PointeeType, ... }`.  When the
+    /// lowerer encounters `state.<ref_scalar>.<field>` or `<binding>.<field>`
+    /// and `(Struct, field)` is listed here, it emits `getfield_gc_r` /
+    /// `setfield_gc_r` (ref-kind) instead of the default `_gc_i` (int-kind).
+    /// The `PointeeType` is recorded so subsequent field access on the
+    /// returned ref can resolve its struct layout.
+    pub ref_fields: Vec<RefFieldEntry>,
+    /// Struct type annotations for ref-returning call results.
+    /// `call_returns = { func_path => StructType, ... }`.  When a
+    /// `residual_ref` (or similar ref-returning) call result is bound,
+    /// the lowerer sets `Binding.struct_type` to the declared type so
+    /// subsequent `result.field` access resolves through `ref_fields`.
+    pub call_returns: Vec<(Path, Path)>,
+    /// Struct literal → concrete allocator mapping for the concrete path.
+    /// `struct_allocs = { StructType => allocator_func, ... }`.  When the
+    /// concrete-path `RefFieldRewriter` encounters a struct literal
+    /// `StructType { f0: v0, f1: v1 }`, it rewrites the literal to
+    /// `allocator_func(v0, v1)`.  The JIT path already handles struct
+    /// literals natively via `lower_struct_value` (New + SetfieldGc).
+    pub struct_allocs: Vec<(Path, Path)>,
     /// Opt-in: route pure forward-advancing dispatch arms (those whose body
     /// only does work then `pc += N`, with no back-edge / `can_enter_jit!` /
     /// early return) through the per-arm sub-JitCode path with a pc-returning
@@ -320,6 +342,21 @@ pub struct PoolArrayEntry {
     pub getter: Path,
 }
 
+/// One entry in `ref_fields = { Struct::field => PointeeType, ... }`.
+/// Declares that `Struct.field` is a ref-kind (pointer) field whose pointee
+/// is `PointeeType`.  The lowerer uses this to emit `getfield_gc_r` /
+/// `setfield_gc_r` for the field access, and tags the resulting ref binding
+/// with `pointee_type` so subsequent field access on it resolves the layout.
+#[derive(Clone)]
+pub struct RefFieldEntry {
+    /// The struct that owns the field (e.g. `Stack`, `Node`).
+    pub struct_type: Path,
+    /// The field name within the struct (e.g. `head`, `next`).
+    pub field: Ident,
+    /// The struct the pointer points to (e.g. `Node`).
+    pub pointee_type: Path,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CallPolicyKind {
     ResidualVoid,
@@ -365,6 +402,7 @@ pub(crate) enum CallPolicyKind {
     // `_can_raise` but distinguishes memory-only failure modes.
     ElidableIntOrMemerror,
     ElidableIntOrMemerrorWrapped,
+    ResidualRef,
     ResidualRefWrapped,
     /// `EF_CANNOT_RAISE` for ref-returning residual helpers.
     /// Mirrors `ResidualIntCannotRaiseWrapped`; the unwrapped variant
@@ -438,6 +476,7 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
         "elidable_int_cannot_raise_wrapped" => CallPolicyKind::ElidableIntCannotRaiseWrapped,
         "elidable_int_or_memerror" => CallPolicyKind::ElidableIntOrMemerror,
         "elidable_int_or_memerror_wrapped" => CallPolicyKind::ElidableIntOrMemerrorWrapped,
+        "residual_ref" => CallPolicyKind::ResidualRef,
         "residual_ref_wrapped" => CallPolicyKind::ResidualRefWrapped,
         "residual_ref_cannot_raise_wrapped" => CallPolicyKind::ResidualRefCannotRaiseWrapped,
         "may_force_ref_wrapped" => CallPolicyKind::MayForceRefWrapped,
@@ -480,6 +519,9 @@ impl Parse for JitInterpConfig {
         let mut recursive_entry: Option<Path> = None;
         let mut residual_writes: Vec<ResidualWriteEntry> = Vec::new();
         let mut pool_arrays: Vec<PoolArrayEntry> = Vec::new();
+        let mut ref_fields: Vec<RefFieldEntry> = Vec::new();
+        let mut call_returns: Vec<(Path, Path)> = Vec::new();
+        let mut struct_allocs: Vec<(Path, Path)> = Vec::new();
         let mut split_dispatch = false;
         let mut switch_dispatch = false;
 
@@ -534,6 +576,15 @@ impl Parse for JitInterpConfig {
                 "pool_arrays" => {
                     pool_arrays = parse_pool_arrays_map(input)?;
                 }
+                "ref_fields" => {
+                    ref_fields = parse_ref_fields_map(input)?;
+                }
+                "call_returns" => {
+                    call_returns = parse_call_returns_map(input)?;
+                }
+                "struct_allocs" => {
+                    struct_allocs = parse_call_returns_map(input)?;
+                }
                 "split_dispatch" => {
                     split_dispatch = input.parse::<LitBool>()?.value;
                 }
@@ -585,6 +636,9 @@ impl Parse for JitInterpConfig {
             recursive_entry,
             residual_writes,
             pool_arrays,
+            ref_fields,
+            call_returns,
+            struct_allocs,
             split_dispatch,
             switch_dispatch,
         })
@@ -629,6 +683,58 @@ fn parse_pool_arrays_map(input: ParseStream) -> syn::Result<Vec<PoolArrayEntry>>
         content.parse::<Token![=>]>()?;
         let getter: Path = content.parse()?;
         entries.push(PoolArrayEntry { base, getter });
+        let _ = content.parse::<Token![,]>();
+    }
+    Ok(entries)
+}
+
+/// Parse `ref_fields = { Struct::field => PointeeType, ... }`.
+/// Each entry declares that `Struct.field` is a ref-kind (pointer) field
+/// whose pointee is `PointeeType`.  The path `Struct::field` is parsed as
+/// a single `Path` and then split: the last segment is the field name, the
+/// remaining prefix is the struct type.
+/// Parse `call_returns = { func_path => StructType, ... }`.
+fn parse_call_returns_map(input: ParseStream) -> syn::Result<Vec<(Path, Path)>> {
+    let content;
+    braced!(content in input);
+    let mut entries = Vec::new();
+    while !content.is_empty() {
+        let func_path: Path = content.parse()?;
+        content.parse::<Token![=>]>()?;
+        let return_type: Path = content.parse()?;
+        entries.push((func_path, return_type));
+        let _ = content.parse::<Token![,]>();
+    }
+    Ok(entries)
+}
+
+fn parse_ref_fields_map(input: ParseStream) -> syn::Result<Vec<RefFieldEntry>> {
+    let content;
+    braced!(content in input);
+    let mut entries = Vec::new();
+    while !content.is_empty() {
+        let full_path: Path = content.parse()?;
+        // Split the last segment as the field name.
+        let mut segments: Vec<_> = full_path.segments.into_iter().collect();
+        if segments.len() < 2 {
+            return Err(syn::Error::new_spanned(
+                &full_path.leading_colon,
+                "ref_fields entry must be `Struct::field => Pointee`",
+            ));
+        }
+        let field_seg = segments.pop().unwrap();
+        let field = field_seg.ident;
+        let struct_type = syn::Path {
+            leading_colon: full_path.leading_colon,
+            segments: segments.into_iter().collect(),
+        };
+        content.parse::<Token![=>]>()?;
+        let pointee_type: Path = content.parse()?;
+        entries.push(RefFieldEntry {
+            struct_type,
+            field,
+            pointee_type,
+        });
         let _ = content.parse::<Token![,]>();
     }
     Ok(entries)
@@ -1201,6 +1307,21 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
     struct RefFieldRewriter {
         // ref-scalar field name -> the `ref(T)` struct path `T`.
         ref_fields: std::collections::HashMap<String, syn::Path>,
+        // `ref_fields` config entries: "StructLast::field" → pointee Path.
+        // Used to determine which fields are ref-kind and propagate struct
+        // type to local bindings.
+        field_pointees: std::collections::HashMap<String, syn::Path>,
+        // Local variable name -> struct type it points to (for ref bindings
+        // returned from getfield_gc_r on state ref scalars or other locals).
+        local_ref_types: std::collections::HashMap<String, syn::Path>,
+        // `call_returns` entries: canonical func path segments → return struct type.
+        // When `let x = func(...)` and func is in this map, `x` is recorded
+        // as a local ref binding pointing to the declared struct type.
+        call_returns: std::collections::HashMap<Vec<String>, syn::Path>,
+        // `struct_allocs` entries: struct type segments → allocator function path.
+        // When `let x = StructType { f0, f1 }` and StructType is in this map,
+        // the concrete path rewrites the struct literal to `allocator(f0, f1)`.
+        struct_allocs: std::collections::HashMap<Vec<String>, syn::Path>,
     }
     impl RefFieldRewriter {
         // For `e == state.<ref_scalar>`, return the `ref(T)` struct path.
@@ -1214,6 +1335,40 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
             };
             self.ref_fields.get(&ref_name.to_string()).cloned()
         }
+
+        // For `e == <local_ident>`, return the struct type if it's a known
+        // local ref binding.
+        fn local_ref_struct_of_base(&self, e: &Expr) -> Option<syn::Path> {
+            let Expr::Path(p) = e else { return None };
+            let ident = p.path.get_ident()?;
+            self.local_ref_types.get(&ident.to_string()).cloned()
+        }
+
+        // Given a struct path and a field name, check if the field is
+        // declared as ref-kind in `field_pointees`.  Returns the pointee
+        // type if so.
+        fn field_pointee(&self, struct_path: &syn::Path, field_name: &str) -> Option<syn::Path> {
+            let struct_last = struct_path.segments.last()?.ident.to_string();
+            let key = format!("{}::{}", struct_last, field_name);
+            self.field_pointees.get(&key).cloned()
+        }
+
+        // Record a local binding as pointing to a struct type.
+        fn record_local_ref(&mut self, name: &str, struct_type: syn::Path) {
+            self.local_ref_types.insert(name.to_string(), struct_type);
+        }
+
+        // Check if a call expression's function is in `call_returns`.
+        fn call_return_type(&self, func: &Expr) -> Option<syn::Path> {
+            let Expr::Path(p) = func else { return None };
+            let segs: Vec<String> = p
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            self.call_returns.get(&segs).cloned()
+        }
     }
     impl VisitMut for RefFieldRewriter {
         fn visit_expr_mut(&mut self, expr: &mut Expr) {
@@ -1221,14 +1376,29 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
             // `unsafe { (*(state.<ref> as *mut T)).<member> = <rhs> }`.
             if let Expr::Assign(assign) = expr {
                 if let Expr::Field(lhs) = &*assign.left {
-                    if let Some(struct_path) = self.ref_struct_of_base(&lhs.base) {
+                    // Unify state-ref and local-ref write-through.
+                    let base_struct = self
+                        .ref_struct_of_base(&lhs.base)
+                        .or_else(|| self.local_ref_struct_of_base(&lhs.base));
+                    if let Some(struct_path) = base_struct {
                         let base = (*lhs.base).clone();
                         let member = lhs.member.clone();
+                        let member_name = match &lhs.member {
+                            syn::Member::Named(id) => id.to_string(),
+                            _ => String::new(),
+                        };
                         let mut rhs = (*assign.right).clone();
                         self.visit_expr_mut(&mut rhs);
-                        *expr = syn::parse_quote! {
-                            unsafe { (*(#base as *mut #struct_path)).#member = #rhs }
-                        };
+                        if let Some(pointee) = self.field_pointee(&struct_path, &member_name) {
+                            // Ref-kind field → cast RHS from usize to *mut Pointee.
+                            *expr = syn::parse_quote! {
+                                unsafe { (*(#base as *mut #struct_path)).#member = #rhs as *mut #pointee }
+                            };
+                        } else {
+                            *expr = syn::parse_quote! {
+                                unsafe { (*(#base as *mut #struct_path)).#member = #rhs }
+                            };
+                        }
                         return;
                     }
                 }
@@ -1248,26 +1418,192 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
                 if let Some(struct_path) = self.ref_struct_of_base(&field.base) {
                     let base = (*field.base).clone();
                     let member = field.member.clone();
-                    *expr = syn::parse_quote! {
-                        {
-                            let __majit_getfield_obj = #base;
-                            match majit_metainterp::consume_observed_getfield(
-                                __majit_getfield_obj as usize,
-                                ::core::mem::offset_of!(#struct_path, #member),
-                            ) {
-                                ::core::option::Option::Some(__majit_getfield_v) => unsafe {
-                                    majit_metainterp::observer_i64_to_value(__majit_getfield_v)
-                                },
-                                ::core::option::Option::None => unsafe {
-                                    (*(__majit_getfield_obj as *const #struct_path)).#member
-                                },
-                            }
-                        }
+                    let member_name = match &field.member {
+                        syn::Member::Named(id) => id.to_string(),
+                        _ => String::new(),
                     };
+                    let is_ref_field = self.field_pointee(&struct_path, &member_name).is_some();
+                    if is_ref_field {
+                        // Ref-kind field → cast to usize (JIT ref bank).
+                        *expr = syn::parse_quote! {
+                            {
+                                let __majit_getfield_obj = #base;
+                                match majit_metainterp::consume_observed_getfield(
+                                    __majit_getfield_obj as usize,
+                                    ::core::mem::offset_of!(#struct_path, #member),
+                                ) {
+                                    ::core::option::Option::Some(__majit_getfield_v) =>
+                                        __majit_getfield_v as usize,
+                                    ::core::option::Option::None => unsafe {
+                                        (*(__majit_getfield_obj as *const #struct_path)).#member as usize
+                                    },
+                                }
+                            }
+                        };
+                    } else {
+                        *expr = syn::parse_quote! {
+                            {
+                                let __majit_getfield_obj = #base;
+                                match majit_metainterp::consume_observed_getfield(
+                                    __majit_getfield_obj as usize,
+                                    ::core::mem::offset_of!(#struct_path, #member),
+                                ) {
+                                    ::core::option::Option::Some(__majit_getfield_v) => unsafe {
+                                        majit_metainterp::observer_i64_to_value(__majit_getfield_v)
+                                    },
+                                    ::core::option::Option::None => unsafe {
+                                        (*(__majit_getfield_obj as *const #struct_path)).#member
+                                    },
+                                }
+                            }
+                        };
+                    }
+                    return;
+                }
+                // Read on local ref binding: `<local>.<member>`.
+                if let Some(struct_path) = self.local_ref_struct_of_base(&field.base) {
+                    let base = (*field.base).clone();
+                    let member = field.member.clone();
+                    let member_name = match &field.member {
+                        syn::Member::Named(id) => id.to_string(),
+                        _ => String::new(),
+                    };
+                    let is_ref_field = self.field_pointee(&struct_path, &member_name).is_some();
+                    if is_ref_field {
+                        // Ref-kind field → cast result to usize (JIT ref bank).
+                        *expr = syn::parse_quote! {
+                            {
+                                let __majit_getfield_obj = #base;
+                                match majit_metainterp::consume_observed_getfield(
+                                    __majit_getfield_obj as usize,
+                                    ::core::mem::offset_of!(#struct_path, #member),
+                                ) {
+                                    ::core::option::Option::Some(__majit_getfield_v) =>
+                                        __majit_getfield_v as usize,
+                                    ::core::option::Option::None => unsafe {
+                                        (*(__majit_getfield_obj as *const #struct_path)).#member as usize
+                                    },
+                                }
+                            }
+                        };
+                    } else {
+                        // Int-kind field → value used as-is.
+                        *expr = syn::parse_quote! {
+                            {
+                                let __majit_getfield_obj = #base;
+                                match majit_metainterp::consume_observed_getfield(
+                                    __majit_getfield_obj as usize,
+                                    ::core::mem::offset_of!(#struct_path, #member),
+                                ) {
+                                    ::core::option::Option::Some(__majit_getfield_v) => unsafe {
+                                        majit_metainterp::observer_i64_to_value(__majit_getfield_v)
+                                    },
+                                    ::core::option::Option::None => unsafe {
+                                        (*(__majit_getfield_obj as *const #struct_path)).#member
+                                    },
+                                }
+                            }
+                        };
+                    }
                     return;
                 }
             }
             syn::visit_mut::visit_expr_mut(self, expr);
+        }
+
+        // Track local `let` bindings that produce ref-typed values from
+        // ref field reads, so subsequent field access rewrites work.
+        fn visit_local_mut(&mut self, local: &mut syn::Local) {
+            // First, recurse into the init expression to rewrite any ref
+            // field reads contained within.
+            syn::visit_mut::visit_local_mut(self, local);
+
+            // After rewriting, check if the init expression was a
+            // state.<ref>.<member> or local.<member> read whose field is
+            // ref-kind, and if so, record the local as a ref binding.
+            //
+            // The rewriter has already transformed the init expr, but we
+            // can recover the original shape from the pattern: if the init
+            // was `state.selected_ref.head` and `Stack::head => Node` is
+            // in field_pointees, the local should be typed as `*mut Node`.
+            //
+            // Since VisitMut has already rewritten the init expr, we check
+            // the LOCAL PATTERN instead and rely on a pre-pass that recorded
+            // the binding name before rewriting.  We handle this via
+            // visit_stmt_mut below.
+        }
+
+        fn visit_stmt_mut(&mut self, stmt: &mut syn::Stmt) {
+            // Before the default visit rewrites the init expression, check
+            // if this is a `let <ident> = <base>.<field>` where <base> is
+            // a state ref scalar or a local ref binding, and the field is
+            // declared ref-kind.
+            if let syn::Stmt::Local(local) = stmt {
+                if let Some(init) = &local.init {
+                    if let Expr::Field(field) = &*init.expr {
+                        let member_name = match &field.member {
+                            syn::Member::Named(id) => Some(id.to_string()),
+                            _ => None,
+                        };
+                        if let Some(member_name) = member_name {
+                            // Check if base is state.<ref_scalar>
+                            let struct_path = self
+                                .ref_struct_of_base(&field.base)
+                                .or_else(|| self.local_ref_struct_of_base(&field.base));
+                            if let Some(struct_path) = struct_path {
+                                if let Some(pointee) =
+                                    self.field_pointee(&struct_path, &member_name)
+                                {
+                                    // This field is ref-kind → the local is a
+                                    // ref binding pointing to pointee type.
+                                    if let syn::Pat::Ident(pat_ident) = &local.pat {
+                                        self.record_local_ref(
+                                            &pat_ident.ident.to_string(),
+                                            pointee,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // `let x = func(...)` where func is in `call_returns` →
+                    // record x as a local ref binding with the declared type.
+                    if let Expr::Call(call) = &*init.expr {
+                        if let Some(struct_type) = self.call_return_type(&call.func) {
+                            if let syn::Pat::Ident(pat_ident) = &local.pat {
+                                self.record_local_ref(&pat_ident.ident.to_string(), struct_type);
+                            }
+                        }
+                    }
+                }
+            }
+            // Rewrite struct literal inits on the concrete path:
+            // `let x = StructType { f0: v0, f1: v1 }` where StructType is
+            // in `struct_allocs` → `let x = allocator_func(v0, v1)`.
+            // The JIT path handles struct literals via `lower_struct_value`
+            // (New + SetfieldGc); this rewrite makes the concrete path
+            // produce the same allocation through the runtime allocator.
+            if let syn::Stmt::Local(local) = stmt {
+                if let Some(init) = &mut local.init {
+                    if let Expr::Struct(s) = &*init.expr {
+                        let segs: Vec<String> = s
+                            .path
+                            .segments
+                            .iter()
+                            .map(|seg| seg.ident.to_string())
+                            .collect();
+                        if let Some(alloc_func) = self.struct_allocs.get(&segs).cloned() {
+                            let field_args: Vec<Expr> =
+                                s.fields.iter().map(|f| f.expr.clone()).collect();
+                            init.expr = Box::new(syn::parse_quote! {
+                                #alloc_func(#(#field_args),*)
+                            });
+                        }
+                    }
+                }
+            }
+            // Now run the default visitor which will rewrite the init expr.
+            syn::visit_mut::visit_stmt_mut(self, stmt);
         }
     }
 
@@ -1282,7 +1618,50 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
             })
             .collect();
         if !ref_fields.is_empty() {
-            RefFieldRewriter { ref_fields }.visit_block_mut(&mut block);
+            // Build field_pointees map from the macro's `ref_fields` config.
+            let field_pointees: std::collections::HashMap<String, syn::Path> = config
+                .ref_fields
+                .iter()
+                .map(|entry| {
+                    let struct_last = entry
+                        .struct_type
+                        .segments
+                        .last()
+                        .map(|s| s.ident.to_string())
+                        .unwrap_or_default();
+                    let key = format!("{}::{}", struct_last, entry.field);
+                    (key, entry.pointee_type.clone())
+                })
+                .collect();
+            let call_returns_map: std::collections::HashMap<Vec<String>, syn::Path> = config
+                .call_returns
+                .iter()
+                .map(|(func, ret_type)| {
+                    let segs: Vec<String> =
+                        func.segments.iter().map(|s| s.ident.to_string()).collect();
+                    (segs, ret_type.clone())
+                })
+                .collect();
+            let struct_allocs_map: std::collections::HashMap<Vec<String>, syn::Path> = config
+                .struct_allocs
+                .iter()
+                .map(|(struct_path, alloc_func)| {
+                    let segs: Vec<String> = struct_path
+                        .segments
+                        .iter()
+                        .map(|s| s.ident.to_string())
+                        .collect();
+                    (segs, alloc_func.clone())
+                })
+                .collect();
+            RefFieldRewriter {
+                ref_fields,
+                field_pointees,
+                local_ref_types: std::collections::HashMap::new(),
+                call_returns: call_returns_map,
+                struct_allocs: struct_allocs_map,
+            }
+            .visit_block_mut(&mut block);
         }
     }
 
@@ -1622,7 +2001,8 @@ fn rewrite_body(
             | CallPolicyKind::MayForceIntWrapped
             | CallPolicyKind::ReleaseGilIntWrapped
             | CallPolicyKind::LoopInvariantIntWrapped => Some(ObserverReplayKind::Int),
-            CallPolicyKind::ResidualRefWrapped
+            CallPolicyKind::ResidualRef
+            | CallPolicyKind::ResidualRefWrapped
             | CallPolicyKind::ResidualRefCannotRaiseWrapped
             | CallPolicyKind::MayForceRefWrapped
             | CallPolicyKind::LoopInvariantRefWrapped => Some(ObserverReplayKind::Ref),

@@ -3,6 +3,7 @@
 /// RPython codewriter/assembler.py: assembler that emits bytecodes into a
 /// JitCode object. This remains in metainterp only as transitional pyre ABI
 /// glue until callers consume `majit_translate::assembler::Assembler`.
+use indexmap::{IndexMap, IndexSet};
 use std::cmp::max;
 
 use majit_backend::JitCellToken;
@@ -30,13 +31,13 @@ pub struct JitCodeBuilder {
     /// against runtime-emitted bytecode.  Recording happens through
     /// `start_instr` / `write_insn`; every helper that pushes an opcode
     /// byte goes through one of those.
-    startpoints: majit_ir::vec_set::VecSet<usize>,
+    startpoints: indexmap::IndexSet<usize>,
     /// RPython `assembler.py:176` `self.alllabels.add(len(self.code))` —
     /// every TLabel emit records the bytecode offset of the 2-byte
     /// label slot so `JitCode.follow_jump` (RPython `jitcode.py:108-109`)
     /// can fire its non-translated `assert position in self._alllabels`
     /// debug check.  Populated by `push_label_ref`.
-    alllabels: majit_ir::vec_set::VecSet<usize>,
+    alllabels: indexmap::IndexSet<usize>,
     num_regs_i: u16,
     num_regs_r: u16,
     num_regs_f: u16,
@@ -93,7 +94,7 @@ pub struct JitCodeBuilder {
     /// different trace wrappers that share a concrete function pointer.
     /// Drained into `JitCodeExecState.call_descr_to_call_target` at
     /// `finish()`.
-    call_descr_to_call_target: majit_ir::VecMap<u16, JitCallTarget>,
+    call_descr_to_call_target: indexmap::IndexMap<u16, JitCallTarget>,
     /// RPython `jitcode.py:47 self._resulttypes = resulttypes` —
     /// per-instruction result-kind char keyed by end-of-instruction
     /// position (`assembler.py:217-219`).  Consumed by
@@ -105,7 +106,7 @@ pub struct JitCodeBuilder {
     /// — pyre's encoding writes operands AFTER the opcode byte, so
     /// `self.code.len()` after the last `push_u*` call equals the
     /// end-of-instruction position the reader sees as `frame.pc`.
-    resulttypes: majit_ir::VecMap<usize, char>,
+    resulttypes: indexmap::IndexMap<usize, char>,
     /// Pending result-kind for a generic `write_insn("...>X")` call.
     /// RPython records the kind after all operands have been emitted
     /// (`assembler.py:217-219`).  In this builder the opcode helper
@@ -515,17 +516,42 @@ impl JitCodeBuilder {
         is_gc_managed: bool,
         fields: &[(usize, bool, &str)],
     ) {
-        let all_fielddescrs = Self::field_specs_from_layout(fields);
-        self.struct_size_specs.insert(
-            type_id,
-            BhSizeSpec {
-                size,
+        let new_fields = Self::field_specs_from_layout(fields);
+        // Merge into existing spec if present — each getfield/setfield
+        // site registers only the field it accesses, so the complete
+        // layout accumulates across multiple register_struct_layout
+        // calls for the same type_id.  Without merging, a later call
+        // would overwrite the spec and lose earlier fields, causing
+        // `field_descr_ref_from_bh` to produce incomplete layouts whose
+        // FieldDescr.get_parent_descr() Weak reference dangles.
+        if let Some(existing) = self.struct_size_specs.get_mut(&type_id) {
+            for nf in new_fields {
+                if !existing
+                    .all_fielddescrs
+                    .iter()
+                    .any(|ef| ef.offset == nf.offset)
+                {
+                    existing.all_fielddescrs.push(nf);
+                }
+            }
+            // Re-sort by offset and re-index so index_in_parent stays
+            // deterministic (same as field_specs_from_layout).
+            existing.all_fielddescrs.sort_by_key(|f| f.offset);
+            for (idx, f) in existing.all_fielddescrs.iter_mut().enumerate() {
+                f.index_in_parent = idx;
+            }
+        } else {
+            self.struct_size_specs.insert(
                 type_id,
-                vtable: 0,
-                is_gc_managed,
-                all_fielddescrs,
-            },
-        );
+                BhSizeSpec {
+                    size,
+                    type_id,
+                    vtable: 0,
+                    is_gc_managed,
+                    all_fielddescrs: new_fields,
+                },
+            );
+        }
     }
 
     /// Build `Vec<BhFieldSpec>` from a `(offset, is_ref, name)` layout,
@@ -4294,6 +4320,7 @@ impl JitCodeBuilder {
         self.patch_labels();
         self.patch_switch_descrs();
         self.patch_const_refs();
+        self.patch_field_descr_parents();
         self.patch_const_u8_refs();
         // RPython `jitcode.py:47 self._resulttypes = resulttypes`.
         // Upstream `assembler.py:217-219` records the result-kind
@@ -4838,6 +4865,40 @@ impl JitCodeBuilder {
         }
     }
 
+    /// descr.py:218-239 parity: `get_field_descr(STRUCT, fieldname)` sets
+    /// `fielddescr.parent_descr = get_size_descr(STRUCT)` — the parent
+    /// always carries the COMPLETE struct layout known at that point.
+    ///
+    /// During emission each `add_struct_field_descr` snapshots the
+    /// `struct_size_specs` entry as `parent`.  Since `register_struct_layout`
+    /// accumulates fields incrementally (each getfield/setfield site
+    /// registers only the field it accesses), an early snapshot may contain
+    /// fewer fields than the final merged spec.  This matters at runtime:
+    /// `field_descr_ref_from_bh` builds a `SizeDescr` from the parent's
+    /// `all_fielddescrs`, and the optimizer's `StructPtrInfo.init_fields`
+    /// allocates one slot per field.  A partial parent → too few slots →
+    /// cross-type forward when different-typed fields land in the same
+    /// slot, or a dangling Weak when a later call creates a fuller
+    /// SizeDescr that the cache rejects.
+    ///
+    /// Fix: after all emit is done, walk every `BhDescr::Field` whose
+    /// `parent` carries a type_id present in `struct_size_specs` and
+    /// replace the parent snapshot with the final (fully merged) spec.
+    /// This is the pyre analogue of PyPy always calling `get_size_descr`
+    /// at descr-creation time (which returns the single canonical
+    /// SizeDescr with all fields populated by `heaptracker.all_fielddescrs`).
+    fn patch_field_descr_parents(&mut self) {
+        for entry in &mut self.descrs {
+            if let RuntimeBhDescr::Descr(CanonicalBhDescr::Field { parent, .. }) = entry {
+                if let Some(p) = parent {
+                    if let Some(final_spec) = self.struct_size_specs.get(&p.type_id) {
+                        *p = final_spec.clone();
+                    }
+                }
+            }
+        }
+    }
+
     /// RPython `assembler.py:131-138` resolves a const-source operand
     /// to `count_regs[kind] + len(constants) - 1`. pyre performs the
     /// same resolution as a post-emission pass once per-kind
@@ -5223,7 +5284,7 @@ mod tests {
     }
 
     fn run_switch_blackhole(input: i64) -> i64 {
-        let mut entries: majit_ir::VecMap<String, u8> = majit_ir::VecMap::new();
+        let mut entries: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
         entries.insert("switch/id".to_string(), jitcode::insns::BC_SWITCH);
         entries.insert("int_copy/i>i".to_string(), jitcode::insns::BC_MOVE_I);
         entries.insert("int_return/i".to_string(), jitcode::insns::BC_INT_RETURN);

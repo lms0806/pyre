@@ -223,6 +223,7 @@ impl<'c> Lowerer<'c> {
                     reg,
                     kind: BindingKind::Int,
                     depends_on_stack: false,
+                    struct_type: None,
                 },
             );
             return Some(());
@@ -642,6 +643,7 @@ impl<'c> Lowerer<'c> {
             reg: result_reg,
             kind: value_kind,
             depends_on_stack: false,
+            struct_type: None,
         })
     }
 
@@ -717,6 +719,7 @@ impl<'c> Lowerer<'c> {
             reg: result_reg,
             kind: BindingKind::Int,
             depends_on_stack: false,
+            struct_type: None,
         })
     }
 
@@ -895,6 +898,11 @@ impl<'c> Lowerer<'c> {
         // matching cached getfield). After lower_state_field_write (which only
         // matches `state.<scalar> = ...` whose LHS base is `state`).
         if let Some(()) = self.lower_state_ref_field_setfield(expr) {
+            return Some(());
+        }
+        // Field write on a local ref binding with known struct type:
+        // `<binding>.<field> = <expr>` → setfield_gc_i/setfield_gc_r.
+        if let Some(()) = self.lower_ref_binding_setfield(expr) {
             return Some(());
         }
         if let Some(()) = self.lower_state_array_write(expr) {
@@ -1394,6 +1402,23 @@ impl<'c> Lowerer<'c> {
                                 __save_err,
                             );
                             #call_stmt
+                        },
+                    );
+                }
+                // Non-wrapped Ref statement-form (result discarded).
+                // Like ResidualVoid but emits a ref-return residual call
+                // whose result is discarded.
+                crate::jit_interp::CallPolicyKind::ResidualRef => {
+                    let typed_args = typed_call_arg_tokens(&arg_bindings);
+                    let throwaway_reg = self.alloc_reg();
+                    let __arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
+                    self.emit_op(
+                        OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(throwaway_reg)]),
+                        quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            let __typed_args = #typed_args;
+                            __builder.residual_call_ref_canonical_via_target(__fn_idx, __typed_args, #throwaway_reg);
                         },
                     );
                 }

@@ -22,6 +22,7 @@
 use crate::heapcache::HeapCache;
 use crate::opencoder::Box as OcBox;
 use crate::recorder::Trace;
+use indexmap::IndexMap;
 use majit_ir::{DescrRef, GreenKey, OpCode, OpRef, Type, Value};
 
 use majit_backend::JitCellToken;
@@ -271,6 +272,17 @@ pub struct TraceCtx {
     /// tracing with their trace positions. First visit records the key +
     /// position; second visit closes the loop.
     pub(crate) current_merge_points: Vec<MergePoint>,
+    /// pyjitpl.py:3912 `same_greenkey` reference — the trace-start loop
+    /// header's concrete green constants, grouped by IR register slot
+    /// (`(ints, refs, floats)`).  Captured on the first merge-point visit of a
+    /// primary trace (the header), then compared element-wise against every
+    /// later visit's greens to decline closing when a scalar green (aheui's
+    /// `stackok` / `is_queue`) differs from the header.  `None` until captured;
+    /// bridges never populate it (they close through the compiled-loop
+    /// registry).  This is the merge-point green vocabulary — distinct from
+    /// `green_key_values`, the back-edge/can_enter_jit key, which carries a
+    /// different arity and cannot be compared against a merge point directly.
+    pub(crate) header_greens: Option<(Vec<i64>, Vec<i64>, Vec<i64>)>,
     /// pyjitpl.py:2979 reached_loop_header parity: callback to check
     /// has_compiled_targets(ptoken) for a given green key. Bridge traces
     /// skip loop headers without compiled targets. Live lookup (not snapshot)
@@ -363,7 +375,7 @@ pub struct TraceCtx {
     /// pyjitpl.py:2397: call_pure_results — maps constant argument tuples
     /// to their concrete result values, recorded during tracing.
     /// Passed to the optimizer for cross-iteration CALL_PURE folding.
-    pub(crate) call_pure_results: majit_ir::VecMap<Vec<Value>, Value>,
+    pub(crate) call_pure_results: indexmap::IndexMap<Vec<Value>, Value>,
     /// Cached `warmstate.trace_limit` snapshot for this tracing session.
     /// pyjitpl.py:2789 reads `self.jitdriver_sd.warmstate.trace_limit` each
     /// call; pyre snapshots it at `setup_tracing` time (warmstate owns the
@@ -1159,6 +1171,7 @@ impl TraceCtx {
                     .collect(),
                 header_pc: 0,
             }],
+            header_greens: None,
             heap_cache: HeapCache::new(),
             force_finish: false,
             last_traced_pc: 0,
@@ -1173,7 +1186,7 @@ impl TraceCtx {
             portal_call_depth_fn: None,
             seen_loop_header_for_jdindex: -1,
             callinfocollection: None,
-            call_pure_results: majit_ir::VecMap::new(),
+            call_pure_results: indexmap::IndexMap::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
             snapshots: Vec::new(),
             resumekey_original_loop_token: None,
@@ -1232,6 +1245,7 @@ impl TraceCtx {
                     .collect(),
                 header_pc: 0,
             }],
+            header_greens: None,
             heap_cache: HeapCache::new(),
             force_finish: false,
             last_traced_pc: 0,
@@ -1246,7 +1260,7 @@ impl TraceCtx {
             portal_call_depth_fn: None,
             seen_loop_header_for_jdindex: -1,
             callinfocollection: None,
-            call_pure_results: majit_ir::VecMap::new(),
+            call_pure_results: indexmap::IndexMap::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
             snapshots: Vec::new(),
             resumekey_original_loop_token: None,

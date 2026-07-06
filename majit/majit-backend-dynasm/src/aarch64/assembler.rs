@@ -9,7 +9,8 @@
 ///   _assemble — assembler.py:779 (walk ops + emit code)
 ///   patch_jump_for_descr — assembler.py:965
 ///   redirect_call_assembler — assembler.py:1138
-use majit_ir::{VecMap, VecMapExt};
+use indexmap::IndexMap;
+use majit_ir::IndexMapExt;
 use std::sync::Arc;
 
 // aarch64/assembler.py parity: aarch64-only backend.
@@ -224,7 +225,7 @@ pub struct AssemblerARM64<'a> {
 
     // ── State tracking for code generation ──
     /// Maps OpRef → jitframe slot index. `IndexMap` (O(1) get/insert), not the
-    /// Vec-backed `VecMap`: `resolve_opref` reads this per emitted op during
+    /// Vec-backed `IndexMap`: `resolve_opref` reads this per emitted op during
     /// codegen and the sync loop inserts one entry per live var, so a Vec-`get`
     /// is O(n) and makes `_assemble` O(n^2) on large traces — `get_index_of`
     /// inlines into `_assemble` and dominated aheui's logo compile. The box→
@@ -256,7 +257,7 @@ pub struct AssemblerARM64<'a> {
     guard_success_cc: Option<u8>,
     /// x86/assembler.py:93 target_tokens_currently_compiling parity.
     /// Keyed by descriptor pointer identity (PyPy uses Python `is`).
-    target_tokens_currently_compiling: VecMap<usize, DynamicLabel>,
+    target_tokens_currently_compiling: IndexMap<usize, DynamicLabel>,
     compiled_target_tokens: Vec<majit_ir::DescrRef>,
     /// llmodel.py:64-69 self.vtable_offset — typeptr field byte offset.
     /// `None` corresponds to RPython's gcremovetypeptr config.
@@ -264,14 +265,14 @@ pub struct AssemblerARM64<'a> {
     /// llsupport/gc.py:563 vtable→typeid table, materialized by the runner
     /// via gc_ll_descr.get_typeid_from_classptr_if_gcremovetypeptr. Used by
     /// the gcremovetypeptr branch of `_cmp_guard_class`.
-    classptr_to_typeid: VecMap<i64, u32>,
+    classptr_to_typeid: IndexMap<i64, u32>,
     /// TYPE_INFO / CLASSTYPE constants for `GUARD_IS_OBJECT` and
     /// `GUARD_SUBCLASS`, fetched by the runner from the active gc_ll_descr.
     guard_gc_type_info: Option<GuardGcTypeInfo>,
     /// Constant classptr → `(subclassrange_min, subclassrange_max)`, matching
     /// `loc_check_against_class.getint()` field reads in
     /// `aarch64/opassembler.py:695-698`.
-    classptr_to_subclass_range: VecMap<i64, (i64, i64)>,
+    classptr_to_subclass_range: IndexMap<i64, (i64, i64)>,
     /// Dynamic label at the function entry for self-recursive CALL_ASSEMBLER.
     self_entry_label: Option<DynamicLabel>,
     /// Leaked pointer holding the resolved entry address for self-recursive
@@ -280,7 +281,7 @@ pub struct AssemblerARM64<'a> {
     /// assembler.py:320 descr._ll_function_addr parity:
     /// Maps call_target_token → compiled code address for CALL_ASSEMBLER.
     /// Populated by the runner before compilation, from registered loop targets.
-    call_assembler_targets: VecMap<u64, usize>,
+    call_assembler_targets: IndexMap<u64, usize>,
     /// opassembler.py:1177 _finish_gcmap.
     finish_gcmap: Option<*mut usize>,
     /// opassembler.py:1215 gcmap_for_finish.
@@ -411,9 +412,9 @@ impl<'a> AssemblerARM64<'a> {
         header_pc: u64,
         constants: majit_ir::ConstMap<majit_ir::Const>,
         vtable_offset: Option<usize>,
-        classptr_to_typeid: VecMap<i64, u32>,
+        classptr_to_typeid: IndexMap<i64, u32>,
         guard_gc_type_info: Option<GuardGcTypeInfo>,
-        classptr_to_subclass_range: VecMap<i64, (i64, i64)>,
+        classptr_to_subclass_range: IndexMap<i64, (i64, i64)>,
         attached_descrs: crate::guard::AttachedDescrPtrs,
         cpu_handle: crate::guard::CpuDescrHandle,
         inputargs: &'a [InputArg],
@@ -441,7 +442,7 @@ impl<'a> AssemblerARM64<'a> {
             constants,
             next_slot: 0,
             guard_success_cc: None,
-            target_tokens_currently_compiling: VecMap::new(),
+            target_tokens_currently_compiling: IndexMap::new(),
             compiled_target_tokens: Vec::new(),
             vtable_offset,
             classptr_to_typeid,
@@ -449,7 +450,7 @@ impl<'a> AssemblerARM64<'a> {
             classptr_to_subclass_range,
             self_entry_label: None,
             self_entry_addr_ptr: Box::into_raw(Box::new(0usize)),
-            call_assembler_targets: VecMap::new(),
+            call_assembler_targets: IndexMap::new(),
             finish_gcmap: None,
             gcmap_for_finish: {
                 let gcmap = allocate_gcmap(1, JITFRAME_FIXED_SIZE);
@@ -674,17 +675,17 @@ impl<'a> AssemblerARM64<'a> {
             (Loc::Reg(s), Loc::Frame(f)) => {
                 let ofs = f.ebp_loc.value;
                 if s.is_xmm {
-                    dynasm!(self.mc ; .arch aarch64 ; str D(s.value), [x29, ofs as u32]);
+                    self.emit_str_fp_d(s.value, ofs);
                 } else {
-                    dynasm!(self.mc ; .arch aarch64 ; str X(s.value), [x29, ofs as u32]);
+                    self.emit_str_fp(s.value, ofs);
                 }
             }
             (Loc::Frame(f), Loc::Reg(d)) => {
                 let ofs = f.ebp_loc.value;
                 if d.is_xmm {
-                    dynasm!(self.mc ; .arch aarch64 ; ldr D(d.value), [x29, ofs as u32]);
+                    self.emit_ldr_fp_d(d.value, ofs);
                 } else {
-                    dynasm!(self.mc ; .arch aarch64 ; ldr X(d.value), [x29, ofs as u32]);
+                    self.emit_ldr_fp(d.value, ofs);
                 }
             }
             (Loc::Immed(i), Loc::Reg(d)) => {
@@ -698,16 +699,14 @@ impl<'a> AssemblerARM64<'a> {
             (Loc::Immed(i), Loc::Frame(f)) => {
                 let ofs = f.ebp_loc.value;
                 self.emit_mov_imm64(16, i.value);
-                dynasm!(self.mc ; .arch aarch64 ; str x16, [x29, ofs as u32]);
+                self.emit_str_fp(16, ofs);
             }
             (Loc::Frame(f1), Loc::Frame(f2)) if f1.position == f2.position => {}
             (Loc::Frame(f1), Loc::Frame(f2)) => {
                 let o1 = f1.ebp_loc.value;
                 let o2 = f2.ebp_loc.value;
-                dynasm!(self.mc ; .arch aarch64
-                    ; ldr x16, [x29, o1 as u32]
-                    ; str x16, [x29, o2 as u32]
-                );
+                self.emit_ldr_fp(16, o1);
+                self.emit_str_fp(16, o2);
             }
             _ => {}
         }
@@ -742,10 +741,12 @@ impl<'a> AssemblerARM64<'a> {
                 dynasm!(self.mc ; .arch aarch64 ; str X(r.value), [sp, #-16]!);
             }
             Loc::Frame(f) if f.ebp_loc.is_float => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr D(15), [x29, f.ebp_loc.value as u32] ; str D(15), [sp, #-16]!);
+                self.emit_ldr_fp_d(15, f.ebp_loc.value);
+                dynasm!(self.mc ; .arch aarch64 ; str D(15), [sp, #-16]!);
             }
             Loc::Frame(f) => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr x16, [x29, f.ebp_loc.value as u32] ; str x16, [sp, #-16]!);
+                self.emit_ldr_fp(16, f.ebp_loc.value);
+                dynasm!(self.mc ; .arch aarch64 ; str x16, [sp, #-16]!);
             }
             _ => {}
         }
@@ -760,10 +761,12 @@ impl<'a> AssemblerARM64<'a> {
                 dynasm!(self.mc ; .arch aarch64 ; ldr X(r.value), [sp], #16);
             }
             Loc::Frame(f) if f.ebp_loc.is_float => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr D(15), [sp], #16 ; str D(15), [x29, f.ebp_loc.value as u32]);
+                dynasm!(self.mc ; .arch aarch64 ; ldr D(15), [sp], #16);
+                self.emit_str_fp_d(15, f.ebp_loc.value);
             }
             Loc::Frame(f) => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr x16, [sp], #16 ; str x16, [x29, f.ebp_loc.value as u32]);
+                dynasm!(self.mc ; .arch aarch64 ; ldr x16, [sp], #16);
+                self.emit_str_fp(16, f.ebp_loc.value);
             }
             _ => {}
         }
@@ -771,7 +774,7 @@ impl<'a> AssemblerARM64<'a> {
 
     fn remap_frame_layout(&mut self, src_locations: &[Loc], dst_locations: &[Loc], tmpreg: Loc) {
         let mut pending_dests = dst_locations.len() as i32;
-        let mut srccount: VecMap<i32, i32> = VecMap::new();
+        let mut srccount: IndexMap<i32, i32> = IndexMap::new();
         for dst in dst_locations {
             srccount.insert(Self::loc_as_key(dst), 0);
         }
@@ -816,7 +819,7 @@ impl<'a> AssemblerARM64<'a> {
                 }
             }
             if !progress {
-                let mut sources: VecMap<i32, Loc> = VecMap::new();
+                let mut sources: IndexMap<i32, Loc> = IndexMap::new();
                 for i in 0..dst_locations.len() {
                     sources.insert(Self::loc_as_key(&dst_locations[i]), src_locations[i]);
                 }
@@ -858,7 +861,7 @@ impl<'a> AssemblerARM64<'a> {
         tmpreg2: Loc,
     ) {
         let mut extrapushes = Vec::new();
-        let mut dst_keys = VecMap::new();
+        let mut dst_keys = IndexMap::new();
         for loc in dst_locations1 {
             dst_keys.insert(Self::loc_as_key(loc), ());
         }
@@ -903,7 +906,7 @@ impl<'a> AssemblerARM64<'a> {
         match loc {
             Loc::Reg(r) => r.value,
             Loc::Frame(f) => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr X(scratch), [x29, f.ebp_loc.value as u32]);
+                self.emit_ldr_fp(scratch, f.ebp_loc.value);
                 scratch
             }
             Loc::Immed(i) => {
@@ -991,7 +994,7 @@ impl<'a> AssemblerARM64<'a> {
         let src_reg = match src {
             Loc::Reg(s) => s.value,
             Loc::Frame(f) => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr x16, [x29, f.ebp_loc.value as u32]);
+                self.emit_ldr_fp(16, f.ebp_loc.value);
                 16
             }
             Loc::Immed(i) => {
@@ -1032,7 +1035,7 @@ impl<'a> AssemblerARM64<'a> {
         let r0 = match loc0 {
             Loc::Reg(r) => r.value,
             Loc::Frame(f) => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr x16, [x29, f.ebp_loc.value as u32]);
+                self.emit_ldr_fp(16, f.ebp_loc.value);
                 16
             }
             Loc::Immed(i) => {
@@ -1044,7 +1047,7 @@ impl<'a> AssemblerARM64<'a> {
         let r1 = match loc1 {
             Loc::Reg(s) => s.value,
             Loc::Frame(f) => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x29, f.ebp_loc.value as u32]);
+                self.emit_ldr_fp(17, f.ebp_loc.value);
                 17
             }
             Loc::Immed(i) => {
@@ -1062,7 +1065,7 @@ impl<'a> AssemblerARM64<'a> {
         let r = match loc {
             Loc::Reg(r) => r.value,
             Loc::Frame(f) => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr x16, [x29, f.ebp_loc.value as u32]);
+                self.emit_ldr_fp(16, f.ebp_loc.value);
                 16
             }
             Loc::Immed(i) => {
@@ -1075,13 +1078,81 @@ impl<'a> AssemblerARM64<'a> {
         return;
     }
 
+    /// Maximum unsigned immediate for `ldr/str X, [base, #imm]` (64-bit).
+    /// AArch64 scaled unsigned offset: 12-bit field × 8 = 0..32760.
+    const MAX_LDR_STR_UIMM: i32 = 32760;
+
+    /// Emit `str Xsrc, [x29, #offset]`, using x16 as scratch when the
+    /// offset exceeds the unsigned-immediate range of the instruction.
+    fn emit_str_fp(&mut self, src: u8, offset: i32) {
+        if offset >= 0 && offset <= Self::MAX_LDR_STR_UIMM {
+            dynasm!(self.mc ; .arch aarch64
+                ; str X(src), [x29, offset as u32]
+            );
+        } else {
+            // Large offset: add x16, x29, #offset; str Xsrc, [x16]
+            self.emit_mov_imm64(16, offset as i64);
+            dynasm!(self.mc ; .arch aarch64
+                ; add x16, x29, x16
+                ; str X(src), [x16]
+            );
+        }
+    }
+
+    /// Emit `str Dsrc, [x29, #offset]` (float/double), using x16 as scratch
+    /// when the offset exceeds the unsigned-immediate range.
+    fn emit_str_fp_d(&mut self, src: u8, offset: i32) {
+        if offset >= 0 && offset <= Self::MAX_LDR_STR_UIMM {
+            dynasm!(self.mc ; .arch aarch64
+                ; str D(src), [x29, offset as u32]
+            );
+        } else {
+            self.emit_mov_imm64(16, offset as i64);
+            dynasm!(self.mc ; .arch aarch64
+                ; add x16, x29, x16
+                ; str D(src), [x16]
+            );
+        }
+    }
+
+    /// Emit `ldr Ddst, [x29, #offset]` (float/double), using x16 as scratch
+    /// when the offset exceeds the unsigned-immediate range.
+    fn emit_ldr_fp_d(&mut self, dst: u8, offset: i32) {
+        if offset >= 0 && offset <= Self::MAX_LDR_STR_UIMM {
+            dynasm!(self.mc ; .arch aarch64
+                ; ldr D(dst), [x29, offset as u32]
+            );
+        } else {
+            self.emit_mov_imm64(16, offset as i64);
+            dynasm!(self.mc ; .arch aarch64
+                ; add x16, x29, x16
+                ; ldr D(dst), [x16]
+            );
+        }
+    }
+
+    /// Emit `ldr Xdst, [x29, #offset]`, using x16 as scratch when the
+    /// offset exceeds the unsigned-immediate range of the instruction.
+    fn emit_ldr_fp(&mut self, dst: u8, offset: i32) {
+        if offset >= 0 && offset <= Self::MAX_LDR_STR_UIMM {
+            dynasm!(self.mc ; .arch aarch64
+                ; ldr X(dst), [x29, offset as u32]
+            );
+        } else {
+            // Large offset: add x16, x29, #offset; ldr Xdst, [x16]
+            self.emit_mov_imm64(16, offset as i64);
+            dynasm!(self.mc ; .arch aarch64
+                ; add x16, x29, x16
+                ; ldr X(dst), [x16]
+            );
+        }
+    }
+
     /// Emit: load the value of `opref` into RAX (x64) / X0 (aarch64).
     fn load_arg_to_rax(&mut self, opref: OpRef) {
         match self.resolve_opref(opref) {
             ResolvedArg::Slot(offset) => {
-                dynasm!(self.mc ; .arch aarch64
-                    ; ldr x0, [x29, offset as u32]
-                );
+                self.emit_ldr_fp(0, offset);
             }
             ResolvedArg::Const(val) => {
                 self.emit_mov_imm64(0, val);
@@ -1112,9 +1183,7 @@ impl<'a> AssemblerARM64<'a> {
     fn load_arg_to_rcx(&mut self, opref: OpRef) {
         match self.resolve_opref(opref) {
             ResolvedArg::Slot(offset) => {
-                dynasm!(self.mc ; .arch aarch64
-                    ; ldr x1, [x29, offset as u32]
-                );
+                self.emit_ldr_fp(1, offset);
             }
             ResolvedArg::Const(val) => {
                 self.emit_mov_imm64(1, val);
@@ -1127,9 +1196,7 @@ impl<'a> AssemblerARM64<'a> {
     fn store_rax_to_result(&mut self, result_opref: OpRef) {
         let slot = self.allocate_slot(result_opref);
         let offset = Self::slot_offset(slot);
-        dynasm!(self.mc ; .arch aarch64
-            ; str x0, [x29, offset as u32]
-        );
+        self.emit_str_fp(0, offset);
     }
 
     // ----------------------------------------------------------------
@@ -1722,7 +1789,7 @@ impl<'a> AssemblerARM64<'a> {
 
     /// assembler.py:320 descr._ll_function_addr parity: store
     /// call_target_token → code_addr mappings for CALL_ASSEMBLER.
-    pub fn set_call_assembler_targets(&mut self, targets: VecMap<u64, usize>) {
+    pub fn set_call_assembler_targets(&mut self, targets: IndexMap<u64, usize>) {
         self.call_assembler_targets = targets;
     }
 
@@ -1878,7 +1945,7 @@ impl<'a> AssemblerARM64<'a> {
 
         // RegAlloc keeps the raw `i64` value map; project it from the
         // typed pool at this boundary (each Const carries its own type).
-        let ra_constants: majit_ir::VecMap<u32, i64> = self
+        let ra_constants: indexmap::IndexMap<u32, i64> = self
             .constants
             .iter()
             .map(|(&k, c)| (k, c.as_raw_i64()))
@@ -2135,35 +2202,13 @@ impl<'a> AssemblerARM64<'a> {
             // ── Unary integer ──
             OpCode::IntNeg => {
                 if let (Some(src), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) {
-                    let src_reg = match src {
-                        Loc::Reg(r) => r.value,
-                        Loc::Frame(f) => {
-                            dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x29, f.ebp_loc.value as u32]);
-                            17
-                        }
-                        Loc::Immed(i) => {
-                            self.emit_mov_imm64(17, i.value);
-                            17
-                        }
-                        _ => 17,
-                    };
+                    let src_reg = self.load_loc_to_reg(src, 17);
                     dynasm!(self.mc ; .arch aarch64 ; neg X(dst.value), X(src_reg as u8));
                 }
             }
             OpCode::IntInvert => {
                 if let (Some(src), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) {
-                    let src_reg = match src {
-                        Loc::Reg(r) => r.value,
-                        Loc::Frame(f) => {
-                            dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x29, f.ebp_loc.value as u32]);
-                            17
-                        }
-                        Loc::Immed(i) => {
-                            self.emit_mov_imm64(17, i.value);
-                            17
-                        }
-                        _ => 17,
-                    };
+                    let src_reg = self.load_loc_to_reg(src, 17);
                     dynasm!(self.mc ; .arch aarch64 ; mvn X(dst.value), X(src_reg as u8));
                 }
             }
@@ -2176,30 +2221,8 @@ impl<'a> AssemblerARM64<'a> {
                     // Rd, Rn, Rm`). The regalloc may pick `result_loc !=
                     // arglocs[0]`, so we must read the real LHS from arg0,
                     // not from the destination register.
-                    let lhs_reg = match lhs {
-                        Loc::Reg(r) => r.value,
-                        Loc::Frame(f) => {
-                            dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x29, f.ebp_loc.value as u32]);
-                            17
-                        }
-                        Loc::Immed(i) => {
-                            self.emit_mov_imm64(17, i.value);
-                            17
-                        }
-                        _ => 17,
-                    };
-                    let sr = match shift_loc {
-                        Loc::Reg(s) => s.value,
-                        Loc::Immed(i) => {
-                            self.emit_mov_imm64(16, i.value);
-                            16
-                        }
-                        Loc::Frame(f) => {
-                            dynasm!(self.mc ; .arch aarch64 ; ldr x16, [x29, f.ebp_loc.value as u32]);
-                            16
-                        }
-                        _ => 16,
-                    };
+                    let lhs_reg = self.load_loc_to_reg(lhs, 17);
+                    let sr = self.load_loc_to_reg(shift_loc, 16);
                     match op.opcode {
                         OpCode::IntLshift => {
                             dynasm!(self.mc ; .arch aarch64 ; lsl X(dst.value), X(lhs_reg as u8), X(sr as u8));
@@ -2278,18 +2301,7 @@ impl<'a> AssemblerARM64<'a> {
             }
             OpCode::IntForceGeZero => {
                 if let (Some(src), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) {
-                    let src_reg = match src {
-                        Loc::Reg(r) => r.value,
-                        Loc::Frame(f) => {
-                            dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x29, f.ebp_loc.value as u32]);
-                            17
-                        }
-                        Loc::Immed(i) => {
-                            self.emit_mov_imm64(17, i.value);
-                            17
-                        }
-                        _ => 17,
-                    };
+                    let src_reg = self.load_loc_to_reg(src, 17);
                     dynasm!(self.mc ; .arch aarch64
                         ; cmp X(src_reg as u8), xzr
                         ; csel X(dst.value), X(src_reg as u8), xzr, ge
@@ -3467,9 +3479,8 @@ impl<'a> AssemblerARM64<'a> {
                 dynasm!(self.mc ; .arch aarch64 ; cmp x16, X(expected.value));
             }
             Loc::Frame(frame) => {
-                let ofs = frame.ebp_loc.value as u32;
+                self.emit_ldr_fp(17, frame.ebp_loc.value);
                 dynasm!(self.mc ; .arch aarch64
-                    ; ldr x17, [x29, ofs]
                     ; cmp x16, x17
                 );
             }
@@ -3554,9 +3565,8 @@ impl<'a> AssemblerARM64<'a> {
                 dynasm!(self.mc ; .arch aarch64 ; cmp x16, X(expected.value));
             }
             Loc::Frame(frame) => {
-                let ofs = frame.ebp_loc.value as u32;
+                self.emit_ldr_fp(17, frame.ebp_loc.value);
                 dynasm!(self.mc ; .arch aarch64
-                    ; ldr x17, [x29, ofs]
                     ; cmp x16, x17
                 );
             }
@@ -3580,11 +3590,10 @@ impl<'a> AssemblerARM64<'a> {
                     dynasm!(self.mc ; .arch aarch64 ; ldr X(dst.value), [x16]);
                 }
                 Loc::Frame(frame) => {
-                    let ofs = frame.ebp_loc.value as u32;
                     dynasm!(self.mc ; .arch aarch64
                         ; ldr x17, [x16]
-                        ; str x17, [x29, ofs]
                     );
+                    self.emit_str_fp(17, frame.ebp_loc.value);
                 }
                 _ => {}
             }
@@ -3937,7 +3946,7 @@ impl<'a> AssemblerARM64<'a> {
         for &(slot, val) in &guard_token.const_stores {
             let ofs = Self::slot_offset(slot);
             self.emit_mov_imm64(16, val);
-            dynasm!(self.mc ; .arch aarch64 ; str x16, [x29, ofs as u32]);
+            self.emit_str_fp(16, ofs);
         }
 
         self._call_footer();
@@ -4340,33 +4349,35 @@ impl<'a> AssemblerARM64<'a> {
         fail_label
     }
 
-    /// Emit a single `b.<cc> =>label` so the guard-success path falls
-    /// through with no taken branch (the failure path takes the branch).
-    ///
-    /// `b.cond` has a 19-bit / ±1MB range; the recovery stub it targets is
-    /// emitted in this same buffer, so for any realistic trace it is well
-    /// within range (±1MB = 262144 instructions, far above the trace-length
-    /// cap).  Should a pathologically large trace overflow it, `finalize()`
-    /// returns `ImpossibleRelocation` which surfaces as `CompilationFailed`
-    /// and the trace falls back to the interpreter — never miscompiled code.
+    /// Emit a conditional branch to `label` using the long-branch pattern:
+    /// `b.<inv_cc> skip; b =>label; skip:` so that the displacement of the
+    /// unconditional `b` is 26-bit / ±128MB instead of the 19-bit / ±1MB
+    /// of `b.cond`. The extra inversion+skip adds one instruction per
+    /// guard, but avoids `ImpossibleRelocation` on large traces (logo's
+    /// 70000-op trace generates >1MB of machine code).
     fn emit_bcond_to_label(&mut self, cc: u8, label: DynamicLabel) {
+        let skip = self.mc.new_dynamic_label();
+        // Invert: branch over the unconditional `b` when the guard succeeds
         match cc {
-            CC_L => dynasm!(self.mc ; .arch aarch64 ; b.lt =>label),
-            CC_LE => dynasm!(self.mc ; .arch aarch64 ; b.le =>label),
-            CC_G => dynasm!(self.mc ; .arch aarch64 ; b.gt =>label),
-            CC_GE => dynasm!(self.mc ; .arch aarch64 ; b.ge =>label),
-            CC_E => dynasm!(self.mc ; .arch aarch64 ; b.eq =>label),
-            CC_NE => dynasm!(self.mc ; .arch aarch64 ; b.ne =>label),
-            CC_B => dynasm!(self.mc ; .arch aarch64 ; b.lo =>label),
-            CC_BE => dynasm!(self.mc ; .arch aarch64 ; b.ls =>label),
-            CC_A => dynasm!(self.mc ; .arch aarch64 ; b.hi =>label),
-            CC_AE => dynasm!(self.mc ; .arch aarch64 ; b.hs =>label),
-            CC_O => dynasm!(self.mc ; .arch aarch64 ; b.vs =>label),
-            CC_NO => dynasm!(self.mc ; .arch aarch64 ; b.vc =>label),
-            CC_S => dynasm!(self.mc ; .arch aarch64 ; b.mi =>label),
-            CC_NS => dynasm!(self.mc ; .arch aarch64 ; b.pl =>label),
-            _ => dynasm!(self.mc ; .arch aarch64 ; b.eq =>label),
+            CC_L => dynasm!(self.mc ; .arch aarch64 ; b.ge =>skip),
+            CC_LE => dynasm!(self.mc ; .arch aarch64 ; b.gt =>skip),
+            CC_G => dynasm!(self.mc ; .arch aarch64 ; b.le =>skip),
+            CC_GE => dynasm!(self.mc ; .arch aarch64 ; b.lt =>skip),
+            CC_E => dynasm!(self.mc ; .arch aarch64 ; b.ne =>skip),
+            CC_NE => dynasm!(self.mc ; .arch aarch64 ; b.eq =>skip),
+            CC_B => dynasm!(self.mc ; .arch aarch64 ; b.hs =>skip),
+            CC_BE => dynasm!(self.mc ; .arch aarch64 ; b.hi =>skip),
+            CC_A => dynasm!(self.mc ; .arch aarch64 ; b.ls =>skip),
+            CC_AE => dynasm!(self.mc ; .arch aarch64 ; b.lo =>skip),
+            CC_O => dynasm!(self.mc ; .arch aarch64 ; b.vc =>skip),
+            CC_NO => dynasm!(self.mc ; .arch aarch64 ; b.vs =>skip),
+            CC_S => dynasm!(self.mc ; .arch aarch64 ; b.pl =>skip),
+            CC_NS => dynasm!(self.mc ; .arch aarch64 ; b.mi =>skip),
+            _ => dynasm!(self.mc ; .arch aarch64 ; b.ne =>skip),
         }
+        // Unconditional branch to the failure target (26-bit, ±128MB)
+        dynasm!(self.mc ; .arch aarch64 ; b =>label);
+        dynasm!(self.mc ; .arch aarch64 ; =>skip);
     }
 
     fn emit_jcc_to_label(&mut self, fail_cc: u8, fail_label: DynamicLabel) {
@@ -4602,7 +4613,8 @@ impl<'a> AssemblerARM64<'a> {
             let arg_ref = op.arg(i).to_opref();
             if arg_ref.is_none() {
                 let dst = Self::slot_offset(i);
-                dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x29, dst as u32] ; str x0, [sp, #-16]!);
+                self.emit_ldr_fp(0, dst);
+                dynasm!(self.mc ; .arch aarch64 ; str x0, [sp, #-16]!);
             } else if arg_ref.is_constant() {
                 let val = arg_ref.inline_const_bits().unwrap_or_else(|| {
                     self.constants
@@ -4614,7 +4626,8 @@ impl<'a> AssemblerARM64<'a> {
                 dynasm!(self.mc ; .arch aarch64 ; str x0, [sp, #-16]!);
             } else if let Some(&old_slot) = self.opref_to_slot.get(&arg_ref) {
                 let src = Self::slot_offset(old_slot);
-                dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x29, src as u32] ; str x0, [sp, #-16]!);
+                self.emit_ldr_fp(0, src);
+                dynasm!(self.mc ; .arch aarch64 ; str x0, [sp, #-16]!);
             } else {
                 dynasm!(self.mc ; .arch aarch64 ; str xzr, [sp, #-16]!);
             }
@@ -4622,7 +4635,8 @@ impl<'a> AssemblerARM64<'a> {
         // Pass 2: pop in reverse into canonical slots
         for i in (0..n_label).rev() {
             let dst = Self::slot_offset(i);
-            dynasm!(self.mc ; .arch aarch64 ; ldr x0, [sp], #16 ; str x0, [x29, dst as u32]);
+            dynasm!(self.mc ; .arch aarch64 ; ldr x0, [sp], #16);
+            self.emit_str_fp(0, dst);
         }
 
         // Bind the LABEL — JUMP targets here (after the copies).
@@ -4652,12 +4666,10 @@ impl<'a> AssemblerARM64<'a> {
     fn emit_slot_move(&mut self, src: i32, dst: i32, is_const: bool, val: i64) {
         if is_const {
             self.emit_mov_imm64(0, val);
-            dynasm!(self.mc ; .arch aarch64 ; str x0, [x29, dst as u32]);
+            self.emit_str_fp(0, dst);
         } else if src != dst {
-            dynasm!(self.mc ; .arch aarch64
-                ; ldr x0, [x29, src as u32]
-                ; str x0, [x29, dst as u32]
-            );
+            self.emit_ldr_fp(0, src);
+            self.emit_str_fp(0, dst);
         }
     }
 
@@ -4680,7 +4692,7 @@ impl<'a> AssemblerARM64<'a> {
         // jump.py:1-64 remap_frame_layout: topological order with
         // cycle breaking via push/pop.
         // srccount[dst] = number of times dst appears as a src
-        let mut srccount: VecMap<i32, i32> = VecMap::new();
+        let mut srccount: IndexMap<i32, i32> = IndexMap::new();
         for m in &moves {
             srccount.entry_or_default(m.1); // ensure dst exists
         }
@@ -4724,8 +4736,8 @@ impl<'a> AssemblerARM64<'a> {
                     let dst = moves[i].1;
                     if srccount.get(&dst).copied().unwrap_or(-1) >= 0 {
                         // Push first dst in the cycle
+                        self.emit_ldr_fp(0, dst);
                         dynasm!(self.mc ; .arch aarch64
-                            ; ldr x0, [x29, dst as u32]
                             ; str x0, [sp, #-16]!
                         );
                         // Walk the cycle
@@ -4742,8 +4754,8 @@ impl<'a> AssemblerARM64<'a> {
                                     // End of cycle: pop into this slot
                                     dynasm!(self.mc ; .arch aarch64
                                         ; ldr x0, [sp], #16
-                                        ; str x0, [x29, cd as u32]
                                     );
+                                    self.emit_str_fp(0, cd);
                                     break;
                                 }
                                 self.emit_slot_move(src, cd, false, 0);
@@ -4893,9 +4905,7 @@ impl<'a> AssemblerARM64<'a> {
     fn load_float_arg_to_d0(&mut self, opref: OpRef) {
         match self.resolve_opref(opref) {
             ResolvedArg::Slot(offset) => {
-                dynasm!(self.mc ; .arch aarch64
-                    ; ldr d0, [x29, offset as u32]
-                );
+                self.emit_ldr_fp_d(0, offset);
             }
             ResolvedArg::Const(val) => {
                 // Load constant via integer register, then move to float register.
@@ -4911,9 +4921,7 @@ impl<'a> AssemblerARM64<'a> {
     fn load_float_arg_to_d1(&mut self, opref: OpRef) {
         match self.resolve_opref(opref) {
             ResolvedArg::Slot(offset) => {
-                dynasm!(self.mc ; .arch aarch64
-                    ; ldr d1, [x29, offset as u32]
-                );
+                self.emit_ldr_fp_d(1, offset);
             }
             ResolvedArg::Const(val) => {
                 self.emit_mov_imm64(1, val);
@@ -4928,9 +4936,7 @@ impl<'a> AssemblerARM64<'a> {
     fn store_d0_to_result(&mut self, result_opref: OpRef) {
         let slot = self.allocate_slot(result_opref);
         let offset = Self::slot_offset(slot);
-        dynasm!(self.mc ; .arch aarch64
-            ; str d0, [x29, offset as u32]
-        );
+        self.emit_str_fp_d(0, offset);
     }
 
     // ----------------------------------------------------------------
@@ -5224,9 +5230,7 @@ impl<'a> AssemblerARM64<'a> {
             match self.resolve_opref(arg) {
                 ResolvedArg::Slot(offset) => {
                     let reg = abi_idx as u8;
-                    dynasm!(self.mc ; .arch aarch64
-                        ; ldr X(reg), [x29, offset as u32]
-                    );
+                    self.emit_ldr_fp(reg, offset);
                 }
                 ResolvedArg::Const(val) => {
                     let reg = abi_idx as u32;
@@ -5237,10 +5241,8 @@ impl<'a> AssemblerARM64<'a> {
 
         match self.resolve_opref(op.arg(func_arg).to_opref()) {
             ResolvedArg::Slot(offset) => {
-                dynasm!(self.mc ; .arch aarch64
-                    ; ldr x8, [x29, offset as u32]
-                    ; blr x8
-                );
+                self.emit_ldr_fp(8, offset);
+                dynasm!(self.mc ; .arch aarch64 ; blr x8);
             }
             ResolvedArg::Const(val) => {
                 self.emit_mov_imm64(8, val);
@@ -5274,7 +5276,7 @@ impl<'a> AssemblerARM64<'a> {
                 true
             }
             Some(Loc::Frame(f)) if !f.ebp_loc.is_float => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x29, f.ebp_loc.value as u32]);
+                self.emit_ldr_fp(17, f.ebp_loc.value);
                 true
             }
             _ => false,
@@ -6504,7 +6506,7 @@ impl<'a> AssemblerARM64<'a> {
                 self.emit_mov_imm64(16, imm.value);
             }
             Loc::Frame(f) if !f.ebp_loc.is_float => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr x16, [x29, f.ebp_loc.value as u32]);
+                self.emit_ldr_fp(16, f.ebp_loc.value);
             }
             _ => {
                 self.emit_load_to_rax(loc);
