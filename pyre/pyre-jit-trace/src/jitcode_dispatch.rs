@@ -2335,8 +2335,8 @@ pub fn dispatch_via_miframe(
     // `fbw_foriter_body_pc_from_op_pc` read it.  This is the PRODUCTION
     // default tracer: `trace.rs` enters `full_body_walk_trace` whenever
     // `PYRE_FULL_BODY_WALK` is not explicitly `0` (the env gate defaults ON),
-    // so `FULL_BODY_SNAPSHOT_SYM` is non-null on every default-JIT and
-    // `PYRE_57_INLINE_NEXT=1` run.  `PYRE_FULL_BODY_WALK=0` is the only opt-out
+    // so `FULL_BODY_SNAPSHOT_SYM` is non-null on every default-JIT
+    // run.  `PYRE_FULL_BODY_WALK=0` is the only opt-out
     // (the transitional trait leg), which leaves the pointer null.
     let _full_body_guard = FullBodySnapshotSymGuard::set(sym_ptr);
 
@@ -4405,21 +4405,20 @@ fn ptr_nullity_record(
         OpCode::PtrEq
     };
     let result = ctx.trace_ctx.record_op(opcode, &[box_, null_const]);
-    // Concrete stamp: prefer the box's own value carrier.  Inside an inline
-    // sub-walk the operand is often a callee argument whose concrete pointer
-    // lives only in the walk's ref-register shadow (seeded by
-    // `run_sub_jitcode_walk` / the inline-call setup), not on the box, so fall
-    // back to that shadow there.  A non-`Ref` shadow (`Null`) means the
-    // pointer is untracked, not provably null — leave the result symbolic.
+    // Concrete stamp: prefer the box's own value carrier (constant pool /
+    // standard-virtualizable shadow / `set_opref_concrete` stamp).  When the
+    // OpRef has no intrinsic concrete (e.g. a residual-call result whose
+    // executor was gated off, or an inline sub-walk callee argument whose
+    // concrete pointer lives only in the walk's ref-register shadow), fall
+    // back to the register's concrete shadow (`concrete_registers_r`).
+    // A non-`Ref` shadow (`Null`) means the pointer is untracked, not
+    // provably null — leave the result symbolic.
     let nonnull = match ctx.trace_ctx.box_value(box_) {
         Some(majit_ir::Value::Ref(r)) => Some(r.0 != 0),
-        _ if INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get()) => {
-            match read_ref_reg_concrete(code, op, 0, ctx) {
-                ConcreteValue::Ref(p) => Some(!p.is_null()),
-                _ => None,
-            }
-        }
-        _ => None,
+        _ => match read_ref_reg_concrete(code, op, 0, ctx) {
+            ConcreteValue::Ref(p) => Some(!p.is_null()),
+            _ => None,
+        },
     };
     if let Some(nonnull) = nonnull {
         ctx.trace_ctx
@@ -6604,22 +6603,26 @@ fn collect_outer_active_boxes(
                     let vbox = trace_ctx.virtualizable_box_at(nvs + s_idx);
                     let walk_box = regs_r.get(color).copied();
                     if s_idx >= nlocals {
-                        // Operand-stack slot.  The vable shadow is synced to
-                        // the stack only at merge points (`close_loop_args_at`),
-                        // so a slot pushed mid-opcode (the two operands a
-                        // `BINARY_OP` / `BINARY_SUBSCR` value-guard resumes
-                        // before) is stale in the shadow — either an unset
-                        // NULL `ConstPtr` or a stale `getfield` ResOp that
-                        // evaluates to NULL at the guard.  The walk register
-                        // file holds the live SSA box; read it directly
-                        // (trait `get_list_of_active_boxes` parity).  Without
-                        // this the snapshot encodes a NULL operand that the
-                        // blackhole re-executes the opcode with (`bh_binary_op_fn`
-                        // "binary op on null operand") and the bridge re-trace
-                        // constant-folds into `CallR(binop, null, null, ...)`.
-                        match walk_box {
-                            Some(v) if v != OpRef::NONE => v,
-                            _ => vbox.unwrap_or_else(fallback),
+                        // Operand-stack slot.  The authoritative source is the
+                        // virtualizable shadow (`setarrayitem_vable_r` keeps it
+                        // current on every push/store).  The walk register file
+                        // (`registers_r[color]`) is NOT authoritative for stack
+                        // slots: stack-slot `write_ref_reg` was retired, so the
+                        // register may hold a stale value from a prior SSA def
+                        // that shared the same color (e.g. a green scratch ref
+                        // like `pycode_var` whose tiny live range lets the
+                        // chordal coloring assign it the same color as an
+                        // iterator).  Read the shadow first; fall back to the
+                        // walk register only when the shadow slot is NULL
+                        // (a mid-opcode transient the portal never wrote).
+                        let shadow_is_real = vbox.is_some_and(|b| !opref_is_null_const_ptr(b));
+                        if shadow_is_real {
+                            vbox.unwrap_or_else(fallback)
+                        } else {
+                            match walk_box {
+                                Some(v) if v != OpRef::NONE && !opref_is_null_const_ptr(v) => v,
+                                _ => vbox.unwrap_or_else(fallback),
+                            }
                         }
                     } else {
                         // Local slot.  Written to the shadow on every
@@ -9216,9 +9219,19 @@ fn kept_stack_has_boxed_int_hazard(
                 }
                 continue;
             }
-            // Neither: an unrestorable / non-Ref-constant kept slot the per-PC
-            // sources cannot prove safe — decline (conservative).
-            return true;
+            // Neither in pcdep nor in const_ref_slots: this kept slot has no
+            // explicit color→slot mapping at the resume py_pc.  Its value IS
+            // recoverable through the virtualizable shadow (the
+            // `collect_outer_active_boxes` operand-stack fallback reads the
+            // shadow when pcdep yields no color, line 6602-6604), so the
+            // snapshot CAN reconstruct it — but we cannot inspect its
+            // concrete here because we lack the color.  Conservatively
+            // report NO hazard: the slot is not a literal boxed int (the
+            // hazard targets hoisted heap-int consts parked in a register
+            // across the guard, which always appear in pcdep or consts),
+            // and declining here is a false positive for iterator /
+            // non-int kept slots.
+            continue;
         }
         false
     }
@@ -9326,7 +9339,10 @@ fn branch_arm_reads_unrestorable_ref(
             // boundary belongs to a different resume coordinate that gets its
             // own guard check, so nothing unrestorable was found here.
             "goto_if_not" | "jit_merge_point" | "loop_header" | "finish" | "leave_frame"
-            | "rvmprof_code" => {
+            | "rvmprof_code"
+            // Return / raise terminators: the arm exits the jitcode entirely.
+            // No further Ref reads to check.
+            | "ref_return" | "int_return" | "void_return" | "float_return" | "raise" => {
                 return false;
             }
             _ => {}
@@ -11769,6 +11785,14 @@ fn try_walker_inline_user_call(
     // jitcodes); this restores that invariant for the pyre FBW
     // inline-at-residual lever.
     if pyre_helper != majit_ir::PyreHelperKind::CallFn {
+        return Ok(None);
+    }
+    // An inline sub-walk inside a FOR_ITER body captures guards with
+    // the loop-header outer_active_boxes, but vable sync writes mid-body
+    // shadow state. On deopt the mismatch replays the last body
+    // iteration. Decline the inline; the call still executes concretely
+    // as a normal residual.
+    if fbw_foriter_inflight_active() {
         return Ok(None);
     }
     if r_args.is_empty() {

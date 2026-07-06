@@ -4264,6 +4264,30 @@ fn filter_liveness_in_place(
             "filter_liveness_in_place: walker_tracked_pc_live_indices must be Some with one \
              entry per Python PC since label retirement retired per-PC label emission",
         );
+    // FOR_ITER body PCs: used to scope Slice B's per-PC frame-live
+    // re-add below. While-loop body PCs are excluded to prevent
+    // perf regressions (wider liveness → more live-across-loop colors
+    // → more spills).
+    let foriter_body_pcs = {
+        let n = code.instructions.len();
+        let mut pcs = bit_set::BitSet::with_capacity(n);
+        let mut scan_state = pyre_interpreter::OpArgState::default();
+        for scan_pc in 0..n {
+            let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
+            if let pyre_interpreter::Instruction::ForIter { delta } = scan_instr {
+                let exhaust_target = pyre_interpreter::jump_target_forward(
+                    &code.instructions,
+                    scan_pc + 1,
+                    delta.get(scan_arg).as_usize(),
+                );
+                pcs.insert(scan_pc);
+                for body_pc in (scan_pc + 1)..exhaust_target.min(n) {
+                    pcs.insert(body_pc);
+                }
+            }
+        }
+        pcs
+    };
     // Run `compute_liveness` + `remove_repeated_live` and resolve each
     // Python PC's `-live-` marker to its POST-merge SSARepr index.
     // `liveness.rs`'s public API (`compute_liveness`,
@@ -4442,6 +4466,22 @@ fn filter_liveness_in_place(
                 s
             };
             pc_live_r.retain(|idx| lv_live.contains(idx));
+            // Re-add the per-PC frame-live colors the SSA-backward retain
+            // dropped — FOR_ITER body PCs only.  A loop-carried operand-
+            // stack value (the iterator) is frame-live at a body PC but
+            // SSA-backward-DEAD there, so `pc_live_r` omits it and the
+            // guard snapshot leaves the slot `OpRef::NONE`.  Re-adding
+            // `lv_live` names the full restorable set for FOR_ITER body
+            // guards.  While-loop body PCs are excluded: widening their
+            // liveness changes the resume layout and causes perf
+            // regressions (int_loop/float_loop/nested_loop).
+            if foriter_body_pcs.contains(py_pc) {
+                for &idx in lv_live.iter() {
+                    if !pc_live_r.contains(&idx) {
+                        pc_live_r.push(idx);
+                    }
+                }
+            }
 
             // Restore the portal red args (`interp_jit.py:67 reds =
             // ['frame', 'ec']`) on the splice path.  The retain above only
@@ -12083,6 +12123,76 @@ impl CodeWriter {
                         inserted += 1;
                     }
                 }
+            }
+            shift.push(inserted);
+            for (_, pos) in spliced.pc_first_insn_pos.iter_mut() {
+                *pos += shift[*pos];
+            }
+            spliced.insns = new_insns;
+        }
+        // Per-PC leading `-live-` (marker PRESENCE), scoped to FOR_ITER body
+        // PCs.  `jtransform.py` puts a `-live-` before every deopt-capable op;
+        // pyre emits `-live-` only trailing-after-calls, so a FOR_ITER body
+        // guard has no marker of its own: `derive_pc_live_indices_from_sparse`
+        // rounds its PC back to the header marker, whose resume coordinate is
+        // not the body's.  Give each FOR_ITER-body pc-carrying op its own
+        // leading marker so its PC resolves to itself.  While-loop body PCs
+        // are excluded — their existing header-folded marker is correct and
+        // giving them individual markers changes their resume layout, breaking
+        // nbody/nested_loop/spectral_norm.
+        {
+            // Build the set of FOR_ITER body PCs: py_pc in
+            // [for_iter_pc, exhaust_target) for each ForIter instruction.
+            let foriter_body_pcs = {
+                let mut pcs = bit_set::BitSet::with_capacity(num_instrs);
+                let mut scan_state = pyre_interpreter::OpArgState::default();
+                for scan_pc in 0..num_instrs {
+                    let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
+                    if let Instruction::ForIter { delta } = scan_instr {
+                        let exhaust_target = pyre_interpreter::jump_target_forward(
+                            &code.instructions,
+                            scan_pc + 1,
+                            delta.get(scan_arg).as_usize(),
+                        );
+                        // Include the FOR_ITER pc itself (for the
+                        // continues guard) and all body PCs up to
+                        // the exhaustion target.
+                        pcs.insert(scan_pc);
+                        for body_pc in (scan_pc + 1)..exhaust_target.min(num_instrs) {
+                            pcs.insert(body_pc);
+                        }
+                    }
+                }
+                pcs
+            };
+            let mut marker_before: Vec<bool> = vec![false; spliced.insns.len()];
+            for &(py_pc, pos) in &spliced.pc_first_insn_pos {
+                if py_pc < 0 {
+                    continue;
+                }
+                if !foriter_body_pcs.contains(py_pc as usize) {
+                    continue;
+                }
+                let already = pos
+                    .checked_sub(1)
+                    .and_then(|p| spliced.insns.get(p))
+                    .is_some_and(|i| i.is_live());
+                if !already {
+                    marker_before[pos] = true;
+                }
+            }
+            let extra = marker_before.iter().filter(|&&b| b).count();
+            let mut new_insns: Vec<super::flatten::Insn> =
+                Vec::with_capacity(spliced.insns.len() + extra);
+            let mut shift: Vec<usize> = Vec::with_capacity(spliced.insns.len() + 1);
+            let mut inserted = 0usize;
+            for (i, insn) in spliced.insns.iter().enumerate() {
+                if marker_before[i] {
+                    new_insns.push(super::flatten::Insn::live(Vec::new()));
+                    inserted += 1;
+                }
+                shift.push(inserted);
+                new_insns.push(insn.clone());
             }
             shift.push(inserted);
             for (_, pos) in spliced.pc_first_insn_pos.iter_mut() {

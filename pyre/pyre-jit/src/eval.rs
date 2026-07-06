@@ -3531,6 +3531,43 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
             | I::JumpForward { .. }
             | I::JumpBackward { .. }
             | I::JumpBackwardNoInterrupt { .. }
+            // nested FOR_ITER: the inner loop's iterator setup and iteration
+            | I::GetIter
+            | I::ForIter { .. }
+            | I::EndFor
+            // sequence unpacking / tuple/slice build: stack-only operations
+            // that produce immutable objects, no heap mutation
+            | I::UnpackSequence { .. }
+            | I::UnpackEx { .. }
+            | I::BuildTuple { .. }
+            | I::BuildSlice { .. }
+            // read-only subscript/membership: lowered to residual calls,
+            // no heap mutation
+            | I::BinarySlice
+            | I::ContainsOp { .. }
+            // string formatting: produces immutable strings
+            | I::FormatSimple
+            | I::ConvertValue { .. }
+            | I::BuildString { .. }
+            // misc read-only: len(), iterator cleanup, local delete,
+            // closure variable read
+            | I::GetLen
+            | I::PopIter
+            | I::DeleteFast { .. }
+            | I::LoadDeref { .. }
+            // function calls and global reads: the Layer 2 dynamic defense
+            // (body_effect_candidate + fbw_foriter_inflight_take) handles
+            // walk-abort safety, and inline sub-walks are declined when a
+            // FOR_ITER item is in-flight (try_walker_inline_user_call).
+            | I::Call { .. }
+            | I::CallKw { .. }
+            | I::LoadGlobal { .. }
+            | I::Resume { .. }
+            // container builders: produce new heap objects but do not mutate
+            // existing ones; walk-abort just drops the incomplete object
+            | I::BuildList { .. }
+            | I::BuildSet { .. }
+            | I::BuildMap { .. }
             // oparg prefix + inline-cache padding (no-ops in the body scan)
             | I::ExtendedArg
             | I::Cache
@@ -3622,10 +3659,7 @@ fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitS
     // `list.append`/`STORE_SUBSCR` cannot deliver or rewind that effect, so the
     // iteration is silently dropped (#57). Bodies with no explicit
     // mutation/call and no nested `FOR_ITER` cannot reach that path — verified
-    // against the battery and adversarial mutation probes. `PYRE_57_INLINE_NEXT=0`
-    // is a kill-switch that restores the pre-flip behaviour (every FOR_ITER
-    // frame runs in the interpreter). Callees are allowed to enter the JIT; this
-    // is not a structural region boundary.
+    // against the battery and adversarial mutation probes.
     let mut arg_state = pyre_interpreter::OpArgState::default();
     let mut has_for_iter = false;
     for unit in code.instructions.iter().copied() {
@@ -3638,19 +3672,11 @@ fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitS
         }
     }
     if has_for_iter {
-        // Kill-switch: `PYRE_57_INLINE_NEXT=0` restores the pre-flip behaviour
-        // (all FOR_ITER frames interpreted).
-        static FOR_ITER_JIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let disabled = *FOR_ITER_JIT_DISABLED
-            .get_or_init(|| std::env::var("PYRE_57_INLINE_NEXT").as_deref() == Ok("0"));
-        // A `finally`-duplicated loop also stays interpreted: its exhaustion
+        // A `finally`-duplicated loop stays interpreted: its exhaustion
         // side-exit resumes through the lossy carry-forward `pc_map` and lands
         // at the exceptional copy with an empty stack (see
         // `for_iter_frame_is_finally_duplicated`).
-        if disabled
-            || !for_iter_bodies_all_jit_safe(code)
-            || for_iter_frame_is_finally_duplicated(code)
-        {
+        if !for_iter_bodies_all_jit_safe(code) || for_iter_frame_is_finally_duplicated(code) {
             return UnsupportedJitShape::CurrentFrameOnly;
         }
     }

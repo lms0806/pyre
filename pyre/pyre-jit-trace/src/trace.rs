@@ -253,10 +253,25 @@ pub fn trace_bytecode(
 /// when no preceding merge point exists (straight-line resume) or the
 /// operand stream is truncated.
 fn loop_header_merge_point_regs(code: &[u8], entry: usize) -> Option<(Vec<u8>, Vec<u8>)> {
+    // The merge point governing `entry`.  A body-guard resume enters PAST the
+    // merge point, so the merge point precedes `entry` and the last `op.pc <=
+    // entry` is the governing one.  A HEADER-entry resume keys to the header
+    // PC's own leading `-live-` marker, inserted immediately before the
+    // header's first insn, which sits just BEFORE the `jit_merge_point` op;
+    // there `entry < mp_pc`, so fall back to the first merge point at or after
+    // `entry`.  A straight-line function has no merge point and returns `None`.
     let mp_pc = crate::jitcode_runtime::decoded_ops(code)
-        .filter(|op| op.opname == "jit_merge_point" && op.pc < entry)
+        .filter(|op| op.opname == "jit_merge_point")
         .map(|op| op.pc)
-        .max()?;
+        .filter(|&pc| pc <= entry)
+        .max()
+        .or_else(|| {
+            crate::jitcode_runtime::decoded_ops(code)
+                .filter(|op| op.opname == "jit_merge_point")
+                .map(|op| op.pc)
+                .filter(|&pc| pc >= entry)
+                .min()
+        })?;
     let mut cursor = mp_pc + 1 + 1; // opcode byte + jdindex (`c`)
     let mut lists: [Vec<u8>; 6] = Default::default();
     for slot in lists.iter_mut() {
@@ -1068,6 +1083,67 @@ fn run_perfn_walk(
                             continue;
                         }
                         seed(color, opref);
+                    }
+                }
+            }
+        } else {
+            // Loop trace: seed operand-stack loop-input registers from
+            // sym.registers_r.  RPython's MIFrame registers are populated
+            // by executing every opcode (including jit_merge_point, which
+            // binds the reds); pyre's walker enters PAST the merge point,
+            // so loop-carried operand-stack variables (e.g. the FOR_ITER
+            // iterator on TOS) are left OpRef::NONE without this seed.
+            // The vable shadow (virtualizable_boxes) holds the correct
+            // InputArgRef for each slot, but vable_getarrayitem_ref routes
+            // through is_nonstandard_virtualizable when the reader OpRef's
+            // concrete is the usize::MAX sentinel (= NONE), so the
+            // standard fast path is never reached.  Seed the operand-stack
+            // colors (nlocals .. nlocals+stack_depth) from sym.registers_r
+            // — the same InputArgRef values init_symbolic placed there.
+            // Clamp to the jitcode's num_regs_r so the argboxes vector
+            // never exceeds the callee register bank size.
+            //
+            // Also stamp each seeded InputArgRef with its concrete pointer
+            // from the live frame's `locals_cells_stack_w` so downstream
+            // `box_value`/`concrete_of_opref` consumers (e.g. residual-call
+            // arg resolution in `try_execute_residual_call_via_executor`)
+            // can resolve loop-input operand-stack values.  Without this,
+            // a `ForIterNext(iterator)` residual declines execution because
+            // the iterator arg's `box_value` returns `None`, leaving the
+            // `ptr_nonzero` result unstemped → `GotoIfNotValueNotConcrete`.
+            let nl = sym.nlocals;
+            let num_regs_r = pjc.jitcode.num_regs_r() as usize;
+            let stack_depth = sym.registers_r.len().saturating_sub(nl);
+            // Read the live frame's locals_cells_stack_w for concrete ptrs.
+            let frame_ref = unsafe { &*(cf_addr as *const pyre_interpreter::pyframe::PyFrame) };
+            let frame_slots: &[pyre_object::PyObjectRef] = unsafe {
+                if !frame_ref.locals_cells_stack_w.is_null() {
+                    (*frame_ref.locals_cells_stack_w).as_slice()
+                } else {
+                    &[]
+                }
+            };
+            for i in 0..stack_depth {
+                let color = nl + i;
+                if color >= num_regs_r {
+                    break;
+                }
+                let opref = sym.registers_r[nl + i];
+                if !opref.is_none() {
+                    if reserved_red_colors.contains(&(color as u8)) {
+                        continue;
+                    }
+                    seed(color as u8, opref);
+                    // Stamp the concrete pointer from the live frame slot.
+                    let frame_idx = nl + i;
+                    if frame_idx < frame_slots.len() {
+                        let ptr = frame_slots[frame_idx];
+                        if !ptr.is_null() {
+                            mi.ctx().set_opref_concrete(
+                                opref,
+                                majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)),
+                            );
+                        }
                     }
                 }
             }
