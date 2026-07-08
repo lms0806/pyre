@@ -30,6 +30,10 @@ class CrateSpec:
     - `cargo_args`: extra flags passed after `--`; each arg may contain the
       `{features}` placeholder, substituted with the active cargo feature set
       (e.g. `["--features", "{features}"]` or `["--no-default-features"]`).
+    - `charon_args`: extra flags passed to Charon itself, before the `--`
+      separator (e.g. `["--include", "somecrate::module::_"]` to translate the
+      bodies of items in a foreign dependency instead of keeping them opaque).
+      Same `{features}` placeholder substitution as `cargo_args`.
     - `fingerprint_pathspecs`: explicit git pathspecs (relative to the driver's
       `root`) that fingerprint this crate's sources. `None` derives them from a
       `cargo metadata` dependency walk instead.
@@ -42,6 +46,7 @@ class CrateSpec:
     crate_dir: Path
     output_name: str
     cargo_args: list[str] = field(default_factory=list)
+    charon_args: list[str] = field(default_factory=list)
     fingerprint_pathspecs: list[str] | None = None
     excluded_deps: set[str] = field(default_factory=set)
 
@@ -96,8 +101,25 @@ def platform_info() -> tuple[str, str]:
     raise SystemExit(f"extract-llbc.py: unsupported platform {system}-{machine}")
 
 
+def expand_features(arg: str, cargo_features: str) -> str:
+    features = [f.strip() for f in cargo_features.split(",") if f.strip()]
+    if "{features}" not in arg or len(features) <= 1:
+        # No placeholder, or a single/absent feature: whole-string
+        # substitution already yields the right flag.
+        return arg.format(features=cargo_features)
+    # Multiple features: a template like `crate/{features}` prefixes the
+    # placeholder, so splicing the raw `a,b` list into one slot only
+    # prefixes the first feature. Expand the template per feature and
+    # rejoin so each feature keeps the prefix.
+    return ",".join(arg.format(features=feature) for feature in features)
+
+
 def crate_flags(spec: CrateSpec, cargo_features: str) -> list[str]:
-    return [arg.format(features=cargo_features) for arg in spec.cargo_args]
+    return [expand_features(arg, cargo_features) for arg in spec.cargo_args]
+
+
+def charon_crate_flags(spec: CrateSpec, cargo_features: str) -> list[str]:
+    return [expand_features(arg, cargo_features) for arg in spec.charon_args]
 
 
 def run_capture(args: list[str], *, cwd: Path) -> str:
@@ -184,7 +206,10 @@ def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> l
             closure.append(package)
 
             for dep in resolve_nodes.get(package_id, {}).get("deps", []):
-                if all(kind.get("kind") == "dev" for kind in dep.get("dep_kinds", [])):
+                dep_kinds = dep.get("dep_kinds", [])
+                # An empty `dep_kinds` is a normal (non-dev) edge; only
+                # drop deps whose every listed kind is `dev`.
+                if dep_kinds and all(kind.get("kind") == "dev" for kind in dep_kinds):
                     continue
                 dep_package = by_id.get(dep["pkg"])
                 if dep_package is not None and dep_package.get("source") is None:
@@ -194,8 +219,9 @@ def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> l
             if package["name"] in exclude:
                 continue
             package_dir = Path(package["manifest_path"]).resolve().parent
-            rel_dir = package_dir.relative_to(root).as_posix()
-            pathspecs.append(f"{rel_dir}/Cargo.toml")
+            if package_dir.is_relative_to(root):
+                rel_dir = package_dir.relative_to(root).as_posix()
+                pathspecs.append(f"{rel_dir}/Cargo.toml")
             for target in package["targets"]:
                 kinds = set(target["kind"])
                 if not ({"lib", "bin", "custom-build"} & kinds):
@@ -308,6 +334,7 @@ def stamp_for(
     charon_stamp: str,
     cargo_features: str,
     flags: list[str],
+    charon_flags: list[str],
 ) -> str:
     return "\n".join(
         [
@@ -316,6 +343,7 @@ def stamp_for(
             f"charon={charon_stamp}",
             f"features={cargo_features}",
             f"flags={' '.join(flags)}",
+            f"charon_flags={' '.join(charon_flags)}",
             f"source={source_fingerprint(eng, [crate], cargo_features)}",
         ]
     )
@@ -359,6 +387,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         spec = eng.spec(crate)
         path = spec.crate_dir
         flags = crate_flags(spec, cargo_features)
+        charon_flags = charon_crate_flags(spec, cargo_features)
         if not path.is_dir():
             raise SystemExit(f"extract-llbc.py: missing crate dir for '{crate}' at {path}")
 
@@ -371,6 +400,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             charon_stamp=charon_stamp,
             cargo_features=cargo_features,
             flags=flags,
+            charon_flags=charon_flags,
         )
 
         if (
@@ -404,6 +434,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             "--ullbc",
             "--dest-file",
             str(dest),
+            *charon_flags,
             "--",
             *flags,
             *host_config,

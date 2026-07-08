@@ -626,6 +626,44 @@ fn is_str_const_define(kind: &OpKind) -> bool {
     )
 }
 
+/// `true` iff `kind` is `front::mir`'s synthetic prebuilt-constant-array
+/// define-op (`Call(["__const_int_array", <i0>, <i1>, …])`,
+/// `fold_named_const_int_array_global`).  A module-level constant array
+/// is carried as a bare `Constant(list)` SSA value, so the pre-pass
+/// ([`legacy_const_define_hlvalue`]) folds the op to that Constant and
+/// [`translate_op`] emits nothing — same contract as
+/// [`is_str_const_define`].
+fn is_const_int_array_define(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } if args.is_empty() && segments.len() >= 2 && segments[0] == "__const_int_array"
+    )
+}
+
+/// Decode the baked integers of a `__const_int_array` define-op's
+/// segments (`["__const_int_array", "0", "2", …]`) into the
+/// `ConstValue::Int` element list.  `None` if any segment past the tag
+/// fails to parse (a malformed synthesis) or the op is not the
+/// define-op shape.
+fn const_int_array_items(kind: &OpKind) -> Option<Vec<ConstValue>> {
+    let OpKind::Call {
+        target: crate::model::CallTarget::FunctionPath { segments },
+        ..
+    } = kind
+    else {
+        return None;
+    };
+    segments
+        .get(1..)?
+        .iter()
+        .map(|s| s.parse::<i64>().ok().map(ConstValue::Int))
+        .collect()
+}
+
 /// The pure, non-raising flowspace opname a `core::<family>::<leaf>`
 /// method-call bridge lowers to in [`translate_op`], or `None` when the
 /// path is not such a bridge.  The single source of truth shared by
@@ -745,6 +783,10 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         // and emits no op — a Constant raises nothing.  Matched before
         // the general `Call` arm, same as the unit-variant elision.
         kind if is_str_const_define(kind) => false,
+        // A prebuilt-constant-array define-op pre-folds to `Constant(list)`
+        // and emits no op — a Constant raises nothing.  Matched before the
+        // general `Call` arm, same as the string-literal elision.
+        kind if is_const_int_array_define(kind) => false,
         // A `hint(x, **kwds)` op (`OpKind::Hint`) lowers to a non-raising
         // `same_as(value)` (`rtyper.py:478-481` internal renaming) in
         // `translate_op` — it emits no raising op.  Matched before the
@@ -866,6 +908,12 @@ pub fn translate_op(
     // way (see `is_str_const_define`); the pre-pass owns the slot's
     // `Hlvalue::Constant`, translate_op emits no FlowspaceOp.
     if is_str_const_define(&op.kind) {
+        return Ok(Vec::new());
+    }
+    // Prebuilt-constant-array define-ops pre-fold to `Constant(list)` the
+    // same way (see `is_const_int_array_define`); the pre-pass owns the
+    // slot's `Hlvalue::Constant`, translate_op emits no FlowspaceOp.
+    if is_const_int_array_define(&op.kind) {
         return Ok(Vec::new());
     }
     match &op.kind {
@@ -1661,6 +1709,54 @@ pub fn translate_op(
                         crate::translator::rtyper::pyre_call_registry::FunctionPathKey::from_segments(
                             segments.iter().cloned(),
                         );
+                    // Method-routing for a registered dispatch family
+                    // (issue #346).  `front::mir`'s `CallKind::Trait` arm
+                    // lowers `<Trait>::method(receiver, …)` to a
+                    // `FunctionPath [<trait leaf>, method]`.  The
+                    // direct-path binder (`lib.rs`) registers only trait
+                    // default bodies and single-impl devirtualizations; a
+                    // REQUIRED method with `>=2` impls is intentionally
+                    // left unregistered ("keep failing loud until
+                    // receiver-driven resolution lands").  When the trait
+                    // is an opted-in family and the receiver carries the
+                    // family base `ClassDef` (seeded by
+                    // `derive_subject_inputcells`), lower the call as a
+                    // `getattr` + `simple_call` so the attrfamily merge
+                    // resolves the impl `MethodDesc` family — exactly as
+                    // `CallTarget::Method`.  Gated on an exact registry
+                    // miss so default bodies and single-impl devirt (both
+                    // registered) keep their direct FunctionPath.
+                    if segments.len() == 2
+                        && call_registry.lookup(&key).is_none()
+                        && call_registry
+                            .bookkeeper()
+                            .is_registered_trait_family_leaf(&segments[0])
+                    {
+                        let mut iter = arg_hls.into_iter();
+                        let receiver = iter.next().ok_or_else(|| {
+                            TyperError::message(format!(
+                                "translate_op: family method call {segments:?} \
+                                 has no receiver arg (receiver must be args[0])"
+                            ))
+                        })?;
+                        let bound_method = Hlvalue::Variable(Variable::new());
+                        let mut call_args = Vec::with_capacity(iter.size_hint().0 + 1);
+                        call_args.push(bound_method.clone());
+                        call_args.extend(iter);
+                        return Ok(vec![
+                            FlowspaceOp::new(
+                                "getattr",
+                                vec![
+                                    receiver,
+                                    Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+                                        &segments[1],
+                                    ))),
+                                ],
+                                bound_method,
+                            ),
+                            FlowspaceOp::new("simple_call", call_args, result),
+                        ]);
+                    }
                     // Three resolution layers, matching upstream's three
                     // dispatch shapes for a dotted call site:
                     //
@@ -2283,6 +2379,17 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<Hlvalue> {
         OpKind::ConstRefAddr(addr) => {
             Some(Hlvalue::Constant(const_ref_gcref_constant(Some(*addr))))
         }
+        // Prebuilt-constant-array define-op.  A module-level constant
+        // array (`OP_STACKDEL: [i32; N]`) is carried as a bare immutable
+        // `Constant(list)`; `immutableconstant` annotates it `SomeList`
+        // and its `arr[i]` read is a foldable getarrayitem.  `front::mir`
+        // has no ConstList opkind and synthesises a 0-arg
+        // `Call(["__const_int_array", <i0>, …])` instead
+        // (`fold_named_const_int_array_global`); re-fold that define-op to
+        // the upstream Constant shape here, the same way the
+        // `__str_const` arm below re-folds a string literal.
+        kind if is_const_int_array_define(kind) => const_int_array_items(kind)
+            .map(|items| Hlvalue::Constant(Constant::new(ConstValue::List(items)))),
         // String-literal constant.  Upstream flowspace carries a string
         // literal as a bare `Constant('text')` SSA value (annotated
         // `SomeString` by `immutablevalue`); `front::mir` has no
@@ -2582,6 +2689,38 @@ pub(crate) fn derive_subject_inputcells(
                     continue;
                 }
                 if let (Some(root), Some(bk)) = (class_root.as_ref(), bookkeeper) {
+                    // A registered receiver-driven dispatch family (issue
+                    // #346): a `dyn Trait` receiver whose bound-trait
+                    // `class_root` names a family opted in through
+                    // `register_trait_families` seeds the family base
+                    // `ClassDef`.  Its impl subclasses carry the methods
+                    // (attrfamily merge), so a method getattr on the
+                    // receiver resolves the impl `MethodDesc` family
+                    // instead of blocking on the classdef-less shell.
+                    // Checked before the unique-impl substitution below —
+                    // a multi-impl family has no unique impl to fold to.
+                    let family_base = bk
+                        .pyre_trait_family_bases
+                        .borrow()
+                        .get(root.as_str())
+                        .cloned();
+                    if let Some(base_host) = family_base {
+                        let cd = bk.getuniqueclassdef(&base_host).map_err(|e| {
+                            TyperError::message(format!(
+                                "derive_subject_inputcells: startblock.inputargs[{idx}] \
+                                 ({var:?}) trait-family base for {root:?} failed \
+                                 ClassDef registration: {e:?}"
+                            ))
+                        })?;
+                        cells.push(crate::annotator::model::SomeValue::Instance(
+                            crate::annotator::model::SomeInstance::new(
+                                Some(cd),
+                                false,
+                                std::collections::BTreeMap::new(),
+                            ),
+                        ));
+                        continue;
+                    }
                     // A generic param (`&T` where `T: Trait`, incl. a
                     // trait default body's `&Self`) carries the bound
                     // trait's qualified path as `class_root`
@@ -5150,5 +5289,70 @@ mod tests {
             }),
             "Input"
         );
+    }
+
+    /// The prebuilt-constant-array define-op (`front::mir`'s
+    /// `__const_int_array` synthetic Call) is recognized, decodes to its
+    /// baked integer list, and pre-folds to a `Constant(List)` the same
+    /// way `__str_const` folds to `Constant(ByteStr)` — so `translate_op`
+    /// emits nothing and the slot carries the prebuilt list constant.
+    #[test]
+    fn const_int_array_define_folds_to_list_constant() {
+        use crate::model::CallTarget;
+
+        let define = OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: vec![
+                    "__const_int_array".to_string(),
+                    "0".to_string(),
+                    "2".to_string(),
+                    "-3".to_string(),
+                ],
+            },
+            args: Vec::new(),
+            result_ty: ValueType::Ref(None),
+        };
+        assert!(is_const_int_array_define(&define));
+        assert_eq!(
+            const_int_array_items(&define),
+            Some(vec![
+                ConstValue::Int(0),
+                ConstValue::Int(2),
+                ConstValue::Int(-3),
+            ])
+        );
+
+        let op = SpaceOperation {
+            result: Some(Variable::new()),
+            kind: define,
+        };
+        // `translate_op` emits no FlowspaceOp — the pre-pass owns the slot.
+        assert!(
+            translate_op(&op, &HashMap::new(), &empty_call_registry())
+                .expect("const-array define translates")
+                .is_empty()
+        );
+        // The pre-pass folds the define to the prebuilt list constant.
+        match legacy_const_define_hlvalue(&op) {
+            Some(Hlvalue::Constant(c)) => assert_eq!(
+                c.value,
+                ConstValue::List(vec![
+                    ConstValue::Int(0),
+                    ConstValue::Int(2),
+                    ConstValue::Int(-3),
+                ])
+            ),
+            other => panic!("expected Constant(List), got {other:?}"),
+        }
+
+        // A `__str_const` call and an ordinary path are not mistaken for it.
+        let str_const = OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: vec!["__str_const".to_string(), "hi".to_string()],
+            },
+            args: Vec::new(),
+            result_ty: ValueType::Ref(None),
+        };
+        assert!(!is_const_int_array_define(&str_const));
     }
 }

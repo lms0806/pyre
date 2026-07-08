@@ -4356,6 +4356,7 @@ impl<'a> Lowering<'a> {
                     .or_else(|| self.static_int_value_op(&segments))
                     .or_else(|| self.const_eval_global(id))
                     .or_else(|| self.fold_size_const_global(id))
+                    .or_else(|| self.fold_named_const_int_array_global(id))
                     .or_else(|| primitive_float_const(&segments))
                     .unwrap_or_else(|| OpKind::Call {
                         target: CallTarget::FunctionPath { segments },
@@ -4724,6 +4725,95 @@ impl<'a> Lowering<'a> {
             }),
             _ => None,
         }
+    }
+
+    /// Fold a `NamedConst` global whose initializer builds a fixed-size
+    /// array of integer literals (`OP_STACKDEL: [i32; N] = [c0, c1, …]`)
+    /// into the synthetic prebuilt-constant-array define-op the adapter
+    /// re-folds to `Constant(list)`
+    /// (`flowspace_adapter.rs::is_const_int_array_define`).  A
+    /// module-level constant array is a prebuilt `Constant(ll_array)`
+    /// whose `arr[i]` runtime-index read is a foldable `getarrayitem`
+    /// (the `ArrayRead` the `Index` projection arm emits); baking the
+    /// literals here lets that read resolve against a constant base
+    /// instead of a residual accessor `Call` no registry can bind.
+    ///
+    /// Accepts only the exact `_0 = [c0, c1, …]; return` shape: a single
+    /// `Array` aggregate assigned to `_0` whose operands are all integer
+    /// literals, over linear `Goto`s to a `Return`.  Anything richer
+    /// (computed elements, non-integer items, a `Repeat` fill, a second
+    /// `_0` write) returns `None` and keeps the residual accessor path;
+    /// so does a foreign const whose init body Charon left opaque (no
+    /// readable body to bake).
+    fn fold_named_const_int_array_global(&self, def_id: u64) -> Option<OpKind> {
+        let gd = self.llbc.global_by_id(def_id)?;
+        if gd
+            .rest
+            .get("global_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("NamedConst")
+        {
+            return None;
+        }
+        let init_id = gd.rest.get("init")?.as_u64()?;
+        let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
+        let mut items: Option<Vec<i64>> = None;
+        for block in &body.body {
+            for stmt in &block.statements {
+                match stmt.stmt_kind() {
+                    Ok(StmtKind::StorageLive(_))
+                    | Ok(StmtKind::StorageDead(_))
+                    | Ok(StmtKind::PlaceMention(_)) => {}
+                    Ok(StmtKind::Assign(place, Rvalue::Aggregate(kind, operands)))
+                        if matches!(place.kind, PlaceKind::Local(0)) =>
+                    {
+                        // Only a fixed-size `Array` aggregate of integer
+                        // literals; a `Repeat` fill or an Adt aggregate is
+                        // out of scope, as is a second `_0`-defining assign.
+                        if aggregate_ctor_name(&kind) != "Array" || items.is_some() {
+                            return None;
+                        }
+                        let mut vals = Vec::with_capacity(operands.len());
+                        for op in &operands {
+                            let Operand::Const(value) = op else {
+                                return None;
+                            };
+                            let DecodedConst::Int(n) = decode_constant(self.llbc, value).ok()?
+                            else {
+                                return None;
+                            };
+                            vals.push(n);
+                        }
+                        items = Some(vals);
+                    }
+                    // Any other statement (a write to a temporary or a
+                    // richer `_0` definition) means the array is computed,
+                    // not a literal aggregate.
+                    _ => return None,
+                }
+            }
+            match block.term() {
+                Ok(TermKind::Return) | Ok(TermKind::Goto { .. }) => {}
+                _ => return None,
+            }
+        }
+        let items = items?;
+        // The annotator infers the list's element type from the baked
+        // literals, so an empty array carries no element type; leave it
+        // to the residual path.
+        if items.is_empty() {
+            return None;
+        }
+        let mut segments = Vec::with_capacity(items.len() + 1);
+        segments.push("__const_int_array".to_string());
+        for n in items {
+            segments.push(n.to_string());
+        }
+        Some(OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args: Vec::new(),
+            result_ty: ValueType::Ref(None),
+        })
     }
 
     fn static_addr_op(&self, segments: &[String]) -> Option<OpKind> {
@@ -12279,6 +12369,17 @@ fn operator_name(kind: &serde_json::Value) -> Option<&str> {
     }
 }
 
+/// The overflow mode string of an operator object (`{"Add": "Wrap"}` →
+/// `Some("Wrap")`). Atom operators (`"Add"`) and payloads that are not a
+/// bare string (cast targets, multi-key objects) yield `None`.
+fn operator_mode(kind: &serde_json::Value) -> Option<&str> {
+    let obj = kind.as_object()?;
+    if obj.len() != 1 {
+        return None;
+    }
+    obj.values().next()?.as_str()
+}
+
 /// Decode a `Field` projection on a tuple container —
 /// `{"Field": [{"Tuple": N}, idx]}` — to its element index.
 fn const_tuple_field_index(elem: &ProjectionElem) -> Option<u64> {
@@ -12338,9 +12439,13 @@ fn const_eval_binop(kind: &serde_json::Value, lhs: ConstLit, rhs: ConstLit) -> O
     let name = operator_name(kind)?;
     match (lhs, rhs) {
         (ConstLit::Int(a), ConstLit::Int(b)) => match name {
-            // checked_* also on the Wrap-mode forms: a genuinely
-            // wrapping fold would need the operand width, so bail to
-            // the residual Call instead of folding wrong.
+            // Wrapping Add/Sub/Mul: the correct result depends on the
+            // operand width the i64 carrier has dropped (`255u8 + 1`
+            // wraps to 0, not 256), so residualize instead of folding
+            // at 64-bit width. Non-wrapping (panic-checked) forms reach
+            // the arms below, where checked_* is exact because a valid
+            // const initializer never overflows.
+            "Add" | "Sub" | "Mul" if operator_mode(kind) == Some("Wrap") => None,
             "Add" => a.checked_add(b).map(ConstLit::Int),
             "Sub" => a.checked_sub(b).map(ConstLit::Int),
             "Mul" => a.checked_mul(b).map(ConstLit::Int),
@@ -12350,6 +12455,12 @@ fn const_eval_binop(kind: &serde_json::Value, lhs: ConstLit, rhs: ConstLit) -> O
                 .ok()
                 .and_then(|s| a.checked_shl(s))
                 .map(ConstLit::Int),
+            // Right shift: the carrier lost the operand's signedness, so
+            // a negative `a` is ambiguous between a signed value (which
+            // wants an arithmetic shift) and an unsigned value past
+            // i64::MAX (which wants a logical shift). Fold only for
+            // `a >= 0`, where both shifts agree; residualize otherwise.
+            "Shr" if a < 0 => None,
             "Shr" => u32::try_from(b)
                 .ok()
                 .and_then(|s| a.checked_shr(s))
@@ -14172,6 +14283,84 @@ mod tests {
         for p in ["f32", "f64", "()", ""] {
             assert!(!type_arg_splits_per_instantiation(p), "{p} must not split");
         }
+    }
+
+    #[test]
+    fn const_eval_binop_declines_width_and_sign_ambiguous_folds() {
+        use super::{ConstLit, const_eval_binop};
+        use serde_json::json;
+
+        // Wrapping Add/Sub/Mul: the i64 carrier has no operand width, so
+        // `255u8 + 1` (wraps to 0, not 256) must residualize.
+        assert!(
+            const_eval_binop(
+                &json!({ "Add": "Wrap" }),
+                ConstLit::Int(255),
+                ConstLit::Int(1)
+            )
+            .is_none()
+        );
+        assert!(
+            const_eval_binop(
+                &json!({ "Sub": "Wrap" }),
+                ConstLit::Int(0),
+                ConstLit::Int(1)
+            )
+            .is_none()
+        );
+        assert!(
+            const_eval_binop(
+                &json!({ "Mul": "Wrap" }),
+                ConstLit::Int(16),
+                ConstLit::Int(16)
+            )
+            .is_none()
+        );
+        // Non-wrapping (panic-checked) forms still fold: a valid const
+        // initializer never overflows, so checked_* is exact.
+        assert!(matches!(
+            const_eval_binop(
+                &json!({ "Add": "Panic" }),
+                ConstLit::Int(255),
+                ConstLit::Int(1)
+            ),
+            Some(ConstLit::Int(256))
+        ));
+
+        // Right shift with a negative carrier is signedness-ambiguous
+        // (`u64::MAX >> 1` collapsed to `-1 >> 1`) — decline.
+        assert!(
+            const_eval_binop(
+                &json!({ "Shr": "Wrap" }),
+                ConstLit::Int(-1),
+                ConstLit::Int(1)
+            )
+            .is_none()
+        );
+        // A non-negative left operand shifts identically signed/unsigned.
+        assert!(matches!(
+            const_eval_binop(
+                &json!({ "Shr": "Wrap" }),
+                ConstLit::Int(0x7fff_ffff),
+                ConstLit::Int(1)
+            ),
+            Some(ConstLit::Int(0x3fff_ffff))
+        ));
+
+        // Census fold targets survive: SMALL_MAX = `(1i64<<62)-1` builds
+        // from a Shl and a SubChecked; SMALL_MIN negates the same Shl.
+        assert!(matches!(
+            const_eval_binop(&json!({ "Shl": "Panic" }), ConstLit::Int(1), ConstLit::Int(62)),
+            Some(ConstLit::Int(v)) if v == 1i64 << 62
+        ));
+        assert!(matches!(
+            const_eval_binop(&json!("SubChecked"), ConstLit::Int(1i64 << 62), ConstLit::Int(1)),
+            Some(ConstLit::Checked(v, false)) if v == (1i64 << 62) - 1
+        ));
+        assert!(matches!(
+            const_eval_binop(&json!("AddChecked"), ConstLit::Int(1i64 << 62), ConstLit::Int(1)),
+            Some(ConstLit::Checked(v, false)) if v == (1i64 << 62) + 1
+        ));
     }
 
     #[test]

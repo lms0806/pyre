@@ -1182,6 +1182,75 @@ fn analyze_pipeline_from_module_paths(
             *struct_leaf_counts.entry(leaf).or_default() += 1;
         }
     }
+    // Opt-in receiver-driven dispatch families (issue #346): a consumer
+    // (e.g. the aheui census) names `>=2`-impl trait qualified paths
+    // whose `dyn Trait` receivers should annotate to a base ClassDef
+    // linking the impl subclasses, so a method getattr on the receiver
+    // resolves the impl MethodDesc family.  Pyre production names none,
+    // so its multi-impl traits keep their classdef-less / fail-loud
+    // disposition unchanged.  Built from `trait_impl_owners` (before it
+    // is consumed below) and forwarded through `CallControl` to
+    // `dual_gate_registry`, which mints each family before the
+    // class-method seeding.
+    let trait_family_registrations: Vec<call::TraitFamilyRegistration> = config
+        .pipeline
+        .register_trait_families
+        .iter()
+        .filter_map(
+            |trait_qualified| match trait_impl_owners.get(trait_qualified) {
+                Some(owners) => {
+                    let impl_roots: Vec<String> = owners
+                        .iter()
+                        .map(|owner| owner.rsplit("::").next().unwrap_or(owner).to_string())
+                        .collect();
+                    // The family interning + method seeding key impl
+                    // subclasses by leaf (`canonical_struct_name`), so two
+                    // impls whose qualified owners share a leaf across
+                    // modules would collapse to one classdef and silently
+                    // drop a member. Skip such a family — leaving the
+                    // trait's classdef-less / fail-loud disposition — rather
+                    // than mis-seed it; a same-leaf consumer needs
+                    // qualified-root interning end-to-end (the leaf-keyed
+                    // struct registry and receiver match are pre-existing).
+                    // Mirrors the `struct_leaf_counts` bail on the
+                    // single-impl path below.
+                    let mut seen = std::collections::HashSet::new();
+                    let dup_leaf = impl_roots.iter().find(|leaf| !seen.insert(leaf.as_str()));
+                    if let Some(dup) = dup_leaf {
+                        eprintln!(
+                            "register_trait_families: {trait_qualified:?} has impls sharing \
+                             leaf {dup:?} across modules ({owners:?}); skipping — leaf-keyed \
+                             seeding cannot disambiguate them"
+                        );
+                        None
+                    } else {
+                        Some(call::TraitFamilyRegistration {
+                            base_root: trait_qualified.clone(),
+                            impl_roots,
+                        })
+                    }
+                }
+                None => {
+                    // Config validation: a named family that matches no
+                    // harvested trait is almost always a spelling mismatch
+                    // (the key is the trait's full `name_path()`).  List the
+                    // available multi-impl trait paths so the consumer can
+                    // correct it.
+                    let candidates: Vec<&String> = trait_impl_owners
+                        .iter()
+                        .filter(|(_, owners)| owners.len() >= 2)
+                        .map(|(path, _)| path)
+                        .collect();
+                    eprintln!(
+                        "register_trait_families: no harvested trait matches {trait_qualified:?}; \
+                     known multi-impl trait paths: {candidates:?}"
+                    );
+                    None
+                }
+            },
+        )
+        .collect();
+    call_control.set_trait_family_registrations(trait_family_registrations);
     let trait_unique_impls: std::collections::HashMap<String, String> = trait_impl_owners
         .into_iter()
         .filter_map(|(trait_qualified, owners)| {
