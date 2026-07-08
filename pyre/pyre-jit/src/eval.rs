@@ -3686,6 +3686,13 @@ fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitS
     // the structural unsupported region instead of keying on a
     // benchmark filename.
     //
+    // The gate cannot be dropped yet: removing it lets a `with` frame trace,
+    // which miscompiles (a raw SIGSEGV in the exception-link path plus
+    // guard-failure storms — test_strftime/test_shlex/test_textwrap, #389).
+    // The eventual fix is a real `WITH_EXCEPT_START` lowering; until then the
+    // decline is recorded in the census (see the `StructuralRegion` arm) so it
+    // is not a silent no-token gap.
+    //
     // `FOR_ITER` is narrower: a FOR_ITER frame may enter the JIT only when
     // every loop body contains exclusively allow-listed opcodes
     // (`for_iter_bodies_all_jit_safe`). The exclusion exists because a FBW walk
@@ -3748,8 +3755,31 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     );
     match unsupported_jit_shape(code) {
         UnsupportedJitShape::None => {}
-        UnsupportedJitShape::CurrentFrameOnly => return frame.execute_frame(None, None),
+        UnsupportedJitShape::CurrentFrameOnly => {
+            // A FOR_ITER frame the #57 gate cannot trace (a non-journalable
+            // mutator body, or a `finally`-duplicated loop): run it in the plain
+            // interpreter.  The tracer never sees it, so record the frame-shape
+            // decline in the census (deduped per code object) — otherwise a hot
+            // loop declined here reads as a silent no-token gap, indistinguishable
+            // from a loop the JIT never noticed.
+            pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
+                code as *const _ as usize,
+                "FrameShape::CurrentFrameOnly",
+            );
+            return frame.execute_frame(None, None);
+        }
         UnsupportedJitShape::StructuralRegion => {
+            // A `with` frame whose `WITH_EXCEPT_START` exception-link lowering
+            // the codewriter still residualizes: tracing it (or its callees)
+            // miscompiles — a raw SIGSEGV in the exception path and guard-failure
+            // storms (#389 gate-regression evidence).  Keep the frame AND its
+            // nested helper frames interpreted via `JitSuppressionGuard`, and
+            // record the census entry so the decline is visible, not a silent
+            // no-token gap.
+            pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
+                code as *const _ as usize,
+                "FrameShape::StructuralRegion",
+            );
             let _guard = JitSuppressionGuard::new();
             return frame.execute_frame(None, None);
         }
@@ -8266,6 +8296,27 @@ mod tests {
         assert_eq!(
             unsupported_jit_shape(&code),
             UnsupportedJitShape::CurrentFrameOnly
+        );
+    }
+
+    #[test]
+    fn with_block_frame_is_structural_region() {
+        // A `with` block compiles to `WITH_EXCEPT_START` for its exception link.
+        // The codewriter still residualizes that lowering, so tracing the frame
+        // (or its nested callees) miscompiles — a raw SIGSEGV in the exception
+        // path plus guard-failure storms (test_strftime/test_shlex/test_textwrap,
+        // #389). The frame must classify as `StructuralRegion` so it and its
+        // callees stay interpreted; dropping this gate regressed the CPython
+        // suite (commit 4daa5c517e, reverted).
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def wf(cm):\n    total = 0\n    for _ in range(3):\n        with cm:\n            total += 1\n    return total\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "wf");
+        assert_eq!(
+            unsupported_jit_shape(&code),
+            UnsupportedJitShape::StructuralRegion
         );
     }
 
