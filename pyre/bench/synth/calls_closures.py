@@ -12,14 +12,14 @@ def recursion__fib(n):
 def recursion__main():
     i = 0
     acc = 0
-    while i < 28:
+    while i < 8:
         acc = acc + recursion__fib(18)
         i = i + 1
     print(acc)
 recursion__main()
 
 # ── closures ──
-closures__N = 500000
+closures__N = 100000
 
 def closures__make_adder(k):
 
@@ -40,7 +40,7 @@ def closures__main():
 closures__main()
 
 # ── function_calls ──
-function_calls__N = 800000
+function_calls__N = 120000
 
 def function_calls__add3(a, b, c):
     return a + b + c
@@ -60,7 +60,7 @@ def function_calls__main():
 function_calls__main()
 
 # ── default_keyword_args ──
-default_keyword_args__N = 500000
+default_keyword_args__N = 100000
 
 def default_keyword_args__f(a, b=3, c=5):
     return a + b * 2 - c
@@ -77,7 +77,7 @@ def default_keyword_args__main():
 default_keyword_args__main()
 
 # ── generator_iteration ──
-generator_iteration__N = 120000
+generator_iteration__N = 30000
 
 def generator_iteration__gen(n):
     i = 0
@@ -96,7 +96,7 @@ def generator_iteration__main():
 generator_iteration__main()
 
 # ── load_deref ──
-load_deref__N = 200000
+load_deref__N = 100000
 
 def load_deref__make_adder():
     base = 7
