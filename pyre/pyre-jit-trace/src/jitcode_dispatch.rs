@@ -8991,20 +8991,6 @@ pub(crate) fn bridge_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_BRIDGE_AUDIT").is_some())
 }
 
-/// `PYRE_M366_BRIDGE_JITCODE` (default OFF) consumes the predecessor-keyed
-/// `pcdep_by_jit_pc` / `depth_pred_by_jit_pc` twins directly from the carried
-/// genuine `jitcode_pc` at `bridge_semantic_maps_at_with_jitcode_pc`, instead of
-/// re-inverting the coordinate to a Python PC via `python_pc_for_jitcode_pc` and
-/// indexing the py_pc-keyed `pcdep_color_slots` / `depth_at_py_pc`. The equality
-/// this relies on is the one `PYRE_PCMAP_BRIDGE_AUDIT` certifies. This is the
-/// decode-side identity step toward retiring the `pc_map` re-inversion — a
-/// behavioral flip validated by that audit certificate plus full corpus, since
-/// no byte-identical fallback exists once the re-inversion is bypassed.
-pub(crate) fn bridge_jitcode_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M366_BRIDGE_JITCODE").is_some())
-}
-
 /// `PYRE_M73_ENCODE_AUDIT` enables the assertion that the trivia-aware
 /// `depth_trivia_by_jit_pc` twin reproduces the ENCODE-side branch-resume depth
 /// that `branch_resume_target_stack_depth` computes via
@@ -9014,18 +9000,6 @@ pub(crate) fn bridge_jitcode_enabled() -> bool {
 pub(crate) fn m73_encode_audit_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_ENCODE_AUDIT").is_some())
-}
-
-/// `PYRE_M73_ENCODE` (default OFF) flips the three ENCODE branch-resume depth
-/// readers from the `python_pc_for_jitcode_pc` inversion + runtime trivia walk
-/// to the jitcode-pc-keyed `depth_trivia_for_jitcode_pc` twin. Behavioral flip
-/// (no byte-identity guarantee), certified by the always-computed
-/// `PYRE_M73_ENCODE_AUDIT` full-`Option` equality + `check.py`. When the twin is
-/// empty (skeleton / portal-bridge / fixture) the reader keeps the raw value so
-/// the pre-populated-twin installs are unaffected.
-pub(crate) fn m73_encode_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_ENCODE").is_some())
 }
 
 /// `PYRE_M73_LIVENESS_AUDIT` enables the assertion that querying the register
@@ -9387,7 +9361,7 @@ fn branch_resume_target_stack_depth(frame: &ActiveResumeFrame, target: usize) ->
                 "depth_trivia twin diverges from branch_resume_target_stack_depth at target={target} py={py}"
             );
         }
-        if m73_encode_enabled() && pjc.depth_trivia_populated() {
+        if pjc.depth_trivia_populated() {
             pjc.depth_trivia_for_jitcode_pc(target)
         } else {
             depth
@@ -9443,7 +9417,7 @@ fn kept_stack_has_boxed_int_hazard(
                 "depth_trivia twin diverges from kept_stack_has_boxed_int_hazard at target={target} py={py}"
             );
         }
-        let depth_opt = if m73_encode_enabled() && pjc.depth_trivia_populated() {
+        let depth_opt = if pjc.depth_trivia_populated() {
             pjc.depth_trivia_for_jitcode_pc(target)
         } else {
             depth_opt
@@ -9741,7 +9715,7 @@ fn branch_resume_target_stack_depth_any_leg(target: usize, jitcode_index: u32) -
             "depth_trivia twin diverges from branch_resume_target_stack_depth_any_leg at target={target} py={py}"
         );
     }
-    if m73_encode_enabled() && pjc.depth_trivia_populated() {
+    if pjc.depth_trivia_populated() {
         pjc.depth_trivia_for_jitcode_pc(target)
     } else {
         depth_opt
