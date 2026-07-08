@@ -1866,6 +1866,7 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::interp_itertools::is_filterfalse(iter)
                 || pyre_object::interp_itertools::is_pairwise(iter)
                 || pyre_object::interp_itertools::is_cycle(iter)
+                || pyre_object::interp_itertools::is_chain(iter)
                 || pyre_object::dictmultiobject::is_dict_view_iterator(iter)
                 || pyre_object::functional::is_enumerate(iter)
                 || pyre_object::functional::is_reversed(iter)
@@ -3331,8 +3332,28 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── print_expr ──
-    // PyPy: PRINT_EXPR → sys.displayhook(value)
+    // PRINT_EXPR → sys.displayhook(value). Routing through the live hook lets
+    // a rebound displayhook (doctest, IDLE) and a redirected sys.stdout take
+    // effect instead of writing straight to the native stream.
     fn print_expr(&mut self, val: PyObjectRef) -> Result<(), PyError> {
+        if let Some(sys_mod) = crate::importing::get_sys_module("sys") {
+            match crate::baseobjspace::getattr_str(sys_mod, "displayhook") {
+                Ok(hook) => {
+                    let r = crate::call_function(hook, &[val]);
+                    if r.is_null() {
+                        return Err(crate::call::take_call_error().unwrap_or_else(|| {
+                            PyError::runtime_error("displayhook raised an exception")
+                        }));
+                    }
+                    return Ok(());
+                }
+                Err(e) if e.kind == PyErrorKind::AttributeError => {
+                    return Err(PyError::runtime_error("lost sys.displayhook"));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        // No `sys` yet (early bootstrap) — native repr print.
         if !unsafe { pyre_object::is_none(val) } {
             let s = unsafe { crate::py_repr(val)? };
             crate::host_seam::emit_stdout(format!("{s}\n").as_bytes());

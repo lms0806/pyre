@@ -838,6 +838,10 @@ pub fn init_typeobjects() {
             &pyre_object::interp_itertools::CYCLE_TYPE as *const PyType as usize,
             new_typeobject_with_base("itertools.cycle", |_| {}, object_type) as usize,
         );
+        reg.insert(
+            &pyre_object::interp_itertools::CHAIN_TYPE as *const PyType as usize,
+            new_typeobject_with_base("itertools.chain", |_| {}, object_type) as usize,
+        );
         // `pypy/objspace/std/specialisedtupleobject.py` — three SpecialisedTuple
         // variants share the public `tuple` PyType name, so all three
         // foreign statics map to a "tuple" typedef.  `gettypefor` keys
@@ -8130,12 +8134,25 @@ fn init_int_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "bit_count",
             |args| {
-                let val = if !args.is_empty() && unsafe { pyre_object::is_int(args[0]) } {
-                    unsafe { pyre_object::w_int_get_value(args[0]) }
+                let count = if args.is_empty() {
+                    0
+                } else if unsafe { pyre_object::is_int(args[0]) } {
+                    // Small-int fast path — `@jit.elidable` `_bit_count`.
+                    pyre_object::int_bit_count(unsafe { pyre_object::w_int_get_value(args[0]) })
+                } else if unsafe { pyre_object::pyobject::is_int_or_long(args[0]) } {
+                    // long/bigint: population count of the magnitude, so the
+                    // i64 fast path (which leaves out-of-range values at 0)
+                    // does not undercount.
+                    unsafe {
+                        crate::builtins::obj_to_bigint(args[0])
+                            .iter_u32_digits()
+                            .map(|d| d.count_ones() as i64)
+                            .sum()
+                    }
                 } else {
                     0
                 };
-                Ok(pyre_object::w_int_new(pyre_object::int_bit_count(val)))
+                Ok(pyre_object::w_int_new(count))
             },
             1,
         ),
@@ -8837,32 +8854,28 @@ fn init_float_type(ns: &mut DictStorage) {
                     ));
                 }
                 let v = unsafe { pyre_object::w_float_get_value(args[0]) };
-                if v.is_nan() || v.is_infinite() {
-                    return Err(crate::PyError::value_error(
-                        "cannot convert NaN/Infinity to integer ratio",
-                    ));
-                }
-                // Decompose f = m * 2^e with an integer mantissa, then
-                // reduce to lowest terms (the mantissa carries trailing
-                // zero bits for values like 0.5, so the raw ratio is not
-                // yet reduced).
-                let (mantissa, exponent, sign) = integer_decode(v);
-                let m = mantissa as i64 * sign as i64;
-                let (num, denom) = if exponent >= 0 {
-                    (m.saturating_mul(1i64 << exponent.min(62)), 1i64)
-                } else {
-                    (m, 1i64 << (-exponent).min(62))
-                };
-                fn gcd(mut a: i64, mut b: i64) -> i64 {
-                    while b != 0 {
-                        (a, b) = (b, a % b);
+                // Exact numerator/denominator via the shared rational
+                // decomposition (full exponent range, reduced to lowest terms).
+                let (numer, denom) =
+                    rustpython_common::int::float_to_ratio(v).ok_or_else(|| {
+                        if v.is_infinite() {
+                            crate::PyError::overflow_error(
+                                "cannot convert Infinity to integer ratio",
+                            )
+                        } else {
+                            crate::PyError::value_error("cannot convert NaN to integer ratio")
+                        }
+                    })?;
+                let to_pyint = |b: malachite_bigint::BigInt| {
+                    if pyre_object::jit_bigint_to_i64_fits(&b) != 0 {
+                        pyre_object::w_int_new(pyre_object::jit_bigint_to_i64_value(&b))
+                    } else {
+                        pyre_object::w_long_new(b)
                     }
-                    a.abs()
-                }
-                let g = gcd(num, denom).max(1);
+                };
                 Ok(pyre_object::w_tuple_new(vec![
-                    pyre_object::w_int_new(num / g),
-                    pyre_object::w_int_new(denom / g),
+                    to_pyint(numer),
+                    to_pyint(denom),
                 ]))
             },
             1,
