@@ -5,7 +5,7 @@
 //! identity, so a callable has one identity regardless of the import
 //! spelling. pyre resolves symbolic paths extracted from LLBC, where a
 //! cross-crate callsite spells the callee with its crate name
-//! (`myinterp::io::output_flush`) while the graph registers under
+//! (`aheui_runtime::io::output_flush`) while the graph registers under
 //! module-relative spellings — so every *local* (LLBC-extracted) crate
 //! name must be an alias root on both the registration side
 //! (`free_function_alias_paths`) and the canonical-dedup side
@@ -35,9 +35,7 @@ thread_local! {
     /// seed and read, flaking alias resolution. The roots belong to one
     /// invocation, so scoping them to the invocation's thread is exact — the
     /// same TLS adaptation of a PyPy GIL-singleton as
-    /// `jitdriver.rs::BACK_EDGE_BH_BUILDER`. (The translate pipeline is a
-    /// build-time / test-fixture code generator, not a runtime path — the
-    /// pyre VM never touches these roots — so no cross-thread reader exists.)
+    /// `jitdriver.rs::BACK_EDGE_BH_BUILDER`.
     static REGISTERED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
