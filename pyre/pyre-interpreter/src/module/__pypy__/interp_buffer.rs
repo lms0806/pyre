@@ -80,6 +80,22 @@ impl W_PickleBuffer {
     }
 }
 
+/// If `obj` is a `PickleBuffer`, the wrapped exporter its buffer protocol
+/// forwards to — `buffer_w` delegates to the underlying object, so `bytes(pb)`
+/// / `memoryview(pb)` operate on the wrapped `bytes`/`bytearray`/`array`/
+/// `memoryview`. `Some(Err(..))` once the buffer was released; `None` when
+/// `obj` is not a `PickleBuffer`.
+pub(crate) fn forwarded_exporter(obj: PyObjectRef) -> Option<Result<PyObjectRef, PyError>> {
+    W_PickleBuffer::from_obj(obj).map(|pb| {
+        let w = pb.wrapped();
+        if unsafe { pyre_object::is_none(w) } {
+            Err(released_error())
+        } else {
+            Ok(w)
+        }
+    })
+}
+
 fn released_error() -> PyError {
     PyError::value_error("operation forbidden on released PickleBuffer object")
 }
@@ -137,6 +153,18 @@ pub(crate) fn buffer_view(obj: PyObjectRef) -> Result<(Vec<u8>, bool), PyError> 
         "a bytes-like object is required, not '{}'",
         type_name(obj)
     )))
+}
+
+/// Whether the wrapped exporter's buffer is C-contiguous, matching the
+/// `_pickle` save path's `iscontiguous(buf)` guard. `bytes`/`bytearray`/`array`
+/// are one-dimensional and always contiguous; a `memoryview` reports through
+/// its `c_contiguous` flag.
+pub(crate) fn is_contiguous(obj: PyObjectRef) -> Result<bool, PyError> {
+    if is_memoryview(obj) {
+        let w = crate::baseobjspace::getattr_str(obj, "c_contiguous")?;
+        return crate::baseobjspace::is_true(w);
+    }
+    Ok(true)
 }
 
 /// The `memoryview` builtin type via the live execution context.
