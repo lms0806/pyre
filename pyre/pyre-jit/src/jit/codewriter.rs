@@ -3463,6 +3463,8 @@ struct FnPtrIndices {
     load_deref_value_fn: HelperHandle,
     store_deref_value_fn: HelperHandle,
     make_cell_fn: HelperHandle,
+    make_function_fn: HelperHandle,
+    set_function_attribute_fn: HelperHandle,
     unary_negative_fn: HelperHandle,
     unary_invert_fn: HelperHandle,
     unary_positive_fn: HelperHandle,
@@ -4107,6 +4109,23 @@ fn register_helper_fn_pointers(
         cpu.call_kw_fn_13 as *const (),
         CallFlavor::MayForce,
     );
+    // `jit_make_function_from_globals` wraps a code object into a function;
+    // it allocates but runs no user code and never raises → `Plain` (matches
+    // the trait tracer's `trace_make_function`, which records only a
+    // no-exception guard).  Appended last to preserve fn_ptr indices.
+    let make_function_fn = bind(
+        assembler,
+        cpu.make_function_fn as *const (),
+        CallFlavor::Plain,
+    );
+    // `jit_set_function_attribute` stamps one typed field on the function; it
+    // runs no user code and never raises → `Plain`.  Appended last to preserve
+    // fn_ptr indices.
+    let set_function_attribute_fn = bind(
+        assembler,
+        cpu.set_function_attribute_fn as *const (),
+        CallFlavor::Plain,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -4196,6 +4215,8 @@ fn register_helper_fn_pointers(
         call_kw_fn_11,
         call_kw_fn_12,
         call_kw_fn_13,
+        make_function_fn,
+        set_function_attribute_fn,
     }
 }
 
@@ -5800,6 +5821,16 @@ impl CodeWriter {
                     idx: call_kw_fn_13_idx,
                     flavor: _call_kw_fn_13_flavor,
                 },
+            make_function_fn:
+                HelperHandle {
+                    idx: make_function_fn_idx,
+                    flavor: _make_function_fn_flavor,
+                },
+            set_function_attribute_fn:
+                HelperHandle {
+                    idx: set_function_attribute_fn_idx,
+                    flavor: _set_function_attribute_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -5882,6 +5913,8 @@ impl CodeWriter {
                 load_deref_value_fn_idx,
                 store_deref_value_fn_idx,
                 make_cell_fn_idx,
+                make_function_fn_idx,
+                set_function_attribute_fn_idx,
                 unary_negative_fn_idx,
                 unary_invert_fn_idx,
                 unary_positive_fn_idx,
@@ -9266,18 +9299,50 @@ impl CodeWriter {
                             );
                         }
                         Instruction::MakeFunction { .. } => {
-                            // Pops code object (TOS), pushes function. Net: 0.
-                            // Replace shadow value so SET_FUNCTION_ATTRIBUTE sees func.
-                            // (1 pushed, 1 popped).
+                            // Pops the code object (TOS), pushes the built
+                            // function. Net: 0.  `make_function_value(globals,
+                            // code)` HLOp → `residual_call_r_r(make_function_fn,
+                            // ListR[globals, code])` → `jit_make_function_from_globals(
+                            // globals, code)` (Plain — allocates a function, runs no
+                            // user code, never raises).  The result replaces the code
+                            // object on the shadow stack so a following
+                            // SET_FUNCTION_ATTRIBUTE / STORE_FAST sees the function.
                             //
-                            // Portable (flowspace `newfunction`) but latent:
-                            // function definition is a def-time op, not a hot-loop
-                            // body, and MAKE_FUNCTION + SET_FUNCTION_ATTRIBUTE must
-                            // port as a pair (the flowspace fold resolves the code
-                            // constant to a Constant closure). No residual yet.
-                            let _ = current_state.stack.pop();
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!(py_pc);
+                            // `globals` is the code's `w_globals` object as a
+                            // post-rtype `Signed(ptr) + Kind::Ref` constant, the same
+                            // shape the StoreAttr arm bakes `w_code` with.
+                            // `pyframe.py:49 self.w_globals = w_globals` stamps a
+                            // `malloc_typed`-immortal wrapper at frame construction,
+                            // so its pointer is fixed and GC-stable at jitcode build
+                            // time (see the LOAD_GLOBAL namespace fold above).
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let code_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let globals_obj = unsafe {
+                                pyre_interpreter::w_code_get_w_globals(
+                                    w_code as pyre_object::PyObjectRef,
+                                )
+                            };
+                            let globals_const: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(globals_obj as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "make_function_value",
+                                vec![globals_const.into(), code_value.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            current_state.stack.push(result_value.into());
+                            emit_pushvalue_ref!(
+                                current_depth,
+                                stack_base + current_depth,
+                                result_value.into(),
+                                py_pc
+                            );
                         }
                         Instruction::StoreAttr { namei } => {
                             let name_idx = namei.get(op_arg) as usize;
@@ -10577,21 +10642,39 @@ impl CodeWriter {
                             );
                         }
 
-                        // SetFunctionAttribute: pops func (TOS), pops attr (TOS1),
-                        // pushes same func back. Net: -1. Preserve func identity.
-                        // eval.rs:1907-1908: func = pop(), attr = pop().
-                        Instruction::SetFunctionAttribute { .. } => {
-                            // Portable (flowspace `newfunction` with constant
-                            // defaults) but latent: the def-time partner of
-                            // MAKE_FUNCTION; ports as a pair with it. No residual
-                            // yet.
-                            let func = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            current_depth = current_depth.saturating_sub(1);
-                            let _ = current_state.stack.pop(); // attr
-                            current_depth = current_depth.saturating_sub(1);
-                            current_state.stack.push(func);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                        // SetFunctionAttribute: pops func (TOS), pops attr
+                        // (TOS1), stamps one attribute on func per the
+                        // compile-time flag, pushes the same func back. Net: -1.
+                        // `set_function_attribute(func, attr, flag)` HLOp →
+                        // `residual_call_ir_r(set_function_attribute_fn,
+                        // ListI[flag], ListR[func, attr])` →
+                        // `jit_set_function_attribute(func, attr, flag)` (Plain —
+                        // stamps a typed field, runs no user code, never raises).
+                        // The result replaces func on the shadow stack so a
+                        // following SET_FUNCTION_ATTRIBUTE / STORE_FAST sees it.
+                        //
+                        // `flag` is baked as the `MakeFunctionFlag` bit-position
+                        // discriminant (`flag as u8`); the residual matches on
+                        // that integer, so the enum's own `#[repr(u8)]` layout is
+                        // the single source of truth for the mapping.
+                        Instruction::SetFunctionAttribute { flag } => {
+                            let flag_disc = flag.get(op_arg) as u8 as i64;
+                            let flag_const: super::flow::FlowValue =
+                                super::flow::Constant::signed(flag_disc).into();
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let func_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let attr_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "set_function_attribute",
+                                vec![func_value.into(), attr_value.into(), flag_const.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // EndSend: pops result (TOS), pops iter (TOS1), pushes result back.
