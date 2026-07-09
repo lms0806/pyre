@@ -538,9 +538,16 @@ fn emit_call_assembler_callee_frame(
                 let pycode_const = ctx.const_ref(w_callee_code as i64);
                 let w_globals_obj_const = ctx.const_ref(callee_globals_obj as i64);
                 let ec = this.ensure_execution_context(ctx);
+                // Re-box the unboxed raw arg into `locals[0]` tag-aware so the
+                // callee reads the same representation it was traced against;
+                // heap-only boxing here forces a `W_IntObject` even when the
+                // value fits the tagged range, deopting the callee's low-bit
+                // guard every recursion.  `box_int_payload` = `wrapint` under
+                // `!CAN_BE_TAGGED`, so the emission is unchanged by default.
+                let arg_box = this.box_int_payload(ctx, raw_arg);
                 let frame = crate::helpers::emit_new_pyframe_inline_self_recursive(
                     ctx,
-                    raw_arg,
+                    arg_box,
                     nlocals + ncells + max_stack,
                     nlocals + ncells,
                     pycode_const,
@@ -5116,7 +5123,7 @@ impl MIFrame {
     fn guard_int_object_value(&mut self, ctx: &mut TraceCtx, int_obj: OpRef, expected: i64) {
         if pyre_object::tagged_int::CAN_BE_TAGGED {
             if let Some(Value::Ref(r)) = ctx.concrete_of_opref(int_obj) {
-                if r != GcRef(usize::MAX) {
+                if r != GcRef::NO_CONCRETE {
                     let o = r.as_usize() as PyObjectRef;
                     if !o.is_null() {
                         if pyre_object::tagged_int::is_tagged_int(o) {
@@ -5206,7 +5213,7 @@ impl MIFrame {
         }
         if pyre_object::tagged_int::CAN_BE_TAGGED {
             if let Some(Value::Ref(r)) = ctx.concrete_of_opref(int_obj) {
-                if r != GcRef(usize::MAX) {
+                if r != GcRef::NO_CONCRETE {
                     let o = r.as_usize() as PyObjectRef;
                     if !o.is_null() {
                         if pyre_object::tagged_int::is_tagged_int(o) {
@@ -5227,6 +5234,31 @@ impl MIFrame {
         }
         self.guard_class(ctx, int_obj, &INT_TYPE as *const PyType);
         opimpl_getfield_gc_i(ctx, int_obj, int_intval_descr())
+    }
+
+    /// Box a raw `Type::Int` payload back into a `Ref`, taking the tagged
+    /// immediate path when `CAN_BE_TAGGED` and the concrete value fits
+    /// (`ll_int_box`, mirror of `walker_box_int`).  The `IntAddOvf(raw,raw)`
+    /// doubling is the `fits_tagged` overflow check; a runtime value that does
+    /// not fit deopts on the `GuardNoOverflow` rather than producing a wrong
+    /// box.  Falls back to `wrapint` (heap `W_IntObject`) when the flag is off
+    /// or the value is not a concrete `Int`, so the emission is unchanged in
+    /// the default configuration.
+    pub(crate) fn box_int_payload(&mut self, ctx: &mut TraceCtx, raw: OpRef) -> OpRef {
+        if pyre_object::tagged_int::CAN_BE_TAGGED {
+            if let Some(Value::Int(value)) = ctx.box_value(raw) {
+                if pyre_object::tagged_int::fits_tagged(value) {
+                    let doubled = ctx.record_op(OpCode::IntAddOvf, &[raw, raw]);
+                    ctx.set_opref_concrete(doubled, Value::Int(value << 1));
+                    self.generate_guard(ctx, OpCode::GuardNoOverflow, &[]);
+                    let one = ctx.const_int(1);
+                    let tagged = ctx.record_op(OpCode::IntOr, &[doubled, one]);
+                    ctx.set_opref_concrete(tagged, Value::Int((value << 1) | 1));
+                    return ctx.record_op(OpCode::CastIntToPtr, &[tagged]);
+                }
+            }
+        }
+        crate::state::wrapint(ctx, raw)
     }
 
     pub(crate) fn guard_len_gt_index(&mut self, ctx: &mut TraceCtx, len: OpRef, index: usize) {

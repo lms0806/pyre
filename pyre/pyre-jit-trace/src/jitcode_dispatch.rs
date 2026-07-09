@@ -1904,7 +1904,7 @@ fn concrete_from_recorded_opref(ctx: &WalkContext<'_, '_>, opref: OpRef) -> Conc
     match ctx.trace_ctx.concrete_of_opref(opref) {
         Some(Value::Int(v)) => ConcreteValue::Int(v),
         Some(Value::Float(v)) => ConcreteValue::Float(v),
-        Some(Value::Ref(r)) if r != majit_ir::GcRef(usize::MAX) => {
+        Some(Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE => {
             ConcreteValue::Ref(r.as_usize() as pyre_object::PyObjectRef)
         }
         _ => ConcreteValue::Null,
@@ -3518,7 +3518,7 @@ fn walker_fill_materialized_array(
         return;
     }
     let block = match ctx.trace_ctx.box_value(array) {
-        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef(usize::MAX) && r.as_usize() != 0 => {
+        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE && r.as_usize() != 0 => {
             r.as_usize() as *mut pyre_object::object_array::ItemsBlock
         }
         // No stamped concrete → not materialized (gate off / non-ref / non-const).
@@ -3532,23 +3532,23 @@ fn walker_fill_materialized_array(
         Some(majit_ir::Value::Int(i)) if i >= 0 => i as usize,
         _ => {
             ctx.trace_ctx
-                .try_set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef(usize::MAX)));
+                .try_set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef::NO_CONCRETE));
             return;
         }
     };
     let cap = unsafe { pyre_object::object_array::items_block_capacity(block) };
     if idx >= cap {
         ctx.trace_ctx
-            .try_set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef(usize::MAX)));
+            .try_set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef::NO_CONCRETE));
         return;
     }
     let elem = match ctx.trace_ctx.box_value(value) {
-        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef(usize::MAX) => {
+        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE => {
             r.as_usize() as pyre_object::PyObjectRef
         }
         _ => {
             ctx.trace_ctx
-                .try_set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef(usize::MAX)));
+                .try_set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef::NO_CONCRETE));
             return;
         }
     };
@@ -5236,7 +5236,7 @@ fn try_fold_pure_call_via_executor(
                 // "no concrete known" — never reach this path because
                 // `box_value` returns `None` for un-stamped OpRefs, but
                 // belt-and-suspenders against future plumbing.
-                if r == majit_ir::GcRef(usize::MAX) {
+                if r == majit_ir::GcRef::NO_CONCRETE {
                     return;
                 }
                 r.as_usize() as i64
@@ -5690,7 +5690,7 @@ fn try_execute_residual_call_via_executor(
         let v = match ctx.trace_ctx.box_value(arg) {
             Some(majit_ir::Value::Int(n)) => n,
             Some(majit_ir::Value::Ref(r)) => {
-                if r == majit_ir::GcRef(usize::MAX) {
+                if r == majit_ir::GcRef::NO_CONCRETE {
                     if is_void {
                         return Err(DispatchError::ResidualCallArgUnbound {
                             pc: op_pc,
@@ -8222,17 +8222,30 @@ pub fn fbw_store_journal_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRe
 /// (`wrapint` / `wrapfloat` = `NewWithVtable` + `SetfieldGc`).  `value_type`
 /// here is `ctx.get_opref_type(value).unwrap_or(Type::Ref)`, the exact body
 /// of `MIFrame::value_type` minus the borrow.
-fn fbw_ensure_boxed_for_ca(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
+fn fbw_ensure_boxed_for_ca(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    value: OpRef,
+) -> Result<OpRef, DispatchError> {
     let ty = if value.is_none() {
         Type::Ref
     } else {
-        ctx.get_opref_type(value).unwrap_or(Type::Ref)
+        ctx.trace_ctx.get_opref_type(value).unwrap_or(Type::Ref)
     };
-    match ty {
-        Type::Int => crate::state::wrapint(ctx, value),
-        Type::Float => crate::state::wrapfloat(ctx, value),
+    let boxed = match ty {
+        Type::Int => {
+            // The concrete int is stamped on `value` by the `int_return`
+            // callers (or carried by a `ConstInt`), so route the box through
+            // the tagged-immediate path when it fits.
+            match ctx.trace_ctx.box_value(value) {
+                Some(majit_ir::Value::Int(v)) => walker_box_int(ctx, op_pc, value, v)?,
+                _ => crate::state::wrapint(ctx.trace_ctx, value),
+            }
+        }
+        Type::Float => crate::state::wrapfloat(ctx.trace_ctx, value),
         Type::Ref | Type::Void => value,
-    }
+    };
+    Ok(boxed)
 }
 
 /// FBW-native port of `MIFrame::store_token_in_vable` (`pyjitpl.py:3222`).
@@ -8266,7 +8279,7 @@ fn fbw_terminate_with_finish(
     result: OpRef,
     op_pc: usize,
 ) -> Result<(), DispatchError> {
-    let finish_value = fbw_ensure_boxed_for_ca(ctx.trace_ctx, result);
+    let finish_value = fbw_ensure_boxed_for_ca(ctx, op_pc, result)?;
     fbw_store_token_in_vable(ctx, op_pc)?;
     FBW_FINISH_PAYLOAD.with(|c| c.set(Some((finish_value, Type::Ref))));
     Ok(())
@@ -12043,9 +12056,20 @@ fn try_walker_call_assembler_self_recursive(
     let nlocals = callee_code.varnames.len();
     let max_stack = callee_code.max_stackdepth as usize;
 
-    // Unbox the boxed int argument -> raw payload, re-boxed inside the new
-    // callee frame.  Mirror of `trace_guarded_int_payload(args[0])`.
+    // Unbox the boxed int argument -> raw payload, then re-box it into the
+    // callee's `locals[0]` through `walker_box_int` so the local carries the
+    // same representation the callee was traced against.  Under
+    // `CAN_BE_TAGGED` a small `int` becomes a tagged immediate (`ll_int_box`);
+    // a heap-only re-box (`emit_box_int_inline`) would force a `W_IntObject`
+    // and the callee's speculative low-bit guard on the local would deopt on
+    // every recursion.  Under `!CAN_BE_TAGGED` `walker_box_int` falls back to
+    // `wrapint` (= `emit_box_int_inline`), so the emitted ops are unchanged.
+    // Mirror of `trace_guarded_int_payload(args[0])`.
     let raw_arg = walker_unbox_int(ctx, op.pc, r_args[2], int_type_addr)?;
+    let arg_box = match ctx.trace_ctx.box_value(raw_arg) {
+        Some(majit_ir::Value::Int(v)) => walker_box_int(ctx, op.pc, raw_arg, v)?,
+        _ => crate::state::wrapint(ctx.trace_ctx, raw_arg),
+    };
 
     // Execution-context red: recover it fresh off the materialized caller
     // portal frame via `GETFIELD_GC_R(frame, execution_context_descr)` rather
@@ -12070,7 +12094,7 @@ fn try_walker_call_assembler_self_recursive(
     let w_globals_obj_const = ctx.trace_ctx.const_ref(callee_globals_obj as i64);
     let callee_frame = crate::helpers::emit_new_pyframe_inline_self_recursive(
         ctx.trace_ctx,
-        raw_arg,
+        arg_box,
         nlocals + max_stack,
         nlocals,
         pycode_const,
@@ -13811,7 +13835,7 @@ fn walker_execute_may_force_boxed(
         let v = match ctx.trace_ctx.box_value(arg) {
             Some(majit_ir::Value::Int(n)) => n,
             Some(majit_ir::Value::Ref(r)) => {
-                if r == majit_ir::GcRef(usize::MAX) {
+                if r == majit_ir::GcRef::NO_CONCRETE {
                     return None;
                 }
                 r.as_usize() as i64
@@ -13841,7 +13865,7 @@ fn walker_concrete_ref_object(
     opref: OpRef,
 ) -> Option<pyre_object::PyObjectRef> {
     match ctx.trace_ctx.concrete_of_opref(opref) {
-        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef(usize::MAX) => {
+        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE => {
             let obj = r.as_usize() as pyre_object::PyObjectRef;
             if obj.is_null() { None } else { Some(obj) }
         }
@@ -14636,6 +14660,21 @@ fn walker_guard_class(
     type_addr: i64,
 ) -> Result<(), DispatchError> {
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+        // `GuardClass` reads `ob_type` off `obj` (rpython/jit/backend/x86/
+        // assembler.py:1885 `_cmp_guard_class` derefs the pointer with no tag
+        // test), so the frontend must not hand it a tagged immediate. `obj`
+        // here is a concrete heap box at record time (callers gate on
+        // `is_long`), but the trace is reused for operands that arrive tagged
+        // on a later entry. Emit the low-bit `GuardFalse` first — mirroring
+        // `walker_unbox_int_typed`'s boxed leg — so a tagged arrival deopts
+        // instead of faulting on the class deref.
+        if pyre_object::tagged_int::CAN_BE_TAGGED
+            && walker_concrete_ref_object(ctx, obj)
+                .is_some_and(|o| !pyre_object::tagged_int::is_tagged_int(o))
+        {
+            let lowbit = crate::helpers::emit_tag_lowbit_test(ctx.trace_ctx, obj, false);
+            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[lowbit])?;
+        }
         let type_const = ctx.trace_ctx.const_int(type_addr);
         ctx.trace_ctx
             .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
@@ -14987,7 +15026,9 @@ fn try_walker_specialize_unpack(
                 crate::descr::specialised_tuple_ii_value1_descr()
             };
             let raw = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, seq, descr);
-            let boxed = crate::state::wrapint(ctx.trace_ctx, raw);
+            let elem =
+                unsafe { pyre_object::w_int_get_value(elem_ptr as pyre_object::PyObjectRef) };
+            let boxed = walker_box_int(ctx, op_pc, raw, elem)?;
             ctx.trace_ctx.set_opref_concrete(
                 boxed,
                 majit_ir::Value::Ref(majit_ir::GcRef(elem_ptr as usize)),
@@ -16091,7 +16132,7 @@ fn try_walker_specialize_subscr(
             let elem = unsafe { pyre_object::w_int_get_value(result_obj) };
             ctx.trace_ctx
                 .set_opref_concrete(raw, majit_ir::Value::Int(elem));
-            crate::state::wrapint(ctx.trace_ctx, raw)
+            walker_box_int(ctx, op_pc, raw, elem)?
         }
         _ => {
             let block = crate::state::opimpl_getfield_gc_r(
@@ -16377,7 +16418,7 @@ fn try_walker_specialize_builtin_len(
     let raw_len = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr);
     ctx.trace_ctx
         .set_opref_concrete(raw_len, majit_ir::Value::Int(concrete_len as i64));
-    let boxed = crate::state::wrapint(ctx.trace_ctx, raw_len);
+    let boxed = walker_box_int(ctx, op.pc, raw_len, concrete_len as i64)?;
     ctx.trace_ctx.set_opref_concrete(
         boxed,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
@@ -17776,7 +17817,8 @@ fn emit_namespace_cell_fold(
             cell_opref,
             crate::descr::int_mutable_cell_value_descr(),
         );
-        crate::state::wrapint(ctx.trace_ctx, raw_int)
+        let intval = unsafe { pyre_object::w_int_get_value(result_obj) };
+        walker_box_int(ctx, op_pc, raw_int, intval)?
     } else {
         cell_opref
     };
@@ -18250,7 +18292,9 @@ fn dispatch_residual_call_iIRd_kind(
     if ei.pyre_helper == majit_ir::PyreHelperKind::BoxInt && dst_bank == 'r' {
         if let Some(&raw_arg) = i_args.first() {
             if let Some(boxed_ptr) = walker_execute_may_force_boxed(ctx, &allboxes, call_descr) {
-                let boxed = crate::state::wrapint(ctx.trace_ctx, raw_arg);
+                let intval =
+                    unsafe { pyre_object::w_int_get_value(boxed_ptr as pyre_object::PyObjectRef) };
+                let boxed = walker_box_int(ctx, op.pc, raw_arg, intval)?;
                 ctx.trace_ctx.set_opref_concrete(
                     boxed,
                     majit_ir::Value::Ref(majit_ir::GcRef(boxed_ptr as usize)),
