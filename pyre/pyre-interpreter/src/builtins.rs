@@ -2570,6 +2570,20 @@ pub(crate) fn has_real_kwargs(kwargs: Option<PyObjectRef>) -> bool {
         .any(|(key, _)| key != "__pyre_kw__")
 }
 
+/// Number of real keyword arguments in the kwargs dict from
+/// [`split_builtin_kwargs`] — every entry other than the `__pyre_kw__`
+/// marker.  The clinic-style "takes at most N arguments (M given)" builtins
+/// (`sum`, `round`, `pow`) count positionals plus this against their limit.
+pub(crate) fn real_kwarg_count(kwargs: Option<PyObjectRef>) -> usize {
+    let Some(dict) = kwargs else {
+        return 0;
+    };
+    unsafe { pyre_object::w_dict_str_entries(dict) }
+        .iter()
+        .filter(|(key, _)| key != "__pyre_kw__")
+        .count()
+}
+
 /// Look up a single keyword argument from the kwargs dict produced by
 /// `split_builtin_kwargs`. Returns `None` when no kwargs dict is present
 /// or the requested key is absent.
@@ -2611,6 +2625,29 @@ pub(crate) fn kwarg_reject_unknown(
         }
     }
     Ok(())
+}
+
+/// Bind a positional-or-keyword parameter that follows a positional-only
+/// prefix (`eval`/`exec`/`compile` style).  Prefers the positional slot and
+/// falls back to the matching keyword.  Raises the argument-clinic
+/// "given by name and position" TypeError when the same parameter is supplied
+/// both ways.  `pos_index` is the 1-based position used in that message.
+pub(crate) fn bind_pos_or_kw(
+    positional: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+    slot: usize,
+    key: &str,
+    fn_name: &str,
+    pos_index: usize,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    match (positional.get(slot).copied(), kwarg_get(kwargs, key)) {
+        (Some(_), Some(_)) => Err(crate::PyError::type_error(format!(
+            "argument for {fn_name}() given by name ('{key}') and position ({pos_index})"
+        ))),
+        (Some(p), None) => Ok(Some(p)),
+        (None, Some(k)) => Ok(Some(k)),
+        (None, None) => Ok(None),
+    }
 }
 
 /// `true` when the last argument is the `__pyre_kw__`-tagged dict the
@@ -5073,6 +5110,27 @@ fn strip_numeric_underscores(s: &str) -> Option<String> {
     Some(out)
 }
 
+/// `float.__float__(self)` — floatobject.py descr___float__: an exact float
+/// is returned as-is; a strict subclass is down-converted to a fresh base
+/// `float`.  Kept separate from the `float()` constructor so `float()` can look
+/// `__float__` up on a subclass (honoring an override) without recursing.
+pub(crate) fn builtin_float_dunder(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args[0];
+    unsafe {
+        if is_exact_type(obj, &FLOAT_TYPE) {
+            return Ok(obj);
+        }
+        if is_float(obj) {
+            return Ok(floatobject::w_float_new(w_float_get_value(obj)));
+        }
+    }
+    // interp2app(W_FloatObject.descr_float) requires a float `self`.
+    Err(crate::PyError::type_error(format!(
+        "descriptor '__float__' requires a 'float' object but received a '{}'",
+        crate::type_methods::arg_type_name(obj)
+    )))
+}
+
 /// `float(obj)` → convert to float
 pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
@@ -5090,14 +5148,14 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     let obj = args[value_idx];
     unsafe {
         if is_float(obj) {
-            // `float(f) is f` only for an exact `float`; a subclass instance
-            // is copied to a fresh base `float`.
+            // `float(f) is f` for an exact `float`. A subclass falls through
+            // to the `__float__` lookup below so an overridden `__float__` is
+            // honored; a subclass that does not override it resolves to
+            // `float.__float__`, which returns a fresh base `float`.
             if is_exact_type(obj, &FLOAT_TYPE) {
                 return Ok(obj);
             }
-            return Ok(floatobject::w_float_new(w_float_get_value(obj)));
-        }
-        if is_int(obj) {
+        } else if is_int(obj) {
             return Ok(floatobject::w_float_new(w_int_get_value(obj) as f64));
         }
         if is_bool(obj) {
@@ -5242,6 +5300,12 @@ fn builtin_hasattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 
 /// `getattr(obj, name[, default])` → value — direct call
 fn builtin_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (args, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "getattr() takes no keyword arguments",
+        ));
+    }
     // `getattr(object, name[, default])`: two or three app-level arguments.
     if args.len() < 2 {
         return Err(crate::PyError::type_error(format!(
@@ -5475,6 +5539,18 @@ pub(crate) fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
 /// Zero-arg super() finds __class__ and self from the calling frame.
 /// CPython: Objects/typeobject.c super_init
 fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (args, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "super() takes no keyword arguments",
+        ));
+    }
+    if args.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "super() expected at most 2 arguments, got {}",
+            args.len()
+        )));
+    }
     if args.len() >= 2 {
         let cls = args[0];
         let obj = args[1];
@@ -5569,17 +5645,27 @@ fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `iter(obj)` / `iter(callable, sentinel)` — PyPy:
 /// `module/__builtin__/operation.py` iter
 fn builtin_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    match args.len() {
+    // `iter` is a keyword-rejecting builtin; a `sentinel` is only ever
+    // positional (`iter(callable, sentinel)`).  Strip the kwargs marker so a
+    // keyword call raises instead of consuming the marker dict as an argument.
+    let (positional, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "iter() takes no keyword arguments",
+        ));
+    }
+    match positional.len() {
         0 => Err(crate::PyError::type_error(
             "iter() requires at least one argument",
         )),
-        1 => crate::baseobjspace::iter(args[0]),
+        1 => crate::baseobjspace::iter(positional[0]),
         2 => {
-            if !crate::baseobjspace::callable_w(args[0]) {
+            if !crate::baseobjspace::callable_w(positional[0]) {
                 return Err(crate::PyError::type_error("iter(v, w): v must be callable"));
             }
             Ok(pyre_object::operation::w_callable_iterator_new(
-                args[0], args[1],
+                positional[0],
+                positional[1],
             ))
         }
         n => Err(crate::PyError::type_error(format!(
@@ -5590,10 +5676,22 @@ fn builtin_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `next(iterator[, default])` — PyPy: baseobjspace.py next
 fn builtin_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (args, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "next() takes no keyword arguments",
+        ));
+    }
     if args.is_empty() {
         return Err(crate::PyError::type_error(
             "next() requires at least one argument",
         ));
+    }
+    if args.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "next expected at most 2 arguments, got {}",
+            args.len()
+        )));
     }
     match crate::baseobjspace::next(args[0]) {
         Ok(v) => Ok(v),
@@ -5641,14 +5739,35 @@ fn compile_err_to_syntax_error(e: String) -> crate::PyError {
 }
 
 fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() < 3 {
-        return Err(crate::PyError::type_error(
-            "compile() requires source, filename, mode",
-        ));
-    }
-    let source = args[0];
-    let filename_obj = args[1];
-    let mode_obj = args[2];
+    // `compile(source, filename, mode, flags=0, dont_inherit=False,
+    // optimize=-1, *, _feature_version=-1)`: the three required parameters are
+    // positional-or-keyword.  pyre honours only source/filename/mode; the
+    // remaining optional parameters are accepted (so a keyword call does not
+    // error) but not yet applied.
+    let (pos, kwargs) = split_builtin_kwargs(args);
+    kwarg_reject_unknown(
+        kwargs,
+        &[
+            "source",
+            "filename",
+            "mode",
+            "flags",
+            "dont_inherit",
+            "optimize",
+            "_feature_version",
+        ],
+        "compile",
+    )?;
+    let source = bind_pos_or_kw(pos, kwargs, 0, "source", "compile", 1)?.ok_or_else(|| {
+        crate::PyError::type_error("compile() missing required argument 'source' (pos 1)")
+    })?;
+    let filename_obj =
+        bind_pos_or_kw(pos, kwargs, 1, "filename", "compile", 2)?.ok_or_else(|| {
+            crate::PyError::type_error("compile() missing required argument 'filename' (pos 2)")
+        })?;
+    let mode_obj = bind_pos_or_kw(pos, kwargs, 2, "mode", "compile", 3)?.ok_or_else(|| {
+        crate::PyError::type_error("compile() missing required argument 'mode' (pos 3)")
+    })?;
     let source_str = unsafe {
         if pyre_object::is_str(source) {
             // The source is decoded to UTF-8 for the tokenizer; a lone
@@ -5703,24 +5822,49 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// them into `DictStorage`s before invocation and copies the post-run
 /// namespace contents back so that callers see the new bindings.
 fn builtin_exec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
-        return Err(crate::PyError::type_error("exec() requires source"));
+    // `exec(source, /, globals=None, locals=None, *, closure=None)`: source is
+    // positional-only; globals/locals are positional-or-keyword.  `closure` is
+    // accepted (keyword-only) but pyre's exec plumbing carries no closure, so a
+    // None closure is a no-op and a non-None one is unsupported.
+    let (pos, kwargs) = split_builtin_kwargs(args);
+    kwarg_reject_unknown(kwargs, &["globals", "locals", "closure"], "exec")?;
+    if pos.is_empty() {
+        return Err(crate::PyError::type_error(
+            "exec() takes at least 1 positional argument (0 given)",
+        ));
     }
-    let source = args[0];
-    let globals_arg = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-    let locals_arg = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+    let source = pos[0];
+    let globals_arg =
+        bind_pos_or_kw(pos, kwargs, 1, "globals", "exec", 2)?.unwrap_or(pyre_object::PY_NULL);
+    let locals_arg =
+        bind_pos_or_kw(pos, kwargs, 2, "locals", "exec", 3)?.unwrap_or(pyre_object::PY_NULL);
+    if let Some(closure) = kwarg_get(kwargs, "closure") {
+        if !unsafe { pyre_object::is_none(closure) } {
+            return Err(crate::PyError::type_error(
+                "exec() closure argument is not supported",
+            ));
+        }
+    }
     exec_or_eval(source, globals_arg, locals_arg, false)
 }
 
 /// `eval(source_or_code, globals=None, locals=None)` — same plumbing as
 /// exec but returns the value of the expression.
 fn builtin_eval(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
-        return Err(crate::PyError::type_error("eval() requires source"));
+    // `eval(source, /, globals=None, locals=None)`: source is positional-only;
+    // globals/locals are positional-or-keyword.
+    let (pos, kwargs) = split_builtin_kwargs(args);
+    kwarg_reject_unknown(kwargs, &["globals", "locals"], "eval")?;
+    if pos.is_empty() {
+        return Err(crate::PyError::type_error(
+            "eval() takes at least 1 positional argument (0 given)",
+        ));
     }
-    let source = args[0];
-    let globals_arg = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-    let locals_arg = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+    let source = pos[0];
+    let globals_arg =
+        bind_pos_or_kw(pos, kwargs, 1, "globals", "eval", 2)?.unwrap_or(pyre_object::PY_NULL);
+    let locals_arg =
+        bind_pos_or_kw(pos, kwargs, 2, "locals", "eval", 3)?.unwrap_or(pyre_object::PY_NULL);
     exec_or_eval(source, globals_arg, locals_arg, true)
 }
 
@@ -5733,8 +5877,19 @@ fn exec_or_eval(
     // Resolve a runnable code object: accept a precompiled W_Code or
     // compile a str on the fly.
     let code_obj_ref = unsafe {
-        if pyre_object::is_str(source) {
-            let s = pyre_object::w_str_get_value(source).to_string();
+        // `compiling.py:103 source_as_str` — accepts a str or a bytes-like
+        // source (decoded), or an already-compiled code object.
+        let source_str = if pyre_object::is_str(source) {
+            Some(pyre_object::w_str_get_value(source).to_string())
+        } else if pyre_object::bytesobject::is_bytes_like(source) {
+            Some(
+                String::from_utf8_lossy(pyre_object::bytesobject::bytes_like_data(source))
+                    .into_owned(),
+            )
+        } else {
+            None
+        };
+        if let Some(s) = source_str {
             let mode = if is_eval {
                 crate::compile::Mode::Eval
             } else {
@@ -5747,9 +5902,10 @@ fn exec_or_eval(
         } else if !source.is_null() && crate::is_code(source) {
             source
         } else {
-            return Err(crate::PyError::type_error(
-                "exec() / eval() expects str or code",
-            ));
+            return Err(crate::PyError::type_error(format!(
+                "{}() arg 1 must be a string, bytes or code object",
+                if is_eval { "eval" } else { "exec" }
+            )));
         }
     };
     let raw_code = unsafe {
@@ -6139,6 +6295,12 @@ fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 fn builtin_vars(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (args, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "vars() takes no keyword arguments",
+        ));
+    }
     if args.is_empty() {
         return builtin_locals(args);
     }
@@ -6219,6 +6381,12 @@ unsafe fn classdir_recurse(
 /// With argument: sorted list of attribute names from obj.__dict__ plus
 /// type MRO. Modules expose their namespace via w_module_get_namespace.
 pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (args, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "dir() takes no keyword arguments",
+        ));
+    }
     if args.is_empty() {
         // `bltinmodule.c builtin_dir` — with no argument, list the names in
         // the caller's local scope: `sorted(frame.f_locals)`.  Resolve the
@@ -6238,6 +6406,12 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             let keys = collect_iterable(keys_iter)?;
             builtin_sorted(&[w_list_new(keys)])
         });
+    }
+    if args.len() > 1 {
+        return Err(crate::PyError::type_error(format!(
+            "dir expected at most 1 argument, got {}",
+            args.len()
+        )));
     }
     let obj = args[0];
     // app_inspect.py:57-62 — dir() is driven by the object's `__dir__`:
@@ -6963,18 +7137,41 @@ pub(crate) fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 // source list directly when `start == 0 + isinstance(it, list)`.
 pub(crate) fn builtin_enumerate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (positional, kwargs) = split_builtin_kwargs(args);
-    if positional.is_empty() {
-        return Err(crate::PyError::type_error(
-            "enumerate() requires at least one argument",
-        ));
-    }
     if positional.len() > 2 {
         return Err(crate::PyError::type_error(format!(
             "enumerate() takes at most 2 arguments ({} given)",
             positional.len()
         )));
     }
-    kwarg_reject_unknown(kwargs, &["start"], "enumerate")?;
+    // `iterable` and `start` are the only accepted keywords; an unknown one is
+    // reported with the vectorcall-style "invalid keyword argument" message.
+    if let Some(dict) = kwargs {
+        for (key, _) in unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }.iter() {
+            let k = key.as_str().unwrap_or("");
+            if k == "__pyre_kw__" || k == "iterable" || k == "start" {
+                continue;
+            }
+            return Err(crate::PyError::type_error(format!(
+                "'{key}' is an invalid keyword argument for enumerate()"
+            )));
+        }
+    }
+    // `iterable` is positional-or-keyword; once filled positionally a stray
+    // `iterable=` keyword is rejected as invalid rather than "multiple values".
+    let source = if !positional.is_empty() {
+        if kwarg_get(kwargs, "iterable").is_some() {
+            return Err(crate::PyError::type_error(
+                "'iterable' is an invalid keyword argument for enumerate()",
+            ));
+        }
+        positional[0]
+    } else if let Some(iterable) = kwarg_get(kwargs, "iterable") {
+        iterable
+    } else {
+        return Err(crate::PyError::type_error(
+            "enumerate() missing required argument 'iterable'",
+        ));
+    };
     let start_obj = if positional.len() > 1 {
         Some(positional[1])
     } else {
@@ -6989,7 +7186,6 @@ pub(crate) fn builtin_enumerate(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
         Some(o) if !unsafe { pyre_object::is_none(o) } => space_index_w(o)?,
         _ => 0,
     };
-    let source = positional[0];
     // `functional.py:268-271` — `if start == 0 and type(w_iterable) is
     // W_ListObject: w_iter = w_iterable` (skip space.iter for the
     // common list-source case so __next__ can `getitem(index)`
@@ -7008,10 +7204,17 @@ pub(crate) fn builtin_enumerate(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
 
 /// `reversed()` — PyPy: functional.py W_ReversedIterator
 pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
+    let (args, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
         return Err(crate::PyError::type_error(
-            "reversed() requires one argument",
+            "reversed() takes no keyword arguments",
         ));
+    }
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "reversed expected 1 argument, got {}",
+            args.len()
+        )));
     }
     let obj = args[0];
     unsafe {
@@ -8534,13 +8737,23 @@ fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// does (`sum([0.1, 0.2, 0.3])` is `0.6000000000000001`, not `0.6`).  A
 /// `str`/`bytes`/`bytearray` `start` is rejected up front.
 fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
+    // `sum(iterable, /, start=0)`: iterable is positional-only, start is
+    // positional-or-keyword; at most two arguments total.
+    let (pos, kwargs) = split_builtin_kwargs(args);
+    let total = pos.len() + real_kwarg_count(kwargs);
+    if total > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "sum() takes at most 2 arguments ({total} given)"
+        )));
+    }
+    if pos.is_empty() {
         return Err(crate::PyError::type_error(
-            "sum() takes at least one argument",
+            "sum() takes at least 1 positional argument (0 given)",
         ));
     }
-    let iterable = args[0];
-    let start = args.get(1).copied().unwrap_or_else(|| w_int_new(0));
+    kwarg_reject_unknown(kwargs, &["start"], "sum")?;
+    let iterable = pos[0];
+    let start = bind_pos_or_kw(pos, kwargs, 1, "start", "sum", 2)?.unwrap_or_else(|| w_int_new(0));
     if unsafe { pyre_object::is_str(start) } {
         return Err(crate::PyError::type_error(
             "sum() can't sum strings [use ''.join(seq) instead]",
@@ -8613,24 +8826,33 @@ fn float_round_ndigits(v: f64, ndigits: i64) -> f64 {
 }
 
 pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
-        return Err(crate::PyError::type_error(
-            "round() missing required argument: 'number' (pos 1)",
-        ));
+    // `round(number, ndigits=None)`: both positional-or-keyword; at most two.
+    let (pos, kwargs) = split_builtin_kwargs(args);
+    let total = pos.len() + real_kwarg_count(kwargs);
+    if total > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "round() takes at most 2 arguments ({total} given)"
+        )));
     }
-    let obj = args[0];
-    let ndigits = args.get(1);
+    kwarg_reject_unknown(kwargs, &["number", "ndigits"], "round")?;
+    let obj = bind_pos_or_kw(pos, kwargs, 0, "number", "round", 1)?.ok_or_else(|| {
+        crate::PyError::type_error("round() missing required argument 'number' (pos 1)")
+    })?;
+    let ndigits_arg = bind_pos_or_kw(pos, kwargs, 1, "ndigits", "round", 2)?;
+    let ndigits = ndigits_arg.as_ref();
     unsafe {
         if is_float(obj) {
             let v = floatobject::w_float_get_value(obj);
             return match ndigits {
                 // `floatobject.py:966-967 _round_float`: nan/inf round to
-                // themselves when an explicit ndigits is supplied.
-                Some(nd) if is_int(*nd) => {
+                // themselves when an explicit ndigits is supplied.  `ndigits`
+                // is taken through `space.getindex_w`, so any `__index__`
+                // object works and a non-index one raises.
+                Some(nd) if !pyre_object::is_none(*nd) => {
+                    let n = space_index_w(*nd)?;
                     if !v.is_finite() {
                         Ok(floatobject::w_float_new(v))
                     } else {
-                        let n = w_int_get_value(*nd);
                         Ok(floatobject::w_float_new(float_round_ndigits(v, n)))
                     }
                 }
@@ -8648,7 +8870,7 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             // ndigits >= 0 leave an int unchanged; ndigits < 0 rounds to
             // the nearest multiple of 10**(-ndigits), ties to even.
             let nd = match ndigits {
-                Some(nd) if is_int(*nd) => w_int_get_value(*nd),
+                Some(nd) if !pyre_object::is_none(*nd) => space_index_w(*nd)?,
                 _ => return Ok(obj),
             };
             if nd >= 0 {
@@ -8683,13 +8905,15 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             };
         }
     }
-    // operation.py:97 — lookup __round__ on user objects
+    // operation.py:97 — lookup __round__ on user objects.  An omitted or
+    // explicit-None `ndigits` calls `__round__()` with no second argument.
     if let Some(tp) = crate::typedef::r#type(obj) {
         if let Some(method) = unsafe { crate::baseobjspace::lookup_in_type(tp, "__round__") } {
-            let result = if let Some(nd) = ndigits {
-                crate::call::call_function_impl_result(method, &[obj, *nd])?
-            } else {
-                crate::call::call_function_impl_result(method, &[obj])?
+            let result = match ndigits {
+                Some(nd) if !unsafe { pyre_object::is_none(*nd) } => {
+                    crate::call::call_function_impl_result(method, &[obj, *nd])?
+                }
+                _ => crate::call::call_function_impl_result(method, &[obj])?,
             };
             return Ok(result);
         }
@@ -8706,6 +8930,12 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 
 /// `divmod(a, b)` — pypy/interpreter/baseobjspace.py:2159 divmod row.
 fn builtin_divmod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (args, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "divmod() takes no keyword arguments",
+        ));
+    }
     if args.len() != 2 {
         return Err(crate::PyError::type_error(format!(
             "divmod() takes exactly two arguments ({} given)",
@@ -8717,73 +8947,123 @@ fn builtin_divmod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `pow(base, exp[, mod])` — pypy/interpreter/baseobjspace.py:2160 pow row.
 fn builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() < 2 {
+    // `pow(base, exp, mod=None)`: all positional-or-keyword; at most three.
+    let (pos, kwargs) = split_builtin_kwargs(args);
+    let total = pos.len() + real_kwarg_count(kwargs);
+    if total > 3 {
         return Err(crate::PyError::type_error(format!(
-            "pow() takes at least two arguments ({} given)",
-            args.len()
+            "pow() takes at most 3 arguments ({total} given)"
         )));
     }
-    if args.len() > 3 {
-        return Err(crate::PyError::type_error(format!(
-            "pow() takes at most 3 arguments ({} given)",
-            args.len()
-        )));
+    kwarg_reject_unknown(kwargs, &["base", "exp", "mod"], "pow")?;
+    let base = bind_pos_or_kw(pos, kwargs, 0, "base", "pow", 1)?.ok_or_else(|| {
+        crate::PyError::type_error("pow() missing required argument 'base' (pos 1)")
+    })?;
+    let exp = bind_pos_or_kw(pos, kwargs, 1, "exp", "pow", 2)?.ok_or_else(|| {
+        crate::PyError::type_error("pow() missing required argument 'exp' (pos 2)")
+    })?;
+    let modulus = bind_pos_or_kw(pos, kwargs, 2, "mod", "pow", 3)?;
+    match modulus {
+        Some(m) if !unsafe { pyre_object::is_none(m) } => crate::baseobjspace::pow3(base, exp, m),
+        _ => crate::baseobjspace::pow(base, exp),
     }
-    if args.len() >= 3 && !unsafe { is_none(args[2]) } {
-        crate::baseobjspace::pow3(args[0], args[1], args[2])
-    } else {
-        crate::baseobjspace::pow(args[0], args[1])
+}
+
+/// Coerce `obj` to a `BigInt` through the index protocol (`_operator.index`),
+/// so `hex`/`oct`/`bin` accept any `__index__` object and arbitrarily large
+/// integers.
+fn index_to_bigint(obj: PyObjectRef) -> Result<BigInt, crate::PyError> {
+    unsafe {
+        if is_int(obj) || is_long(obj) {
+            return Ok(obj_to_bigint(obj));
+        }
+        if pyre_object::is_bool(obj) {
+            return Ok(BigInt::from(pyre_object::w_bool_get_value(obj) as i64));
+        }
+        if let Some(tp) = crate::typedef::r#type(obj) {
+            if let Some(index_fn) = crate::baseobjspace::lookup_in_type(tp, "__index__") {
+                let result = crate::call::call_function_impl_result(index_fn, &[obj])?;
+                if is_int(result) || is_long(result) {
+                    return Ok(obj_to_bigint(result));
+                }
+                if pyre_object::is_bool(result) {
+                    return Ok(BigInt::from(pyre_object::w_bool_get_value(result) as i64));
+                }
+            }
+        }
+    }
+    let tp_name = unsafe {
+        match crate::typedef::r#type(obj) {
+            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+            None => "object".to_string(),
+        }
+    };
+    Err(crate::PyError::type_error(format!(
+        "'{tp_name}' object cannot be interpreted as an integer"
+    )))
+}
+
+/// Format a `BigInt` in `radix` with the given `0x`/`0o`/`0b` prefix, keeping
+/// the sign ahead of the prefix (`-0xff`).
+fn format_int_radix(value: &BigInt, radix: u32, prefix: &str) -> String {
+    let digits = value.to_str_radix(radix);
+    match digits.strip_prefix('-') {
+        Some(magnitude) => format!("-{prefix}{magnitude}"),
+        None => format!("{prefix}{digits}"),
     }
 }
 
 /// `hex(x)` — PyPy: operation.py hex
 fn builtin_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (args, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "hex() takes no keyword arguments",
+        ));
+    }
     if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "hex() takes exactly one argument ({} given)",
             args.len()
         )));
     }
-    let v = unsafe { w_int_get_value(args[0]) };
-    let s = if v < 0 {
-        format!("-0x{:x}", -v)
-    } else {
-        format!("0x{v:x}")
-    };
+    let s = format_int_radix(&index_to_bigint(args[0])?, 16, "0x");
     Ok(w_str_new(&s))
 }
 
 /// `oct(x)` — PyPy: operation.py oct
 fn builtin_oct(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (args, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "oct() takes no keyword arguments",
+        ));
+    }
     if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "oct() takes exactly one argument ({} given)",
             args.len()
         )));
     }
-    let v = unsafe { w_int_get_value(args[0]) };
-    let s = if v < 0 {
-        format!("-0o{:o}", -v)
-    } else {
-        format!("0o{v:o}")
-    };
+    let s = format_int_radix(&index_to_bigint(args[0])?, 8, "0o");
     Ok(w_str_new(&s))
 }
 
 /// `bin(x)` — PyPy: operation.py bin
 fn builtin_bin(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (args, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "bin() takes no keyword arguments",
+        ));
+    }
     if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "bin() takes exactly one argument ({} given)",
             args.len()
         )));
     }
-    let v = unsafe { w_int_get_value(args[0]) };
-    let s = if v < 0 {
-        format!("-0b{:b}", -v)
-    } else {
-        format!("0b{v:b}")
-    };
+    let s = format_int_radix(&index_to_bigint(args[0])?, 2, "0b");
     Ok(w_str_new(&s))
 }
 
@@ -8943,9 +9223,21 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
 
 /// `format(value, format_spec='')` — operation.py format → space.format
 fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (args, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "format() takes no keyword arguments",
+        ));
+    }
     if args.is_empty() {
         return Err(crate::PyError::type_error(format!(
             "format() takes at least one argument ({} given)",
+            args.len()
+        )));
+    }
+    if args.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "format expected at most 2 arguments, got {}",
             args.len()
         )));
     }
@@ -8980,18 +9272,24 @@ fn builtin_import_stub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             .unwrap_or(pyre_object::PY_NULL)
     };
     let name_obj = arg(0, "name");
-    let name = if !name_obj.is_null() && unsafe { pyre_object::is_str(name_obj) } {
-        unsafe { pyre_object::w_str_get_value(name_obj) }
-    } else {
-        ""
-    };
+    if name_obj.is_null() {
+        return Err(crate::PyError::type_error(
+            "__import__() missing required argument 'name' (pos 1)",
+        ));
+    }
+    if !unsafe { pyre_object::is_str(name_obj) } {
+        return Err(crate::PyError::type_error("module name must be a string"));
+    }
+    let name = unsafe { pyre_object::w_str_get_value(name_obj) };
     let globals = arg(1, "globals");
     let fromlist = arg(3, "fromlist");
     let level_obj = arg(4, "level");
-    let level = if !level_obj.is_null() && unsafe { pyre_object::is_int(level_obj) } {
-        unsafe { pyre_object::w_int_get_value(level_obj) }
-    } else {
+    // `@unwrap_spec(level=int)` — an omitted level defaults to 0; a supplied
+    // non-integer raises through the index protocol rather than defaulting.
+    let level = if level_obj.is_null() {
         0
+    } else {
+        space_index_w(level_obj)?
     };
     let exec_ctx = crate::eval::CURRENT_FRAME.with(|current| {
         let frame = current.get();

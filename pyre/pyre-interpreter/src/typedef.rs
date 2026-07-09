@@ -1894,8 +1894,23 @@ fn set_alloc_for_class(
 /// ignores everything past `w_settype`. The actual argument count check
 /// lives on `descr_init`, which type.__call__ runs after `__new__`.
 fn set_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let (params, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let cls = params.first().copied().unwrap_or(pyre_object::PY_NULL);
     let set_type = crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);
+    // `set.__new__` ignores its extra arguments and leaves positional-count
+    // validation to `__init__`; only a plain `set(...)` whose `__init__` is not
+    // overridden rejects keywords here (`_PyArg_NoKeywords`).  A subclass that
+    // defines an `__init__` taking keywords must still receive them, so the
+    // keyword check is skipped whenever the subtype overrides `__init__`
+    // (passing 0 for `positional_extra` keeps the surplus-positional report in
+    // `__init__`).
+    builtinclass_new_args_check(
+        "set",
+        set_type,
+        cls,
+        0,
+        crate::builtins::has_real_kwargs(kwargs),
+    )?;
     set_alloc_for_class(cls, set_type, false)
 }
 
@@ -1959,12 +1974,17 @@ fn frozenset_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     )?;
     let iterable = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
 
-    if !iterable.is_null() && std::ptr::eq(cls, frozenset_type) {
-        if let Some(iterable_type) = crate::typedef::r#type(iterable) {
-            if std::ptr::eq(iterable_type, frozenset_type) {
-                return Ok(iterable);
-            }
+    // setobject.py:616-618 — reuse the argument only when the target type is
+    // exactly `frozenset` and the argument's implementation class is exactly
+    // `W_FrozensetObject` (`type(w_iterable) is W_FrozensetObject`); a subclass
+    // instance retags `w_class` and is rebuilt.
+    if !iterable.is_null()
+        && std::ptr::eq(cls, frozenset_type)
+        && unsafe {
+            pyre_object::pyobject::is_exact_type(iterable, &pyre_object::setobject::FROZENSET_TYPE)
         }
+    {
+        return Ok(iterable);
     }
 
     let obj = set_alloc_for_class(cls, frozenset_type, true)?;
@@ -4906,7 +4926,12 @@ fn slice_method_indices(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 
 /// sliceobject.py `W_SliceObject.descr__new__` — `slice([start,] stop[, step])`.
 fn slice_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let params = &args[1..];
+    let (params, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "slice() takes no keyword arguments",
+        ));
+    }
     let none = pyre_object::w_none();
     let (start, stop, step) = match params {
         [stop] => (none, *stop, none),
@@ -9008,7 +9033,7 @@ fn init_float_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__float__",
-        make_builtin_function_with_arity("__float__", crate::builtins::builtin_float, 1),
+        make_builtin_function_with_arity("__float__", crate::builtins::builtin_float_dunder, 1),
     );
     dict_storage_store(
         ns,
