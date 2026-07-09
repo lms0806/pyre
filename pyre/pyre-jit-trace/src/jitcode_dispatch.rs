@@ -7329,6 +7329,28 @@ pub(crate) fn fbw_vable_scalar_ca_enabled() -> bool {
     })
 }
 
+/// `PYRE_FBW_DEEPKEPT_INT` (default OFF) — extend the deep-kept operand-stack
+/// recovery in [`walker_capture_snapshot_for_last_guard_impl`] to fill an
+/// UNBOXED-INT hole from the Int register bank. A Ref-typed stack slot
+/// semantically holding an Int (e.g. condexpr's `a+i` `IntAdd` result) is left
+/// a hole by the Ref-only fill; when on, the capture reads `registers_i[color]`
+/// (the color named by `semantic_slot_color_for_int_slot`) and boxes the raw
+/// int into a `W_IntObject` (`wrapint`) so the vable array carries a Ref.
+/// Ports the `if length_i:` i-bank section of `get_list_of_active_boxes`
+/// (`pyjitpl.py:206-210`). Default OFF: flag-off is byte-identical to the
+/// int-as-hole behavior (resume re-materializes the int from its defining IR),
+/// mirroring how the S1 mirror extension staged behind `PYRE_FBW_DEEPKEPT_MIRROR`.
+pub(crate) fn deepkept_int_recovery_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_DEEPKEPT_INT") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
+    })
+}
+
 /// `PYRE_FBW_RAISE` (default ON) — the FBW walker owns the Python raise/except
 /// loop.  The twin NULL-ref guards exempt the trailing `cause` sentinel of a
 /// [`PyreHelperKind::RaiseVarargs`] residual so the walker records the raise.
@@ -10165,6 +10187,145 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     .collect()
             } else {
                 Vec::new()
+            };
+            // Recover a kept operand-stack slot the walk mirror lost across a
+            // not-taken branch merge.  At a branch guard whose not-taken arm
+            // keeps a CALL result deep on the operand stack
+            // (`t=(g(i),h(i),(g(i) if p or q else h(i)))`), the walk took the
+            // OTHER arm, so `ctx.vstack_boxes[s]` is a `PY_NULL` hole for the
+            // deep slot and the `stack_sync` overlay above omits it — the
+            // resumed vable array then reads that slot NULL and the interpreted
+            // body dereferences it (SIGSEGV).  The trampoline edge-move recovery
+            // (`resolved_recovered`) is empty for this shape, so the mirror is
+            // the only kept-stack source and it has a hole.
+            // Fill the hole from the guard-PC register file: the per-PC
+            // `pcdep_color_slots` map at `guard_py_pc` names the Ref-bank color
+            // that holds operand-stack slot `nlocals + s` at THIS guard PC (the
+            // same authoritative inversion `collect_outer_active_boxes` reads),
+            // and `ctx.registers_r[color]` holds the live guard-state box.  This
+            // is the guard-PC color read (as `resolved_recovered` does for
+            // `registers_r[src]`), NOT the retired stale merge-color read.
+            // This ports `get_list_of_active_boxes`
+            // (rpython/jit/metainterp/pyjitpl.py:177-234), which captures guard
+            // resume boxes from `registers_r[index]` via the per-PC `-live-`
+            // set.
+            // Capture-only: writes the transient snapshot overlay, never the live
+            // shadow (the trace_opcode.rs:2218 bridge-NULL constraint holds).
+            let stack_sync: Vec<(usize, OpRef)> = if guard_py_pc.is_some()
+                && sym.owns_virtualizable_shadow()
+                && !sym.jitcode.is_null()
+            {
+                let gpc = guard_py_pc.unwrap() as usize;
+                let nlocals = sym.nlocals;
+                let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+                let depth = unsafe {
+                    let jc = &*sym.jitcode;
+                    if jc.payload.code_ptr.is_null() {
+                        0usize
+                    } else {
+                        crate::liveness::liveness_for(jc.payload.code_ptr)
+                            .depth_at_py_pc()
+                            .get(gpc)
+                            .copied()
+                            .unwrap_or(0) as usize
+                    }
+                };
+                let pcdep: Vec<(u8, u16, u16)> = unsafe {
+                    let jc = &*sym.jitcode;
+                    jc.payload
+                        .metadata
+                        .pcdep_color_slots
+                        .get(gpc)
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                let mut covered: std::collections::HashSet<usize> =
+                    stack_sync.iter().map(|&(idx, _)| idx).collect();
+                let mut augmented = stack_sync;
+                for s in 0..depth {
+                    let vidx = nvs + nlocals + s;
+                    if covered.contains(&vidx) {
+                        continue;
+                    }
+                    // Guard-PC Ref color that owns operand-stack slot
+                    // `nlocals + s` (`get_list_of_active_boxes` `if length_r:`
+                    // section, `pyjitpl.py:211-215`).
+                    if let Some(color) =
+                        crate::state::semantic_slot_color_for_ref_slot(&pcdep, nlocals + s)
+                    {
+                        if let Some(&box_op) = ctx.registers_r.get(color) {
+                            // Only a genuine Ref box may fill an operand-stack
+                            // slot: the vable array is uniformly Ref-typed, and
+                            // `build_vable_snapshot_boxes` reads each entry's
+                            // `OpRef::ty()`.  An unboxed-int kept temp (a `Ref`-
+                            // bank color holding an `IntAdd` result, e.g.
+                            // condexpr's `a+i`) is Int-typed and would decode as
+                            // `Box type Int != expected Ref`; it needs a
+                            // `NEW_W_INT` box the capture cannot synthesize
+                            // (boxing here emits into a settled trace →
+                            // `store_final_boxes_in_guard` panic), so leave it a
+                            // hole (the mirror already sourced every restorable
+                            // slot). The int-bank recovery below handles the
+                            // bank-0 channel where a raw int lives in the Int
+                            // register file instead.
+                            if box_op != OpRef::NONE
+                                && !opref_is_null_const_ptr(box_op)
+                                && box_op.ty() == Some(majit_ir::Type::Ref)
+                            {
+                                augmented.push((vidx, box_op));
+                                covered.insert(vidx);
+                            }
+                        }
+                    }
+                    // Int-bank fill (`get_list_of_active_boxes` `if length_i:`
+                    // section, `pyjitpl.py:206-210` —
+                    // `add_box_to_storage(self.registers_i[index])`), gated
+                    // `PYRE_FBW_DEEPKEPT_INT` (default OFF). Ref precedence:
+                    // only fill a slot the Ref bank left a hole. A bank-0 (Int)
+                    // pcdep entry names the Int-bank color owning slot
+                    // `nlocals + s`, and `registers_i[color]` holds the raw
+                    // unboxed int; box it into a `W_IntObject` (`wrapint`, the
+                    // `NewWithVtable` + `SetfieldGc(intval)` pair
+                    // `materialize_loop_carried_value` emits for a Ref-typed
+                    // loop-carried slot) so the uniformly Ref-typed vable array
+                    // carries a Ref, not a raw Int the resume decode would
+                    // reject as `Box type Int != expected Ref`. Default OFF:
+                    // flag-off leaves the int a hole, byte-identical to today
+                    // (resume re-materializes it from its defining IR).
+                    //
+                    // Scaffolding on the current frontend: pyre's operand stack
+                    // is uniformly Ref-banked in the pcdep map
+                    // (`locals_cells_stack_w` is a `W_Root[]` array), so no
+                    // bank-0 stack entry exists yet and this fires nowhere. The
+                    // real int-hole source — a Ref-bank color whose
+                    // `registers_r[color]` OpRef is itself Int-typed — CANNOT be
+                    // boxed here: `wrapint` emits `NewWithVtable` + `SetfieldGc`
+                    // into an already-settled trace at capture time, which trips
+                    // `store_final_boxes_in_guard` (`resume.py:397`
+                    // `resume_position >= 0`). The box must be synthesized at
+                    // operand-stack PUSH time, not lazily at snapshot capture —
+                    // that is a frontend change beyond this capture hook (a
+                    // bank-0 channel, e.g. the tagged-int epic, or a push-time
+                    // NEW_W_INT), tracked as a follow-up. This literal i-bank
+                    // read stays as the RPython-parity channel for when bank-0
+                    // stack entries do exist.
+                    if deepkept_int_recovery_enabled() && !covered.contains(&vidx) {
+                        if let Some(color) =
+                            crate::state::semantic_slot_color_for_int_slot(&pcdep, nlocals + s)
+                        {
+                            if let Some(&raw) = ctx.registers_i.get(color) {
+                                if raw != OpRef::NONE && raw.ty() == Some(majit_ir::Type::Int) {
+                                    let boxed = crate::state::wrapint(ctx.trace_ctx, raw);
+                                    augmented.push((vidx, boxed));
+                                    covered.insert(vidx);
+                                }
+                            }
+                        }
+                    }
+                }
+                augmented
+            } else {
+                stack_sync
             };
             let saved_shadow: Vec<(usize, Option<OpRef>)> = stack_sync
                 .iter()
