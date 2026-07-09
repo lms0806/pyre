@@ -70,8 +70,7 @@ use std::ops::{Deref, DerefMut};
 pub struct PyJitCodeMetadata {
     /// py_pc → jitcode byte offset of the post-`residual_call` `-live-`
     /// marker (the one immediately preceding the opcode's own
-    /// `catch_exception`), `None` for PCs that do not make a residual
-    /// call.  RPython keeps `frame.pc` at this position for
+    /// `catch_exception`).  RPython keeps `frame.pc` at this position for
     /// `capture_resumedata(after_residual_call=True, resumepc=-1)`
     /// (`pyjitpl.py:2610-2624`); pyre stores Python PCs in the snapshot
     /// and translates through `resume_jitcode_pc_for` (derived from
@@ -79,8 +78,11 @@ pub struct PyJitCodeMetadata {
     /// `carryfwd_resume_pc` sidecar), so after-residual-call resume
     /// needs this second map to reach the call's own catch rather than
     /// the next opcode's start marker (`blackhole.py:396-410
-    /// handle_exception_in_frame`).  Same length as `first_jit_pc_by_py_pc`.
-    pub after_residual_call_resume_pc: Vec<Option<usize>>,
+    /// handle_exception_in_frame`).  Sparse `(py_pc, offset)` pairs sorted
+    /// ascending by py_pc for binary search; only residual-call PCs appear
+    /// (most PCs have no entry), empty for skeleton / portal-bridge /
+    /// fixture metadata.
+    pub after_residual_call_resume_pc: Vec<(u32, usize)>,
     /// py_pc → jitcode byte offset of the FIRST instruction the opcode
     /// emitted (`usize::MAX` for PCs that emit no jitcode of their own:
     /// trivia, folded ops).  The dense marker resolution that
@@ -624,11 +626,11 @@ impl PyJitCode {
     /// on the call's own catch rather than the next opcode's start
     /// marker (`resume_jitcode_pc_for(next_pc)`).
     pub fn after_residual_call_resume_pc_for(&self, py_pc: usize) -> Option<usize> {
-        self.metadata
-            .after_residual_call_resume_pc
-            .get(py_pc)
-            .copied()
-            .flatten()
+        let table = &self.metadata.after_residual_call_resume_pc;
+        table
+            .binary_search_by_key(&(py_pc as u32), |&(py, _)| py)
+            .ok()
+            .map(|i| table[i].1)
     }
 
     /// Translate a resume-data pc word (as carried in rd_numb / RebuiltFrame)
@@ -680,13 +682,55 @@ impl PyJitCode {
         carried: i32,
         op_live: u8,
     ) -> Option<usize> {
-        if carried != majit_ir::resumedata::NO_JITCODE_PC && carried >= 0 {
-            let jp = carried as usize;
-            if self.jitcode.can_decode_live_vars(jp, op_live) {
-                return Some(jp);
+        let used_carried = carried != majit_ir::resumedata::NO_JITCODE_PC
+            && carried >= 0
+            && self.jitcode.can_decode_live_vars(carried as usize, op_live);
+        let resolved = if used_carried {
+            Some(carried as usize)
+        } else {
+            self.resolve_resume_pc(raw_pc)
+        };
+        if crate::jitcode_dispatch::m369_recover_audit_enabled() {
+            self.m369_recover_audit(raw_pc, used_carried, resolved);
+        }
+        resolved
+    }
+
+    /// `PYRE_M369_RECOVER_AUDIT` probe: for the JitCode offset the #369 flip would
+    /// store in the `pc` word (`resolved`), report whether the original Python pc
+    /// (`decode_resume_pc(raw_pc).0`) is recovered by
+    /// `python_pc_for_jitcode_pc(resolved)`, bucketed by frame class. Off in
+    /// production; pure `eprintln!`, no behavioral effect.
+    fn m369_recover_audit(&self, raw_pc: i32, used_carried: bool, resolved: Option<usize>) {
+        let (py_pc, after_residual_call) = majit_ir::resumedata::decode_resume_pc(raw_pc);
+        if py_pc < 0 {
+            return;
+        }
+        let bucket = if used_carried {
+            "branch_guard"
+        } else if self.metadata.block_head_py_by_jit_pc.is_empty() {
+            "portal_bridge"
+        } else if after_residual_call {
+            "after_residual_call"
+        } else {
+            "sentinel_plain"
+        };
+        match resolved {
+            None => {
+                eprintln!(
+                    "[m369-recover] bucket={bucket} match=unresolved raw_pc={raw_pc} py_pc={py_pc}"
+                );
+            }
+            Some(flip_offset) => {
+                let recovered =
+                    crate::jitcode_dispatch::python_pc_for_jitcode_pc(&self.metadata, flip_offset);
+                let matched = recovered as i64 == py_pc as i64;
+                eprintln!(
+                    "[m369-recover] bucket={bucket} match={matched} raw_pc={raw_pc} \
+                     py_pc={py_pc} flip_offset={flip_offset} recovered={recovered}"
+                );
             }
         }
-        self.resolve_resume_pc(raw_pc)
     }
 
     /// Skeleton slot inserted by [`Self::skeleton`] — neither `code`
