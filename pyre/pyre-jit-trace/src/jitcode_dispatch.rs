@@ -13716,6 +13716,23 @@ fn walker_unbox_int_typed(
     type_addr: i64,
     intval_descr: majit_ir::DescrRef,
 ) -> Result<OpRef, DispatchError> {
+    if pyre_object::tagged_int::CAN_BE_TAGGED {
+        if let Some(o) = walker_concrete_ref_object(ctx, obj) {
+            if pyre_object::tagged_int::is_tagged_int(o) {
+                let lowbit = crate::helpers::emit_tag_lowbit_test(ctx.trace_ctx, obj, true);
+                walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[lowbit])?;
+                return Ok(crate::helpers::emit_untag_int(
+                    ctx.trace_ctx,
+                    obj,
+                    pyre_object::tagged_int::untag_int(o),
+                ));
+            } else {
+                let lowbit = crate::helpers::emit_tag_lowbit_test(ctx.trace_ctx, obj, false);
+                walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[lowbit])?;
+                // fall through: boxed leg now deopts (not faults) on a tagged arrival.
+            }
+        }
+    }
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.trace_ctx.const_int(type_addr);
         ctx.trace_ctx
@@ -14015,6 +14032,34 @@ fn walker_emit_float_pow_inline(
     Ok(Some(z))
 }
 
+/// Box a raw i64 int result. Under `CAN_BE_TAGGED`, when the recorded
+/// concrete `value` fits the tagged range, emit an immediate
+/// `(value<<1)|1` (rtagged.py ll_int_to_unboxed) guarded by
+/// `IntAddOvf(raw,raw)` + `GuardNoOverflow` — the doubling overflow IS the
+/// fits check, and a runtime value that does not fit deopts instead of
+/// producing a wrong box. Otherwise (or flag off) fall back to the heap
+/// `wrapint` box. The caller stamps the Ref concrete.
+fn walker_box_int(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    raw: OpRef,
+    value: i64,
+) -> Result<OpRef, DispatchError> {
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::fits_tagged(value) {
+        let doubled = ctx.trace_ctx.record_op(OpCode::IntAddOvf, &[raw, raw]);
+        ctx.trace_ctx
+            .set_opref_concrete(doubled, majit_ir::Value::Int(value << 1));
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoOverflow, &[])?;
+        let one = ctx.trace_ctx.const_int(1);
+        let tagged = ctx.trace_ctx.record_op(OpCode::IntOr, &[doubled, one]);
+        ctx.trace_ctx
+            .set_opref_concrete(tagged, majit_ir::Value::Int((value << 1) | 1));
+        let ptr = ctx.trace_ctx.record_op(OpCode::CastIntToPtr, &[tagged]);
+        return Ok(ptr);
+    }
+    Ok(crate::state::wrapint(ctx.trace_ctx, raw))
+}
+
 /// #57: walker-native speculative int specialization for the `BINARY_OP`
 /// helper residual_call (oopspec `BinaryOp`).  Re-derives
 /// `generated_binary_int_value`'s structure (`guard_class` +
@@ -14228,7 +14273,7 @@ fn try_walker_specialize_binary_op_int(
     let boxed = if result_is_bool {
         crate::helpers::emit_trace_bool_value_from_truth(ctx.trace_ctx, raw_result, false)
     } else {
-        crate::state::wrapint(ctx.trace_ctx, raw_result)
+        walker_box_int(ctx, op_pc, raw_result, concrete_value)?
     };
     ctx.trace_ctx.set_opref_concrete(
         boxed,
@@ -14803,6 +14848,16 @@ fn try_walker_specialize_newtuple(
     // `W_LongObject` arm `is_plain_int1` also accepts, which would need the
     // long unbox the trait `trace_plain_int_payload` does (out of scope
     // here).  Any other shape falls through to the residual (correct).
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && (pyre_object::tagged_int::is_tagged_int(c0)
+            || pyre_object::tagged_int::is_tagged_int(c1))
+    {
+        // A tagged-immediate element has no real header to read for the exact
+        // `&INT_TYPE` ob_type check below, and the spec_ii emit (w_class guard +
+        // typed unbox) is not tag-aware. Fall through to the opaque residual,
+        // which is correct for any element shape.
+        return Ok(None);
+    }
     let int_ty = &pyre_object::pyobject::INT_TYPE as *const pyre_object::pyobject::PyType;
     let both_plain_int = unsafe {
         pyre_object::is_plain_int1(c0)
@@ -16163,9 +16218,13 @@ unsafe fn orthodox_list_append_recognize(
     }
     // Int-storage specialization: plain-int value stored unboxed (a
     // fits-int `W_LongObject` is declined, see note above).
+    // A tagged-immediate value would need a tag-aware unboxed store and no
+    // `w_class` pin; decline to the generic residual append instead.
     let int_ok = pyre_object::w_list_uses_int_storage(inner_self)
         && pyre_object::is_plain_int1(value)
-        && !pyre_object::pyobject::is_long(value);
+        && !pyre_object::pyobject::is_long(value)
+        && !(pyre_object::tagged_int::CAN_BE_TAGGED
+            && pyre_object::tagged_int::is_tagged_int(value));
     // Object-storage extension: any non-null `Ref` value stored into the
     // object items block — no unboxing, so the value carries no type
     // precondition.

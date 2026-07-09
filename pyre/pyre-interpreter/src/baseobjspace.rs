@@ -2583,6 +2583,13 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
     // identity — the exact-type gate excludes both (a `bool`'s
     // `w_class` is `bool`, a subclass instance's is the subclass), so
     // they fall through to the `ptr::eq` above.
+    //
+    // Tagged immediates need no special case: `is_exact_type` reports a
+    // tagged int as an exact `int` (never a subclass — those stay boxed),
+    // and `range_obj_to_bigint` reads its value through the tag-aware
+    // `w_int_get_value`. Two equal-valued immediates already matched the
+    // `ptr::eq` above (identical bit patterns); an immediate and a boxed
+    // int of the same value fall here and compare equal by value.
     unsafe {
         if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::pyobject::INT_TYPE)
             && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::pyobject::INT_TYPE)
@@ -5319,7 +5326,15 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     }
 
     // MRO lookup on the object's Python class (w_class) for method resolution.
-    let w_class = unsafe { (*obj).w_class };
+    // A tagged immediate has no `w_class` slot to deref; its class is the
+    // `int` type object (via the tag-safe `typedef::r#type`). Gated on
+    // `CAN_BE_TAGGED` (default false).
+    let w_class =
+        if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+            crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut())
+        } else {
+            unsafe { (*obj).w_class }
+        };
     if !w_class.is_null() && unsafe { is_type(w_class) } {
         if let Some(method) = unsafe { lookup_in_type_where(w_class, name) } {
             if unsafe {
@@ -5338,10 +5353,11 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     }
 
     unsafe {
-        let tp_name = if obj.is_null() {
-            "NULL"
-        } else {
-            (*(*obj).ob_type).name
+        // Name the object's type via the tag-safe `typedef::r#type`
+        // (a tagged immediate has no `ob_type` slot to deref).
+        let tp_name = match crate::typedef::r#type(obj) {
+            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+            None => "NULL".to_string(),
         };
         Err(PyError::attribute_error_with_context(
             format!("'{tp_name}' object has no attribute '{name}'"),

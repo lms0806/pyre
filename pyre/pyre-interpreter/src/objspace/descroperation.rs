@@ -1624,6 +1624,17 @@ unsafe fn bytes_operand_overrides(obj: PyObjectRef, fwd: &str, rev: &str) -> boo
     dunder_overridden(obj, fwd, t) || dunder_overridden(obj, rev, t)
 }
 
+/// True when `obj` is an exact builtin numeric instance
+/// (`int`/`long`/`float`/`complex`/`bool`, not a subclass).  These types
+/// define no in-place special method (`__iadd__` etc.), so
+/// [`try_inplace_special`] can skip the in-place lookup for them.  A
+/// subclass ([`is_exact_builtin_instance`] false) may override the slot, so
+/// it is excluded.
+unsafe fn is_exact_numeric_builtin(obj: PyObjectRef) -> bool {
+    pyre_object::is_exact_builtin_instance(obj)
+        && (is_int(obj) || is_long(obj) || is_float(obj) || is_complex(obj))
+}
+
 /// The builtin numeric base type backing `obj`'s storage — `int` for
 /// int/long, `float` for float, `None` for a non-numeric operand.
 unsafe fn numeric_base_type(obj: PyObjectRef) -> Option<*const pyre_object::PyType> {
@@ -1636,6 +1647,22 @@ unsafe fn numeric_base_type(obj: PyObjectRef) -> Option<*const pyre_object::PyTy
     }
 }
 
+/// The builtin numeric base type object of `obj`, returned only when `obj`
+/// is a subclass instance that may override a special method.  An exact
+/// builtin numeric instance ([`is_exact_builtin_instance`]) cannot override
+/// any special method, so it yields `None`, skipping the string-keyed
+/// method-cache lookups in [`dunder_overridden`].  Those lookups (one
+/// UTF-8-keyed cache probe per dunder) are the dominant per-iteration cost
+/// of the interpreter numeric fast path.  This mirrors the exact-builtin
+/// gate already opening `subclass_special_override` / `is_true`.
+unsafe fn numeric_base_type_of_overriding_subclass(obj: PyObjectRef) -> Option<PyObjectRef> {
+    if pyre_object::is_exact_builtin_instance(obj) {
+        return None;
+    }
+    let base = numeric_base_type(obj)?;
+    crate::typedef::gettypefor(base)
+}
+
 /// True when numeric operand `obj` (int/long/float storage) has a Python
 /// class that overrides `dunder` relative to its builtin base — int/long
 /// against `int`, float against `float`.  Mirrors [`dunder_overridden`]
@@ -1644,10 +1671,7 @@ unsafe fn numeric_base_type(obj: PyObjectRef) -> Option<*const pyre_object::PyTy
 /// Rust fast path, which both matches the builtin result and avoids
 /// re-entering the inherited slot (it would recurse back into this op).
 unsafe fn numeric_operand_overrides(obj: PyObjectRef, dunder: &str, rdunder: &str) -> bool {
-    let Some(base) = numeric_base_type(obj) else {
-        return false;
-    };
-    let Some(t) = crate::typedef::gettypefor(base) else {
+    let Some(t) = numeric_base_type_of_overriding_subclass(obj) else {
         return false;
     };
     dunder_overridden(obj, dunder, t) || dunder_overridden(obj, rdunder, t)
@@ -1676,10 +1700,7 @@ unsafe fn needs_numeric_binop_dispatch(
 /// special `dunder` relative to its builtin base.
 #[majit_macros::dont_look_inside]
 unsafe fn needs_numeric_unaryop_dispatch(a: PyObjectRef, dunder: &str) -> bool {
-    let Some(base) = numeric_base_type(a) else {
-        return false;
-    };
-    let Some(t) = crate::typedef::gettypefor(base) else {
+    let Some(t) = numeric_base_type_of_overriding_subclass(a) else {
         return false;
     };
     dunder_overridden(a, dunder, t)
@@ -1782,8 +1803,8 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if let Some(result) = try_instance_binop(a, b, "__add__") {
             return result;
         }
-        let a_name = (*(*a).ob_type).name;
-        let b_name = (*(*b).ob_type).name;
+        let a_name = (*ll_type(a)).name;
+        let b_name = (*ll_type(b)).name;
         // Sequence concatenation slot (sq_concat) reports a distinct
         // message when the left operand is a sequence — `unicode_concatenate`
         // / `list_concat` / `tuple_concat`.
@@ -1847,8 +1868,8 @@ pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if let Some(result) = try_typedef_binop(a, b, "__sub__") {
             return result;
         }
-        let a_name = (*(*a).ob_type).name;
-        let b_name = (*(*b).ob_type).name;
+        let a_name = (*ll_type(a)).name;
+        let b_name = (*ll_type(b)).name;
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for -: '{a_name}' and '{b_name}'"
         )))
@@ -1939,8 +1960,8 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if let Some(result) = try_instance_binop(a, b, "__mul__") {
             return result;
         }
-        let a_name = (*(*a).ob_type).name;
-        let b_name = (*(*b).ob_type).name;
+        let a_name = (*ll_type(a)).name;
+        let b_name = (*ll_type(b)).name;
         // Sequence repetition slot (sq_repeat): a sequence on either side
         // with a non-int multiplier reports the non-int's type.
         let a_seq =
@@ -1989,8 +2010,8 @@ pub fn floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if let Some(result) = try_instance_binop(a, b, "__floordiv__") {
             return result;
         }
-        let a_name = (*(*a).ob_type).name;
-        let b_name = (*(*b).ob_type).name;
+        let a_name = (*ll_type(a)).name;
+        let b_name = (*ll_type(b)).name;
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for //: '{a_name}' and '{b_name}'"
         )))
@@ -2025,8 +2046,8 @@ pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if let Some(result) = try_instance_binop(a, b, "__mod__") {
             return result;
         }
-        let a_name = (*(*a).ob_type).name;
-        let b_name = (*(*b).ob_type).name;
+        let a_name = (*ll_type(a)).name;
+        let b_name = (*ll_type(b)).name;
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for %: '{a_name}' and '{b_name}'"
         )))
@@ -2075,8 +2096,8 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if let Some(result) = try_instance_binop(a, b, "__truediv__") {
             return result;
         }
-        let a_name = (*(*a).ob_type).name;
-        let b_name = (*(*b).ob_type).name;
+        let a_name = (*ll_type(a)).name;
+        let b_name = (*ll_type(b)).name;
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for /: '{a_name}' and '{b_name}'"
         )))
@@ -2112,8 +2133,8 @@ pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if let Some(result) = try_instance_binop(a, b, "__pow__") {
             return result;
         }
-        let a_name = (*(*a).ob_type).name;
-        let b_name = (*(*b).ob_type).name;
+        let a_name = (*ll_type(a)).name;
+        let b_name = (*ll_type(b)).name;
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for **: '{a_name}' and '{b_name}'"
         )))
@@ -2491,6 +2512,16 @@ pub(crate) fn try_inplace_special(
     rdunder: Option<&str>,
     seq_bug_compat: bool,
 ) -> Result<Option<PyObjectRef>, PyError> {
+    // An exact builtin numeric lhs (int/long/float/complex/bool) defines no
+    // in-place special, so the lookup below is always a miss.  Skip it — the
+    // string-keyed method-cache probe (a UTF-8 dunder-name intern) is the
+    // dominant per-iteration cost of `total += …`.  Only exact numerics are
+    // gated: builtin sequences (list/bytearray) define `__iadd__`/`__imul__`,
+    // and a subclass may override the in-place slot, so both must fall
+    // through to the lookup.
+    if unsafe { is_exact_numeric_builtin(lhs) } {
+        return Ok(None);
+    }
     // descroperation.py:826 — only when the lhs in-place method exists.
     if let Some(method) = unsafe { lookup_type_special(lhs, idunder) } {
         // descroperation.py:831 seq_bug_compat — for `+=` / `*=` where the
@@ -2635,13 +2666,13 @@ pub(crate) fn binary_builtin_type_error(
     let lhs_name = unsafe {
         match crate::typedef::r#type(lhs) {
             Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
-            None => (*(*lhs).ob_type).name.to_string(),
+            None => (*ll_type(lhs)).name.to_string(),
         }
     };
     let rhs_name = unsafe {
         match crate::typedef::r#type(rhs) {
             Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
-            None => (*(*rhs).ob_type).name.to_string(),
+            None => (*ll_type(rhs)).name.to_string(),
         }
     };
     PyError::type_error(format!(
@@ -2826,8 +2857,8 @@ pub fn lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if let Some(result) = try_instance_binop(a, b, "__lshift__") {
             return result;
         }
-        let a_name = (*(*a).ob_type).name;
-        let b_name = (*(*b).ob_type).name;
+        let a_name = (*ll_type(a)).name;
+        let b_name = (*ll_type(b)).name;
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for <<: '{a_name}' and '{b_name}'"
         )))
@@ -2857,8 +2888,8 @@ pub fn rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if let Some(result) = try_instance_binop(a, b, "__rshift__") {
             return result;
         }
-        let a_name = (*(*a).ob_type).name;
-        let b_name = (*(*b).ob_type).name;
+        let a_name = (*ll_type(a)).name;
+        let b_name = (*ll_type(b)).name;
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for >>: '{a_name}' and '{b_name}'"
         )))
@@ -2916,8 +2947,8 @@ pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if let Some(result) = try_typedef_binop(a, b, "__and__") {
             return result;
         }
-        let a_name = (*(*a).ob_type).name;
-        let b_name = (*(*b).ob_type).name;
+        let a_name = (*ll_type(a)).name;
+        let b_name = (*ll_type(b)).name;
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for &: '{a_name}' and '{b_name}'"
         )))
@@ -3024,8 +3055,8 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if let Some(result) = try_typedef_binop(a, b, "__or__") {
             return result;
         }
-        let a_name = (*(*a).ob_type).name;
-        let b_name = (*(*b).ob_type).name;
+        let a_name = (*ll_type(a)).name;
+        let b_name = (*ll_type(b)).name;
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for |: '{a_name}' and '{b_name}'"
         )))
@@ -3084,8 +3115,8 @@ pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if let Some(result) = try_typedef_binop(a, b, "__xor__") {
             return result;
         }
-        let a_name = (*(*a).ob_type).name;
-        let b_name = (*(*b).ob_type).name;
+        let a_name = (*ll_type(a)).name;
+        let b_name = (*ll_type(b)).name;
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for ^: '{a_name}' and '{b_name}'"
         )))
@@ -3418,8 +3449,8 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
         if matches!(op, CompareOp::Ne) {
             return Ok(w_bool_from(!std::ptr::eq(a, b)));
         }
-        let a_name = (*(*a).ob_type).name;
-        let b_name = (*(*b).ob_type).name;
+        let a_name = (*ll_type(a)).name;
+        let b_name = (*ll_type(b)).name;
         let op_symbol = op.symbol();
         Err(PyError::type_error(format!(
             "'{op_symbol}' not supported between instances of '{a_name}' and '{b_name}'"
@@ -3484,7 +3515,7 @@ pub fn pos(a: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "bad operand type for unary +: '{}'",
-            (*(*a).ob_type).name,
+            (*ll_type(a)).name,
         )))
     }
 }
@@ -3524,7 +3555,7 @@ pub fn neg(a: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "bad operand type for unary -: '{}'",
-            (*(*a).ob_type).name,
+            (*ll_type(a)).name,
         )))
     }
 }
@@ -3548,7 +3579,7 @@ pub fn invert(a: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "bad operand type for unary ~: '{}'",
-            (*(*a).ob_type).name,
+            (*ll_type(a)).name,
         )))
     }
 }

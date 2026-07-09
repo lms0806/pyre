@@ -359,6 +359,7 @@ fn install_gc_box(mut gc: Box<dyn GcAllocator>) {
     set_cranelift_jitframe_type_id(jitframe_type_id);
     majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
         check_is_object: Some(check_is_object_via_active_runtime),
+        is_tagged_immediate: Some(is_tagged_immediate_via_active_runtime),
         get_actual_typeid: Some(get_actual_typeid_via_active_runtime),
         subclass_range: Some(subclass_range_via_active_runtime),
         typeid_subclass_range: Some(typeid_subclass_range_via_active_runtime),
@@ -1428,6 +1429,13 @@ fn cranelift_gc_active() -> bool {
 /// reach the live GC allocator without taking a cranelift dependency.
 fn check_is_object_via_active_runtime(gcref: GcRef) -> bool {
     with_cranelift_gc(|gc| gc.check_is_object(gcref)).unwrap_or(false)
+}
+
+/// `majit_gc::IsTaggedImmediateFn` installed by `set_gc_allocator`.
+/// Dispatches gc/base.py:380-383 `is_valid_gc_object`'s tagged-immediate
+/// test through the thread-local `CRANELIFT_ACTIVE_GC`.
+fn is_tagged_immediate_via_active_runtime(addr: usize) -> bool {
+    with_cranelift_gc(|gc| gc.is_tagged_immediate(addr)).unwrap_or(false)
 }
 
 /// `majit_gc::GetActualTypeidFn` installed by `set_gc_allocator`.
@@ -7693,6 +7701,22 @@ impl CraneliftBackend {
         // x86_64 register pressure (rbp already taken by preserve_frame_pointers),
         // spills to a stack slot and is reloaded on every frame access.
         flag_builder.set("enable_pinned_reg", "true").unwrap();
+        // Windows enforces the stack guard page strictly: a prologue that moves
+        // %rsp past the 4KB guard in one `sub` (a deep trace body's
+        // fixed_frame_storage can reach hundreds of KB) faults 0xC0000005 on the
+        // first write below the skipped page. Linux/macOS auto-grow the stack
+        // instead. Emit inline stack probes (the __chkstk analog: a probe loop
+        // touching each page) so the guard page is hit during the prologue.
+        // `inline` emits the loop directly; `outline` would need a probestack
+        // libcall symbol registered in the JITModule. Scoped to Windows via the
+        // runtime `cfg!` macro (not a `#[cfg]` attribute) so these `set` calls
+        // still compile on every platform and only take effect on Windows,
+        // keeping non-Windows codegen unchanged (probestack is a pure prologue
+        // insertion — no body instruction-selection change).
+        if cfg!(windows) {
+            flag_builder.set("enable_probestack", "true").unwrap();
+            flag_builder.set("probestack_strategy", "inline").unwrap();
+        }
 
         let isa_builder = cranelift_native::builder().expect("host ISA not supported");
         let isa = isa_builder
