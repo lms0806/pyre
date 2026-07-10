@@ -706,12 +706,23 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     // `_jit_look_inside_` source as `merge_hints_from_llbcs`) so the
     // per-fn push can stamp the matching `return_type` token, keyed by
     // the identical `{module_path}::{name}` path the merge uses.
-    let dont_look_inside: std::collections::HashSet<String> =
-        crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc))
-            .into_iter()
-            .filter(|(_, hints)| hints.iter().any(|h| h == "dont_look_inside"))
-            .map(|(path, _)| path)
-            .collect();
+    let harvested = crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc));
+    let dont_look_inside: std::collections::HashSet<String> = harvested
+        .iter()
+        .filter(|(_, hints)| hints.iter().any(|h| h == "dont_look_inside"))
+        .map(|(path, _)| path.clone())
+        .collect();
+    // `#[majit_macros::elidable]` callees (`llbc_hints.rs:31` maps the
+    // `_elidable_function_` marker → `"elidable"`): the codewriter's
+    // elidable effect already lowers the callsite to CALL_PURE and never
+    // looks inside the body.  Harvest the elidable set from the same
+    // vector so `stamp_return_token` can stamp the matching FUNC.RESULT
+    // token, gated on `PYRE_ELIDABLE_RESIDUALIZE`.
+    let elidable_residual: std::collections::HashSet<String> = harvested
+        .iter()
+        .filter(|(_, hints)| hints.iter().any(|h| h == "elidable"))
+        .map(|(path, _)| path.clone())
+        .collect();
     let mut functions = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     for fd in llbc.iter_local_fns() {
@@ -812,7 +823,19 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         } else {
             format!("{module_path}::{name}")
         };
-        let return_type = if dont_look_inside.contains(&fn_path) {
+        // A trait default body is registered as the `<default methods of
+        // Trait>` family sentinel and picked as the Indirect-dispatch
+        // witness (`getcalldescr`'s indirect arm reads its `return_type` as
+        // `FUNC.RESULT`).  Left `None` it maps to `Void` and mismatches the
+        // caller's `Ref`/`Int` `result_ty`; stamp the same token an opaque
+        // callee gets so the witness reports its real return kind.  Gated on
+        // `PYRE_DYN_INDIRECT` so the direct `[Trait, method]` registration
+        // (`lib.rs`) keeps its `None`→`Void` default when the routing is off
+        // — off-path byte-identity holds.
+        let stamp_return_token = dont_look_inside.contains(&fn_path)
+            || (elidable_residualize_enabled() && elidable_residual.contains(&fn_path))
+            || (dyn_indirect_enabled() && trait_root.is_some() && self_ty_root.is_none());
+        let return_type = if stamp_return_token {
             dont_look_inside_return_token(&fd.signature.output, llbc)
         } else {
             None
@@ -4633,6 +4656,57 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Decode an inline-Field `dyn Trait` call operand into the
+    /// `(trait_root, method_name)` pair the `CallTarget::Indirect`
+    /// vtable-dispatch pipeline keys on.
+    ///
+    /// The inline dispatch reads the method fn-ptr straight out of the
+    /// receiver's vtable — the operand's terminal projection is
+    /// `Field[Adt(vtable_id), slot]` off `(*recv).vtable`, where the
+    /// vtable type is the `<Trait>::{vtable}` struct and the slot field
+    /// is named `method_<name>`.  Returns `None` for any other operand
+    /// shape (the one-hop `Option<fn-ptr>` deref and `call_once` closure
+    /// shims are bare locals / non-`Field[Adt]` projections), which keeps
+    /// those on the synthetic `__dyn_call` path.
+    fn dyn_indirect_target(&self, dyn_operand: &Operand) -> Option<(String, String)> {
+        let place = match dyn_operand {
+            Operand::Copy(p) | Operand::Move(p) => p,
+            Operand::Const(_) => return None,
+        };
+        let PlaceKind::Projection(_, elem) = &place.kind else {
+            return None;
+        };
+        let ProjectionElem::Tagged(v) = elem else {
+            return None;
+        };
+        let field_payload = v.as_object()?.get("Field")?;
+        // The terminal container must be an `Adt` (the vtable struct);
+        // decode its type id the same two ways `resolve_adt_field` does
+        // (bare u64 or `{id:{Adt}}` head), never hardcoding a value.
+        let arr = field_payload.as_array()?;
+        let container = arr.first()?.as_object()?;
+        let adt = container.get("Adt")?.as_array()?;
+        let head = adt.first()?;
+        let vtable_id = match head.as_u64() {
+            Some(id) => id,
+            None => head.get("id")?.get("Adt")?.as_u64()?,
+        };
+        // `resolve_adt_field` names the slot `method_<name>`; strip the
+        // prefix for the trait method leaf.
+        let (_owner, field_name, _ty, _id) = self.resolve_adt_field(field_payload)?;
+        let method_name = field_name.strip_prefix("method_")?.to_string();
+        // The vtable type is spelled `<path>::<Trait>::{vtable}`; the
+        // trait_root the family lookup keys on is the bare trait leaf
+        // (matching `register_trait_method`, which registers under
+        // `SemanticFunction.trait_root` = the trait's leaf name).
+        let vtable_path = self.llbc.type_by_id(vtable_id)?.item_meta.name_path();
+        let trait_path = vtable_path
+            .strip_suffix("::{vtable}")
+            .unwrap_or(vtable_path.as_str());
+        let trait_root = trait_path.rsplit("::").next()?.to_string();
+        Some((trait_root, method_name))
+    }
+
     /// Resolve a global `def_id` to its fully-qualified path segments
     /// via the reader's `global_decls` table.
     fn global_segments(&self, mir_bb: usize, def_id: u64) -> Result<Vec<String>, LowerError> {
@@ -5185,6 +5259,22 @@ impl<'a> Lowering<'a> {
             tyref_node(&call.dest.ty, self.llbc)
                 .and_then(|n| strip_ty_wrappers(n, self.llbc))
                 .and_then(|n| raw_ptr_pointee_class_root(n, self.llbc))
+                // A `dont_look_inside` residual returning `Option<*mut PyObject>`
+                // erases the same way — `dont_look_inside_return_token` maps it to
+                // the `ref` GCREF token, so `result_ty` is `Ref(None)` too — but its
+                // `call.dest.ty` is the `Option<…>` ADT, not a bare raw pointer, so
+                // the `raw_ptr_pointee_class_root` above misses.  Narrow it to the
+                // per-instantiation `Option` enum root a constructed
+                // `Some(..)`/`None` of the same instantiation mints, so the caller's
+                // `if let Some(x) = ..` (`Discriminant` → `__discriminant` read, then
+                // the Some-arm `__pos_0` payload) resolves against the Option classdef
+                // instead of blocking on a classdef-less GCREF.  Gated so the
+                // bare-GCREF residual result can be restored.
+                .or_else(|| {
+                    option_residual_narrow_enabled()
+                        .then(|| self.option_residual_narrow_root(&call.dest.ty))
+                        .flatten()
+                })
         } else {
             None
         };
@@ -6063,23 +6153,45 @@ impl<'a> Lowering<'a> {
                 }
             }
             (CallClass::Dynamic, CallFunc::Dynamic(dyn_operand)) => {
-                // `dyn Trait` virtual call. The fat-pointer receiver
-                // is carried in `dyn_operand`; thread it into `args[0]`
-                // and emit a synthetic `__dyn_call` path so the
-                // codewriter sees a uniform `Call` shape.  A faithful
-                // lowering would emit `VtableMethodPtr` + `IndirectCall`;
-                // that needs the trait_root/method_name pair Charon does
-                // not yet surface.
-                let recv = self.resolve_operand(mir_bb, dyn_operand)?;
-                let mut full_args = Vec::with_capacity(args.len() + 1);
-                full_args.push(recv);
-                full_args.extend(args);
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec!["__dyn_call".to_string()],
-                    },
-                    args: full_args,
-                    result_ty,
+                // `dyn Trait` virtual call.  The inline-dispatch form reads
+                // the method fn-ptr straight out of the receiver's vtable
+                // (`(*recv).vtable.method_<name>`), so the operand's
+                // terminal projection is `Field[Adt(vtable_id), slot]`.
+                // Route those through the faithful `CallTarget::Indirect`
+                // vtable pipeline (`rpbc::lower_indirect_calls` →
+                // `VtableMethodPtr` + `IndirectCall`, carrying the full
+                // impl family) instead of the synthetic `__dyn_call`.  The
+                // call args already carry the receiver in `args[0]` (the
+                // operand projection's base local), which is exactly the
+                // receiver slot `IndirectCall` expects, so the arg list
+                // passes through unchanged.
+                //
+                // Any other operand shape — the one-hop `Option<fn-ptr>`
+                // deref and `call_once` closure shims — is a stored
+                // fn-ptr / `FnOnce`, not a vtable slot; it keeps the
+                // synthetic `__dyn_call` path (the fat-pointer receiver
+                // threaded into `args[0]`).
+                let indirect = dyn_indirect_enabled()
+                    .then(|| self.dyn_indirect_target(&dyn_operand))
+                    .flatten();
+                if let Some((trait_root, method_name)) = indirect {
+                    OpKind::Call {
+                        target: CallTarget::indirect(trait_root, method_name),
+                        args,
+                        result_ty,
+                    }
+                } else {
+                    let recv = self.resolve_operand(mir_bb, dyn_operand)?;
+                    let mut full_args = Vec::with_capacity(args.len() + 1);
+                    full_args.push(recv);
+                    full_args.extend(args);
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: vec!["__dyn_call".to_string()],
+                        },
+                        args: full_args,
+                        result_ty,
+                    }
                 }
             }
             (CallClass::Ptr, _) => {
@@ -7742,6 +7854,52 @@ impl<'a> Lowering<'a> {
         };
         let inner = body.get("Adt")?.get("generics")?.get("types")?.get(0)?;
         Some(self.type_node_to_value_type(inner))
+    }
+
+    /// The per-instantiation `Option` enum root for a residual-call
+    /// destination `dest_ty` that is an `Option<*mut RegisteredStruct>`
+    /// (`Option<PyObjectRef>`), or `None` when `dest_ty` is not an Option
+    /// whose payload is a raw pointer to a registered struct root.
+    ///
+    /// A `dont_look_inside` residual returning `Option<*mut PyObject>` has
+    /// its result kind erased to the `ref` GCREF token, so the call result
+    /// arrives classdef-less; the caller's `if let Some(x) = ..` then reads
+    /// `__discriminant` off a bare pointer and panics.  Minting the SAME
+    /// root a constructed `Some(..)`/`None` of this instantiation mints
+    /// (`Option`'s `name_path` + the destination `<X>` suffix, exactly as
+    /// [`Self::recognize_bool_then_site`] / the tagged-pair ctor derive it)
+    /// lets the narrowed result share the constructed Option's ClassDef, so
+    /// the residual and constructed Options unify at a phi merge and the
+    /// discriminant / payload reads resolve.
+    ///
+    /// The payload distinguisher is [`raw_ptr_pointee_class_root`] on the
+    /// Option's first type argument: `Some` for `Option<*mut PyObject>`,
+    /// `None` for `Option<u64>` (no raw pointer) and `Option<*mut u8>` (a
+    /// primitive pointee with no registered struct root) — both of which
+    /// stay classdef-less GCREF, unchanged.
+    fn option_residual_narrow_root(&self, dest_ty: &TyRef) -> Option<String> {
+        if !crate::front::result_exc::tyref_is_option(dest_ty, self.llbc) {
+            return None;
+        }
+        // Distinguisher: the Option's payload must be a raw pointer whose
+        // pointee resolves to a registered struct root.
+        let payload = tyref_node(dest_ty, self.llbc)?
+            .as_object()?
+            .get("Adt")?
+            .get("generics")?
+            .get("types")?
+            .get(0)?;
+        strip_ty_wrappers(payload, self.llbc)
+            .and_then(|n| raw_ptr_pointee_class_root(n, self.llbc))?;
+        // The narrow root is the Option enum instantiation itself — the same
+        // spelling a static `Some(..)` construction of this instantiation mints.
+        let def_id = self.tyref_adt_def_id(dest_ty)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        Some(format!(
+            "{}{}",
+            td.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+        ))
     }
 
     /// Project a raw Charon type node (a `generics.types` entry) to a
@@ -11870,6 +12028,47 @@ fn render_adt_type_args(
 fn tuple_per_shape_enabled() -> bool {
     !matches!(
         std::env::var("PYRE_TUPLE_PER_SHAPE_CLASSDEF").as_deref(),
+        Ok("0") | Ok("false")
+    )
+}
+
+/// Route inline-Field `dyn Trait` virtual calls through the faithful
+/// `CallTarget::Indirect` vtable pipeline instead of the synthetic
+/// `__dyn_call` residual (see the `(CallClass::Dynamic, ..)` arm).
+/// Default-OFF — `PYRE_DYN_INDIRECT=1` opts in; every other value (unset
+/// included) keeps the inert `__dyn_call` emit.
+pub(crate) fn dyn_indirect_enabled() -> bool {
+    matches!(
+        std::env::var("PYRE_DYN_INDIRECT").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+/// Residualize a `#[majit_macros::elidable]` graph — stamp its return-kind
+/// FUNC.RESULT token and prefill a signature-only stub instead of lifting
+/// the body — mirroring `@elidable` + `look_inside_graph=False` (the
+/// callsite already lowers to CALL_PURE via the codewriter's elidable
+/// effect; the body is never looked inside).  Default-OFF —
+/// `PYRE_ELIDABLE_RESIDUALIZE=1` opts in; every other value (unset
+/// included) keeps the elidable body lifted as today.
+pub(crate) fn elidable_residualize_enabled() -> bool {
+    matches!(
+        std::env::var("PYRE_ELIDABLE_RESIDUALIZE").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+/// Narrow a `dont_look_inside` residual call whose destination is
+/// `Option<*mut PyObject>` from the classdef-less `ref` GCREF token to the
+/// per-instantiation `Option` enum root, so the caller's `if let Some(x) =
+/// ..` (`__discriminant` read + Some-arm `__pos_0` payload) resolves against
+/// the Option classdef instead of panicking with `Ptr{Opaque(GCREF)}
+/// instance has no field "__discriminant"`.  On by default;
+/// `PYRE_OPTION_RESIDUAL_NARROW=0` is the kill switch that restores the
+/// bare-GCREF residual result.
+pub(crate) fn option_residual_narrow_enabled() -> bool {
+    !matches!(
+        std::env::var("PYRE_OPTION_RESIDUAL_NARROW").as_deref(),
         Ok("0") | Ok("false")
     )
 }

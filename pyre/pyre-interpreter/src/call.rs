@@ -234,6 +234,12 @@ pub fn set_last_exec_ctx(ctx: *const crate::PyExecutionContext) {
 /// that need to temporarily pin a different context (blackhole's
 /// `bh_call_fn_impl` cold path, for example) pair this with
 /// `set_last_exec_ctx` to restore the prior value on return.
+///
+/// `dont_look_inside`: the `LAST_EXEC_CTX` thread-local `.with` read has no
+/// extractable graph (front::mir const-folds the `ThreadLocal` global to
+/// None), so the call stays a residual read via the registered fnaddr
+/// (`@dont_look_inside`, `rlib/jit.py:139`), the `take_call_error` twin.
+#[majit_macros::dont_look_inside]
 pub fn take_last_exec_ctx() -> *const crate::PyExecutionContext {
     LAST_EXEC_CTX.with(|c| c.get())
 }
@@ -876,14 +882,18 @@ fn metaclass_call_override(callable: PyObjectRef) -> Option<PyObjectRef> {
     if std::ptr::eq(metaclass, crate::typedef::w_type()) {
         return None;
     }
-    // Resolve __call__ AND where it is defined; the default `type.__call__`
+    // Resolve WHERE `__call__` is defined first; the default `type.__call__`
     // (the implicit instantiation path) is not an override, so a metaclass
-    // that merely inherits it — e.g. ABCMeta — keeps the fast path.
-    let (where_defined, call_descr) =
-        unsafe { crate::baseobjspace::lookup_where(metaclass, "__call__") }?;
+    // that merely inherits it — e.g. ABCMeta — keeps the fast path.  The
+    // defining-class half is the cheap guard, so it runs before the value
+    // half's second residual walk (avoided on the common fast path).
+    let where_defined =
+        unsafe { crate::baseobjspace::lookup_where_class_uncached(metaclass, "__call__") }?;
     if std::ptr::eq(where_defined, crate::typedef::w_type()) {
         return None;
     }
+    let call_descr =
+        unsafe { crate::baseobjspace::lookup_in_type_where_uncached(metaclass, "__call__") }?;
     let bound = unsafe { crate::baseobjspace::get(call_descr, callable, metaclass) }
         .ok()
         .flatten()
@@ -2441,9 +2451,9 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
     let func_code = unsafe {
         crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
     };
-    let exec_ctx = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
+    let exec_ctx = build_class_exec_ctx();
     let exec_ctx = if exec_ctx.is_null() {
-        LAST_EXEC_CTX.with(|c| c.get())
+        take_last_exec_ctx()
     } else {
         exec_ctx
     };
@@ -2525,9 +2535,9 @@ fn call_user_function_resolved_frameless(func: PyObjectRef, args: &[PyObjectRef]
     let func_code = unsafe {
         crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
     };
-    let exec_ctx = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
+    let exec_ctx = build_class_exec_ctx();
     let exec_ctx = if exec_ctx.is_null() {
-        LAST_EXEC_CTX.with(|c| c.get())
+        take_last_exec_ctx()
     } else {
         exec_ctx
     };
@@ -2589,7 +2599,7 @@ fn call_metaclass_with_kwargs(
             Vec::new()
         };
         let frame = {
-            let stored = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
+            let stored = build_class_exec_ctx();
             if stored.is_null() {
                 std::ptr::null_mut()
             } else {
@@ -2957,7 +2967,7 @@ fn build_class_inner(
                     _ => Vec::new(),
                 };
                 let prepare_frame = {
-                    let stored = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
+                    let stored = build_class_exec_ctx();
                     if stored.is_null() {
                         std::ptr::null_mut()
                     } else {
@@ -3058,7 +3068,7 @@ fn build_class_inner(
     // class body stores into it after execution. This lets EnumDict etc.
     // track member definitions via __setitem__.
 
-    let stored = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
+    let stored = build_class_exec_ctx();
     let exec_ctx = if stored.is_null() {
         std::ptr::null::<crate::PyExecutionContext>()
     } else {
@@ -3555,9 +3565,9 @@ pub(crate) fn call_init_subclass_on_bases(
         .map(|(k, v)| (unsafe { pyre_object::w_str_get_wtf8(*k) }.to_owned(), *v))
         .collect();
     let frame = {
-        let stored = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
+        let stored = build_class_exec_ctx();
         let stored = if stored.is_null() {
-            LAST_EXEC_CTX.with(|c| c.get())
+            take_last_exec_ctx()
         } else {
             stored
         };
@@ -3597,6 +3607,17 @@ thread_local! {
 /// Set the execution context for __build_class__ to use.
 pub fn set_build_class_exec_ctx(ctx: *const crate::PyExecutionContext) {
     BUILD_CLASS_EXEC_CTX.with(|c| c.set(ctx));
+}
+
+/// Read the __build_class__ execution context.
+///
+/// `dont_look_inside`: the `BUILD_CLASS_EXEC_CTX` thread-local `.with` read
+/// has no extractable graph (front::mir const-folds the `ThreadLocal` global
+/// to None), so the call stays a residual read via the registered fnaddr
+/// (`@dont_look_inside`, `rlib/jit.py:139`), the `take_last_exec_ctx` twin.
+#[majit_macros::dont_look_inside]
+pub fn build_class_exec_ctx() -> *const crate::PyExecutionContext {
+    BUILD_CLASS_EXEC_CTX.with(|c| c.get())
 }
 
 // ── Type calling (instance creation) ─────────────────────────────────
