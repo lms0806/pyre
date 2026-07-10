@@ -1536,6 +1536,11 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
             };
         };
         let payload = &jc.payload;
+        // #73 S3.5: expand a tagged branch `orgpc` word to the block-head marker
+        // BEFORE the `>= 0` / offset uses below — a tagged NEGATIVE word cast to
+        // usize would otherwise be a huge OOB index. No-op for offsets /
+        // NO_JITCODE_PC (flip-off), so byte-identical when off.
+        let jitcode_pc = crate::jitcode_dispatch::expand_branch_carried(payload, jitcode_pc);
         // The rd_numb pc word may carry an after-residual-call marker;
         // recover the plain Python PC for the py_pc-keyed liveness/depth
         // tables (same decode as
@@ -1603,6 +1608,16 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
                 match via_twin {
                     Some(pair) => pair,
                     None => {
+                        // Slice A census: soft, non-aborting count of the
+                        // py_pc re-inversion fallback (empty-twin portal bridge
+                        // or Err(0) colored coord). Emits ONLY when this arm
+                        // runs, so zero output == dead.
+                        if crate::jitcode_dispatch::bridge_audit_enabled() {
+                            eprintln!(
+                                "M73_FALLBACK site=bridge jp={jp} is_portal_bridge={}",
+                                payload.is_portal_bridge()
+                            );
+                        }
                         let rp =
                             crate::jitcode_dispatch::python_pc_for_jitcode_pc(&payload.metadata, jp)
                                 as usize;
@@ -1679,9 +1694,36 @@ pub(crate) fn const_ref_slots_at_pc_at(
         let Some(jc) = sd.jitcodes.get(jitcode_index as usize) else {
             return Vec::new();
         };
+        // #73 S3.5: expand a tagged branch `orgpc` word to the block-head marker
+        // before the `>= 0` / offset uses below. No-op for offsets /
+        // NO_JITCODE_PC (flip-off), so byte-identical when off.
+        let jitcode_pc = crate::jitcode_dispatch::expand_branch_carried(&jc.payload, jitcode_pc);
         let real_pc = if jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_pc >= 0 {
             let jp = jitcode_pc as usize;
             if jc.payload.jitcode.can_decode_live_vars(jp, sd.op_live) {
+                // gh#73 S3.2: source the const slots directly from the carried
+                // genuine `jitcode_pc` via the predecessor-keyed twin, bypassing
+                // the `python_pc_for_jitcode_pc` re-inversion — the same
+                // decode-identity shape the pcdep/depth twins use at
+                // `bridge_semantic_maps_at_with_jitcode_pc`. A colored jitcode
+                // returns `Some` (an empty slot list is a legitimate hit); an
+                // empty twin (skeleton / portal-bridge) returns `None` and falls
+                // through to the re-inversion, which still keys the populated
+                // `const_ref_slots_at_pc`. Equal by construction (built in the
+                // same `by_off` loop, same predecessor keying, as the twins
+                // check.py certifies on the hot bridge path).
+                if let Some(slots) = jc.payload.const_ref_slots_for_jitcode_pc(jp) {
+                    return slots;
+                }
+                // Slice A census: soft, non-aborting count of the py_pc
+                // re-inversion fallback (empty const-slot twin). Known COLD.
+                // Zero output == dead.
+                if crate::jitcode_dispatch::bridge_audit_enabled() {
+                    eprintln!(
+                        "M73_FALLBACK site=const jp={jp} is_portal_bridge={}",
+                        jc.payload.is_portal_bridge()
+                    );
+                }
                 crate::jitcode_dispatch::python_pc_for_jitcode_pc(&jc.payload.metadata, jp) as usize
             } else {
                 majit_ir::resumedata::decode_resume_pc(pc).0 as usize
@@ -11864,6 +11906,7 @@ mod tests {
                 max_stackdepth: 0,
                 pcdep_color_slots: Vec::new(),
                 const_ref_slots_at_pc: Vec::new(),
+                const_ref_slots_by_jit_pc: Vec::new(),
                 is_drained: true,
             },
             std::ptr::null(),

@@ -12559,6 +12559,7 @@ impl CodeWriter {
         // op offset or a block-head marker — never a mid-op byte.  Certified by
         // `PYRE_PCMAP_BRIDGE_AUDIT`; empty for skeleton / portal-bridge.
         let mut pcdep_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)> = Vec::new();
+        let mut const_ref_slots_by_jit_pc: Vec<(usize, Vec<(u16, i64)>)> = Vec::new();
         let mut depth_pred_by_jit_pc: Vec<(usize, u16)> = Vec::new();
         // task#50 #73-core: trivia-aware predecessor twin of the STATIC dense
         // liveness depth.  The ENCODE-side branch-resume depth reader
@@ -12641,8 +12642,10 @@ impl CodeWriter {
             for (&off, &py) in by_off.iter() {
                 let pcdep = pcdep_color_slots.get(py).cloned().unwrap_or_default();
                 let depth = depth_at_pc.get(py).copied().unwrap_or(0);
+                let const_slots = const_ref_slots_at_pc.get(py).cloned().unwrap_or_default();
                 pcdep_by_jit_pc.push((off, pcdep));
                 depth_pred_by_jit_pc.push((off, depth));
+                const_ref_slots_by_jit_pc.push((off, const_slots));
             }
             // Marker tier: exact-match, block-head precedence (first-seen dedup
             // gives the smallest py resolving at the marker offset).
@@ -12702,6 +12705,7 @@ impl CodeWriter {
             max_stackdepth: code.max_stackdepth as usize,
             pcdep_color_slots,
             const_ref_slots_at_pc,
+            const_ref_slots_by_jit_pc,
             is_drained: true,
         };
 

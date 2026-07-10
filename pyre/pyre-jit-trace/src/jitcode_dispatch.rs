@@ -648,6 +648,17 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// boundary; read by [`reconcile_vstack_at_boundary`] for the
     /// RESULT-TO-TOS class.
     pub vstack_last_ref: OpRef,
+    /// #73 (SLICE 1, INERT): the jitcode offset of the `-live-` byte that
+    /// precedes the CURRENT opcode's guard resume point — the `-live-`
+    /// BEFORE (`pyjitpl.py:198`, normal guard resume reads at
+    /// `self.pc - SIZE_LIVE_OP`).  Maintained purely from `DecodedOp` by the
+    /// walk; `usize::MAX` until the first `-live-` is seen.  Side-data only.
+    pub live_before_jit_pc: usize,
+    /// #73 (SLICE 1, INERT): the jitcode offset of the `-live-` byte that
+    /// trails a residual-call opcode — the `-live-` AFTER (`pyjitpl.py:195`,
+    /// residual-call guard resume reads at `self.pc`).  Maintained purely
+    /// from `DecodedOp` by the walk; `usize::MAX` until set.  Side-data only.
+    pub live_after_jit_pc: usize,
 }
 
 /// Outcome of dispatching one opcode. The walker uses this to decide
@@ -1342,6 +1353,14 @@ pub fn step(
     ctx: &mut WalkContext<'_, '_>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let op: DecodedOp = decode_op_at(code, pc).ok_or(DispatchError::UndecodableOpcode { pc })?;
+    // #73 (SLICE 1, INERT): maintain the `-live-` BEFORE anchor.  Every
+    // `-live-` byte the walk decodes becomes the resume point preceding the
+    // NEXT guard (`pyjitpl.py:198`, normal guard resume reads at
+    // `self.pc - SIZE_LIVE_OP`).  `op.pc` is the genuine jitcode offset of
+    // the `-live-` byte.  Side-data only — read under a debug audit gate.
+    if op.opname == "live" {
+        ctx.live_before_jit_pc = op.pc;
+    }
     // #73 (SLICE 1, INERT): maintain the walk-level operand-stack box
     // mirror.  Detects a Python-opcode boundary at this jitcode pc and
     // reconciles the previous opcode's stack effect into `ctx.vstack_boxes`
@@ -2520,6 +2539,8 @@ pub fn dispatch_via_miframe(
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         // #73 (SLICE 1, INERT): seed the walk-level operand-stack box mirror
         // at entry.  The mirror is only enabled when the outer sym owns the
@@ -2821,6 +2842,8 @@ pub(crate) fn drive_bridge_carrier_subwalk(
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
             trace_ctx: ctx,
             done_with_this_frame_descr_ref: done_ref,
             done_with_this_frame_descr_int: done_int,
@@ -3073,6 +3096,8 @@ pub(crate) fn drive_outer_frame_continuation(
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
             trace_ctx: ctx,
             done_with_this_frame_descr_ref: done_ref,
             done_with_this_frame_descr_int: done_int,
@@ -3300,6 +3325,8 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let outcome = walk(entry_jitcode.code.as_slice(), 0, &mut wc);
         let final_last_exc = wc.last_exc_value;
@@ -9121,6 +9148,127 @@ pub(crate) fn m73_liveness_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_LIVENESS_AUDIT").is_some())
 }
 
+/// `PYRE_M73_PEROP_AUDIT` (#73 S2, default OFF): census that, for a
+/// specialization guard (`GuardValue`/`GuardClass`), measures whether the
+/// walk-maintained per-op `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
+/// `pyjitpl.py:198`) decodes IDENTICALLY to the block-head marker
+/// (`resume_jitcode_pc_for(py_pc)`) across EVERY consumer of the carried
+/// resume word — the liveness banks (resolver-funneled) AND the
+/// coordinate-sensitive `bridge_semantic_maps_at_with_jitcode_pc` (depth +
+/// pcdep) and `const_ref_slots_at_pc_at` (const refill), which invert the
+/// carried offset back to a `py_pc` and index py_pc-keyed tables. Emits one
+/// `M73_PEROP_SPEC` line per specialization capture: `eq=1` when the per-op
+/// anchor coincides with the block-head marker (carry is a byte-identical
+/// re-source), `eq=0 banks_eq=.. bmaps_eq=.. const_eq=..` when it differs
+/// (each consumer certified independently), or `eq=nolb`/`eq=nomarker` edge
+/// cases. Off in production.
+pub(crate) fn m73_perop_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_PEROP_AUDIT").is_some())
+}
+
+/// `PYRE_M73_BRANCH_AUDIT` (#73 S3 phase-0, default OFF): census that, for a
+/// depth-0 branch guard (`GuardTrue`/`GuardFalse`), measures whether carrying
+/// the walk's genuine JitCode resume coordinate `op_pc` (== the branch
+/// `other_target` produced by `resolve_branch_target_through_trampoline`)
+/// directly would be byte-behavior-safe versus today's py_pc round-trip marker
+/// (`resume_jitcode_pc_for(py_pc)`). Emits one `M73_BRANCH` line per depth-0
+/// branch capture: `eq=1` when `op_pc` coincides with the marker (carry is a
+/// byte-identical re-source), `eq=0 ...` with per-consumer agreement at
+/// `op_pc` vs `marker` (liveness banks + bridge maps + const refill), a direct
+/// `python_pc_for_jitcode_pc(op_pc)`-vs-`py_pc` probe (the marker path applies
+/// `skip_python_trivia_forward`, this inverse does not — it is the real signal
+/// because a non-decodable `op_pc` self-masks the consumers back to the py_pc
+/// baseline), and the `can_decode_live_vars(op_pc)` flag; or `eq=nomarker`
+/// when `py_pc` carries no resume entry. Off in production.
+pub(crate) fn m73_branch_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_BRANCH_AUDIT").is_some())
+}
+
+/// `PYRE_M73_ARM_AUDIT` (#73 S3.1, approach C, default OFF): certifies that a
+/// branch guard's resume coordinate `other_target` is re-derivable at decode
+/// time from the guard's OWN `-live-` BEFORE anchor `orgpc` plus the recorded
+/// flavor (`GuardTrue`/`GuardFalse`), WITHOUT the runtime condbox — mirroring
+/// PyPy `generate_guard(resumepc=orgpc)` (`pyjitpl.py:520`). Emits one
+/// `M73_ARM` line per non-constant `goto_if_not` capture. Off in production.
+pub(crate) fn m73_arm_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_ARM_AUDIT").is_some())
+}
+
+/// `PYRE_M73_FLIP_AUDIT` (#73 S3.4, approach C, default OFF): the flip-gate
+/// certificate. At the branch-guard capture seam it simulates the decode-side
+/// reconstruction of Approach C — author `orgpc` (`ctx.live_before_jit_pc`) and
+/// expand it via `decode_side_other_target` → `skip_python_trivia_forward`
+/// (num_instrs clamp) → `resume_jitcode_pc_for` — and soft-logs whether that
+/// reproduces today's carried coordinate (`marker`) and every consumer's read.
+/// Off in production → byte-identical. Read-only; no asserts.
+pub(crate) fn m73_flip_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_FLIP_AUDIT").is_some())
+}
+
+/// `PYRE_M73_DERIVED_AUDIT` (#73 S4, default OFF): the py_pc-deletion
+/// precondition census. For each depth-0 branch-guard capture, compares the
+/// resume consumers (liveness banks, bridge semantic maps, const ref slots,
+/// AND the loop-header walk-entry merge-point/register seed) keyed at the raw
+/// `derived` (not-taken-arm jitcode offset) vs the block-head `marker` the
+/// decode currently reconstructs. Certifies `consumers(derived) ==
+/// consumers(marker)` on the `derived != marker` subset — the precondition for
+/// returning `derived` directly and deleting the py_pc round-trip from
+/// `expand_branch_carried`. Read-only; OFF is byte-identical, ON adds only
+/// `M73_DERIVED` stderr lines.
+pub(crate) fn m73_derived_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_DERIVED_AUDIT").is_some())
+}
+
+/// `PYRE_M73_PEROP_CARRY` (#73 S2, default ON): source a specialization
+/// guard's (`GuardValue`/`GuardClass`) resume coordinate from the walk
+/// cursor's per-op `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
+/// `pyjitpl.py:198`) instead of the py_pc-keyed `resume_jitcode_pc_for(py_pc)`
+/// block-head marker — the genuine JitCode cursor the migration authors resume
+/// data from. Byte-behavior-identical: the per-op anchor coincides with the
+/// marker for 99%+ of specialization captures (`PYRE_M73_PEROP_AUDIT` census),
+/// and the divergent minority resumes correctly (per-op == `self.pc -
+/// SIZE_LIVE_OP`). Validated OFF==ON on check.py (155x2), cpython_tests
+/// (39x2), and extra_tests (219x2), both backends. Opt out with
+/// `PYRE_M73_PEROP_CARRY=0`.
+pub(crate) fn m73_perop_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_PEROP_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
+/// `PYRE_M73_BRANCH_CARRY` (#73 S3.5, default ON): the terminal branch-guard
+/// flip. A depth-0 `GuardTrue`/`GuardFalse` sources its resume word from the
+/// walk's arm-independent `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
+/// `orgpc`) TAGGED into the negative space of the `jitcode_pc` word (plus a
+/// 1-bit flavor), instead of the py_pc-keyed `resume_jitcode_pc_for` block-head
+/// marker. Byte-identical by construction: encode carries the tagged word only
+/// when its decode-side expansion ([`expand_branch_carried`]) reproduces the
+/// baseline `marker` (self-cert), and decode expands it back to that same
+/// `marker` before any consumer reads it. Disabled (`PYRE_M73_BRANCH_CARRY=0`)
+/// → encode never emits a tagged word, so the decode expand is a no-op and the
+/// carried word is the block-head `marker` as before. Certified by
+/// `PYRE_M73_FLIP_AUDIT` (S3.4) and check.py (159×2, on and off).
+pub(crate) fn m73_branch_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_BRANCH_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
 pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
     // Exact inverse: `first_jit_pc_by_py_pc[py]` is the byte offset of the
     // FIRST instruction opcode `py` emitted (`usize::MAX` = the PC emitted
@@ -9280,6 +9428,76 @@ fn resolve_branch_target_through_trampoline(code: &[u8], target: usize) -> usize
     resume
 }
 
+/// #73 S3.1 (approach C): re-derive a branch guard's resume `other_target` from
+/// the guard's OWN `-live-` BEFORE anchor `orgpc` (== ctx.live_before_jit_pc at
+/// the goto_if_not) + the recorded flavor (GuardTrue/GuardFalse), WITHOUT the
+/// runtime condbox — mirroring PyPy generate_guard(resumepc=orgpc) (pyjitpl.py:520),
+/// where orgpc is arm-independent and the arm is re-derived. A BOUNDED single
+/// leading `-live-` skip (NOT a permissive loop), mirroring pyjitpl.py:198's
+/// `assert code[pc]==op_live`: a mispositioned orgpc (e.g. `live; ref_copy;
+/// goto_if_not`, orgpc one op early) FAILS loudly rather than being walked forward.
+///
+/// The only conditional-branch opname reaching the walk dispatch is
+/// `goto_if_not` (`goto_if_not/iL`): pyre keeps COMPARE_OP and the branch as
+/// SEPARATE JitCode ops and never emits the jtransform-fused `n_<cmp>` form on
+/// the trace/walker path, so the goto opname set is the single `"goto_if_not"`.
+/// The `L` label operand sits at index 1 (`iL`: 1B int reg, then 2B label) —
+/// the same index the `goto_if_not/iL` handler reads `target` from — re-read
+/// here from the re-derived `goto` so the arm-select is genuinely reconstructed
+/// from `orgpc` alone rather than reusing the capture-site op.
+fn decode_side_other_target(
+    code: &[u8],
+    orgpc: usize,
+    flavor_guard_true: bool,
+) -> Result<usize, &'static str> {
+    let live = decode_op_at(code, orgpc).ok_or("notlive")?;
+    if live.opname != "live" {
+        return Err("notlive");
+    }
+    let goto = decode_op_at(code, live.next_pc).ok_or("notgoto")?;
+    if goto.opname != "goto_if_not" {
+        return Err("notgoto");
+    }
+    let target = read_label(code, &goto, 1);
+    let raw = if flavor_guard_true {
+        target
+    } else {
+        goto.next_pc
+    };
+    Ok(resolve_branch_target_through_trampoline(code, raw))
+}
+
+/// #73 S4 decode: if `carried` is a tagged branch `orgpc` (negative-space
+/// encoding, [`majit_ir::resumedata::encode_branch_orgpc`]), expand it to the
+/// genuine not-taken-arm jitcode offset (`derived` / other_target) DIRECTLY:
+/// `decode_side_other_target` picks the not-taken arm from `orgpc` + flavor and
+/// that jitcode offset IS the returned value. The former py_pc round-trip
+/// (`python_pc_for_jitcode_pc` -> `skip_python_trivia_forward` ->
+/// `resume_jitcode_pc_for`, with its `num_instrs` overshoot clamp) is deleted:
+/// it is byte-identical because the encode self-cert
+/// (`walker_capture_snapshot_for_last_guard_impl`) tags a word ONLY when this
+/// same `expand_branch_carried` yields `derived == marker`, so returning
+/// `derived` reproduces exactly the marker the round-trip would have. Non-tagged
+/// words (offsets `>= 0`, `NO_JITCODE_PC`) pass through unchanged, so this is a
+/// no-op whenever the flip is off (`decode_branch_orgpc` returns `None`).
+///
+/// Returns `NO_JITCODE_PC` only if the arm cannot be decoded, so the decoder
+/// falls back to the stored `py_pc` path; the encode self-cert declines to carry
+/// any tagged word whose reconstruction fails, so a genuinely-carried tagged
+/// word never reaches that leg.
+pub(crate) fn expand_branch_carried(payload: &crate::PyJitCode, carried: i32) -> i32 {
+    match majit_ir::resumedata::decode_branch_orgpc(carried) {
+        None => carried,
+        Some((orgpc, flavor)) => {
+            let code = payload.jitcode.code.as_slice();
+            match decode_side_other_target(code, orgpc, flavor) {
+                Err(_) => majit_ir::resumedata::NO_JITCODE_PC,
+                Ok(derived) => derived as i32,
+            }
+        }
+    }
+}
+
 /// Decode a not-taken branch trampoline's `ref_copy` parallel-move
 /// sequence into `(dst, src)` Ref-color pairs (`#420`).  The trampoline
 /// (`live; (ref_copy|int_copy|float_copy)*; [goto]; live; <op>`,
@@ -9407,36 +9625,19 @@ fn branch_resume_target_stack_depth(frame: &ActiveResumeFrame, target: usize) ->
     if pjc.code_ptr.is_null() {
         return None;
     }
-    // SAFETY: `code_ptr` / `metadata` are immutable payload layout fields;
-    // the frame holds an `Arc<PyJitCode>` keeping them alive for this read.
-    unsafe {
-        let code = &*pjc.code_ptr;
-        let py = python_pc_for_jitcode_pc(&pjc.metadata, target) as usize;
-        let py = skip_python_trivia_forward(code, py);
-        let depth = crate::liveness::liveness_for(pjc.code_ptr)
-            .depth_at_py_pc()
-            .get(py)
-            .copied();
-        // task#50 #73-core: certify the trivia-aware `depth_trivia_by_jit_pc`
-        // twin reproduces this depth off the genuine jitcode `target`, without
-        // the `python_pc_for_jitcode_pc` inversion + runtime `skip_python_trivia_forward`
-        // walk. When the twin has an entry for `target`, it must equal the depth
-        // read here (both derive from the same static `liveness_for` depth +
-        // trivia-skip, baked at compile time). Precondition certificate for
-        // retiring the inversion at this ENCODE site. Off in production.
-        if m73_encode_audit_enabled() && pjc.depth_trivia_populated() {
-            assert_eq!(
-                pjc.depth_trivia_for_jitcode_pc(target),
-                depth,
-                "depth_trivia twin diverges from branch_resume_target_stack_depth at target={target} py={py}"
-            );
-        }
-        if pjc.depth_trivia_populated() {
-            pjc.depth_trivia_for_jitcode_pc(target)
-        } else {
-            depth
-        }
-    }
+    // #73 family(ii) Slice B: source the not-taken-arm depth off the genuine
+    // jitcode `target` through the compile-time `depth_trivia` twin, retiring
+    // the `python_pc_for_jitcode_pc` inversion + runtime
+    // `skip_python_trivia_forward` + static-liveness read. The twin is built for
+    // every drained real-code jitcode (codewriter.rs), and the Slice A census
+    // (`PYRE_M73_ENCODE_AUDIT`) proved the empty-twin fallback is never reached
+    // here (0 fallback trips / 162 programs; this reader 1181 hits, all
+    // populated). The `debug_assert` re-certifies the invariant in test builds.
+    debug_assert!(
+        pjc.depth_trivia_populated(),
+        "branch_resume_target_stack_depth on an unpopulated depth-trivia twin at target={target}"
+    );
+    pjc.depth_trivia_for_jitcode_pc(target)
 }
 
 /// Flat-free (#267) boxed-int kept-slot hazard: a kept operand-stack slot
@@ -9490,6 +9691,15 @@ fn kept_stack_has_boxed_int_hazard(
         let depth_opt = if pjc.depth_trivia_populated() {
             pjc.depth_trivia_for_jitcode_pc(target)
         } else {
+            // Slice A census: soft, non-aborting count of the py_pc-inversion
+            // fallback (empty depth-trivia twin). Zero output == dead.
+            if m73_encode_audit_enabled() {
+                eprintln!(
+                    "M73_FALLBACK site=kshbih target={target} is_portal_bridge={} code_null={}",
+                    pjc.is_portal_bridge(),
+                    pjc.code_ptr.is_null()
+                );
+            }
             depth_opt
         };
         let Some(depth) = depth_opt.map(|d| d as usize) else {
@@ -9763,29 +9973,15 @@ fn branch_resume_target_stack_depth_any_leg(target: usize, jitcode_index: u32) -
     if pjc.code_ptr.is_null() {
         return None;
     }
-    let code_obj = unsafe { &*pjc.code_ptr };
-    let py = python_pc_for_jitcode_pc(&pjc.metadata, target) as usize;
-    let py = skip_python_trivia_forward(code_obj, py);
-    let depth_opt = crate::liveness::liveness_for(pjc.code_ptr)
-        .depth_at_py_pc()
-        .get(py)
-        .copied();
-    // task#50 #73-core: certify the shared `depth_trivia_by_jit_pc` twin at the
-    // leg-independent depth probe. Same static-liveness + trivia-skip source as
-    // the two full-body-walk readers, so the same twin must reproduce it off the
-    // genuine jitcode `target`. Off in production.
-    if m73_encode_audit_enabled() && pjc.depth_trivia_populated() {
-        assert_eq!(
-            pjc.depth_trivia_for_jitcode_pc(target),
-            depth_opt,
-            "depth_trivia twin diverges from branch_resume_target_stack_depth_any_leg at target={target} py={py}"
-        );
-    }
-    if pjc.depth_trivia_populated() {
-        pjc.depth_trivia_for_jitcode_pc(target)
-    } else {
-        depth_opt
-    }
+    // #73 family(ii) Slice B: twin-sourced leg-independent depth, py_pc inversion
+    // retired (see `branch_resume_target_stack_depth`). Slice A census: this
+    // reader 1178 hits, all populated, 0 fallback trips — including at the
+    // `outer_jitcode_index==0` coincidence that reads `jitcodes[0]`.
+    debug_assert!(
+        pjc.depth_trivia_populated(),
+        "branch_resume_target_stack_depth_any_leg on an unpopulated depth-trivia twin at target={target} idx={jitcode_index}"
+    );
+    pjc.depth_trivia_for_jitcode_pc(target)
 }
 
 /// `generate_guard` (`pyjitpl.py:2599-2603`) keys `after_residual_call`
@@ -10458,9 +10654,499 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     let jc = &*sym.jitcode;
                     jc.payload.resume_jitcode_pc_for(py_pc as usize)
                 };
-                match marker {
-                    Some(jp) => jp as i32,
-                    None => majit_ir::resumedata::NO_JITCODE_PC,
+                // #73 S2 census: for a specialization guard measure whether the
+                // per-op `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
+                // `pyjitpl.py:198`) decodes IDENTICALLY to the block-head marker
+                // across EVERY consumer of the carried resume word. The banks
+                // reader funnels through the carried-word resolver (safe at any
+                // `-live-` offset), but `bridge_semantic_maps_at_with_jitcode_pc`
+                // (depth + pcdep) and `const_ref_slots_at_pc_at` (const refill)
+                // invert the carried offset to a `py_pc` via the two-tier
+                // `python_pc_for_jitcode_pc` and index py_pc-keyed tables, so a
+                // per-op offset that is not a block head can invert to a DIFFERENT
+                // `py_pc`. The per-op carry is byte-behavior-safe only where all
+                // consumers agree; this census is the precondition certificate.
+                // Read-only: `marker` is consumed unchanged by the match below.
+                if m73_perop_audit_enabled() {
+                    let is_specialization = matches!(
+                        ctx.trace_ctx.last_guard_opcode(),
+                        Some(OpCode::GuardValue | OpCode::GuardClass)
+                    );
+                    if is_specialization {
+                        match marker {
+                            None => {
+                                eprintln!("M73_PEROP_SPEC eq=nomarker py_pc={}", py_pc);
+                            }
+                            Some(bh) if ctx.live_before_jit_pc == usize::MAX => {
+                                eprintln!("M73_PEROP_SPEC eq=nolb py_pc={} bh={}", py_pc, bh);
+                            }
+                            Some(bh) if ctx.live_before_jit_pc == bh => {
+                                eprintln!("M73_PEROP_SPEC eq=1 py_pc={} bh={}", py_pc, bh);
+                            }
+                            Some(bh) => {
+                                // per-op `-live-` differs from the block-head marker:
+                                // measure whether EVERY consumer of the carried word
+                                // decodes identically at the two offsets.
+                                let lb = ctx.live_before_jit_pc as i32;
+                                let no = majit_ir::resumedata::NO_JITCODE_PC;
+                                let ji = jitcode_index as i32;
+                                let pp = py_pc as i32;
+                                let banks_p =
+                                    crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                                        ji, pp, lb,
+                                    );
+                                let banks_b =
+                                    crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                                        ji, pp, no,
+                                    );
+                                let banks_eq = banks_p.int == banks_b.int
+                                    && banks_p.ref_ == banks_b.ref_
+                                    && banks_p.float == banks_b.float;
+                                let bm_p = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
+                                    ji, pp, lb,
+                                );
+                                let bm_b = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
+                                    ji, pp, no,
+                                );
+                                let bmaps_eq = bm_p.stack_depth_at_pc == bm_b.stack_depth_at_pc
+                                    && bm_p.pcdep_entries == bm_b.pcdep_entries;
+                                let const_eq = crate::state::const_ref_slots_at_pc_at(ji, pp, lb)
+                                    == crate::state::const_ref_slots_at_pc_at(ji, pp, no);
+                                eprintln!(
+                                    "M73_PEROP_SPEC eq=0 py_pc={} lb={} bh={} banks_eq={} \
+                                     bmaps_eq={} const_eq={}",
+                                    py_pc, lb, bh, banks_eq, bmaps_eq, const_eq
+                                );
+                            }
+                        }
+                    }
+                }
+                // #73 S3 phase-0 census: for a depth-0 branch guard
+                // (`GuardTrue`/`GuardFalse`) measure whether carrying the walk's
+                // genuine JitCode resume coordinate `op_pc` (== `other_target`)
+                // directly is byte-behavior-safe versus today's py_pc round-trip
+                // marker (`resume_jitcode_pc_for(py_pc)`). This arm is enclosed
+                // by `!inline_subwalk && !full_body_sym.is_null()`, and depth-0
+                // is guaranteed because kept-stack (depth>0) branch guards set
+                // `BRANCH_GUARD_JITCODE_PC` and take the raw-`op.pc` arm above
+                // instead. Unlike the specialization census it compares against
+                // `marker` (the ACTUAL carried word), not `NO_JITCODE_PC`, and
+                // adds a DIRECT `python_pc_for_jitcode_pc(op_pc)`-vs-`py_pc`
+                // probe to defeat the `can_decode_live_vars` self-masking that
+                // would otherwise report false agreement for a non-decodable
+                // `op_pc`. Read-only: nothing here mutates the carried word.
+                //
+                // Phase-0 corpus result (1506 captures): `op_pc == marker` in
+                // ~31% (a vacuous re-source — `marker` is still derived), and in
+                // the ~69% divergent majority `op_pc` is NON-decodable
+                // (`can_decode_live_vars == false`) so a decoder consuming it
+                // ignores it and falls back to the py_pc path
+                // (`resolve_resume_pc_with_jitcode_pc`, pyjitcode.rs), which
+                // diverges from the `marker` path in the bridge maps / const
+                // refill. The walk's raw `other_target` is therefore NOT a
+                // byte-identical substitute for `marker`: the
+                // `resume_jitcode_pc_for(py_pc)` normalization to the decodable
+                // block-head `-live-` marker is load-bearing, not a removable
+                // round-trip. Retiring it for the branch family needs a
+                // jitcode-keyed resume-marker twin (author the block-head marker
+                // in jitcode space), not a raw-target carry.
+                if m73_branch_audit_enabled() {
+                    let is_branch = matches!(
+                        ctx.trace_ctx.last_guard_opcode(),
+                        Some(OpCode::GuardTrue | OpCode::GuardFalse)
+                    );
+                    if is_branch {
+                        match marker {
+                            None => {
+                                eprintln!("M73_BRANCH eq=nomarker py_pc={} op_pc={}", py_pc, op_pc);
+                            }
+                            Some(m) if op_pc == m => {
+                                eprintln!("M73_BRANCH eq=1 py_pc={} op_pc={}", py_pc, op_pc);
+                            }
+                            Some(m) => {
+                                // op_pc != marker: probe the two divergence
+                                // sources and every consumer.
+                                let ji = jitcode_index as i32;
+                                let pp = py_pc as i32;
+                                // (1) direct skip_trivia-asymmetry / decodability
+                                //     probe on op_pc. `python_pc_for_jitcode_pc`
+                                //     has NO skip_trivia; `py_pc` DID get it.
+                                //     Also record `can_decode_live_vars(op_pc)` — a
+                                //     non-decodable op_pc makes the consumers below
+                                //     silently fall back to the pp baseline
+                                //     (self-masking), so `inv_*` is the real signal.
+                                let (inv_pp, decodable) = unsafe {
+                                    let jc = &*sym.jitcode;
+                                    let inv = python_pc_for_jitcode_pc(&jc.payload.metadata, op_pc);
+                                    let dec = jc
+                                        .payload
+                                        .jitcode
+                                        .can_decode_live_vars(op_pc, crate::state::op_live());
+                                    (inv, dec)
+                                };
+                                let inv_eq = inv_pp == py_pc;
+                                // (2) per-consumer agreement at op_pc vs marker
+                                //     (baseline = m, NOT NO_JITCODE_PC).
+                                let banks_o =
+                                    crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                                        ji, pp, op_pc as i32,
+                                    );
+                                let banks_m =
+                                    crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                                        ji, pp, m as i32,
+                                    );
+                                let banks_eq = banks_o.int == banks_m.int
+                                    && banks_o.ref_ == banks_m.ref_
+                                    && banks_o.float == banks_m.float;
+                                let bm_o = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
+                                    ji,
+                                    pp,
+                                    op_pc as i32,
+                                );
+                                let bm_m = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
+                                    ji, pp, m as i32,
+                                );
+                                let bmaps_eq = bm_o.stack_depth_at_pc == bm_m.stack_depth_at_pc
+                                    && bm_o.pcdep_entries == bm_m.pcdep_entries;
+                                let const_eq =
+                                    crate::state::const_ref_slots_at_pc_at(ji, pp, op_pc as i32)
+                                        == crate::state::const_ref_slots_at_pc_at(ji, pp, m as i32);
+                                eprintln!(
+                                    "M73_BRANCH eq=0 py_pc={} op_pc={} marker={} inv_pp={} \
+                                     inv_eq={} decodable={} banks_eq={} bmaps_eq={} const_eq={}",
+                                    py_pc,
+                                    op_pc,
+                                    m,
+                                    inv_pp,
+                                    inv_eq,
+                                    decodable,
+                                    banks_eq,
+                                    bmaps_eq,
+                                    const_eq
+                                );
+                            }
+                        }
+                    }
+                }
+                // #73 S3.4 flip-gate certificate (`PYRE_M73_FLIP_AUDIT`, default
+                // OFF): ahead of the terminal S3.5 flip, simulate the whole
+                // Approach C decode-side reconstruction for a depth-0 branch
+                // guard and soft-log whether it reproduces today's carried
+                // coordinate. Author `orgpc` (the guard's OWN `-live-` BEFORE
+                // anchor, `ctx.live_before_jit_pc`), expand it through the
+                // decode-side arm resolver (`decode_side_other_target`), then run
+                // the SAME py_pc derivation the real capture uses at 10124-10187
+                // (`python_pc_for_jitcode_pc` → `skip_python_trivia_forward` →
+                // num_instrs overshoot clamp; `after_residual_call` is false in
+                // this arm, so the fallthrough / bit-14 leg is intentionally not
+                // replicated) and the marker round-trip (`resume_jitcode_pc_for`).
+                // Reports whether the derived coordinate, its py_pc, its marker,
+                // and every consumer read (liveness banks + bridge maps + const
+                // refill) match the baseline, plus whether the flip's carried word
+                // (`orgpc`) genuinely differs from today's (`marker`). Read-only;
+                // no asserts; the carried `marker` is left untouched.
+                if m73_flip_audit_enabled() {
+                    let is_branch = matches!(
+                        ctx.trace_ctx.last_guard_opcode(),
+                        Some(OpCode::GuardTrue | OpCode::GuardFalse)
+                    );
+                    if is_branch {
+                        let orgpc = ctx.live_before_jit_pc;
+                        match marker {
+                            None => {
+                                eprintln!("M73_FLIP result=nomarker py_pc={py_pc} op_pc={op_pc}");
+                            }
+                            // nolb residual: no `-live-` anchor stepped for this
+                            // guard, so Approach C has no `orgpc` to author from —
+                            // it stays on the marker channel. A non-zero
+                            // nolb-branch bucket is a residual the terminal flip
+                            // (S3.5) keeps on the py_pc round-trip.
+                            Some(_) if orgpc == usize::MAX => {
+                                eprintln!("M73_FLIP result=nolb py_pc={py_pc} op_pc={op_pc}");
+                            }
+                            Some(m) => {
+                                let flavor_guard_true = matches!(
+                                    ctx.trace_ctx.last_guard_opcode(),
+                                    Some(OpCode::GuardTrue)
+                                );
+                                // Range check on the ORIGINAL usize, before any
+                                // narrowing cast into the carried label space.
+                                let range_ok = orgpc <= i16::MAX as usize;
+                                let jc = unsafe { &*sym.jitcode };
+                                let bytes = jc.payload.jitcode.code.as_slice();
+                                match decode_side_other_target(bytes, orgpc, flavor_guard_true) {
+                                    Err(reason) => {
+                                        eprintln!(
+                                            "M73_FLIP result=undecodable reason={reason} \
+                                             orgpc={orgpc} py_pc={py_pc} op_pc={op_pc} \
+                                             range_ok={range_ok}"
+                                        );
+                                    }
+                                    Ok(derived) => {
+                                        // Re-confirms the S3.1 arm claim: the
+                                        // decode-derived coordinate equals the
+                                        // walk's not-taken landing.
+                                        let coord_eq = derived == op_pc;
+                                        // Re-derive py_pc from `derived`, mirroring
+                                        // the real capture derivation exactly:
+                                        // inversion → forward trivia skip →
+                                        // num_instrs overshoot clamp. This arm has
+                                        // `after_residual_call == false`, so the
+                                        // fallthrough / bit-14 leg is not replicated.
+                                        let py_pc_cand = unsafe {
+                                            let meta = &jc.payload.metadata;
+                                            let mut py = python_pc_for_jitcode_pc(meta, derived);
+                                            if !jc.payload.code_ptr.is_null() {
+                                                let code_obj = &*jc.payload.code_ptr;
+                                                py = skip_python_trivia_forward(
+                                                    code_obj,
+                                                    py as usize,
+                                                )
+                                                    as u32;
+                                            }
+                                            let num_instrs = meta.first_jit_pc_by_py_pc.len();
+                                            if py as usize >= num_instrs {
+                                                ctx.entry_py_pc
+                                            } else {
+                                                py
+                                            }
+                                        };
+                                        let invpp_eq = py_pc_cand == py_pc;
+                                        let flip_marker =
+                                            jc.payload.resume_jitcode_pc_for(py_pc_cand as usize);
+                                        let marker_eq = flip_marker == Some(m);
+                                        // Whether the flip's carried word (`orgpc`)
+                                        // genuinely differs from today's (`m`): a
+                                        // vacuous self-source would carry the same
+                                        // value.
+                                        let flip_changes_word = orgpc != m;
+                                        // Per-consumer read at the candidate
+                                        // (py_pc_cand, flip_marker) vs the baseline
+                                        // (py_pc, m).
+                                        let ji = jitcode_index as i32;
+                                        let pp_b = py_pc as i32;
+                                        let pp_c = py_pc_cand as i32;
+                                        let jm_b = m as i32;
+                                        let jm_c = flip_marker
+                                            .map(|x| x as i32)
+                                            .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
+                                        let banks_b =
+                                            crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                                                ji, pp_b, jm_b,
+                                            );
+                                        let banks_c =
+                                            crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                                                ji, pp_c, jm_c,
+                                            );
+                                        let banks_eq = banks_b.int == banks_c.int
+                                            && banks_b.ref_ == banks_c.ref_
+                                            && banks_b.float == banks_c.float;
+                                        let bm_b =
+                                            crate::state::bridge_semantic_maps_at_with_jitcode_pc(
+                                                ji, pp_b, jm_b,
+                                            );
+                                        let bm_c =
+                                            crate::state::bridge_semantic_maps_at_with_jitcode_pc(
+                                                ji, pp_c, jm_c,
+                                            );
+                                        let bmaps_eq = bm_b.stack_depth_at_pc
+                                            == bm_c.stack_depth_at_pc
+                                            && bm_b.pcdep_entries == bm_c.pcdep_entries;
+                                        let const_eq =
+                                            crate::state::const_ref_slots_at_pc_at(ji, pp_b, jm_b)
+                                                == crate::state::const_ref_slots_at_pc_at(
+                                                    ji, pp_c, jm_c,
+                                                );
+                                        eprintln!(
+                                            "M73_FLIP result=recon orgpc={orgpc} op_pc={op_pc} \
+                                             derived={derived} coord_eq={coord_eq} py_pc={py_pc} \
+                                             py_pc_cand={py_pc_cand} invpp_eq={invpp_eq} \
+                                             marker={m} flip_marker={flip_marker:?} \
+                                             marker_eq={marker_eq} \
+                                             flip_changes_word={flip_changes_word} \
+                                             range_ok={range_ok} banks_eq={banks_eq} \
+                                             bmaps_eq={bmaps_eq} const_eq={const_eq}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // #73 S4 (SUB-A) derived-vs-marker precondition census
+                // (`PYRE_M73_DERIVED_AUDIT`, default OFF): a STANDALONE sibling
+                // of the FLIP_AUDIT block above (fires independently of it).
+                // For each depth-0 branch guard it re-derives its own `orgpc`
+                // (`ctx.live_before_jit_pc`) and the not-taken-arm landing
+                // `derived = decode_side_other_target(orgpc, flavor)`, then
+                // compares EVERY resume consumer keyed at the raw `derived`
+                // jitcode offset vs today's block-head `marker`: liveness banks
+                // (a), bridge semantic maps (b), const ref slots (c), and the
+                // loop-header walk-entry merge-point governance + (gr, rr) seed
+                // (d) — the leg banks/bmaps equality does NOT cover. Certifies
+                // `consumers(derived) == consumers(marker)`, the precondition
+                // for returning `derived` directly and deleting the py_pc
+                // round-trip in `expand_branch_carried`. Read-only; no asserts;
+                // the carried word is left untouched (OFF is byte-identical).
+                if m73_derived_audit_enabled() {
+                    let is_branch = matches!(
+                        ctx.trace_ctx.last_guard_opcode(),
+                        Some(OpCode::GuardTrue | OpCode::GuardFalse)
+                    );
+                    let orgpc = ctx.live_before_jit_pc;
+                    if is_branch && orgpc != usize::MAX {
+                        if let Some(m) = marker {
+                            let flavor_true = matches!(
+                                ctx.trace_ctx.last_guard_opcode(),
+                                Some(OpCode::GuardTrue)
+                            );
+                            let jc = unsafe { &*sym.jitcode };
+                            let code = jc.payload.jitcode.code.as_slice();
+                            if let Ok(derived) = decode_side_other_target(code, orgpc, flavor_true)
+                            {
+                                let derived_eq_marker = derived as i32 == m as i32;
+                                // Whether the walk cursor could key at `derived`
+                                // — the same `can_decode_live_vars` test the
+                                // consumers gate their jitcode-pc read on.
+                                let decodable = jc
+                                    .payload
+                                    .jitcode
+                                    .can_decode_live_vars(derived, crate::state::op_live());
+                                let ji = jitcode_index as i32;
+                                let pp = py_pc as i32;
+                                // (a) liveness reg-index banks.
+                                let banks_d =
+                                    crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                                        ji, pp, derived as i32,
+                                    );
+                                let banks_m =
+                                    crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                                        ji, pp, m as i32,
+                                    );
+                                let banks_eq = banks_d.int == banks_m.int
+                                    && banks_d.ref_ == banks_m.ref_
+                                    && banks_d.float == banks_m.float;
+                                // (b) bridge semantic maps (depth + pcdep).
+                                let bm_d = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
+                                    ji,
+                                    pp,
+                                    derived as i32,
+                                );
+                                let bm_m = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
+                                    ji, pp, m as i32,
+                                );
+                                let bmaps_eq = bm_d.stack_depth_at_pc == bm_m.stack_depth_at_pc
+                                    && bm_d.pcdep_entries == bm_m.pcdep_entries;
+                                // (c) const ref slot refill (cold in the default
+                                // corpus — both sides empty flags `const_cold`).
+                                let const_d =
+                                    crate::state::const_ref_slots_at_pc_at(ji, pp, derived as i32);
+                                let const_m =
+                                    crate::state::const_ref_slots_at_pc_at(ji, pp, m as i32);
+                                let const_eq = const_d == const_m;
+                                let const_cold = const_d.is_empty() && const_m.is_empty();
+                                // (d) loop-header walk-entry merge-point seed
+                                // (`sym.bridge_walk_entry_pc` -> entry ->
+                                // `loop_header_merge_point_regs`, trace.rs:1123 +
+                                // walk-replay start 1319). Compare BOTH the
+                                // governing merge-point selection (mirrors the
+                                // `<= entry` max / `>= entry` min pick at
+                                // trace.rs:379) AND the (gr, rr) register vectors
+                                // the real seed reads.
+                                let governing_mp = |coord: usize| -> Option<usize> {
+                                    crate::jitcode_runtime::decoded_ops(code)
+                                        .filter(|op| op.opname == "jit_merge_point")
+                                        .map(|op| op.pc)
+                                        .filter(|&p| p <= coord)
+                                        .max()
+                                        .or_else(|| {
+                                            crate::jitcode_runtime::decoded_ops(code)
+                                                .filter(|op| op.opname == "jit_merge_point")
+                                                .map(|op| op.pc)
+                                                .filter(|&p| p >= coord)
+                                                .min()
+                                        })
+                                };
+                                let regs_d =
+                                    crate::trace::loop_header_merge_point_regs(code, derived);
+                                let regs_m = crate::trace::loop_header_merge_point_regs(code, m);
+                                let mp_eq =
+                                    governing_mp(derived) == governing_mp(m) && regs_d == regs_m;
+                                eprintln!(
+                                    "M73_DERIVED derived={derived} marker={m} \
+                                     derived_eq_marker={derived_eq_marker} \
+                                     decodable={decodable} banks_eq={banks_eq} \
+                                     bmaps_eq={bmaps_eq} const_eq={const_eq} \
+                                     const_cold={const_cold} mp_eq={mp_eq}"
+                                );
+                            }
+                        }
+                    }
+                }
+                // #73 S2 flip (`PYRE_M73_PEROP_CARRY`, default OFF): a
+                // specialization guard (`GuardValue`/`GuardClass`) sources its
+                // resume coordinate from the walk cursor's per-op `-live-`
+                // BEFORE anchor (`ctx.live_before_jit_pc`, `pyjitpl.py:198`)
+                // directly, dropping the py_pc-keyed `resume_jitcode_pc_for`
+                // lookup. Requires a stepped `-live-` and a resolvable
+                // block-head marker (else keep the baseline, byte-identical).
+                // The `PYRE_M73_PEROP_AUDIT` census certifies both offsets
+                // decode identically for every consumer (banks + bridge maps +
+                // const refill) where the anchor coincides, and flags the
+                // divergent minority for the check.py output-equality gate.
+                // #73 S3.5 flip (`PYRE_M73_BRANCH_CARRY`, default ON, opt-out
+                // `=0`/`false`): a depth-0
+                // branch guard (`GuardTrue`/`GuardFalse`) carries the walk's
+                // arm-independent `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
+                // `orgpc`) TAGGED into the negative space of the word plus the
+                // guard flavor, instead of the py_pc-keyed block-head `marker`.
+                // Carried ONLY when the tagged word's decode-side expansion
+                // (`expand_branch_carried`, the same fn every consumer runs)
+                // reproduces today's `marker` (self-cert) — so decode expands it
+                // back to exactly `marker` and the encode is byte-identical by
+                // construction. Requires a stepped `-live-` anchor in i16-tag
+                // range (`BRANCH_ORGPC_MAX`) and a resolvable `marker`; otherwise
+                // fall through to the perop / marker paths unchanged.
+                let flavor_true =
+                    matches!(ctx.trace_ctx.last_guard_opcode(), Some(OpCode::GuardTrue));
+                let is_branch = matches!(
+                    ctx.trace_ctx.last_guard_opcode(),
+                    Some(OpCode::GuardTrue | OpCode::GuardFalse)
+                );
+                if m73_branch_carry_enabled()
+                    && is_branch
+                    && ctx.live_before_jit_pc != usize::MAX
+                    && ctx.live_before_jit_pc <= majit_ir::resumedata::BRANCH_ORGPC_MAX
+                    && marker.is_some()
+                    && {
+                        // Self-certify byte-identity: the tagged word must expand
+                        // back to today's carried `marker`.
+                        let tagged = majit_ir::resumedata::encode_branch_orgpc(
+                            ctx.live_before_jit_pc,
+                            flavor_true,
+                        );
+                        let jc = unsafe { &*sym.jitcode };
+                        expand_branch_carried(&jc.payload, tagged)
+                            == marker
+                                .map(|m| m as i32)
+                                .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC)
+                    }
+                {
+                    majit_ir::resumedata::encode_branch_orgpc(ctx.live_before_jit_pc, flavor_true)
+                } else if m73_perop_carry_enabled()
+                    && marker.is_some()
+                    && ctx.live_before_jit_pc != usize::MAX
+                    && matches!(
+                        ctx.trace_ctx.last_guard_opcode(),
+                        Some(OpCode::GuardValue | OpCode::GuardClass)
+                    )
+                {
+                    ctx.live_before_jit_pc as i32
+                } else {
+                    match marker {
+                        Some(jp) => jp as i32,
+                        None => majit_ir::resumedata::NO_JITCODE_PC,
+                    }
                 }
             } else if m366_nonbranch_pc_enabled() && after_residual_call {
                 // #366: extend the direct-pc carry to the after-residual-call
@@ -12986,6 +13672,8 @@ fn try_walker_inline_user_call(
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
             done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
@@ -13687,6 +14375,13 @@ fn dispatch_residual_call_iRd_kind(
         // `PyError::runtime_error("ABORT_ESCAPE: ...")` before walker IR
         // diff would run.
         if emit_guard_not_forced {
+            // #73 (SLICE 1, INERT): maintain the `-live-` AFTER anchor.  A
+            // residual-call guard reads its resume point at `self.pc` (the
+            // `-live-` trailing the call, `pyjitpl.py:195`).  `op.next_pc` is
+            // the first byte after the residual_call opcode, which the
+            // `[funcptr, Call, -live-]` layout (jitcode.rs:565) makes the
+            // trailing `-live-` byte.  Side-data only.
+            ctx.live_after_jit_pc = op.next_pc;
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
@@ -18894,6 +19589,8 @@ fn run_sub_jitcode_walk(
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         walk(sub_body.code, 0, &mut sub_wc)?
     };
@@ -19519,6 +20216,34 @@ fn handle(
                 if switchcase != 0 { target } else { op.next_pc },
             );
             if !valuebox.is_constant() {
+                if m73_arm_audit_enabled() {
+                    let orgpc = ctx.live_before_jit_pc;
+                    let flavor_guard_true = switchcase != 0;
+                    if orgpc == usize::MAX {
+                        eprintln!(
+                            "M73_ARM result=nolb other_target={} switchcase={}",
+                            other_target, switchcase
+                        );
+                    } else {
+                        match decode_side_other_target(code, orgpc, flavor_guard_true) {
+                            Err(reason) => eprintln!(
+                                "M73_ARM result={} orgpc={} other_target={} switchcase={}",
+                                reason, orgpc, other_target, switchcase
+                            ),
+                            Ok(derived) => {
+                                let r = if derived == other_target {
+                                    "match"
+                                } else {
+                                    "mismatch"
+                                };
+                                eprintln!(
+                                    "M73_ARM result={} orgpc={} other_target={} derived={} switchcase={}",
+                                    r, orgpc, other_target, derived, switchcase
+                                );
+                            }
+                        }
+                    }
+                }
                 // #124/#281: a branch guard whose resume target still holds a
                 // live operand-stack temp (short-circuit `and`/`or`, the
                 // conditional expression, chained comparison) keeps that temp
@@ -21342,6 +22067,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
 
         // Synthesize a 2-byte op fixture: `<opcode_byte> <reg_idx>`.
@@ -21405,6 +22132,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         // `getfield_vable_i/rd>i`: operand 0 (the box) sits at code[pc+1].
         let code = [0u8, 0x00, 0x00, 0x00, 0x00];
@@ -21458,6 +22187,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         // `setfield_vable_i/rid`: operand 0 (the box) sits at code[pc+1].
         let code = [0u8, 0x00, 0x00, 0x00, 0x00];
@@ -21529,6 +22260,8 @@ mod tests {
                 vstack_cur_pypc: 0,
                 vstack_valid: false,
                 vstack_last_ref: OpRef::NONE,
+                live_before_jit_pc: usize::MAX,
+                live_after_jit_pc: usize::MAX,
             };
             let op = DecodedOp {
                 key,
@@ -21711,6 +22444,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("switch hit must dispatch");
@@ -21765,6 +22500,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("switch miss must dispatch");
@@ -21818,6 +22555,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
 
         let err = step(&code, 0, &mut wc).expect_err("non-constant switch value must not guess");
@@ -21880,6 +22619,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("truthy branch must dispatch");
@@ -21934,6 +22675,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("falsy branch must dispatch");
@@ -21987,6 +22730,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
 
         let err = step(&code, 0, &mut wc).expect_err("non-constant branch value must not guess");
@@ -22249,6 +22994,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         fbw_finish_payload_reset();
         let (outcome, end_pc) =
@@ -22415,6 +23162,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_r_i must dispatch");
@@ -22529,6 +23278,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_ir_r must dispatch");
@@ -22637,6 +23388,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_irf_r must dispatch");
@@ -22734,6 +23487,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err =
             step(&caller_code, 0, &mut wc).expect_err("I-list overflow must surface typed error");
@@ -22828,6 +23583,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, _) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
         assert_eq!(
@@ -22903,6 +23660,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&caller_code, 0, &mut wc)
             .expect_err("FailDescr at inline_call's d-slot must hit ExpectedJitCodeDescr");
@@ -22957,6 +23716,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&caller_code, 0, &mut wc)
             .expect_err("missing sub-jitcode must hit SubJitCodeNotFound");
@@ -23007,6 +23768,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("live/ must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -23066,6 +23829,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         fbw_finish_payload_reset();
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_return/r must dispatch");
@@ -23123,6 +23888,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("must surface RegisterOutOfRange");
         assert_eq!(
@@ -23183,6 +23950,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let ops_before = wc.trace_ctx.num_ops();
         fbw_finish_payload_reset();
@@ -23259,6 +24028,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = step(&code, 0, &mut wc).expect("int_return/i must dispatch");
@@ -23323,6 +24094,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let ops_before = wc.trace_ctx.num_ops();
         fbw_finish_payload_reset();
@@ -23388,6 +24161,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = step(&code, 0, &mut wc).expect("void_return/ must dispatch");
@@ -23441,6 +24216,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("raise/r must read its operand");
         assert_eq!(
@@ -23497,6 +24274,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("goto/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -23553,6 +24332,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("goto/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -23657,6 +24438,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err =
             step(&code, 0, &mut wc).expect_err("catch_exception/L with active exc must error");
@@ -23709,6 +24492,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("catch_exception/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -23774,6 +24559,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = walk(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -23871,6 +24658,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         // `raise/r` emits the GuardClass during dispatch, then surfaces
         // `SubRaise`; `walk()`'s top-level SubRaise arm records the FINISH.
@@ -23952,6 +24741,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         // With `PYRE_FBW_RAISE` on (default), `reraise/` surfaces
         // `SubRaise` and `walk()`'s top-level SubRaise arm records the
@@ -24028,6 +24819,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("reraise/ without last_exc_value must error");
         assert_eq!(err, DispatchError::ReraiseWithoutLastExcValue { pc: 0 });
@@ -24079,6 +24872,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(
@@ -24194,6 +24989,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         fbw_finish_payload_reset();
         let (outcome, end_pc) =
@@ -24313,6 +25110,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
@@ -24379,6 +25178,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int_copy/i>i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -24442,6 +25243,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("int_copy/i>i must dispatch");
         assert_eq!(
@@ -24496,6 +25299,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_copy dst OOR must surface a typed error");
         assert_eq!(
@@ -24549,6 +25354,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_copy/i>i must read its src operand");
         assert_eq!(
@@ -24622,6 +25429,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_copy/r>r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -24683,6 +25492,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("ref_copy/r>r must dispatch");
         assert_eq!(
@@ -24735,6 +25546,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("ref_copy dst OOR must surface a typed error");
         assert_eq!(
@@ -24786,6 +25599,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("ref_copy/r>r must read its src operand");
         assert_eq!(
@@ -24848,6 +25663,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -25036,6 +25853,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) =
             int_between_record(&code, &op, &mut wc).expect("int_between_record must dispatch");
@@ -25170,6 +25989,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -25256,6 +26077,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("float_neg/f>f must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -25320,6 +26143,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -25409,6 +26234,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -25478,6 +26305,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("float_add must read its src operand");
         assert_eq!(
@@ -25530,6 +26359,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_add must read its src operand");
         assert_eq!(
@@ -25584,6 +26415,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_add dst OOR must surface a typed error");
         assert_eq!(
@@ -25646,6 +26479,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err =
             step(&code, 0, &mut wc).expect_err("unsupported opname must hit UnsupportedOpname");
@@ -25700,6 +26535,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ptr_nonzero must record PtrNe");
         assert!(matches!(outcome, DispatchOutcome::Continue));
@@ -25781,6 +26618,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("abort/>r must dispatch");
         assert!(matches!(outcome, DispatchOutcome::Continue));
@@ -25844,6 +26683,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("ref_guard_value must record GuardValue");
@@ -25923,6 +26764,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_guard_value Const arm");
         assert!(matches!(outcome, DispatchOutcome::Continue));
@@ -26015,6 +26858,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
@@ -26179,6 +27024,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -26260,6 +27107,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = try_execute_residual_call_via_executor(
             &mut wc,
@@ -26314,6 +27163,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = try_execute_residual_call_via_executor(
             &mut wc,
@@ -26383,6 +27234,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = try_execute_residual_call_via_executor(
             &mut wc,
@@ -26476,6 +27329,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let result = try_execute_residual_call_via_executor(
             &mut wc,
@@ -26573,6 +27428,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let result = try_execute_residual_call_via_executor(
             &mut wc,
@@ -26645,6 +27502,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("OS_NOT_IN_TRACE must surface a typed error");
         assert_eq!(
@@ -26705,6 +27564,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err =
             step(&code, 0, &mut wc).expect_err("OS_JIT_FORCE_VIRTUAL must surface a typed error");
@@ -26760,6 +27621,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -26824,6 +27687,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -26890,6 +27755,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         // The dst slot must hold the OpRef of the recorded CallR. Each
@@ -26976,6 +27843,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -27051,6 +27920,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
         drop(wc);
@@ -27125,6 +27996,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("dst OOR must surface a typed error");
         assert_eq!(
@@ -27181,6 +28054,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("descr index 5 with pool size 2 must surface DescrIndexOutOfRange");
@@ -27275,6 +28150,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_r_i/iRd>i must dispatch");
@@ -27366,6 +28243,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_i/iRd>i must dispatch");
         drop(wc);
@@ -27467,6 +28346,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
@@ -27598,6 +28479,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
         drop(wc);
@@ -27665,6 +28548,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("FailDescr (not CallDescr) must surface ResidualCallDescrNotCallDescr");
@@ -27720,6 +28605,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("R-list member out of range must surface RegisterOutOfRange");
@@ -27799,6 +28686,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, end_pc) =
             walk(&jc.code, 0, &mut wc).expect("ReturnValue arm must walk to a terminator");
@@ -27923,6 +28812,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, end_pc) =
             walk(&jc.code, 0, &mut wc).expect("PopTop arm must walk to a terminator");
@@ -28023,6 +28914,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&caller_code, 0, &mut wc).expect_err("arity overflow must surface error");
         assert_eq!(
@@ -28122,6 +29015,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, _) =
             walk(&caller_code, 0, &mut wc).expect("inline_call_r_v with void callee must succeed");
@@ -28200,6 +29095,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_r_v with non-void callee must reject");
@@ -28281,6 +29178,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, _) =
             walk(&caller_code, 0, &mut wc).expect("inline_call_ir_v with void callee must succeed");
@@ -28360,6 +29259,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_ir_v with non-void callee must reject");
@@ -28444,6 +29345,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, _) = walk(&caller_code, 0, &mut wc)
             .expect("inline_call_irf_v with void callee must succeed");
@@ -28526,6 +29429,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_irf_v with non-void callee must reject");
@@ -28597,6 +29502,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getfield_gc_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -28689,6 +29596,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("getfield_gc_i must dispatch");
         let dst_post = wc.registers_i[5];
@@ -28759,6 +29668,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("getfield_gc_r must dispatch");
         let dst_post = wc.registers_r[6];
@@ -28817,6 +29728,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("getfield_gc must validate r-reg");
         assert_eq!(
@@ -28887,6 +29800,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getfield_vable_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -28977,6 +29892,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("setfield_vable_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -29057,6 +29974,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_i must dispatch");
         drop(wc);
@@ -29115,6 +30034,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_i must dispatch");
         drop(wc);
@@ -29199,6 +30120,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_r must dispatch");
         drop(wc);
@@ -29266,6 +30189,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getarrayitem_gc_r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -29344,6 +30269,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("getarrayitem_gc_r must dispatch");
         let dst_post = wc.registers_r[5];
@@ -29410,6 +30337,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("setarrayitem_gc_r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -29718,6 +30647,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         assert_eq!(
             walk(&code, 0, &mut wc),
@@ -29794,6 +30725,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
 
         // Arrival without a preceding `loop_header` stamp and with no
@@ -29880,6 +30813,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
         let (outcome, next) = step(&code, 0, &mut wc).expect("loop_header must dispatch");
@@ -29941,6 +30876,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         assert_eq!(
             step(&code, 0, &mut wc),
