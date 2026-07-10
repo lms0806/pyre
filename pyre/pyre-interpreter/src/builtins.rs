@@ -39,35 +39,6 @@ unsafe fn memoryview_backing_buffer(backing: PyObjectRef) -> pyre_object::buffer
     }
 }
 
-/// The full byte storage of a memoryview backing, read through its tagged
-/// `Buffer` variant.
-unsafe fn memoryview_backing_slice(backing: PyObjectRef) -> &'static [u8] {
-    unsafe { memoryview_backing_buffer(backing).as_bytes() }
-}
-
-/// Mutable raw byte storage of a writable memoryview backing — `bytearray`
-/// or `array.array`, the two mutable buffer exporters.  `None` for a
-/// read-only exporter (`bytes`) or one without in-place byte storage, so a
-/// write assignment reports "cannot modify read-only memory".
-unsafe fn memoryview_backing_bytes_mut(backing: PyObjectRef) -> Option<&'static mut [u8]> {
-    unsafe {
-        let bytearray_ty =
-            crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE);
-        if pyre_object::bytearrayobject::is_bytearray(backing)
-            || crate::baseobjspace::isinstance_w(backing, bytearray_ty)
-        {
-            return Some(pyre_object::bytearrayobject::w_bytearray_data_mut(backing));
-        }
-        let array_ty = crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
-        if pyre_object::interp_array::is_array(backing)
-            || crate::baseobjspace::isinstance_w(backing, array_ty)
-        {
-            return Some(pyre_object::interp_array::w_array_vec_mut(backing).as_mut_slice());
-        }
-        None
-    }
-}
-
 /// Wrap native per-dimension extents (a `shape` or `strides`) into a fresh
 /// `tuple[int]` for the `descr` getters.  Each int is pinned as built, so a
 /// later element's allocation cannot strand an earlier one before
@@ -86,65 +57,97 @@ unsafe fn memoryview_wrap_dims(dims: &[i64]) -> PyObjectRef {
     }
 }
 
-/// Allocate a `W_MemoryView` over a freshly built off-heap `BufferView`.
-/// Selects the backing `Buffer` variant (needs `isinstance_w`, hence here and
-/// not in pyre-object) and builds the geometry's Python objects (`format` /
-/// `shape` / `strides`) *inside* the rooted region, pinning every ref across
-/// the allocations — building the boxes and allocating the header can trigger a
-/// collection before the new memoryview roots them.  Geometry arrives as native
-/// values so no caller has to hold an unrooted `format` / `shape` / `strides`
-/// object across the call; `fmt` must borrow non-GC storage (e.g. a Rust
-/// `String`) since it is read after the pin.
-#[allow(clippy::too_many_arguments)]
-unsafe fn w_memoryview_alloc(
-    w_obj: PyObjectRef,
-    w_backing: PyObjectRef,
-    fmt: &str,
-    shape: &[i64],
-    strides: &[i64],
-    itemsize: i64,
-    ndim: i64,
-    offset: i64,
-    length: i64,
-    readonly: bool,
-    released: bool,
+/// Allocate a `W_MemoryView` whose view DERIVES from an existing view — the
+/// copy (`W_MemoryView.copy`) and zero-copy slice (`new_slice`) constructors.
+/// PyPy hands the same immutable view object to the derived memoryview; pyre
+/// clones it into the new owner's box via `derive`.
+///
+/// GC-safety: the source memoryview is pinned across the header allocation
+/// (the sole collection point).  Its custom trace keeps every ref inside its
+/// off-heap box alive and updated in place, so `derive` — which must not
+/// allocate on the GC heap — runs on post-collection refs.
+unsafe fn w_memoryview_new_derived(
+    mv_src: PyObjectRef,
+    derive: impl FnOnce(&pyre_object::bufferview::BufferView) -> pyre_object::bufferview::BufferView,
 ) -> PyObjectRef {
     unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
         let sp = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_obj);
-        pyre_object::gc_roots::pin_root(w_backing);
+        pyre_object::gc_roots::pin_root(mv_src);
+        let mv = pyre_object::memoryview::w_memoryview_alloc_header(false);
+        let r_src = pyre_object::gc_roots::shadow_stack_get(sp);
+        let view = derive(pyre_object::memoryview::w_memoryview_view(r_src));
+        let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
+        pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
+        mv
+    }
+}
+
+/// `_cast_to_1D` (`memoryobject.py:635`) — a `View1D` reinterpreting the
+/// source view's bytes under a new 1-D element format.  The source
+/// memoryview and the fresh format object are pinned across the header
+/// allocation (the sole collection point); the source view then clones over
+/// as the boxed parent with post-collection refs.
+unsafe fn w_memoryview_cast_1d(mv_src: PyObjectRef, fmt: &str, itemsize: i64) -> PyObjectRef {
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(mv_src);
+        pyre_object::gc_roots::pin_root(w_str_new(fmt));
+        let mv = pyre_object::memoryview::w_memoryview_alloc_header(false);
+        let r_src = pyre_object::gc_roots::shadow_stack_get(sp);
+        let r_fmt = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+        let src_view = pyre_object::memoryview::w_memoryview_view(r_src);
+        let view = pyre_object::bufferview::BufferView::View1D {
+            parent: Box::new(src_view.clone()),
+            w_obj: src_view.w_obj(),
+            w_fmt: r_fmt,
+            itemsize,
+        };
+        let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
+        pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
+        mv
+    }
+}
+
+/// `descr_cast` with a shape — `_cast_to_1D` then `_cast_to_ND`
+/// (`memoryobject.py:599-603`): a `ViewND` reshaping a fresh `View1D` over
+/// the source view.  The shape / strides tuples are built and pinned inside
+/// the rooted region alongside the source memoryview and format object.
+unsafe fn w_memoryview_cast_nd(
+    mv_src: PyObjectRef,
+    fmt: &str,
+    itemsize: i64,
+    shape: &[i64],
+    strides: &[i64],
+) -> PyObjectRef {
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(mv_src);
         // Build each geometry object and pin it as produced: a later allocation
         // may relocate an earlier one, so the pinned shadow slot (re-read below)
         // is the source of truth, not the stale local.
         pyre_object::gc_roots::pin_root(w_str_new(fmt));
-        pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(
-            shape.iter().map(|&x| w_int_new(x)).collect(),
-        ));
-        pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(
-            strides.iter().map(|&x| w_int_new(x)).collect(),
-        ));
-        // Allocate the managed header last of the ref-bearing allocations; a
-        // moving collection here relocates the pinned refs, so read every one
-        // back from the shadow stack before building the off-heap view (mirrors
-        // `W_TupleObject` filling its items block from the relocated slots).
-        let mv = pyre_object::memoryview::w_memoryview_alloc_header(released);
-        let r_obj = pyre_object::gc_roots::shadow_stack_get(sp);
-        let r_backing = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-        let r_format = pyre_object::gc_roots::shadow_stack_get(sp + 2);
-        let r_shape = pyre_object::gc_roots::shadow_stack_get(sp + 3);
-        let r_strides = pyre_object::gc_roots::shadow_stack_get(sp + 4);
-        let view = pyre_object::bufferview::BufferView::Strided {
-            backing: memoryview_backing_buffer(r_backing),
-            w_obj: r_obj,
-            w_format: r_format,
+        pyre_object::gc_roots::pin_root(memoryview_wrap_dims(shape));
+        pyre_object::gc_roots::pin_root(memoryview_wrap_dims(strides));
+        let mv = pyre_object::memoryview::w_memoryview_alloc_header(false);
+        let r_src = pyre_object::gc_roots::shadow_stack_get(sp);
+        let r_fmt = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+        let r_shape = pyre_object::gc_roots::shadow_stack_get(sp + 2);
+        let r_strides = pyre_object::gc_roots::shadow_stack_get(sp + 3);
+        let src_view = pyre_object::memoryview::w_memoryview_view(r_src);
+        let view = pyre_object::bufferview::BufferView::ViewND {
+            parent: Box::new(pyre_object::bufferview::BufferView::View1D {
+                parent: Box::new(src_view.clone()),
+                w_obj: src_view.w_obj(),
+                w_fmt: r_fmt,
+                itemsize,
+            }),
+            w_obj: src_view.w_obj(),
+            ndim: shape.len() as i64,
             w_shape: r_shape,
             w_strides: r_strides,
-            itemsize,
-            ndim,
-            offset,
-            length,
-            readonly,
         };
         let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
         pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
@@ -155,8 +158,8 @@ unsafe fn w_memoryview_alloc(
 /// Build a `memoryview` over a plain contiguous 1-D exporter — a `SimpleView`
 /// (`bytes` / `bytearray`, derived format `'B'`) or a `RawBufferView`
 /// (`array.array`, explicit format).  The exporter's `Buffer` variant picks
-/// which, and both derive shape / strides / ndim / offset, so — unlike the
-/// `Strided` builder — no geometry Python objects are constructed; only a
+/// which, and both derive shape / strides / ndim / offset, so no geometry
+/// Python objects are constructed; only a
 /// `Raw` view keeps a format object.  Pins the exporter (and, for `Raw`, the
 /// format) across the header allocation (the sole collection point), then
 /// re-reads them relocated before building the off-heap box.
@@ -268,23 +271,10 @@ pub(crate) fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate:
     unsafe {
         if is_w_memoryview(w_obj) {
             memoryview_check_released(w_obj)?;
-            let backing = w_memoryview_backing(w_obj);
-            let fmt = w_memoryview_format_str(w_obj).to_owned();
-            let shape = w_memoryview_native_shape(w_obj);
-            let strides = w_memoryview_native_strides(w_obj);
-            return Ok(w_memoryview_alloc(
-                w_memoryview_obj(w_obj),
-                backing,
-                &fmt,
-                &shape,
-                &strides,
-                w_memoryview_itemsize(w_obj),
-                w_memoryview_ndim(w_obj),
-                w_memoryview_offset(w_obj),
-                w_memoryview_length(w_obj),
-                w_memoryview_readonly(w_obj),
-                false,
-            ));
+            // `W_MemoryView.copy` shares the source's (immutable) view; the
+            // clone preserves the variant, so copying a sliced / plain view
+            // keeps its zero-copy window and derived geometry.
+            return Ok(w_memoryview_new_derived(w_obj, |v| v.clone()));
         }
         let (fmt, itemsize, _readonly, byte_len) = match memoryview_buffer_params(w_obj) {
             Some(p) => p,
@@ -491,33 +481,24 @@ unsafe fn memoryview_values(mv: PyObjectRef) -> Vec<PyObjectRef> {
     }
 }
 
-/// A live strided sub-view `m[start:stop:step]`, sharing the same backing.
-/// Slicing operates on dimension 0 (`buffer.py BufferSlice`): the element
-/// count is `shape[0]`, the step rides `strides[0]`, and dimensions `1..ndim`
-/// are preserved, so slicing an N-D view keeps its dimensionality.  The byte
-/// `offset += start*strides[0]` and `strides[0] *= step` make the result read
-/// through to the original storage.
+/// A live sub-view `m[start:stop:step]` sharing the same storage
+/// (`descr_getitem` slice arm → `view.new_slice(start, step, slicelength)`).
+/// A step==1 slice of a plain view stays a `Simple` / `Raw` view over a
+/// `Buffer::Sub` window; a strided slice wraps the view in a
+/// `BufferView::Slice`, whose dimension-0 shape / stride derive from the
+/// parent's, so slicing an N-D view keeps its dimensionality.
 unsafe fn memoryview_slice_view(
     mv: PyObjectRef,
     index: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
     use pyre_object::memoryview::*;
     unsafe {
-        let itemsize = w_memoryview_itemsize(mv);
         let ndim = w_memoryview_ndim(mv);
-        let parent_shape = w_memoryview_native_shape(mv);
-        let parent_strides = w_memoryview_native_strides(mv);
         let count = if ndim >= 1 {
-            parent_shape.first().copied().unwrap_or(0)
+            w_memoryview_native_shape(mv).first().copied().unwrap_or(0)
         } else {
             0
         };
-        let stride_p = if ndim >= 1 {
-            parent_strides.first().copied().unwrap_or(0)
-        } else {
-            itemsize
-        };
-        let offset_p = w_memoryview_offset(mv);
         let (start, stop, step) = crate::baseobjspace::normalize_slice(index, count)?;
         let slicelength = if step > 0 {
             if stop > start {
@@ -530,31 +511,9 @@ unsafe fn memoryview_slice_view(
         } else {
             0
         };
-        let new_offset = offset_p + start * stride_p;
-        let new_stride = stride_p * step;
-        // Dimension 0 takes the slice's shape/stride; later dimensions ride
-        // along unchanged.
-        let mut shape_v = vec![slicelength];
-        let mut strides_v = vec![new_stride];
-        for d in 1..ndim {
-            shape_v.push(parent_shape.get(d as usize).copied().unwrap_or(0));
-            strides_v.push(parent_strides.get(d as usize).copied().unwrap_or(0));
-        }
-        let new_length = shape_v.iter().product::<i64>() * itemsize;
-        let fmt = w_memoryview_format_str(mv).to_owned();
-        Ok(w_memoryview_alloc(
-            w_memoryview_obj(mv),
-            w_memoryview_backing(mv),
-            &fmt,
-            &shape_v,
-            &strides_v,
-            itemsize,
-            ndim.max(1),
-            new_offset,
-            new_length,
-            w_memoryview_readonly(mv),
-            false,
-        ))
+        Ok(w_memoryview_new_derived(mv, |v| unsafe {
+            v.new_slice(start, step, slicelength)
+        }))
     }
 }
 
@@ -706,7 +665,7 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                 return Err(crate::PyError::index_error("index out of bounds"));
             }
             let base = (w_memoryview_offset(mv) + i * w_memoryview_stride0(mv)) as usize;
-            let full = memoryview_backing_slice(w_memoryview_backing(mv));
+            let full = w_memoryview_view(mv).backing().as_bytes();
             let fmt = w_memoryview_format_str(mv);
             return Ok(memoryview_unpack_element(
                 fmt,
@@ -732,7 +691,7 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                 let start = memoryview_start_from_tuple(mv, index)?;
                 let itemsize = w_memoryview_itemsize(mv);
                 let base = (w_memoryview_offset(mv) + start) as usize;
-                let full = memoryview_backing_slice(w_memoryview_backing(mv));
+                let full = w_memoryview_view(mv).backing().as_bytes();
                 let fmt = w_memoryview_format_str(mv);
                 return Ok(memoryview_unpack_element(
                     fmt,
@@ -769,8 +728,7 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         if w_memoryview_readonly(mv) {
             return Err(crate::PyError::type_error("cannot modify read-only memory"));
         }
-        let backing = w_memoryview_backing(mv);
-        if memoryview_backing_bytes_mut(backing).is_none() {
+        if w_memoryview_view(mv).backing().as_bytes_mut().is_none() {
             return Err(crate::PyError::type_error("cannot modify read-only memory"));
         }
         let itemsize = w_memoryview_itemsize(mv);
@@ -811,8 +769,10 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                     "cannot modify size of memoryview object",
                 ));
             }
-            let full =
-                memoryview_backing_bytes_mut(backing).expect("writable backing checked above");
+            let full = w_memoryview_view(mv)
+                .backing()
+                .as_bytes_mut()
+                .expect("writable backing checked above");
             for (k, &idx) in indices.iter().enumerate() {
                 let dst = (offset + idx * stride0) as usize;
                 full[dst..dst + isz].copy_from_slice(&src[k * isz..k * isz + isz]);
@@ -851,8 +811,10 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             memoryview_check_released(mv)?;
             let start = memoryview_start_from_tuple(mv, index)?;
             let addr = (offset + start) as usize;
-            let full =
-                memoryview_backing_bytes_mut(backing).expect("writable backing checked above");
+            let full = w_memoryview_view(mv)
+                .backing()
+                .as_bytes_mut()
+                .expect("writable backing checked above");
             full[addr..addr + isz].copy_from_slice(&packed);
             return Ok(w_none());
         }
@@ -872,7 +834,10 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         // Re-check release after value coercion (see tuple path above).
         memoryview_check_released(mv)?;
         let addr = (offset + i * stride0) as usize;
-        let full = memoryview_backing_bytes_mut(backing).expect("writable backing checked above");
+        let full = w_memoryview_view(mv)
+            .backing()
+            .as_bytes_mut()
+            .expect("writable backing checked above");
         full[addr..addr + isz].copy_from_slice(&packed);
         Ok(w_none())
     }
@@ -928,9 +893,9 @@ fn memoryview_raw_address(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
         memoryview_check_released(mv)?;
-        let backing = pyre_object::memoryview::w_memoryview_backing(mv);
-        let base = memoryview_backing_slice(backing).as_ptr() as usize;
-        let offset = pyre_object::memoryview::w_memoryview_offset(mv) as usize;
+        let view = pyre_object::memoryview::w_memoryview_view(mv);
+        let base = view.backing().as_bytes().as_ptr() as usize;
+        let offset = view.offset() as usize;
         Ok(w_int_new((base + offset) as i64))
     }
 }
@@ -1078,7 +1043,9 @@ fn memoryview_tolist(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         }
         let isz = pyre_object::memoryview::w_memoryview_itemsize(mv) as usize;
         let fmt = pyre_object::memoryview::w_memoryview_format_str(mv);
-        let full = memoryview_backing_slice(pyre_object::memoryview::w_memoryview_backing(mv));
+        let full = pyre_object::memoryview::w_memoryview_view(mv)
+            .backing()
+            .as_bytes();
         let start = pyre_object::memoryview::w_memoryview_offset(mv);
         Ok(memoryview_tolist_rec(mv, fmt, full, isz, ndim, 0, start))
     }
@@ -1175,25 +1142,8 @@ fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                 "memoryview: length is not a multiple of itemsize",
             ));
         }
-        let offset = w_memoryview_offset(mv);
-        let backing = w_memoryview_backing(mv);
-        let obj = w_memoryview_obj(mv);
-        let readonly = w_memoryview_readonly(mv);
         if !has_shape {
-            let count = total / new_itemsize;
-            return Ok(w_memoryview_alloc(
-                obj,
-                backing,
-                &fmt,
-                &[count],
-                &[new_itemsize],
-                new_itemsize,
-                1,
-                offset,
-                total,
-                readonly,
-                false,
-            ));
+            return Ok(w_memoryview_cast_1d(mv, &fmt, new_itemsize));
         }
         // _cast_to_ND: `length = itemsize; for d in shape: length *= d`, then
         // `length != view.getlength()` rejects.  A negative dimension makes the
@@ -1218,18 +1168,12 @@ fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             ));
         }
         let strides_v = memoryview_strides_from_shape(&dims, new_itemsize);
-        Ok(w_memoryview_alloc(
-            obj,
-            backing,
+        Ok(w_memoryview_cast_nd(
+            mv,
             &fmt,
+            new_itemsize,
             &dims,
             &strides_v,
-            new_itemsize,
-            ndim,
-            offset,
-            total,
-            readonly,
-            false,
         ))
     }
 }
@@ -1240,22 +1184,13 @@ fn memoryview_toreadonly(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     unsafe {
         use pyre_object::memoryview::*;
         memoryview_check_released(mv)?;
-        let fmt = w_memoryview_format_str(mv).to_owned();
-        let shape = w_memoryview_native_shape(mv);
-        let strides = w_memoryview_native_strides(mv);
-        Ok(w_memoryview_alloc(
-            w_memoryview_obj(mv),
-            w_memoryview_backing(mv),
-            &fmt,
-            &shape,
-            &strides,
-            w_memoryview_itemsize(mv),
-            w_memoryview_ndim(mv),
-            w_memoryview_offset(mv),
-            w_memoryview_length(mv),
-            true,
-            false,
-        ))
+        // `ReadonlyWrapper(self.view)` (memoryobject.py:256).
+        Ok(w_memoryview_new_derived(mv, |v| {
+            pyre_object::bufferview::BufferView::Readonly {
+                view: Box::new(v.clone()),
+                w_obj: v.w_obj(),
+            }
+        }))
     }
 }
 
@@ -1382,21 +1317,34 @@ fn memoryview_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::typedef::bytes_method_hex(&fwd)
 }
 
-/// `memoryview.__hash__` — `descr_hash`: a writable view is unhashable;
-/// a read-only view hashes its raw bytes (so `hash(mv) == hash(bytes)`).
+/// `descr_hash` (memoryobject.py:476) — a writable view is unhashable; a
+/// read-only view hashes its raw bytes (so `hash(mv) == hash(bytes)`),
+/// cached in `self._hash` with the `-1` sentinel (`_hash_str` never returns
+/// `-1`) — the release / readonly checks run only on the first call, and a
+/// view hashed before `release()` keeps hashing afterwards.
+unsafe fn memoryview_hash_value(mv: PyObjectRef) -> Result<i64, crate::PyError> {
+    unsafe {
+        let mut hash = pyre_object::memoryview::w_memoryview_hash(mv);
+        if hash == -1 {
+            memoryview_check_released(mv)?;
+            if !pyre_object::memoryview::w_memoryview_readonly(mv) {
+                return Err(crate::PyError::value_error(
+                    "cannot hash writable memoryview object",
+                ));
+            }
+            // `compute_hash(self.view.as_str())` — the same content digest the
+            // bytes path uses, so `hash(memoryview(b)) == hash(b)`.
+            hash = hash_str_bytes(&memoryview_gather_bytes(mv));
+            pyre_object::memoryview::w_memoryview_set_hash(mv, hash);
+        }
+        Ok(hash)
+    }
+}
+
+/// `memoryview.__hash__` — see [`memoryview_hash_value`].
 fn memoryview_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
-    unsafe {
-        memoryview_check_released(mv)?;
-        if !pyre_object::memoryview::w_memoryview_readonly(mv) {
-            return Err(crate::PyError::value_error(
-                "cannot hash writable memoryview object",
-            ));
-        }
-        // `compute_hash(self.view.as_str())` — the same content digest the
-        // bytes path uses, so `hash(memoryview(b)) == hash(b)`.
-        Ok(w_int_new(hash_str_bytes(&memoryview_gather_bytes(mv))))
-    }
+    unsafe { Ok(w_int_new(memoryview_hash_value(mv)?)) }
 }
 
 /// `memoryview.__delitem__` — memoryview does not support item deletion.
@@ -6866,15 +6814,9 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             )));
         }
         if pyre_object::memoryview::is_w_memoryview(obj) {
-            // `descr_hash` — released views and writable views are
-            // unhashable; a read-only view hashes its raw bytes.
-            memoryview_check_released(obj)?;
-            if !pyre_object::memoryview::w_memoryview_readonly(obj) {
-                return Err(crate::PyError::value_error(
-                    "cannot hash writable memoryview object",
-                ));
-            }
-            return Ok(_hash_str(&memoryview_gather_bytes(obj)));
+            // `descr_hash` — released and writable views are unhashable; a
+            // read-only view hashes its raw bytes, cached in `_hash`.
+            return memoryview_hash_value(obj);
         }
         if is_tuple(obj) {
             let n = w_tuple_len(obj);
