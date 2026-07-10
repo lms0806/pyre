@@ -686,6 +686,10 @@ pub fn generated_list_setitem_by_strategy<F: pyre_jit_trace::walker_frame_ops::W
         obj,
         &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType,
     );
+    frame.guard_exact_w_class(
+        obj,
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
+    );
     frame.guard_list_strategy(obj, strategy_id);
     let len_descr = match strategy_id {
         0 => crate::descr::list_length_descr(),
@@ -1795,6 +1799,12 @@ pub fn generated_dynamic_list_index(
 /// Combined with guard_class + guard_strategy + opimpl_check_resizable_neg_index
 /// as emitted by jtransform do_resizable_list_getitem.
 ///
+/// The runtime exact-`w_class` subclass guard for the LIVE getitem path is
+/// enforced by walker-native `try_walker_specialize_subscr`
+/// (jitcode_dispatch.rs, guard at the `walker_guard_exact_w_class` call);
+/// this typed-trace helper is reached only by the retired executor-trait
+/// path (trace_opcode.rs), so it carries no separate exact-w_class guard.
+///
 /// strategy_id: 0 = object, 1 = int, 2 = float.
 #[inline]
 pub fn generated_list_getitem_by_strategy(
@@ -1869,7 +1879,13 @@ pub fn generated_binary_subscr_value(
         }
         let index = pyre_object::w_int_get_value(concrete_key);
 
-        if pyre_object::pyobject::is_tuple(concrete_obj) {
+        // EXACT tuple/list only: a subclass instance shares the builtin
+        // `ob_type` but retags `w_class` and may override `__getitem__`;
+        // exclude it so the read falls to the generic residual (which honours
+        // the override) instead of a direct backing-storage load.  The
+        // arity-2 specialised tuples stay admitted — `is_exact_tuple` reports
+        // them exact (they carry the canonical `tuple` `w_class`).
+        if pyre_object::is_exact_tuple(concrete_obj) {
             let concrete_len = pyre_object::w_tuple_len(concrete_obj);
             if check_index_in_bounds(index, concrete_len) {
                 return Some(generated_tuple_getitem(
@@ -1882,7 +1898,7 @@ pub fn generated_binary_subscr_value(
                     concrete_len,
                 ));
             }
-        } else if pyre_object::pyobject::is_list(concrete_obj) {
+        } else if pyre_object::is_exact_list(concrete_obj) {
             if let Some(sid) = detect_list_getitem_strategy(concrete_obj) {
                 let concrete_len = pyre_object::w_list_len(concrete_obj);
                 if check_index_in_bounds(index, concrete_len) {
@@ -1917,9 +1933,11 @@ pub fn generated_store_subscr_value<F: pyre_jit_trace::walker_frame_ops::WalkerF
         return false;
     }
     unsafe {
-        if pyre_object::pyobject::is_list(concrete_obj)
-            && pyre_object::pyobject::is_int(concrete_key)
-        {
+        // EXACT list only: a list SUBCLASS instance shares `ob_type ==
+        // &LIST_TYPE` but retags `w_class` and may override `__setitem__`;
+        // exclude it so the store falls to the generic residual (which honours
+        // the override) instead of a direct backing-storage write.
+        if pyre_object::is_exact_list(concrete_obj) && pyre_object::pyobject::is_int(concrete_key) {
             if let Some((sid, unbox_long)) =
                 detect_list_setitem_strategy(concrete_obj, concrete_value)
             {
