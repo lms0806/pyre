@@ -2386,11 +2386,12 @@ impl OpcodeStepExecutor for PyFrame {
     /// pyre-equivalent flow runs the bytecode opcode and writes into
     /// the class_locals namespace just like CPython).
     fn setup_annotations(&mut self) -> Result<(), PyError> {
-        // Route the `__annotations__` ensure through `space.contains` /
-        // `space.setitem` on the locals mapping object, mirroring STORE_NAME.
+        // `if not self.space.finditem_str(w_locals, '__annotations__')`:
+        // probe by item lookup, not membership — a custom mapping's
+        // `__contains__` can disagree with `__getitem__`/KeyError.
         let w_locals = self.get_or_create_w_locals();
-        let key = unsafe { pyre_object::w_str_new("__annotations__") };
-        if !crate::baseobjspace::contains(w_locals, key)? {
+        if crate::baseobjspace::finditem_str(w_locals, "__annotations__")?.is_none() {
+            let key = unsafe { pyre_object::w_str_new("__annotations__") };
             crate::baseobjspace::setitem(w_locals, key, pyre_object::w_dict_new())?;
         }
         Ok(())
@@ -2708,21 +2709,9 @@ impl OpcodeStepExecutor for PyFrame {
 
     fn import_name(&mut self, name: &str) -> Result<(), PyError> {
         let w_fromlist = self.pop();
-        let w_level = self.pop();
-        let level = if unsafe { pyre_object::is_int(w_level) } {
-            unsafe { pyre_object::w_int_get_value(w_level) }
-        } else {
-            0
-        };
-
-        let module = crate::importing::importhook(
-            name,
-            self.get_w_globals(), // for relative imports: __name__/__package__
-            w_fromlist,
-            level,
-            self.execution_context,
-        )?;
-        self.push(module);
+        let w_flag = self.pop();
+        let w_obj = crate::importing::import_name(self, name, w_fromlist, w_flag)?;
+        self.push(w_obj);
         Ok(())
     }
 
@@ -3409,18 +3398,21 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── import_star ──
-    // pypy/interpreter/pyopcode.py:1076 IMPORT_STAR — merge module's public names into
-    // the locals mapping (class body / exec-with-locals), not globals.
-    //
-    // Non-dict mapping locals route through `import_all_from_w` so each
-    // `from module import *` entry lands via `space.setitem(w_locals,
-    // name, value)` rather than the `*mut DictStorage` fast path,
-    // matching `pyopcode.py:1078 self.getdictscope()` returning a
-    // generic `w_obj`.
+    // IMPORT_STAR — merge the module's public names into the locals
+    // mapping (class body / exec-with-locals), not globals:
+    //     w_locals = self.getdictscope()
+    //     import_all_from(self.space, w_module, w_locals)
+    //     self.setdictscope(w_locals)
+    // `getdictscope` runs fast2locals so the mapping reflects the live
+    // fast locals; `import_all_from_w` lands each `from module import *`
+    // entry via `space.setitem(w_locals, name, value)` rather than the
+    // `*mut DictStorage` fast path; `setdictscope` runs locals2fast to
+    // write the merged mapping back into the frame's fast locals.
     fn import_star(&mut self) -> Result<(), PyError> {
         let module = self.pop();
-        let w_locals = self.get_or_create_w_locals();
+        let w_locals = self.getdictscope()?;
         crate::importing::import_all_from_w(module, w_locals)?;
+        self.setdictscope(w_locals)?;
         Ok(())
     }
 
