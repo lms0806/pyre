@@ -2184,7 +2184,10 @@ fn init_list_type(ns: &mut DictStorage) {
         "__getitem__",
         make_builtin_function_with_arity(
             "__getitem__",
-            |args| crate::baseobjspace::getitem_slot(args[0], args[1]),
+            |args| {
+                crate::type_methods::arity_exact(args, "list.__getitem__", 1)?;
+                crate::baseobjspace::getitem_slot(args[0], args[1])
+            },
             2,
         ),
     );
@@ -2194,6 +2197,7 @@ fn init_list_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__setitem__",
             |args| {
+                crate::type_methods::arity_exact_unpack(args, "__setitem__", 2)?;
                 crate::baseobjspace::setitem_slot(args[0], args[1], args[2])?;
                 Ok(pyre_object::w_none())
             },
@@ -2206,6 +2210,7 @@ fn init_list_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__delitem__",
             |args| {
+                crate::type_methods::arity_slot(args, 1)?;
                 crate::baseobjspace::delitem_slot(args[0], args[1])?;
                 Ok(pyre_object::w_none())
             },
@@ -2217,7 +2222,10 @@ fn init_list_type(ns: &mut DictStorage) {
         "__len__",
         make_builtin_function_with_arity(
             "__len__",
-            |args| crate::baseobjspace::len_slot(args[0]),
+            |args| {
+                crate::type_methods::arity_slot(args, 0)?;
+                crate::baseobjspace::len_slot(args[0])
+            },
             1,
         ),
     );
@@ -2227,6 +2235,7 @@ fn init_list_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__contains__",
             |args| {
+                crate::type_methods::arity_slot(args, 1)?;
                 let found = crate::baseobjspace::contains_slot(args[0], args[1])?;
                 Ok(pyre_object::w_bool_from(found))
             },
@@ -2246,6 +2255,7 @@ fn init_list_type(ns: &mut DictStorage) {
                 if obj.is_null() {
                     return Ok(pyre_object::w_none());
                 }
+                crate::type_methods::arity_slot(args, 0)?;
                 Ok(pyre_object::w_seq_iter_new(obj, unsafe {
                     pyre_object::w_list_len(obj)
                 }))
@@ -2262,6 +2272,7 @@ fn init_list_type(ns: &mut DictStorage) {
                 // `listobject.py:737 descr_reversed` — a lazy reverse iterator
                 // over the list, the same `W_ReversedIterator` representation as
                 // `reversed(list)` (walks `getitem(seq, remaining)` downward).
+                crate::type_methods::arity_no_args(args, "list.__reversed__")?;
                 let obj = args[0];
                 let n = unsafe { pyre_object::w_list_len(obj) } as i64;
                 Ok(pyre_object::functional::w_reversed_new(obj, n - 1))
@@ -2278,6 +2289,7 @@ fn init_list_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__add__",
             |args| {
+                crate::type_methods::arity_slot(args, 1)?;
                 if unsafe { pyre_object::is_list(args[1]) } {
                     unsafe { crate::objspace::descroperation::list_concat(args[0], args[1]) }
                 } else {
@@ -2306,6 +2318,10 @@ fn init_list_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__iadd__",
             |args| {
+                // Validate the slot arity before delegating so a bad call
+                // reports "expected 1 argument, got M" rather than the
+                // `extend` message surfaced by the shared implementation.
+                crate::type_methods::arity_slot(args, 1)?;
                 crate::type_methods::list_method_extend(args)?;
                 Ok(args[0])
             },
@@ -2320,6 +2336,7 @@ fn init_list_type(ns: &mut DictStorage) {
             |args| {
                 // listobject.py descr_inplace_mul: the count goes through
                 // `__index__`; a non-index operand becomes NotImplemented.
+                crate::type_methods::arity_slot(args, 1)?;
                 let Some(w_count) = list_repeat_index(args[1])? else {
                     return Ok(pyre_object::w_not_implemented());
                 };
@@ -2357,6 +2374,7 @@ fn list_repeat_index(w_obj: PyObjectRef) -> Result<Option<PyObjectRef>, crate::P
 /// `listobject.c:list_repeat` — `list * n` / `n * list`.  The count goes
 /// through `__index__`, so any object implementing it repeats the list.
 fn list_descr_mul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 1)?;
     let Some(w_count) = list_repeat_index(args[1])? else {
         return Ok(pyre_object::w_not_implemented());
     };
@@ -2668,12 +2686,7 @@ fn init_str_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__contains__",
             |args| {
-                if args.len() != 2 {
-                    return Err(crate::PyError::type_error(format!(
-                        "expected 1 argument, got {}",
-                        args.len().saturating_sub(1)
-                    )));
-                }
+                crate::type_methods::arity_slot(args, 1)?;
                 Ok(pyre_object::w_bool_from(
                     crate::baseobjspace::contains_slot(args[0], args[1])?,
                 ))
@@ -2690,6 +2703,7 @@ fn init_str_type(ns: &mut DictStorage) {
                 if args.is_empty() {
                     return Ok(pyre_object::w_int_new(0));
                 }
+                crate::type_methods::arity_slot(args, 0)?;
                 crate::baseobjspace::len_slot(args[0])
             },
             1,
@@ -2701,9 +2715,7 @@ fn init_str_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__getitem__",
             |args| {
-                if args.len() < 2 {
-                    return Err(crate::PyError::type_error("__getitem__"));
-                }
+                crate::type_methods::arity_slot(args, 1)?;
                 crate::baseobjspace::getitem_slot(args[0], args[1])
             },
             2,
@@ -2729,9 +2741,7 @@ fn init_str_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__add__",
             |args| {
-                if args.len() < 2 {
-                    return Err(crate::PyError::type_error("__add__"));
-                }
+                crate::type_methods::arity_slot(args, 1)?;
                 // Self-contained concat: returning NotImplemented for a
                 // non-str operand lets the `+` operator emit the
                 // "can only concatenate" message, and avoids the
@@ -2752,9 +2762,7 @@ fn init_str_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__mul__",
             |args| {
-                if args.len() < 2 {
-                    return Err(crate::PyError::type_error("__mul__"));
-                }
+                crate::type_methods::arity_slot(args, 1)?;
                 if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
                     unsafe { crate::objspace::descroperation::str_repeat(args[0], args[1]) }
                 } else {
@@ -2773,9 +2781,7 @@ fn init_str_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__mod__",
             |args| {
-                if args.len() < 2 {
-                    return Err(crate::PyError::type_error("__mod__"));
-                }
+                crate::type_methods::arity_slot(args, 1)?;
                 crate::baseobjspace::mod_(args[0], args[1])
             },
             2,
@@ -2980,9 +2986,7 @@ fn init_dict_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__setitem__",
             |args| {
-                if args.len() < 3 {
-                    return Err(crate::PyError::type_error("__setitem__ requires 3 args"));
-                }
+                crate::type_methods::arity_exact_unpack(args, "__setitem__", 2)?;
                 // For plain dict: direct store. For dict subclass instance: use backing dict.
                 unsafe {
                     if pyre_object::is_dict(args[0]) {
@@ -3009,9 +3013,7 @@ fn init_dict_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__getitem__",
             |args| {
-                if args.len() < 2 {
-                    return Err(crate::PyError::type_error("__getitem__ requires 2 args"));
-                }
+                crate::type_methods::arity_exact(args, "dict.__getitem__", 1)?;
                 unsafe {
                     if pyre_object::is_dict(args[0]) {
                         return crate::baseobjspace::getitem(args[0], args[1]);
@@ -3049,9 +3051,7 @@ fn init_dict_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__contains__",
             |args| {
-                if args.len() < 2 {
-                    return Ok(pyre_object::w_bool_from(false));
-                }
+                crate::type_methods::arity_exact(args, "dict.__contains__", 1)?;
                 let dict = crate::type_methods::resolve_dict_backing(args[0]);
                 if !dict.is_null() {
                     return match unsafe {
@@ -3077,6 +3077,7 @@ fn init_dict_type(ns: &mut DictStorage) {
                 if args.is_empty() {
                     return Ok(pyre_object::w_int_new(0));
                 }
+                crate::type_methods::arity_slot(args, 0)?;
                 let dict = crate::type_methods::resolve_dict_backing(args[0]);
                 if !dict.is_null() {
                     return Ok(pyre_object::w_int_new(
@@ -3142,9 +3143,7 @@ fn init_dict_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__delitem__",
             |args| {
-                if args.len() < 2 {
-                    return Err(crate::PyError::type_error("__delitem__ requires 2 args"));
-                }
+                crate::type_methods::arity_slot(args, 1)?;
                 // For plain dict: direct delete. For dict subclass instance: use backing dict.
                 unsafe {
                     if pyre_object::is_dict(args[0]) {
@@ -3171,9 +3170,7 @@ fn init_dict_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__eq__",
             |args| {
-                if args.len() < 2 {
-                    return Ok(pyre_object::w_bool_from(false));
-                }
+                crate::type_methods::arity_slot(args, 1)?;
                 // A dict subclass is instance-represented (the mapping lives in
                 // the `__dict_data__` backing), so `compare` would not see it as
                 // a dict and would re-dispatch to this `__eq__`, recursing.
@@ -3205,9 +3202,7 @@ fn init_dict_type(ns: &mut DictStorage) {
                 //       new = self.descr_copy(space)
                 //       new.descr_update(space, w_other)
                 //       return new
-                if args.len() < 2 {
-                    return Ok(args[0]);
-                }
+                crate::type_methods::arity_slot(args, 1)?;
                 let src = crate::type_methods::resolve_dict_backing(args[0]);
                 let other = crate::type_methods::resolve_dict_backing(args[1]);
                 if other.is_null() {
@@ -3241,9 +3236,7 @@ fn init_dict_type(ns: &mut DictStorage) {
             |args| {
                 // `dictmultiobject.py:295 descr_ror`: `other | dict` copies
                 // the right-hand-side base (other) and overlays self.
-                if args.len() < 2 {
-                    return Ok(args[0]);
-                }
+                crate::type_methods::arity_slot(args, 1)?;
                 let self_ = crate::type_methods::resolve_dict_backing(args[0]);
                 let other = crate::type_methods::resolve_dict_backing(args[1]);
                 if other.is_null() {
@@ -3271,9 +3264,7 @@ fn init_dict_type(ns: &mut DictStorage) {
             |args| {
                 // `dictmultiobject.py:303 descr_ior`: in-place update via
                 // `update1`, returns self.
-                if args.len() < 2 {
-                    return Ok(args[0]);
-                }
+                crate::type_methods::arity_slot(args, 1)?;
                 let self_ = crate::type_methods::resolve_dict_backing(args[0]);
                 if !self_.is_null() {
                     crate::type_methods::dict_update1(self_, args[1])?;
@@ -4578,6 +4569,7 @@ fn init_mappingproxy_type(ns: &mut DictStorage) {
             if args.is_empty() {
                 return Ok(pyre_object::w_int_new(0));
             }
+            crate::type_methods::arity_slot(args, 0)?;
             crate::baseobjspace::len_slot(args[0])
         }),
     );
@@ -4586,9 +4578,7 @@ fn init_mappingproxy_type(ns: &mut DictStorage) {
         ns,
         "__getitem__",
         make_builtin_function("__getitem__", |args| {
-            if args.len() < 2 {
-                return Err(crate::PyError::type_error("__getitem__ requires 2 args"));
-            }
+            crate::type_methods::arity_slot(args, 1)?;
             crate::baseobjspace::getitem(args[0], args[1])
         }),
     );
@@ -4597,9 +4587,7 @@ fn init_mappingproxy_type(ns: &mut DictStorage) {
         ns,
         "__contains__",
         make_builtin_function("__contains__", |args| {
-            if args.len() < 2 {
-                return Ok(pyre_object::w_bool_from(false));
-            }
+            crate::type_methods::arity_slot(args, 1)?;
             Ok(pyre_object::w_bool_from(crate::baseobjspace::contains(
                 args[0], args[1],
             )?))
@@ -4659,9 +4647,7 @@ fn init_mappingproxy_type(ns: &mut DictStorage) {
         ns,
         "__or__",
         make_builtin_function("__or__", |args| {
-            if args.len() < 2 {
-                return Err(crate::PyError::type_error("__or__ requires 2 args"));
-            }
+            crate::type_methods::arity_slot(args, 1)?;
             let lhs = args[0];
             let rhs = unsafe {
                 if pyre_object::is_dict_proxy(args[1]) {
@@ -4684,9 +4670,7 @@ fn init_mappingproxy_type(ns: &mut DictStorage) {
         ns,
         "__ror__",
         make_builtin_function("__ror__", |args| {
-            if args.len() < 2 {
-                return Err(crate::PyError::type_error("__ror__ requires 2 args"));
-            }
+            crate::type_methods::arity_slot(args, 1)?;
             let self_mapping = unsafe {
                 if pyre_object::is_dict_proxy(args[0]) {
                     pyre_object::w_dict_proxy_get_mapping(args[0])
@@ -4827,9 +4811,7 @@ fn init_tuple_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__contains__",
             |args| {
-                if args.len() < 2 {
-                    return Ok(pyre_object::w_bool_from(false));
-                }
+                crate::type_methods::arity_slot(args, 1)?;
                 Ok(pyre_object::w_bool_from(
                     crate::baseobjspace::contains_slot(args[0], args[1]).unwrap_or(false),
                 ))
@@ -4846,6 +4828,7 @@ fn init_tuple_type(ns: &mut DictStorage) {
                 if args.is_empty() {
                     return Ok(pyre_object::w_int_new(0));
                 }
+                crate::type_methods::arity_slot(args, 0)?;
                 Ok(pyre_object::w_int_new(
                     unsafe { pyre_object::w_tuple_len(args[0]) } as i64,
                 ))
@@ -4878,7 +4861,10 @@ fn init_tuple_type(ns: &mut DictStorage) {
         "__getitem__",
         make_builtin_function_with_arity(
             "__getitem__",
-            |args| crate::baseobjspace::getitem_slot(args[0], args[1]),
+            |args| {
+                crate::type_methods::arity_slot(args, 1)?;
+                crate::baseobjspace::getitem_slot(args[0], args[1])
+            },
             2,
         ),
     );
@@ -4890,6 +4876,7 @@ fn init_tuple_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__add__",
             |args| {
+                crate::type_methods::arity_slot(args, 1)?;
                 if unsafe { pyre_object::is_tuple(args[1]) } {
                     unsafe { crate::objspace::descroperation::tuple_concat(args[0], args[1]) }
                 } else {
@@ -4942,6 +4929,7 @@ fn init_tuple_type(ns: &mut DictStorage) {
 /// `tupleobject.c` `tuple * n` / `n * tuple`.  A non-integer count
 /// raises the `__index__` TypeError.
 fn tuple_descr_mul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 1)?;
     if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
         crate::objspace::descroperation::mul(args[0], args[1])
     } else {
@@ -7768,6 +7756,7 @@ fn int_as_plain_int(args: &[PyObjectRef]) -> PyObjectRef {
 macro_rules! int_binop_fwd {
     ($name:ident, $op:path) => {
         fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            crate::type_methods::arity_slot(args, 1)?;
             if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
                 $op(args[0], args[1])
             } else {
@@ -7779,6 +7768,7 @@ macro_rules! int_binop_fwd {
 macro_rules! int_binop_rev {
     ($name:ident, $op:path) => {
         fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            crate::type_methods::arity_slot(args, 1)?;
             if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
                 $op(args[1], args[0])
             } else {
@@ -7790,6 +7780,7 @@ macro_rules! int_binop_rev {
 macro_rules! float_binop_fwd {
     ($name:ident, $op:path) => {
         fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            crate::type_methods::arity_slot(args, 1)?;
             let b = args[1];
             if unsafe {
                 pyre_object::pyobject::is_float(b) || pyre_object::pyobject::is_int_or_long(b)
@@ -7804,6 +7795,7 @@ macro_rules! float_binop_fwd {
 macro_rules! float_binop_rev {
     ($name:ident, $op:path) => {
         fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            crate::type_methods::arity_slot(args, 1)?;
             let b = args[1];
             if unsafe {
                 pyre_object::pyobject::is_float(b) || pyre_object::pyobject::is_int_or_long(b)
@@ -7826,6 +7818,7 @@ fn complex_binop_operand(b: PyObjectRef) -> bool {
 macro_rules! complex_binop_fwd {
     ($name:ident, $op:path) => {
         fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            crate::type_methods::arity_slot(args, 1)?;
             if complex_binop_operand(args[1]) {
                 $op(args[0], args[1])
             } else {
@@ -7837,6 +7830,7 @@ macro_rules! complex_binop_fwd {
 macro_rules! complex_binop_rev {
     ($name:ident, $op:path) => {
         fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            crate::type_methods::arity_slot(args, 1)?;
             if complex_binop_operand(args[1]) {
                 $op(args[1], args[0])
             } else {
@@ -7890,10 +7884,16 @@ int_binop_rev!(
     int_dunder_rdivmod,
     crate::objspace::descroperation::divmod_builtin
 );
-int_binop_rev!(
-    int_dunder_rpow,
-    crate::objspace::descroperation::pow_builtin
-);
+/// `int.__rpow__(self, base[, mod])` — the reflected slot accepts an
+/// optional modulus argument, so it validates arity as one-or-two.
+fn int_dunder_rpow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_pow(args)?;
+    if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
+        crate::objspace::descroperation::pow_builtin(args[1], args[0])
+    } else {
+        Ok(pyre_object::w_not_implemented())
+    }
+}
 int_binop_fwd!(
     int_dunder_lshift,
     crate::objspace::descroperation::lshift_builtin
@@ -7926,11 +7926,7 @@ int_binop_rev!(
 /// `int.__pow__(self, exp[, mod])` — optional modulus routes through the
 /// three-argument modular power.
 fn int_dunder_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() < 2 || args.len() > 3 {
-        return Err(crate::PyError::type_error(
-            "__pow__ expected 1 or 2 arguments",
-        ));
-    }
+    crate::type_methods::arity_pow(args)?;
     if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
         if args.len() >= 3 {
             if unsafe { pyre_object::pyobject::is_none(args[2]) } {
@@ -8002,14 +7998,26 @@ float_binop_rev!(
     float_dunder_rdivmod,
     crate::objspace::descroperation::divmod_builtin
 );
-float_binop_fwd!(
-    float_dunder_pow,
-    crate::objspace::descroperation::pow_builtin
-);
-float_binop_rev!(
-    float_dunder_rpow,
-    crate::objspace::descroperation::pow_builtin
-);
+/// `float.__pow__` / `__rpow__` — the ternary-power slot accepts an
+/// optional modulus argument, so arity is validated as one-or-two.
+fn float_dunder_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_pow(args)?;
+    let b = args[1];
+    if unsafe { pyre_object::pyobject::is_float(b) || pyre_object::pyobject::is_int_or_long(b) } {
+        crate::objspace::descroperation::pow_builtin(args[0], b)
+    } else {
+        Ok(pyre_object::w_not_implemented())
+    }
+}
+fn float_dunder_rpow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_pow(args)?;
+    let b = args[1];
+    if unsafe { pyre_object::pyobject::is_float(b) || pyre_object::pyobject::is_int_or_long(b) } {
+        crate::objspace::descroperation::pow_builtin(b, args[0])
+    } else {
+        Ok(pyre_object::w_not_implemented())
+    }
+}
 
 complex_binop_fwd!(
     complex_dunder_add,
@@ -8043,14 +8051,24 @@ complex_binop_rev!(
     complex_dunder_rtruediv,
     crate::objspace::descroperation::truediv_builtin
 );
-complex_binop_fwd!(
-    complex_dunder_pow,
-    crate::objspace::descroperation::pow_builtin
-);
-complex_binop_rev!(
-    complex_dunder_rpow,
-    crate::objspace::descroperation::pow_builtin
-);
+/// `complex.__pow__` / `__rpow__` — the ternary-power slot accepts an
+/// optional modulus argument, so arity is validated as one-or-two.
+fn complex_dunder_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_pow(args)?;
+    if complex_binop_operand(args[1]) {
+        crate::objspace::descroperation::pow_builtin(args[0], args[1])
+    } else {
+        Ok(pyre_object::w_not_implemented())
+    }
+}
+fn complex_dunder_rpow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_pow(args)?;
+    if complex_binop_operand(args[1]) {
+        crate::objspace::descroperation::pow_builtin(args[1], args[0])
+    } else {
+        Ok(pyre_object::w_not_implemented())
+    }
+}
 
 // Rich comparison dunders (`__eq__` / `__ne__` / `__lt__` / `__le__` /
 // `__gt__` / `__ge__`).  Each built-in numeric / sequence type only
@@ -8089,6 +8107,7 @@ fn cmp_guard_bytearray(b: PyObjectRef) -> bool {
 macro_rules! cmp_dunder {
     ($name:ident, $op:ident, $guard:path) => {
         fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            crate::type_methods::arity_slot(args, 1)?;
             if $guard(args[1]) {
                 crate::objspace::descroperation::compare_slot(
                     args[0],
@@ -8138,7 +8157,8 @@ cmp_dunder!(complex_dunder_ne, Ne, cmp_guard_complex);
 // raises TypeError through the comparison fallback.
 macro_rules! complex_fail_cmp {
     ($name:ident) => {
-        fn $name(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            crate::type_methods::arity_slot(args, 1)?;
             Ok(pyre_object::w_not_implemented())
         }
     };
@@ -10026,6 +10046,108 @@ fn init_bytes_type(ns: &mut DictStorage) {
         "fromhex",
         pyre_object::function::w_classmethod_new(make_builtin_function("fromhex", bytes_fromhex)),
     );
+    dict_storage_store(
+        ns,
+        "__add__",
+        make_builtin_function_with_arity(
+            "__add__",
+            |args| {
+                crate::type_methods::arity_slot(args, 1)?;
+                unsafe { crate::objspace::descroperation::bytes_concat(args[0], args[1]) }
+            },
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__mul__",
+        make_builtin_function_with_arity("__mul__", |args| bytes_descr_repeat(args), 2),
+    );
+    dict_storage_store(
+        ns,
+        "__rmul__",
+        make_builtin_function_with_arity("__rmul__", |args| bytes_descr_repeat(args), 2),
+    );
+    dict_storage_store(
+        ns,
+        "__contains__",
+        make_builtin_function_with_arity(
+            "__contains__",
+            |args| {
+                crate::type_methods::arity_slot(args, 1)?;
+                Ok(pyre_object::w_bool_from(
+                    crate::baseobjspace::contains_slot(args[0], args[1])?,
+                ))
+            },
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__getitem__",
+        make_builtin_function_with_arity(
+            "__getitem__",
+            |args| {
+                crate::type_methods::arity_slot(args, 1)?;
+                crate::baseobjspace::getitem_slot(args[0], args[1])
+            },
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__iter__",
+        make_builtin_function_with_arity(
+            "__iter__",
+            |args| {
+                crate::type_methods::arity_slot(args, 0)?;
+                crate::baseobjspace::iter(args[0])
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__len__",
+        make_builtin_function_with_arity(
+            "__len__",
+            |args| {
+                crate::type_methods::arity_slot(args, 0)?;
+                crate::baseobjspace::len_slot(args[0])
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__mod__",
+        make_builtin_function_with_arity(
+            "__mod__",
+            |args| {
+                crate::type_methods::arity_slot(args, 1)?;
+                unsafe { crate::objspace::std::formatting::bytes_format_percent(args[0], args[1]) }
+            },
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__rmod__",
+        make_builtin_function_with_arity(
+            "__rmod__",
+            |args| {
+                crate::type_methods::arity_slot(args, 1)?;
+                if unsafe { pyre_object::bytesobject::is_bytes(args[1]) } {
+                    unsafe {
+                        crate::objspace::std::formatting::bytes_format_percent(args[1], args[0])
+                    }
+                } else {
+                    Ok(pyre_object::w_not_implemented())
+                }
+            },
+            2,
+        ),
+    );
     for (name, func) in [
         ("__eq__", bytes_dunder_eq as DunderFn),
         ("__ne__", bytes_dunder_ne),
@@ -10053,6 +10175,14 @@ fn init_bytes_type(ns: &mut DictStorage) {
         ),
     );
     // bytes methods are mostly shared with bytearray — add as needed.
+}
+
+fn bytes_descr_repeat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 1)?;
+    let Some(count) = list_repeat_index(args[1])? else {
+        return Ok(pyre_object::w_not_implemented());
+    };
+    unsafe { crate::objspace::descroperation::bytes_repeat(args[0], count) }
 }
 
 /// `stringmethods.py:_op_val(space, w_sub, allow_char=True)` — the
@@ -12631,7 +12761,7 @@ fn init_bytearray_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__add__",
             |args| {
-                crate::type_methods::arity_at_least(args, "__add__", 1)?;
+                crate::type_methods::arity_slot(args, 1)?;
                 let a = args[0];
                 let b = args[1];
                 unsafe {
@@ -12664,7 +12794,7 @@ fn init_bytearray_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__iadd__",
             |args| {
-                crate::type_methods::arity_at_least(args, "__iadd__", 1)?;
+                crate::type_methods::arity_slot(args, 1)?;
                 let ba = args[0];
                 let other = args[1];
                 unsafe {
@@ -12861,7 +12991,10 @@ fn init_bytearray_type(ns: &mut DictStorage) {
         "__getitem__",
         make_builtin_function_with_arity(
             "__getitem__",
-            |args| crate::baseobjspace::getitem_slot(args[0], args[1]),
+            |args| {
+                crate::type_methods::arity_slot(args, 1)?;
+                crate::baseobjspace::getitem_slot(args[0], args[1])
+            },
             2,
         ),
     );
@@ -12871,6 +13004,7 @@ fn init_bytearray_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__setitem__",
             |args| {
+                crate::type_methods::arity_exact_unpack(args, "__setitem__", 2)?;
                 crate::baseobjspace::setitem_slot(args[0], args[1], args[2])?;
                 Ok(pyre_object::w_none())
             },
@@ -12883,6 +13017,7 @@ fn init_bytearray_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__delitem__",
             |args| {
+                crate::type_methods::arity_slot(args, 1)?;
                 crate::baseobjspace::delitem_slot(args[0], args[1])?;
                 Ok(pyre_object::w_none())
             },
