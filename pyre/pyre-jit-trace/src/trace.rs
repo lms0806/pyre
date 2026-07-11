@@ -599,6 +599,51 @@ fn dispatch_perfn_frame(
     Some((code_len, walk_result))
 }
 
+/// Select a reconstructed frame's walk-entry JitCode offset: prefer the
+/// guard-carried `jitcode_pc` decoded from the resume frame only when it belongs
+/// to the same JitCode body that will drive the walk. Pyre permits multiple
+/// JitCode bodies per code object, so the carried offset is invalid in another
+/// body's coordinate space. Upstream `resume.py:1050-1051` uses the same
+/// snapshot-selected jitcode for frame construction and its PC. Fall back to
+/// the runtime `resume_jitcode_pc_for` derivation supplied by `derived`.
+/// Gated by `PYRE_M73_ENTRY_CARRY` (off → derivation only); the audit gate
+/// censuses carried-vs-derived disagreements as `M73EntryAudit::RecipeMismatch`.
+fn select_recipe_entry(
+    jitcode_index: i32,
+    body_index: i32,
+    py_pc: usize,
+    carried_jitcode_pc: i32,
+    derived: impl Fn() -> Option<usize>,
+    diag_tag: std::fmt::Arguments<'_>,
+) -> Option<usize> {
+    let carried = (carried_jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC
+        && jitcode_index == body_index)
+        .then(|| {
+            crate::state::resolve_bridge_walk_entry_at(
+                jitcode_index,
+                py_pc as i32,
+                carried_jitcode_pc,
+            )
+        })
+        .flatten();
+    if crate::jitcode_dispatch::m73_entry_carry_enabled()
+        && crate::jitcode_dispatch::m73_entry_audit_enabled()
+    {
+        let derived_entry = derived();
+        if carried != derived_entry {
+            crate::jitcode_dispatch::census_record("M73EntryAudit::RecipeMismatch");
+            eprintln!(
+                "[m73-entry-audit] recipe {diag_tag} carried={carried:?} derived={derived_entry:?}"
+            );
+        }
+    }
+    if crate::jitcode_dispatch::m73_entry_carry_enabled() {
+        carried.or_else(derived)
+    } else {
+        derived()
+    }
+}
+
 /// Issue #215 item 2 (P2 drain): drive a multiframe bridge-carrier resume via
 /// the full-body walker instead of aborting to a no-JIT re-interpret.
 ///
@@ -686,7 +731,18 @@ fn drive_bridge_carrier_walk(
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleePjc");
         return TraceAction::Abort;
     };
-    let Some(entry) = callee_pjc.resume_jitcode_pc_for(recipe.pc) else {
+    let entry = select_recipe_entry(
+        recipe.jitcode_index,
+        callee_pjc.jitcode.index() as i32,
+        recipe.pc,
+        recipe.jitcode_pc,
+        || callee_pjc.resume_jitcode_pc_for(recipe.pc),
+        format_args!(
+            "jitcode_index={} pc={} jitcode_pc={}",
+            recipe.jitcode_index, recipe.pc, recipe.jitcode_pc
+        ),
+    );
+    let Some(entry) = entry else {
         ctx.cut_trace(pre_pos);
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleeEntry");
         return TraceAction::Abort;
@@ -837,7 +893,18 @@ fn drive_bridge_framestack_walk(
         crate::jitcode_dispatch::census_record("P2Framestack::NoCalleePjc");
         return TraceAction::Abort;
     };
-    let Some(entry) = callee_pjc.resume_jitcode_pc_for(recipe.pc) else {
+    let entry = select_recipe_entry(
+        recipe.jitcode_index,
+        callee_pjc.jitcode.index() as i32,
+        recipe.pc,
+        recipe.jitcode_pc,
+        || callee_pjc.resume_jitcode_pc_for(recipe.pc),
+        format_args!(
+            "jitcode_index={} pc={} jitcode_pc={}",
+            recipe.jitcode_index, recipe.pc, recipe.jitcode_pc
+        ),
+    );
+    let Some(entry) = entry else {
         ctx.cut_trace(pre_pos);
         crate::jitcode_dispatch::census_record("P2Framestack::NoCalleeEntry");
         return TraceAction::Abort;
@@ -916,7 +983,14 @@ fn drive_bridge_framestack_walk(
         // `SafeAbortReconstruction` below (correct no-JIT re-interpret).
         if carrier.recipes.len() == 1 {
             if let Some(action) = drive_outer_continuation_and_map(
-                ctx, sym, w_code, root_pc, cf_addr, result, pre_pos,
+                ctx,
+                sym,
+                w_code,
+                root_pc,
+                carrier.root_jitcode_pc,
+                cf_addr,
+                result,
+                pre_pos,
             ) {
                 return action;
             }
@@ -943,12 +1017,20 @@ fn drive_outer_continuation_and_map(
     sym: &mut PyreSym,
     w_code: *const (),
     root_pc: usize,
+    root_jitcode_pc: i32,
     _cf_addr: usize,
     result: majit_ir::OpRef,
     pre_pos: majit_metainterp::recorder::TracePosition,
 ) -> Option<TraceAction> {
     let root_pjc = crate::state::pyjitcode_for_code(w_code)?;
-    let entry = root_pjc.resume_jitcode_pc_for(root_pc)?;
+    let entry = select_recipe_entry(
+        root_pjc.jitcode.index() as i32,
+        root_pjc.jitcode.index() as i32,
+        root_pc,
+        root_jitcode_pc,
+        || root_pjc.resume_jitcode_pc_for(root_pc),
+        format_args!("root pc={root_pc} jitcode_pc={root_jitcode_pc}"),
+    )?;
     // Decode the call-dst register: the op whose `next_pc == entry` is the
     // residual call the outer resumes after; its `>r` dst is the last operand
     // byte (`code[entry-1]`).
@@ -1074,7 +1156,48 @@ fn run_perfn_walk(
         eprintln!("[walk-perfn] no per-CodeObject PyJitCode for code={w_code:?}");
         return None;
     };
-    let Some(pc_map_entry) = pjc.resume_jitcode_pc_for(start_pc) else {
+    // The green stays in Python-bytecode coordinates for merge-point matching;
+    // the codewrite-time trace-entry sidecar carries its JitCode coordinate for
+    // plain-portal function entries and loop headers. A bridge starts at its
+    // guard resume py_pc, outside that sidecar by construction.
+    let is_plain_portal = !ctx.is_bridge_trace;
+    let is_loop_header =
+        !pjc.code_ptr.is_null() && start_pc_is_loop_header(unsafe { &*pjc.code_ptr }, start_pc);
+    let is_entry_green = start_pc == 0 || is_loop_header;
+    let uses_entry_sidecar = is_plain_portal && is_entry_green;
+    let sidecar_entry = pjc.merge_entry_for(start_pc);
+    if crate::jitcode_dispatch::m73_entry_audit_enabled() {
+        if uses_entry_sidecar {
+            let derived = pjc.resume_jitcode_pc_for(start_pc);
+            if sidecar_entry != derived {
+                crate::jitcode_dispatch::census_record("M73EntryAudit::Mismatch");
+                eprintln!(
+                    "[m73-entry-audit] start_pc={start_pc} sidecar={sidecar_entry:?} derived={derived:?}"
+                );
+            }
+        }
+        if ctx.is_bridge_trace && sym.bridge_walk_entry_pc.is_none() {
+            crate::jitcode_dispatch::census_record("M73EntryAudit::BridgeNoCarry");
+            eprintln!("[m73-entry-audit] bridge-no-carry start_pc={start_pc}");
+        }
+    }
+    let carry = crate::jitcode_dispatch::m73_entry_carry_enabled();
+    let pc_map_entry = if carry && sym.bridge_walk_entry_pc.is_some() {
+        // Guard resume with a carried jitcode coordinate: the walk enters at
+        // the carried offset (override below); the entry-marker derivation is
+        // unused, so a py_pc the tables cannot encode must not decline the walk.
+        sym.bridge_walk_entry_pc
+    } else if carry && uses_entry_sidecar {
+        sidecar_entry
+    } else {
+        // Bridge resume: `start_pc` is the guard's py_pc, not a loop-header
+        // green — outside the sidecar by construction. The carried coordinate
+        // for this leg is `sym.bridge_walk_entry_pc` (used below when present);
+        // retiring this residual derivation needs the carried `frame0.jitcode_pc`
+        // generalized to every bridge resume, a separate #73 front.
+        pjc.resume_jitcode_pc_for(start_pc)
+    };
+    let Some(pc_map_entry) = pc_map_entry else {
         // The frozen pc_map of this already-built body does not encode
         // `start_pc` as a resume coordinate, so the same body walked from
         // the same entry recurs identically on every retrace.  Decline the
