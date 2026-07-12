@@ -1220,10 +1220,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 // Value-routing types in `extract_live` order: int scalars,
                 // int array elements, then per virt-array the identity ptr
                 // (Ref) + length (Int), then the appended ref scalars (Ref).
-                // The ptr slot MUST be Ref so the folded loop-invariant
-                // `&state` identity numbers as a ref const (TAGCONST), not an
-                // int const — the resume reader decodes it through `decode_ref`
-                // in both the vable section and the frame ref-liveness.
+                // The ptr slot MUST be Ref so the live `&state` identity is a
+                // Ref failarg (TAGBOX), which the resume reader decodes through
+                // `decode_ref` in both the vable section and the frame
+                // ref-liveness.
                 let mut types: Vec<majit_ir::Type> = Vec::new();
                 for _ in 0..#num_scalars {
                     types.push(majit_ir::Type::Int);
@@ -1404,6 +1404,19 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 // The state struct is a stack-allocated mainloop local —
                 // stable and non-GC. Use its address as the vable identity
                 // heap pointer.
+                Some(self as *const Self as *mut u8)
+            }
+
+            fn blackhole_virtualizable_identity(
+                &self,
+                _meta: &Self::Meta,
+                _virtualizable: &str,
+                _info: &majit_metainterp::virtualizable::VirtualizableInfo,
+            ) -> Option<*mut u8> {
+                // This is intentionally distinct from the PyFrame path:
+                // `state` is the current host-stack object, not a movable GC
+                // object whose trace-time address may be baked into resume
+                // data. At deopt, re-derive its identity from this call.
                 Some(self as *const Self as *mut u8)
             }
 
@@ -2157,7 +2170,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 __all_liveness: &[u8],
                 __virtualizable_boxes: &[majit_ir::OpRef],
                 __virtualref_boxes: &[(majit_ir::OpRef, usize)],
-                __identity_const: Option<i64>,
             ) -> Option<majit_metainterp::recorder::Snapshot> {
                 use majit_metainterp::JitCodeSym as _;
                 if frames.frames.is_empty() {
@@ -2195,7 +2207,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     false,
                     __virtualizable_boxes,
                     __virtualref_boxes,
-                    __identity_const,
                     Some((sym.int_identity_slots_base(), sym.int_identity_slots_end())),
                 );
                 let __root = &mut frames.frames[0];

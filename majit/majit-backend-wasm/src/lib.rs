@@ -50,6 +50,13 @@ fn diag_bump(i: usize) {
     BRIDGE_DIAG[i].fetch_add(1, Ordering::Relaxed);
 }
 
+// A source token is compiled before a later guard may become a CA bridge.
+// Freeze modest room for that bridge at first compilation; a later trace that
+// exceeds either bound is declined rather than changing the live frame's
+// offsets. Fib's bridge needs about 20 positional slots and 8 homes.
+const FROZEN_CHAIN_VALUE_SLOTS: usize = 32;
+const FROZEN_CHAIN_REF_HOMES: usize = 16;
+
 /// An arithmetic op whose result advances a loop-carried numeric value (the
 /// `IntAdd`/`IntSub`/… and float-arithmetic block plus the overflow-checked
 /// variants and the unary `IntNeg`/`IntInvert`). Excludes copies (`SameAs*`),
@@ -449,118 +456,16 @@ pub extern "C" fn wasm_jit_write_barrier(obj: i64) -> i64 {
     0
 }
 
-/// Plain unsynchronized static cell for CA runtime-helper state. These
-/// helpers only ever execute inside the wasm32 guest, which is
-/// single-threaded (native builds compile them for the codegen unit tests
-/// but never call them — `execute_token` requires a wasm host, see the
-/// `func_handle` placeholder arm in `compile_loop`). There is no
-/// thread-locality to model, so `thread_local!` here was asserting a
-/// per-thread identity the state never had; same invariant as the arena
-/// globals in pyre-jit's `call_jit`.
-///
-/// Safety contract for [`GuestCell::get_mut`]: single-threaded caller and no
-/// re-entrant second reference to the same cell while one is live.
-struct GuestCell<T>(std::cell::UnsafeCell<T>);
-unsafe impl<T> Sync for GuestCell<T> {}
-impl<T> GuestCell<T> {
-    const fn new(value: T) -> Self {
-        Self(std::cell::UnsafeCell::new(value))
-    }
-    /// See the safety contract on [`GuestCell`].
-    #[allow(clippy::mut_from_ref)]
-    unsafe fn get_mut(&self) -> &mut T {
-        unsafe { &mut *self.0.get() }
-    }
-}
-
-/// Per-gcmap cache of the contiguous marked-item runs to re-zero on CA
-/// frame reuse: `(gcmap_ptr, &[(first_item, item_count)])`. One gcmap is
-/// built per CA bridge and leaked for the program's life, so a linear
-/// scan over a handful of entries resolves in one pointer compare and
-/// the derived runs can be leaked alongside it.
-static CA_GCMAP_ZERO_RUNS: GuestCell<Vec<(usize, &'static [(usize, usize)])>> =
-    GuestCell::new(Vec::new());
-
-/// CA callee frames as `(frame_addr, alloc_capacity_bytes)`, live-prefix
-/// + pooled-suffix in one Vec: `entries[..live]` are the live frames in
-/// recursion order (mirroring the CA entries on the jf shadow stack) and
-/// `entries[live..]` is the LIFO reuse pool with its top at
-/// `entries[live]`. Strict CA recursion order means a returning frame is
-/// retired IN PLACE by decrementing `live` and the next call revives it
-/// by incrementing `live` back, so alloc and pop each touch this single
-/// static once and steady-state recursion performs no allocator calls at
-/// all. Entries stay registered as libc jitframes and are never freed
-/// (bounded by peak recursion depth).
-static CA_FRAMES: GuestCell<CaFrames> = GuestCell::new(CaFrames {
-    entries: Vec::new(),
-    live: 0,
-});
-
-/// Backing store for [`CA_FRAMES`]: `entries[..live]` live, `entries[live..]`
-/// pooled (top at `entries[live]`).
-struct CaFrames {
-    entries: Vec<(usize, usize)>,
-    live: usize,
-}
-
-/// Contiguous runs of gcmap-marked jf_frame items for a CA callee gcmap, as
-/// `(first_item, item_count)` pairs — the slots [`wasm_jit_ca_alloc_frame`]
-/// must re-zero when reusing a pooled frame. Derived once per gcmap (built by
-/// [`build_callee_gcmap`], leaked per bridge) and cached: the marked items are
-/// the CA input slots and the Ref-home region, i.e. two dense runs, so frame
-/// reuse re-zeroes them with a couple of bulk `memory.fill`s instead of either
-/// a whole-frame memset or a per-bit scatter loop (both measurably slower).
-fn ca_gcmap_zero_runs(gcmap_ptr: usize) -> &'static [(usize, usize)] {
-    let cache = unsafe { CA_GCMAP_ZERO_RUNS.get_mut() };
-    if let Some(&(_, runs)) = cache.iter().find(|&&(p, _)| p == gcmap_ptr) {
-        return runs;
-    }
-    // Marked items sit one per 8-byte slot at Signed (4-byte on wasm32)
-    // item granularity, i.e. stride 2 — never bit-contiguous. Merging
-    // across small gaps turns each dense region (inputs, homes) into one
-    // run; zeroing the unmarked gap items is sound (a strict subset of
-    // the whole-frame zero this replaces).
-    const MERGE_SLACK: usize = 16;
-    let mut runs: Vec<(usize, usize)> = Vec::new();
-    unsafe {
-        let gcmap = gcmap_ptr as *const usize;
-        let num_words = *gcmap;
-        let bits_per_word = usize::BITS as usize;
-        for w in 0..num_words {
-            let mut word = *gcmap.add(1 + w);
-            while word != 0 {
-                let bit = word.trailing_zeros() as usize;
-                word &= word - 1;
-                let item = w * bits_per_word + bit;
-                match runs.last_mut() {
-                    Some((first, count)) if item <= *first + *count + MERGE_SLACK => {
-                        *count = item - *first + 1;
-                    }
-                    _ => runs.push((item, 1)),
-                }
-            }
-        }
-    }
-    let leaked: &'static [(usize, usize)] = Box::leak(runs.into_boxed_slice());
-    cache.push((gcmap_ptr, leaked));
-    leaked
-}
-
 /// Self-recursive CALL_ASSEMBLER (`PYRE_WASM_CA`) callee-frame allocation
-/// helper. Allocates the callee's execution frame as a **libc-jitframe**
-/// (malloc memory, like dynasm's `execute_token` calloc frames — registered
-/// via `register_libc_jitframe` so the collector's jf-root walk traces its
-/// gcmap-marked Ref slots), initializes its header + per-frame `jf_gcmap`
-/// (covering the callee's input + home Ref slots), and pushes it on the
-/// jitframe shadow stack so a mid-recursion collection forwards those Refs
-/// via the registered libc-jitframe tracer. Malloc (not nursery/old-gen)
-/// keeps the frame non-moving AND off the GC's `bytes_made_old_since_cycle`
-/// accounting — a per-call old-gen frame made every recursion level look
-/// like heap growth and drove back-to-back major collections (fib: 1704
-/// majors for one bench run). Frames are pooled LIFO on pop and re-zeroed on
-/// reuse, so steady-state recursion performs no allocator calls at all.
-/// Returns the frame base (codegen adds `FIRST_ITEM_OFFSET` for the
-/// bespoke-layout frame pointer), or 0 on allocation failure.
+/// helper. Allocates the callee's execution frame as a young nursery
+/// GC-managed `JitFrame`, mirroring rewrite.py's nursery frame allocation:
+/// steady recursive frames die young, while only frames alive across a
+/// collection are promoted. The frame is traced through the jitframe type id's
+/// custom trace using its per-frame `jf_gcmap`, rooted by pushing it on the
+/// jitframe shadow stack, and reloaded after the recursive call because a
+/// nursery frame may move. Returns the frame base (codegen adds
+/// `FIRST_ITEM_OFFSET` for the bespoke-layout frame pointer), or 0 on
+/// allocation failure.
 ///
 /// Each callee frame self-describes through its own per-frame gcmap, so
 /// mixed-geometry frames from distinct CA bridges are each forwarded by their
@@ -569,105 +474,81 @@ fn ca_gcmap_zero_runs(gcmap_ptr: usize) -> &'static [(usize, usize)] {
 pub extern "C" fn wasm_jit_ca_alloc_frame(frame_bytes: i64, gcmap_ptr: i64) -> i64 {
     use majit_backend::jitframe::JitFrame;
     let depth = frame_bytes as usize / std::mem::size_of::<isize>();
-    let alloc_size = JitFrame::alloc_size(depth);
-    // Reuse the pool top (`entries[live]`) when it is large enough (`>=` also
-    // covers a smaller bridge nesting inside a larger one) by reviving it in
-    // place — bump `live`. A too-small top is left in place: the fresh frame
-    // is inserted at `live`, becoming the new live top with the old pool top
-    // right below it in LIFO order.
-    // `(frame_addr, needs_rezero)`: a revived pool frame carries the previous
-    // run's bytes; a fresh `alloc_zeroed` frame does not.
-    let got = {
-        let f = unsafe { CA_FRAMES.get_mut() };
-        if let Some(&(addr, _)) = f.entries.get(f.live).filter(|&&(_, cap)| cap >= alloc_size) {
-            f.live += 1;
-            Some((addr, true))
-        } else {
-            let layout = std::alloc::Layout::from_size_align(alloc_size, 16)
-                .expect("CA frame layout overflow");
-            let p = unsafe { std::alloc::alloc_zeroed(layout) };
-            if p.is_null() {
-                None
-            } else {
-                majit_gc::shadow_stack::register_libc_jitframe(p as usize);
-                let live = f.live;
-                f.entries.insert(live, (p as usize, alloc_size));
-                f.live += 1;
-                Some((p as usize, false))
-            }
-        }
-    };
-    let addr = match got {
-        Some((addr, true)) => {
-            // Re-zero only what a reused frame must present as zeroed:
-            //   * the JitFrame header — `JitFrame::init` writes only
-            //     jf_frame_info + the jf_frame length and relies on the other
-            //     header fields (jf_descr, jf_guard_exc, jf_forward, ...)
-            //     being zero (jitframe.py:48-52 "other fields are zero from
-            //     malloc"), and
-            //   * the gcmap-marked items — stale Refs from a previous run
-            //     must not reach the jf-root tracer, and the trace's
-            //     store-on-def home discipline assumes null-initialized homes.
-            // Every unmarked jf_frame slot is trace data the compiled code
-            // writes before any read (inputs by the CA arm, outputs/spills by
-            // the trace itself), so its stale bytes are unobservable. The
-            // marked items form contiguous runs (the input slots and the
-            // Ref-home region), pre-derived per gcmap by
-            // [`ca_gcmap_zero_runs`], so this is a couple of small
-            // `memory.fill`s instead of the whole `alloc_size` (which was
-            // ~35% of a recursive CALL_ASSEMBLER call).
-            use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JITFRAME_FIXED_SIZE, SIGN_SIZE};
-            unsafe {
-                std::ptr::write_bytes(addr as *mut u8, 0, JITFRAME_FIXED_SIZE);
-                let items = (addr + FIRST_ITEM_OFFSET) as *mut u8;
-                for &(first, count) in ca_gcmap_zero_runs(gcmap_ptr as usize) {
-                    std::ptr::write_bytes(items.add(first * SIGN_SIZE), 0, count * SIGN_SIZE);
-                }
-            }
-            addr
-        }
-        Some((addr, false)) => addr,
-        None => return 0,
-    };
-    let jf = addr as *mut JitFrame;
+    // Slice A1: collecting nursery allocation, matching rewrite.py's
+    // `gen_malloc_nursery_varsize_frame`. The caller frame remains rooted at
+    // the shadow-stack top during a collection; wasm reloads it from there
+    // after this call, then this freshly allocated callee is pushed below its
+    // own execution. Steady recursive frames die young; only frames that live
+    // through a collection are promoted instead of inflating the old-gen major
+    // collection threshold on every call.
+    let jf_ref = WASM_ACTIVE_GC.with(|cell| match cell.borrow_mut().as_deref_mut() {
+        Some(gc) => gc.alloc_nursery_typed(wasm_jitframe_tid(), JitFrame::alloc_size(depth)),
+        None => GcRef(0),
+    });
+    if jf_ref.0 == 0 {
+        return 0;
+    }
+    let jf = jf_ref.0 as *mut JitFrame;
     unsafe {
         JitFrame::init(jf, std::ptr::null(), depth);
         (*jf).jf_gcmap = gcmap_ptr as *const u8;
     }
-    majit_gc::shadow_stack::push_jf(GcRef(addr));
-    addr as i64
+    majit_gc::shadow_stack::push_jf(jf_ref);
+    jf_ref.0 as i64
 }
 
 /// Companion to [`wasm_jit_ca_alloc_frame`]: pop the top jitframe shadow-stack
-/// entry on CA-arm exit (the callee frame just ran to finish/deopt) and retire
-/// the frame into the reuse pool — in place, by decrementing the [`CA_FRAMES`]
-/// live watermark. The CA recursion is strict LIFO — each level pushes one
-/// frame before its `call_indirect` and pops after, and a deopt resume runs on
-/// the host's own shadow stack — so removing the top entry releases exactly
+/// entry on CA-arm exit. The CA recursion is strict LIFO — each level pushes
+/// one frame before its `call_indirect` and pops after, and a deopt resume runs
+/// on the host's own shadow stack — so removing the top entry releases exactly
 /// this callee's frame.
 pub extern "C" fn wasm_jit_ca_pop_frame(_frame_base: i64) -> i64 {
     majit_gc::shadow_stack::pop_jf_top();
-    let f = unsafe { CA_FRAMES.get_mut() };
-    f.live = f.live.saturating_sub(1);
     0
 }
 
-/// Build the per-frame `jf_gcmap` for a CA callee frame: mark the CA input slots
-/// (`v64` + `ec`, at `FRAME_SLOT_BASE`) AND the surviving home slots (Refs live
-/// across collecting calls), in the `JitFrame`'s Signed-granular item indexing
-/// (see [`build_home_gcmap`] for the wasm32 layout). Unlike the host-entry frame
-/// F0 (homes only), a callee frame keeps its virtualizable `v64` in an input slot
-/// (never homed by the loop), so the input slots are roots too. Returned buffer
-/// is leaked by the caller (one per bridge) and lives for the program's life.
-fn build_callee_gcmap(input_count: usize, home_count: usize) -> Box<[usize]> {
+/// Reload the current CA callee frame pointer after a recursive call. The GC
+/// may have moved the callee frame during the recursive call; `jf_top_ptr()`
+/// reads the forwarded base from the jitframe shadow-stack slot. At this point
+/// this recursion level's frame is the top — deeper levels have already popped.
+/// Analog of `_reload_frame_if_necessary`; returns the ITEMS base held in the
+/// CA arm's `ca_cfp_local`.
+pub extern "C" fn wasm_jit_ca_reload_frame() -> i64 {
+    majit_gc::shadow_stack::jf_top_ptr().0 as i64
+        + majit_backend::jitframe::FIRST_ITEM_OFFSET as i64
+}
+
+/// Reload the CA caller's frame pointer after the callee-frame allocation.
+/// The allocation occurs before the callee is pushed, so while the callee is
+/// live the caller remains one entry below the shadow-stack top. Returns that
+/// caller's ITEMS base for local 0.
+pub extern "C" fn wasm_jit_ca_reload_caller_frame() -> i64 {
+    majit_gc::shadow_stack::jf_under_top_ptr().0 as i64
+        + majit_backend::jitframe::FIRST_ITEM_OFFSET as i64
+}
+
+/// Build the per-frame `jf_gcmap` for a CA callee frame: mark the input slots
+/// (at `FRAME_SLOT_BASE`) and the home slots (at `HOME_SLOT_BASE`), in the
+/// `JitFrame`'s Signed-granular item indexing (see [`build_home_gcmap`] for the
+/// wasm32 layout). The collector's `is_nursery_object_start` gate skips any
+/// marked slot that does not hold a live nursery object base, so a slot holding
+/// a scalar or an already-promoted Ref is traced harmlessly.
+///
+/// Returned buffer is leaked by the caller (one per bridge) and lives for the
+/// program's life.
+fn build_callee_gcmap(
+    input_types: &[majit_ir::Type],
+    frame: codegen::FrameGeometry,
+) -> Box<[usize]> {
     let sign = std::mem::size_of::<isize>();
     let bits_per_word = std::mem::size_of::<usize>() * 8;
-    let mut indices: Vec<usize> = Vec::with_capacity(input_count + home_count);
+    let input_count = input_types.len();
+    let mut indices: Vec<usize> = Vec::with_capacity(input_count + frame.home_slots);
     for i in 0..input_count {
         indices.push((codegen::FRAME_SLOT_BASE as usize + i * 8) / sign);
     }
-    for h in 0..home_count {
-        indices.push((codegen::HOME_SLOT_BASE as usize + h * 8) / sign);
+    for h in 0..frame.home_slots {
+        indices.push((frame.home_slot_base as usize + h * 8) / sign);
     }
     let max_index = indices.iter().copied().max().unwrap_or(0);
     let num_words = max_index / bits_per_word + 1;
@@ -767,8 +648,7 @@ pub fn set_wasm_jitframe_tid(id: u32) {
     WASM_JITFRAME_TID.store(id, std::sync::atomic::Ordering::Relaxed);
 }
 
-// Only read on the wasm32 execute_token path (CA frame allocs use libc
-// jitframes and no longer consume the tid).
+// Only read on the wasm32 execute_token path and by CA callee-frame allocation.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn wasm_jitframe_tid() -> u32 {
     WASM_JITFRAME_TID.load(std::sync::atomic::Ordering::Relaxed)
@@ -793,19 +673,19 @@ fn wasm_jitframe_tid() -> u32 {
         reason = "native test builds compile the wasm backend without running wasm frame entry"
     )
 )]
-fn build_home_gcmap(home_count: usize) -> Box<[usize]> {
+fn build_home_gcmap(frame: codegen::FrameGeometry) -> Box<[usize]> {
     let sign = std::mem::size_of::<isize>();
     let bits_per_word = std::mem::size_of::<usize>() * 8;
-    if home_count == 0 {
+    if frame.home_slots == 0 {
         // One empty data word: a non-null jf_gcmap that traces nothing.
         return vec![1usize, 0usize].into_boxed_slice();
     }
-    let last_index = (codegen::HOME_SLOT_BASE as usize + (home_count - 1) * 8) / sign;
+    let last_index = (frame.home_slot_base as usize + (frame.home_slots - 1) * 8) / sign;
     let num_words = last_index / bits_per_word + 1;
     let mut buf = vec![0usize; 1 + num_words];
     buf[0] = num_words;
-    for h in 0..home_count {
-        let index = (codegen::HOME_SLOT_BASE as usize + h * 8) / sign;
+    for h in 0..frame.home_slots {
+        let index = (frame.home_slot_base as usize + h * 8) / sign;
         buf[1 + index / bits_per_word] |= 1usize << (index % bits_per_word);
     }
     buf.into_boxed_slice()
@@ -1268,6 +1148,14 @@ impl majit_backend::Backend for WasmBackend {
         let alloc_fn_ptr = wasm_jit_alloc as *const () as usize as i64;
         let alloc_array_fn_ptr = wasm_jit_alloc_array as *const () as usize as i64;
         let wb_fn_ptr = wasm_jit_write_barrier as *const () as usize as i64;
+        // Freeze this token's generated frame layout at first compilation.
+        // `jitframe.py` sizes native JitFrames as `JITFRAME_FIXED_SIZE +
+        // frame_depth`; wasm CA frames follow the same per-token depth instead
+        // of inheriting the host arena's call-area floor.
+        let frame = codegen::FrameGeometry::compact(
+            codegen::frame_value_slots(inputargs, ops).max(FROZEN_CHAIN_VALUE_SLOTS),
+            codegen::count_ref_homes(inputargs, ops).max(FROZEN_CHAIN_REF_HOMES),
+        );
         // Exit indices come from the global fail-index space so a cross-trace
         // chain's `frame[0]` resolves regardless of which module wrote it
         // (`failguard::FAIL_DESCR_REGISTRY`).
@@ -1287,7 +1175,13 @@ impl majit_backend::Backend for WasmBackend {
                 fail_index_base,
                 0, // external_jump_slot: a loop's JUMP is a local back-edge `br`
                 0, // external_jump_key: unused without an external JUMP
-                codegen::CaParams::default(), // a loop never emits the CA arm
+                frame,
+                codegen::CaParams {
+                    // Loops do not emit the CA arm, but they can run on a
+                    // nursery CA frame and must reload local 0 after a collect.
+                    ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
+                    ..codegen::CaParams::default()
+                },
             )?;
 
         // Build fail descriptors
@@ -1412,7 +1306,7 @@ impl majit_backend::Backend for WasmBackend {
                         num_args: label_num_args[j],
                         resume_safe: label_resume_safe[j],
                         is_last_label: j == last,
-                        num_ref_homes,
+                        frame,
                     },
                 );
             }
@@ -1429,7 +1323,7 @@ impl majit_backend::Backend for WasmBackend {
                         // an entry re-run lands at the header without any
                         // advancing segment — the livelock check applies.
                         is_last_label: true,
-                        num_ref_homes,
+                        frame,
                     },
                 );
             }
@@ -1443,6 +1337,7 @@ impl majit_backend::Backend for WasmBackend {
             num_inputs: inputargs.len(),
             max_output_slots,
             num_ref_homes,
+            frame,
             bridge_cells_base,
             num_guard_cells: guard_exits.len(),
             has_preamble,
@@ -1452,7 +1347,6 @@ impl majit_backend::Backend for WasmBackend {
             chained_trace_meta: std::cell::RefCell::new(std::collections::HashMap::new()),
             _bridge_cells_owner: bridge_cells_owner,
             _bridge_owned_cells: std::cell::RefCell::new(Vec::new()),
-            ca_bridge_ref_homes: std::cell::Cell::new(0),
             ca_active: std::cell::Cell::new(false),
         };
 
@@ -1552,11 +1446,10 @@ impl majit_backend::Backend for WasmBackend {
         let (
             source_guard,
             source_is_direct,
-            source_num_ref_homes,
             source_func_handle,
             source_has_preamble,
-            source_max_output_slots,
-            source_num_inputs,
+            source_frame,
+            source_input_types,
             source_loop_finish_fi,
             source_compiled_ptr,
             source_ca_active,
@@ -1618,11 +1511,10 @@ impl majit_backend::Backend for WasmBackend {
             (
                 guard,
                 is_direct,
-                source_loop.num_ref_homes,
                 source_loop.func_handle,
                 source_loop.has_preamble,
-                source_loop.max_output_slots,
-                source_loop.num_inputs,
+                source_loop.frame,
+                source_loop.input_types.clone(),
                 loop_finish_fi,
                 // Address of the source loop's metadata, baked into the CA arm
                 // (opaque cookie in the deopt-helper ABI; `frame[0]` resolution
@@ -1669,6 +1561,25 @@ impl majit_backend::Backend for WasmBackend {
             ));
         }
 
+        // A chained bridge executes in the source token's *same* frame. Its
+        // offsets are frozen when that token is compiled, so accept it only if
+        // its positional spill region and Ref-home region fit exactly within
+        // that layout. Declining here preserves the normal blackhole fallback;
+        // it is never safe to grow an already-allocated CA frame underneath a
+        // later bridge.
+        let bridge_value_slots = codegen::frame_value_slots(inputargs, ops);
+        let bridge_ref_homes = codegen::count_ref_homes(inputargs, ops);
+        if bridge_value_slots > source_frame.value_slots
+            || bridge_ref_homes > source_frame.home_slots
+        {
+            diag_bump(4);
+            return Err(BackendError::Unsupported(format!(
+                "wasm backend: bridge frame needs values={bridge_value_slots}, homes={bridge_ref_homes}; \
+                 source frozen layout has values={}, homes={}",
+                source_frame.value_slots, source_frame.home_slots,
+            )));
+        }
+
         // A loop-closing bridge (terminal JUMP, no local LABEL) re-enters the
         // source loop through `source_func_handle` — the function entry. For a
         // peeled source loop, entering at the function entry re-runs the preamble
@@ -1712,15 +1623,8 @@ impl majit_backend::Backend for WasmBackend {
         // reads exactly that many positional frame slots), the label's args
         // are not the complete live set of the target trace's remainder
         // (`resume_safe` — resuming there would read a null local), or the
-        // target loop's Ref-home region exceeds what the chain's entry frame
-        // is guaranteed to carry (`max(source homes, FRAME_REF_HOME_FLOOR)` —
-        // the frame `execute_token` sized for the loop the chain entered
-        // through; requiring target ≤ that bound keeps every hop within the
-        // entry frame by induction, since the entry frame itself is sized to
-        // at least the floor). Ref homes are the only variable requirement:
-        // value slots are bounded by codegen's `CALL_AREA_FIRST_SLOT` decline,
-        // below the constant `MIN_FRAME_BYTES / 8` value region every host
-        // frame carries. A declined guard falls back to blackhole resume and
+        // target loop's frozen frame geometry differs from the source frame.
+        // A declined guard falls back to blackhole resume and
         // `declined_bridge_guards` stops the metainterp re-tracing it.
         let mut external_jump_key: u32 = 0;
         let mut external_jump_slot: u32 = source_func_handle;
@@ -1750,11 +1654,8 @@ impl majit_backend::Backend for WasmBackend {
                     diag_bump(9); // label args not the full live set
                     false
                 }
-                Some(t)
-                    if t.num_ref_homes
-                        > source_num_ref_homes.max(failguard::FRAME_REF_HOME_FLOOR) =>
-                {
-                    diag_bump(4); // target Ref homes exceed the entry frame's bound
+                Some(t) if t.frame != source_frame => {
+                    diag_bump(4); // target uses different frozen frame offsets
                     false
                 }
                 Some(t) => {
@@ -1869,68 +1770,39 @@ impl majit_backend::Backend for WasmBackend {
         let alloc_array_fn_ptr = wasm_jit_alloc_array as *const () as usize as i64;
         let wb_fn_ptr = wasm_jit_write_barrier as *const () as usize as i64;
 
-        // Self-recursive CALL_ASSEMBLER (PYRE_WASM_CA): the CA arm bump-allocates
-        // a fresh callee frame per recursive `call_indirect` into the source
-        // loop. Size it for the source loop's frame layout (base_slots + the
-        // dispatch-key slot + surviving ref-home region, mirroring
-        // `execute_token`);
-        // `build_wasm_module` widens it to also fit THIS bridge, which reuses the
-        // same frame when the loop's guard-exit chains back into it.
-        // This bridge materializes the recursive callee frame and homes any
-        // bridge Refs live across collecting calls in the SAME arena frame the
-        // source loop runs on, store-on-def'ing at its OWN dense home indices. A
-        // self-recursive fib bridge may reserve more surviving homes than the
-        // source loop, so the arena frame and the GC walker must cover the WIDER
-        // of the two: otherwise a bridge home (index >= `source_num_ref_homes`)
-        // lands past the frame's walked region and a minor collection
-        // mid-recursion reclaims it, leaving a later deopt to read zeroed nursery
-        // memory. `count_ref_homes` matches the CA-enabled `num_ref_homes`
-        // `build_wasm_module` returns below.
-        //
-        // The recursion can also chain into NESTED bridges (and sibling loops via
-        // loop-closing tail calls) while running ON a CA callee frame — and those
-        // were accepted against the `FRAME_REF_HOME_FLOOR` bound `execute_token`
-        // guarantees for HOST frames. The callee frame must give the same
-        // guarantee, or a chained bridge homes/reads Ref slots past the frame's
-        // sized (and gcmap-walked) region — wrong-value corruption (suite
-        // `recursion_memo_branch` / `generator_tree_recursion`). Mirror
-        // `execute_token`'s `chain_floor`.
-        let chain_floor = failguard::FRAME_REF_HOME_FLOOR;
-        let ca_ref_homes = if allow_ca {
-            source_num_ref_homes
-                .max(codegen::count_ref_homes(inputargs, ops))
-                .max(chain_floor)
-        } else {
-            source_num_ref_homes
-        };
+        // Self-recursive CALL_ASSEMBLER (PYRE_WASM_CA): the CA arm allocates a
+        // fresh callee using the source token's frozen geometry. The earlier
+        // frame-fit decline guarantees this bridge uses those same offsets.
         let ca_params = if allow_ca {
-            let min_slots = (codegen::MIN_FRAME_BYTES / 8) as u32;
-            let src_base_slots =
-                min_slots.max(1 + source_max_output_slots.max(source_num_inputs) as u32);
-            let src_frame_slots = src_base_slots + 1 + ca_ref_homes as u32;
-            // Per-bridge callee-frame gcmap (input + home Ref slots), leaked to
-            // live for the program — each callee frame's `jf_gcmap` points at it.
+            // Per-bridge callee-frame gcmap (real Ref inputs + home Ref slots),
+            // leaked to live for the program — each callee frame's `jf_gcmap`
+            // points at it.
             let callee_gcmap_ptr =
-                Box::leak(build_callee_gcmap(source_num_inputs as usize, ca_ref_homes)).as_ptr()
-                    as i64;
+                Box::leak(build_callee_gcmap(&source_input_types, source_frame)).as_ptr() as i64;
             codegen::CaParams {
                 emit_ca: true,
-                callee_frame_bytes: src_frame_slots * 8,
+                callee_frame_bytes: source_frame.frame_bytes,
                 loop_finish_fi: source_loop_finish_fi,
                 deopt_helper_slot: ca_deopt_helper_slot(),
                 source_compiled_ptr,
                 ca_alloc_fn_ptr: wasm_jit_ca_alloc_frame as *const () as usize as i64,
                 ca_pop_fn_ptr: wasm_jit_ca_pop_frame as *const () as usize as i64,
+                ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
+                ca_reload_caller_fn_ptr: wasm_jit_ca_reload_caller_frame as *const () as usize
+                    as i64,
                 callee_gcmap_ptr,
             }
         } else {
-            codegen::CaParams::default()
+            codegen::CaParams {
+                ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
+                ..codegen::CaParams::default()
+            }
         };
 
         // This bridge's exit indices come from the global fail-index space,
         // like every trace's (`failguard::FAIL_DESCR_REGISTRY`).
         let base = fail_descr_base();
-        let (wasm_bytes, guard_exits, num_ref_homes, bridge_cells_base, bridge_cells_owner) =
+        let (wasm_bytes, guard_exits, _num_ref_homes, bridge_cells_base, bridge_cells_owner) =
             codegen::build_wasm_module(
                 inputargs,
                 ops,
@@ -1949,34 +1821,9 @@ impl majit_backend::Backend for WasmBackend {
                 // `external_jump_key` selects.
                 external_jump_slot,
                 external_jump_key,
+                source_frame,
                 ca_params,
             )?;
-
-        // The bridge runs in the chain's entry frame, so it must not address
-        // more Ref-home slots than that frame is guaranteed to carry —
-        // `max(source loop's homes, FRAME_REF_HOME_FLOOR)`, the same inductive
-        // bound as the JUMP-target check above. If it would, decline: the host
-        // round-trip path allocates a frame sized for the bridge.
-        // The bridge's value/output slots need no separate bound check:
-        // `build_wasm_module` already declined this bridge (above, via `?`) if
-        // its value slots reach `CALL_AREA_FIRST_SLOT` (codegen.rs), and
-        // `execute_token` floors the frame at `MIN_FRAME_BYTES/8` slots — which
-        // exceeds `CALL_AREA_FIRST_SLOT` — before the Ref-home region, so every
-        // in-bounds value-slot write lands strictly below both the call area and
-        // the home roots regardless of how the bridge's exit arity compares to
-        // the source loop's `max_output_slots`.
-        // A self-recursive CALL_ASSEMBLER bridge (`allow_ca`) is exempt: its
-        // recursive calls run in arena callee frames sized for it
-        // (`callee_frame_bytes`), and the outermost call runs in the host entry
-        // frame `F0`, which `execute_token` widens via `ca_bridge_ref_homes`
-        // (set below). So its home writes never overflow.
-        if !allow_ca && num_ref_homes > source_num_ref_homes.max(failguard::FRAME_REF_HOME_FLOOR) {
-            diag_bump(4); // declined: ref-home overflow
-            return Err(BackendError::Unsupported(format!(
-                "wasm backend: bridge needs {num_ref_homes} ref homes, entry frame bound is \
-                 max({source_num_ref_homes}, floor)"
-            )));
-        }
 
         // Bridge exit descrs (fail_index already base-offset by build_wasm_module).
         let bridge_descrs: Vec<Arc<WasmFailDescr>> = guard_exits
@@ -2057,13 +1904,7 @@ impl majit_backend::Backend for WasmBackend {
             if let Some(owner) = bridge_cells_owner {
                 source_loop._bridge_owned_cells.borrow_mut().push(owner);
             }
-            // A self-recursive CALL_ASSEMBLER bridge runs its outermost call in
-            // the loop's host entry frame `F0`. Record its (possibly larger)
-            // home count so `execute_token` sizes `F0` and registers GC roots for
-            // it, not just the loop's own homes.
             if allow_ca {
-                let prev = source_loop.ca_bridge_ref_homes.get();
-                source_loop.ca_bridge_ref_homes.set(prev.max(num_ref_homes));
                 // Freeze this recursion to the CA mechanism: no further bridge
                 // chains here (see the decline above the codegen call).
                 source_loop.ca_active.set(true);
@@ -2297,22 +2138,15 @@ impl majit_backend::Backend for WasmBackend {
         // and the Ref-home region (now at HOME_SLOT_BASE = MIN_FRAME_BYTES + 8).
         // `vec![0i64]` zeroes it, so a fresh host entry reads key 0 (preamble).
         //
-        // A self-recursive CALL_ASSEMBLER bridge runs its outermost call in this
-        // frame and may home more collection-live Refs than the loop, so size
-        // for the LARGER of the two (`ca_bridge_ref_homes`); the extra slots are
-        // zeroed and GC-rooted below exactly like the loop's own homes.
-        // A cross-trace tail call can land in a loop or bridge homing more Refs
-        // than this one, so also size at least `FRAME_REF_HOME_FLOOR` — the bound
-        // `compile_bridge`'s frame-fit accept checks rely on.
-        let chain_floor = failguard::FRAME_REF_HOME_FLOOR;
-        let eff_ref_homes = compiled
-            .num_ref_homes
-            .max(compiled.ca_bridge_ref_homes.get())
-            .max(chain_floor);
-        let frame_size = base_slots + 1 + eff_ref_homes;
+        // The host/arena allocation deliberately retains its historical floor:
+        // any token may run here. Generated code, however, addresses only the
+        // compact offsets frozen on `compiled.frame`; all chained bridges use
+        // that same geometry or are declined at compile time.
+        let _ = base_slots;
+        let frame_size = min_slots.max((compiled.frame.frame_bytes as usize).div_ceil(8));
         #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
         {
-            let _ = (frame_size, eff_ref_homes, args);
+            let _ = (frame_size, args);
             panic!("wasm backend execute_token requires a wasm host");
         }
         #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
@@ -2351,7 +2185,7 @@ impl majit_backend::Backend for WasmBackend {
                 // Per-loop gcmap over the surviving Ref-home region. Held in this
                 // stack frame (jf_gcmap points at it) until the outputs are read
                 // after the trace returns.
-                let gcmap = build_home_gcmap(eff_ref_homes);
+                let gcmap = build_home_gcmap(compiled.frame);
                 unsafe { (*jf).jf_gcmap = gcmap.as_ptr() as *const u8 };
 
                 let items_base = jf as usize + FIRST_ITEM_OFFSET;
@@ -2412,13 +2246,13 @@ impl majit_backend::Backend for WasmBackend {
                 };
             }
             let frame_ptr = frame.as_mut_ptr() as usize as u32;
-            let home_base = codegen::HOME_SLOT_BASE as usize / 8;
-            for h in 0..eff_ref_homes {
+            let home_base = compiled.frame.home_slot_base as usize / 8;
+            for h in 0..compiled.frame.home_slots {
                 let slot = unsafe { frame.as_mut_ptr().add(home_base + h) } as *mut GcRef;
                 unsafe { wasm_gc_add_root(slot) };
             }
             glue::execute(compiled.func_handle, frame_ptr);
-            for h in 0..eff_ref_homes {
+            for h in 0..compiled.frame.home_slots {
                 let slot = unsafe { frame.as_mut_ptr().add(home_base + h) } as *mut GcRef;
                 wasm_gc_remove_root(slot);
             }
