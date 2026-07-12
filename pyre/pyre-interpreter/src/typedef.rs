@@ -3180,11 +3180,16 @@ fn init_dict_type(ns: &mut DictStorage) {
                     let backing = crate::type_methods::resolve_dict_backing(o);
                     if backing.is_null() { o } else { backing }
                 };
-                crate::baseobjspace::compare(
-                    resolve(args[0]),
-                    resolve(args[1]),
-                    crate::baseobjspace::CompareOp::Eq,
-                )
+                let a = resolve(args[0]);
+                let b = resolve(args[1]);
+                // `dictmultiobject.py descr_eq`: a non-dict operand yields
+                // NotImplemented. Handing it to `compare` would re-dispatch
+                // to this `__eq__` (the operand is not a dict for compare's
+                // fast path) and recurse.
+                if !unsafe { pyre_object::is_dict(b) } {
+                    return Ok(pyre_object::w_not_implemented());
+                }
+                crate::baseobjspace::compare(a, b, crate::baseobjspace::CompareOp::Eq)
             },
             2,
         ),
@@ -4750,10 +4755,17 @@ fn init_mappingproxy_type(ns: &mut DictStorage) {
         args: &[PyObjectRef],
         op: crate::baseobjspace::CompareOp,
     ) -> Result<PyObjectRef, crate::PyError> {
-        if args.len() < 2 {
-            return Ok(pyre_object::w_bool_from(false));
-        }
-        crate::baseobjspace::compare(args[0], args[1], op)
+        crate::type_methods::arity_slot(args, 1)?;
+        // descr_op → getattr(space, op)(self.w_mapping, w_other): the
+        // comparison runs on the wrapped mapping, not the proxy itself.
+        let self_mapping = unsafe {
+            if pyre_object::is_dict_proxy(args[0]) {
+                pyre_object::w_dict_proxy_get_mapping(args[0])
+            } else {
+                args[0]
+            }
+        };
+        crate::baseobjspace::compare(self_mapping, args[1], op)
     }
     fn proxy_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         cmp_helper(args, crate::baseobjspace::CompareOp::Eq)
@@ -9414,9 +9426,8 @@ fn init_object_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__eq__",
             |args| {
-                Ok(pyre_object::w_bool_from(
-                    args.len() >= 2 && std::ptr::eq(args[0], args[1]),
-                ))
+                crate::type_methods::arity_slot(args, 1)?;
+                Ok(pyre_object::w_bool_from(std::ptr::eq(args[0], args[1])))
             },
             2,
         ),
@@ -9431,9 +9442,7 @@ fn init_object_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__ne__",
             |args| {
-                if args.len() < 2 {
-                    return Ok(pyre_object::w_bool_from(true));
-                }
+                crate::type_methods::arity_slot(args, 1)?;
                 let eq = crate::baseobjspace::compare(
                     args[0],
                     args[1],
