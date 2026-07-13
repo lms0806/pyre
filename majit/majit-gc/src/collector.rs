@@ -3205,6 +3205,10 @@ impl GcAllocator for MiniMarkGC {
         self.is_valid_gc_object(addr) && (self.nursery.contains(addr) || self.oldgen.contains(addr))
     }
 
+    fn is_nursery_object(&self, addr: usize) -> bool {
+        self.is_nursery_object_start(addr)
+    }
+
     fn write_barrier(&mut self, obj: GcRef) {
         self.do_write_barrier(obj);
     }

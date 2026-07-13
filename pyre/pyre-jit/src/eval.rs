@@ -726,26 +726,26 @@ unsafe fn memoryview_object_destructor(obj_addr: usize) {
 /// express two of those slots: the `locals_cells_stack_w` items when the
 /// array is a stationary `std::alloc` block (regime-a — the collector
 /// never enters `trace_and_update_object` on a non-nursery array so its
-/// varsize walker never runs), and the `debugdata->{w_locals, w_f_trace}`
-/// refs, which live one pointer indirection away inside a non-GC
-/// `malloc`'d `FrameDebugData`.  Both require a custom trace.
+/// varsize walker never runs), and the in-place scan of old-gen / Box
+/// `FrameDebugData` fields. Both require a custom trace.
 ///
 /// Forwarded (mirrors `walk_pyframe_roots` eval.rs:496-556):
 ///   - `f_backref` — the parent frame pointer.
 ///   - `pycode` — visited to match the walker; inert while code objects
 ///     are Box-immortal (`is_nursery_object_start` short-circuits).
-///   - `locals_cells_stack_w` — the array pointer.  When the array is a
-///     GC-managed (moving) nursery block its slot is forwarded and the
-///     type-9 varsize walker forwards the items; when it is a stationary
-///     `std::alloc` block each item is forwarded in place — the same
-///     regime split as `list_object_custom_trace` / `tuple_object_custom_trace`.
+///   - `locals_cells_stack_w` — the array pointer.  A GC-managed nursery
+///     block forwards through its field slot and its type-9 walker owns the
+///     items. An old-gen GC block also visits the field slot and walks its
+///     items in place: barrier-less interpreter stores require that at minors,
+///     and it is harmless duplicate marking at majors. A stationary
+///     `std::alloc` block always forwards its items in place.
 ///   - `f_generator_nowref`, `w_yielding_from`, `w_builtin`, `w_globals`
 ///     — the ref-bearing statics.
-///   - `debugdata->w_locals`, `debugdata->w_f_trace` — null-guarded.
+///   - `debugdata` / `lastblock` — managed field slots are forwarded.
+///   - `debugdata->{w_locals, w_f_trace, hidden_operationerr}` — null-guarded.
 ///
 /// Excluded (matches the walker): `execution_context` (persistent, not
-/// GC), `debugdata`/`lastblock` (non-GC heap), the module-dict / method-
-/// cache / prebuilt-family global walks (those are not frame-owned; the
+/// GC), the module-dict / method-cache / prebuilt-family global walks (those are not frame-owned; the
 /// root walker performs them once per collection, not per frame).
 unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let frame = unsafe { &mut *(obj_addr as *mut PyFrame) };
@@ -753,23 +753,32 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
     f(&mut frame.f_backref as *mut *mut PyFrame as *mut majit_ir::GcRef);
     f(&mut frame.pycode as *mut *const () as *mut majit_ir::GcRef);
 
-    // locals_cells_stack_w: forward the array pointer, then its items.
+    // locals_cells_stack_w: visit the field slot for every GC array so major
+    // marking reaches it. A nursery array is subsequently scanned by its own
+    // type-9 walker; an old-gen array also needs this in-place scan because
+    // interpreter stores do not write-barrier its items. At a major, its own
+    // walker reaches them too, so this is harmless duplicate marking.
+    // RPython's phase-agnostic precedent is jitframe.py:104 `jitframe_trace`.
     let array = frame.locals_cells_stack_w;
     if !array.is_null() {
-        if pyre_object::gc_hook::try_gc_owns_object(array as *mut u8) {
-            // GC-managed (moving) nursery block: hand the collector the
-            // array field slot; the type-9 varsize walker forwards the
-            // items once the array itself is copied.
+        let walk_items = if pyre_object::gc_hook::try_gc_owns_object(array as *mut u8) {
             f(
                 &mut frame.locals_cells_stack_w as *mut *mut pyre_object::FixedObjectArray
                     as *mut majit_ir::GcRef,
             );
+            !majit_gc::gc_is_nursery_object(array as usize)
         } else {
-            // Stationary `std::alloc` block (type_id 0, never entered by
-            // `trace_and_update_object`): forward each item in place. Walk
-            // the FULL fixed-length array, not just the live prefix —
-            // matching `walk_pyframe_roots` (eval.rs:626), which forwards
-            // popped-in-transit argument slots past `valuestackdepth`.
+            true
+        };
+        // Stationary `std::alloc` blocks (never entered by
+        // `trace_and_update_object`) and old-gen GC blocks forward the FULL
+        // fixed-length array, not just the live prefix. The old-gen major
+        // walk is idempotent duplicate marking; the minor walk covers
+        // barrier-less interpreter stores. This matches RPython's
+        // phase-agnostic jitframe.py:104 `jitframe_trace`.
+        // This matches `walk_pyframe_roots` (eval.rs:626), which forwards
+        // popped-in-transit argument slots past `valuestackdepth`.
+        if walk_items {
             let arr = unsafe { &mut *array };
             let base = arr.items_mut_ptr();
             for i in 0..arr.len() {
@@ -784,32 +793,40 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
     f(&mut frame.w_globals as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
 
     if !frame.debugdata.is_null() {
-        let d = unsafe { &mut *frame.debugdata };
-        f(&mut d.w_locals as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-        f(&mut d.w_f_trace as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+        let debugdata = frame.debugdata;
+        let walk_fields = if pyre_object::gc_hook::try_gc_owns_object(debugdata as *mut u8) {
+            f(
+                &mut frame.debugdata as *mut *mut pyre_interpreter::pyframe::FrameDebugData
+                    as *mut majit_ir::GcRef,
+            );
+            !majit_gc::gc_is_nursery_object(debugdata as usize)
+        } else {
+            true
+        };
+        // A nursery payload is scanned by FRAME_DEBUG_DATA_GC_TYPE_ID's
+        // ordinary offset walker. Box payloads and old-gen payloads need this
+        // in-place walk because interpreter stores do not individually
+        // write-barrier w_f_trace and its sibling fields. The old-gen major
+        // walk is harmless duplicate marking, matching RPython's
+        // phase-agnostic jitframe.py:104 `jitframe_trace` contract.
+        if walk_fields {
+            let d = unsafe { &mut *frame.debugdata };
+            f(&mut d.w_locals as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            f(&mut d.w_f_trace as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            f(&mut d.hidden_operationerr as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+        }
     }
-}
 
-/// Destructor for `PyFrame` (type id [`PYFRAME_GC_TYPE_ID`]).
-///
-/// A GC-managed frame is reclaimed by a major mark-sweep once no root
-/// reaches it (`pyframe.py class PyFrame(W_Root)`; `FrameBox::drop`
-/// performs no manual free for these).  This runs at sweep to release the
-/// frame's owned off-GC resources — the `FrameDebugData` box, the
-/// `FrameBlock` chain, and the `locals_cells_stack_w` array — mirroring
-/// `PyFrame::drop`, which handles the `std::alloc` fallback frames instead.
-///
-/// The locals array is freed only when it is a `std::alloc` block (every
-/// `FrameBox` frame): a JIT-built inline frame's array is a GC-managed
-/// `PY_OBJECT_ARRAY_GC_TYPE_ID` block the collector sweeps on its own, so
-/// freeing it here would double-free.  `try_gc_owns_object` distinguishes
-/// them — the same regime split `pyframe_object_custom_trace` uses.
-unsafe fn pyframe_object_destructor(obj_addr: usize) {
-    let frame = unsafe { &mut *(obj_addr as *mut PyFrame) };
-    let array = frame.locals_cells_stack_w;
-    let free_locals_array =
-        !array.is_null() && !pyre_object::gc_hook::try_gc_owns_object(array as *mut u8);
-    unsafe { frame.free_owned_contents(free_locals_array) };
+    if !frame.lastblock.is_null()
+        && pyre_object::gc_hook::try_gc_owns_object(frame.lastblock as *mut u8)
+    {
+        // FRAME_BLOCK_GC_TYPE_ID's `previous` walker forwards the rest of
+        // the chain. Blocks themselves contain no PyObjectRefs.
+        f(
+            &mut frame.lastblock as *mut *mut pyre_interpreter::pyframe::FrameBlock
+                as *mut majit_ir::GcRef,
+        );
+    }
 }
 
 /// RPython jitexc.py:53 ContinueRunningNormally parity.
@@ -827,18 +844,18 @@ enum JitAction {
 }
 
 use crate::jit::descr::{
-    BUILTIN_CODE_GC_TYPE_ID, FUNCTION_GC_TYPE_ID, GC_FLOAT_ARRAY_GC_TYPE_ID,
-    GC_INT_ARRAY_GC_TYPE_ID, JITFRAME_GC_TYPE_ID, OBJECT_GC_TYPE_ID, PY_OBJECT_ARRAY_GC_TYPE_ID,
-    PYFRAME_GC_TYPE_ID, RANGE_ITER_GC_TYPE_ID, SPECIALISED_TUPLE_FF_GC_TYPE_ID,
-    SPECIALISED_TUPLE_II_GC_TYPE_ID, SPECIALISED_TUPLE_OO_GC_TYPE_ID, VREF_GC_TYPE_ID,
-    W_BASE_EXCEPTION_GC_TYPE_ID, W_BOOL_GC_TYPE_ID, W_BYTEARRAY_GC_TYPE_ID, W_BYTES_GC_TYPE_ID,
-    W_CELL_GC_TYPE_ID, W_CLASSMETHOD_GC_TYPE_ID, W_COUNT_GC_TYPE_ID, W_DICT_GC_TYPE_ID,
-    W_DICT_PROXY_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID, W_GENERATOR_GC_TYPE_ID, W_INT_GC_TYPE_ID,
-    W_LIST_GC_TYPE_ID, W_LONG_GC_TYPE_ID, W_MEMBER_GC_TYPE_ID, W_METHOD_GC_TYPE_ID,
-    W_MODULE_DICT_GC_TYPE_ID, W_MODULE_GC_TYPE_ID, W_PROPERTY_GC_TYPE_ID, W_REPEAT_GC_TYPE_ID,
-    W_SEQ_ITER_GC_TYPE_ID, W_SET_GC_TYPE_ID, W_SLICE_GC_TYPE_ID, W_STATICMETHOD_GC_TYPE_ID,
-    W_SUPER_GC_TYPE_ID, W_TUPLE_GC_TYPE_ID, W_TYPE_GC_TYPE_ID, W_UNICODE_GC_TYPE_ID,
-    W_UNION_GC_TYPE_ID,
+    BUILTIN_CODE_GC_TYPE_ID, FRAME_BLOCK_GC_TYPE_ID, FRAME_DEBUG_DATA_GC_TYPE_ID,
+    FUNCTION_GC_TYPE_ID, GC_FLOAT_ARRAY_GC_TYPE_ID, GC_INT_ARRAY_GC_TYPE_ID, JITFRAME_GC_TYPE_ID,
+    OBJECT_GC_TYPE_ID, PY_OBJECT_ARRAY_GC_TYPE_ID, PYFRAME_GC_TYPE_ID, RANGE_ITER_GC_TYPE_ID,
+    SPECIALISED_TUPLE_FF_GC_TYPE_ID, SPECIALISED_TUPLE_II_GC_TYPE_ID,
+    SPECIALISED_TUPLE_OO_GC_TYPE_ID, VREF_GC_TYPE_ID, W_BASE_EXCEPTION_GC_TYPE_ID,
+    W_BOOL_GC_TYPE_ID, W_BYTEARRAY_GC_TYPE_ID, W_BYTES_GC_TYPE_ID, W_CELL_GC_TYPE_ID,
+    W_CLASSMETHOD_GC_TYPE_ID, W_COUNT_GC_TYPE_ID, W_DICT_GC_TYPE_ID, W_DICT_PROXY_GC_TYPE_ID,
+    W_FLOAT_GC_TYPE_ID, W_GENERATOR_GC_TYPE_ID, W_INT_GC_TYPE_ID, W_LIST_GC_TYPE_ID,
+    W_LONG_GC_TYPE_ID, W_MEMBER_GC_TYPE_ID, W_METHOD_GC_TYPE_ID, W_MODULE_DICT_GC_TYPE_ID,
+    W_MODULE_GC_TYPE_ID, W_PROPERTY_GC_TYPE_ID, W_REPEAT_GC_TYPE_ID, W_SEQ_ITER_GC_TYPE_ID,
+    W_SET_GC_TYPE_ID, W_SLICE_GC_TYPE_ID, W_STATICMETHOD_GC_TYPE_ID, W_SUPER_GC_TYPE_ID,
+    W_TUPLE_GC_TYPE_ID, W_TYPE_GC_TYPE_ID, W_UNICODE_GC_TYPE_ID, W_UNION_GC_TYPE_ID,
 };
 use majit_gc::collector::MiniMarkGC;
 use majit_metainterp::JitDriver;
@@ -1609,19 +1626,15 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // remain `type_id = 0` off-GC blocks reached only as roots via
     // `walk_jit_callee_frame_roots` (S2c).
     //
-    // The destructor releases a swept GC-managed frame's owned off-GC
-    // resources (debug data, block chain, and the `std::alloc` locals
-    // array of a `FrameBox` frame — NOT a JIT inline frame's GC array) —
-    // `FrameBox::drop` no longer frees them under policy A
-    // (`executioncontext.py:91-107 leave` frees nothing; frame lifetime
-    // is GC reachability).
-    let pyframe_tid = gc.register_type(
-        majit_gc::trace::TypeInfo::with_custom_trace(
-            std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
-            pyframe_object_custom_trace,
-        )
-        .with_destructor_fn(pyframe_object_destructor),
-    );
+    // Frame-owned locals arrays, debug data, and block-stack nodes are all
+    // GC-managed.  The collector reclaims them with the frame once it is
+    // unreachable; `FrameBox::drop` only frees the `std::alloc` snapshot /
+    // bootstrap fallback regime.  With no destructor or weakref flag,
+    // `type_alloc_is_plain` admits PYFRAME's normal allocation fast paths.
+    let pyframe_tid = gc.register_type(majit_gc::trace::TypeInfo::with_custom_trace(
+        std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
+        pyframe_object_custom_trace,
+    ));
     debug_assert_eq!(pyframe_tid, PYFRAME_GC_TYPE_ID);
     // `W_DictProxyObject` carries a single GC-traceable
     // `w_mapping: PyObjectRef` slot (the wrapped W_DictObject —
@@ -2302,6 +2315,31 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         .with_external_size(pyre_object::longobject::bigint_external_size),
     );
     pyre_object::longobject::set_bigint_gc_type_id(bigint_tid);
+    // PyPy's FrameDebugData is a plain GC object. It owns three PyObjectRef
+    // fields; once the frame custom trace greys the payload, the ordinary
+    // offset walker finds all of them during a major mark.
+    let frame_debug_data_tid = gc.register_type(TypeInfo::with_gc_ptrs(
+        std::mem::size_of::<pyre_interpreter::pyframe::FrameDebugData>(),
+        vec![
+            std::mem::offset_of!(pyre_interpreter::pyframe::FrameDebugData, w_locals),
+            std::mem::offset_of!(pyre_interpreter::pyframe::FrameDebugData, w_f_trace),
+            std::mem::offset_of!(
+                pyre_interpreter::pyframe::FrameDebugData,
+                hidden_operationerr
+            ),
+        ],
+    ));
+    debug_assert_eq!(frame_debug_data_tid, FRAME_DEBUG_DATA_GC_TYPE_ID);
+    // Block-stack nodes are young GC objects. `previous` is their only GC
+    // edge, so the normal walker forwards and major-marks an entire chain.
+    let frame_block_tid = gc.register_type(TypeInfo::with_gc_ptrs(
+        std::mem::size_of::<pyre_interpreter::pyframe::FrameBlock>(),
+        vec![std::mem::offset_of!(
+            pyre_interpreter::pyframe::FrameBlock,
+            previous
+        )],
+    ));
+    debug_assert_eq!(frame_block_tid, FRAME_BLOCK_GC_TYPE_ID);
     // rclass.py:340-346 — assign subclassrange_{min,max} to each
     // vtable entry. freeze_types() runs assign_inheritance_ids
     // (normalizecalls.py:373-389), then we write the computed ranges

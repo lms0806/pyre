@@ -33,14 +33,8 @@ const SLOT_SIZE: u64 = 8;
 /// (al, ah, bl, bh, mid1).
 const UMULHI_SCRATCH: u32 = 5;
 
-/// Call area layout (fixed offsets from frame_ptr).
+/// Call area layout in the historical fixed frame geometry.
 const CALL_RESULT_OFS: u64 = 2000;
-/// First frame *slot* index occupied by the fixed call area. Frame value slots
-/// (inputs at entry, fail-arg spills at guard exit) occupy `[1, 1 + max(num
-/// inputs, max fail args))`; they must stay below this index, or they clobber
-/// the call area and — past `HOME_SLOT_BASE` — the Ref-home region. A trace that
-/// would exceed it is declined in `build_wasm_module`.
-pub const CALL_AREA_FIRST_SLOT: u64 = CALL_RESULT_OFS / SLOT_SIZE;
 const CALL_FUNC_OFS: u64 = 2008;
 const CALL_NARGS_OFS: u64 = 2016;
 const CALL_ARGS_OFS: u64 = 2024;
@@ -48,14 +42,14 @@ const CALL_ARGS_OFS: u64 = 2024;
 /// Minimum frame allocation size in bytes to accommodate the call area.
 pub const MIN_FRAME_BYTES: usize = 2024 + 16 * 8; // 16 max call args
 
-/// Per-token layout of a wasm execution frame.  Host entry frames retain the
-/// historical [`MIN_FRAME_BYTES`] allocation floor, but generated code and CA
-/// nursery frames use these offsets.  This mirrors `jitframe.py`'s
-/// `JITFRAME_FIXED_SIZE + frame_depth`: a frame carries the slots its token
-/// actually needs, rather than a backend-wide slot floor.
+/// Per-token layout of a wasm execution frame.  Every frozen geometry carries
+/// the host-trampoline call area, so a later chained bridge can use it without
+/// changing its source token's frame offsets.  CA callee frames alone allocate
+/// the prefix ending after the Ref homes; the tail is protected by the
+/// trampoline-decline floor in `compile_bridge`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameGeometry {
-    /// Number of data slots before the call trampoline (including frame[0]).
+    /// Number of value slots before the dispatch key (including frame[0]).
     pub value_slots: usize,
     /// Byte offset of the call trampoline result word.
     pub call_result_ofs: u64,
@@ -68,7 +62,11 @@ pub struct FrameGeometry {
     pub home_slot_base: u64,
     /// Number of Ref-home slots the layout reserves.
     pub home_slots: usize,
-    /// Bytes in the JitFrame item area required by this layout.
+    /// Bytes through the end of Ref homes. CA callee frames allocate exactly
+    /// this many item bytes; the tail call area is intentionally omitted.
+    pub ca_frame_bytes: u32,
+    /// Full bytes in the frame layout, including the tail call area. Host entry
+    /// frames and every chained bridge use this geometry and allocation size.
     pub frame_bytes: u32,
 }
 
@@ -87,22 +85,26 @@ impl FrameGeometry {
             dispatch_key_ofs: DISPATCH_KEY_OFS,
             home_slot_base: HOME_SLOT_BASE,
             home_slots: 0,
+            ca_frame_bytes: HOME_SLOT_BASE as u32,
             frame_bytes: (MIN_FRAME_BYTES + SLOT_SIZE as usize) as u32,
         }
     }
 
-    /// Compact geometry for one token.  `value_slots` includes frame[0], so
-    /// the call area begins immediately after the greatest positional input or
-    /// fail-arg slot used by that token.
+    /// Compact frozen geometry for one token:
+    /// `[value slots | dispatch key | Ref homes | call area]`.
+    /// `value_slots` includes frame[0].  The trailing call area is always
+    /// present, even for direct-only source traces, because later bridges are
+    /// compiled against this immutable geometry.
     pub fn compact(value_slots: usize, home_slots: usize) -> Self {
         let value_slots = value_slots.max(1);
-        let call_result_ofs = (value_slots as u64) * SLOT_SIZE;
+        let dispatch_key_ofs = (value_slots as u64) * SLOT_SIZE;
+        let home_slot_base = dispatch_key_ofs + SLOT_SIZE;
+        let ca_frame_bytes = home_slot_base + home_slots as u64 * SLOT_SIZE;
+        let call_result_ofs = ca_frame_bytes;
         let call_func_ofs = call_result_ofs + SLOT_SIZE;
         let call_nargs_ofs = call_func_ofs + SLOT_SIZE;
         let call_args_ofs = call_nargs_ofs + SLOT_SIZE;
-        let dispatch_key_ofs = call_result_ofs + Self::CALL_AREA_SLOTS as u64 * SLOT_SIZE;
-        let home_slot_base = dispatch_key_ofs + SLOT_SIZE;
-        let frame_bytes = home_slot_base + home_slots as u64 * SLOT_SIZE;
+        let frame_bytes = call_result_ofs + Self::CALL_AREA_SLOTS as u64 * SLOT_SIZE;
         Self {
             value_slots,
             call_result_ofs,
@@ -112,6 +114,7 @@ impl FrameGeometry {
             dispatch_key_ofs,
             home_slot_base,
             home_slots,
+            ca_frame_bytes: ca_frame_bytes as u32,
             frame_bytes: frame_bytes as u32,
         }
     }
@@ -125,18 +128,17 @@ impl FrameGeometry {
 /// then the trace reloads the live Ref locals from their homes — making object
 /// movement transparent without rooting Refs that never cross a collection.
 ///
-/// Placed past the call area so it never overlaps the fail-index / input /
-/// output slots (which sit below the call area at offset 2000) or the call
-/// trampoline area. Inert while `wasm_jit_alloc` is no-collect (epic B): the
+/// In compact geometries this region follows the dispatch key and precedes the
+/// trailing call area. Inert while `wasm_jit_alloc` is no-collect (epic B): the
 /// extra stores write a region nothing reads until the allocator collects.
 pub const HOME_SLOT_BASE: u64 = MIN_FRAME_BYTES as u64 + SLOT_SIZE;
 
-/// Resume-at-LABEL dispatch key (one reserved frame slot, between the call
-/// area and the Ref-home region). 0 = preamble/host entry (the `vec![0i64]`
+/// Historical fixed-geometry resume-at-LABEL dispatch key (one reserved frame
+/// slot, between the call area and the Ref-home region). 0 = preamble/host entry (the `vec![0i64]`
 /// frame is always 0 here on a fresh `execute_token`); non-zero = a
 /// loop-closing bridge re-entering a single-label peeled loop at its LABEL,
-/// skipping the preamble. Distinct from every value/fail-arg slot (< 2000) and
-/// the call trampoline (2000..2152); homes follow it at `HOME_SLOT_BASE`.
+/// skipping the preamble. Compact geometries derive this offset from their
+/// value-slot count and put the call area after the homes.
 pub const DISPATCH_KEY_OFS: u64 = MIN_FRAME_BYTES as u64;
 const _: () = assert!(HOME_SLOT_BASE == DISPATCH_KEY_OFS + SLOT_SIZE);
 
@@ -146,6 +148,10 @@ fn mem64(offset: u64) -> MemArg {
         align: 3,
         memory_index: 0,
     }
+}
+
+fn mem32(offset: u64) -> MemArg {
+    memarg(offset, 2)
 }
 
 fn memarg(offset: u64, align: u32) -> MemArg {
@@ -675,8 +681,15 @@ fn emit_reload_frame_if_necessary(
     sink: &mut InstructionSink<'_>,
     residual_type_base: Option<u32>,
     ca_reload_fn_ptr: i64,
+    jf_top_addr: Option<u32>,
 ) {
-    if let Some(base) = residual_type_base {
+    if let Some(top_addr) = jf_top_addr {
+        // assembler.py:1369-1377: reload the possibly-forwarded top JitFrame
+        // directly from the shadow-stack cell. Unlike the helper-table call,
+        // this does not need the residual direct-call type to be declared.
+        emit_ca_reload_top(sink, top_addr);
+        sink.local_set(0);
+    } else if let Some(base) = residual_type_base {
         sink.i32_const(ca_reload_fn_ptr as i32);
         sink.call_indirect(0, base);
         sink.i32_wrap_i64();
@@ -684,6 +697,47 @@ fn emit_reload_frame_if_necessary(
     } else {
         // The trampoline path still assumes a non-moving frame: its scratch writes use local 0.
     }
+}
+
+/// CA-arm-only variant of [`emit_reload_frame_if_necessary`]. The direct CA
+/// configuration owns an inline shadow-stack top cell; all other call sites
+/// retain their pre-existing helper reload.
+fn emit_reload_ca_frame_if_necessary(
+    sink: &mut InstructionSink<'_>,
+    residual_type_base: Option<u32>,
+    ca_reload_fn_ptr: i64,
+    ca_inline: Option<CaInlineParams>,
+) {
+    if let Some(inline) = ca_inline {
+        debug_assert!(residual_type_base.is_some());
+        emit_ca_reload_top(sink, inline.jf_top_addr);
+        sink.local_set(0);
+    } else {
+        emit_reload_frame_if_necessary(sink, residual_type_base, ca_reload_fn_ptr, None);
+    }
+}
+
+/// assembler.py `_reload_frame_if_necessary`: `top[-WORD]` is the top
+/// jitframe pointer. The wasm CA ABI carries its ITEMS base in local 0.
+fn emit_ca_reload_top(sink: &mut InstructionSink<'_>, top_addr: u32) {
+    sink.i32_const(top_addr as i32);
+    sink.i32_load(mem32(0));
+    sink.i32_const(4);
+    sink.i32_sub();
+    sink.i32_load(mem32(0));
+    sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+    sink.i32_add();
+}
+
+/// While a CA callee is pushed, its caller's `jf_ptr` is `top[-3 * WORD]`.
+fn emit_ca_reload_caller(sink: &mut InstructionSink<'_>, top_addr: u32) {
+    sink.i32_const(top_addr as i32);
+    sink.i32_load(mem32(0));
+    sink.i32_const(12);
+    sink.i32_sub();
+    sink.i32_load(mem32(0));
+    sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+    sink.i32_add();
 }
 
 /// Reload the Ref operands which the CA arm resolves only after its collecting
@@ -896,6 +950,40 @@ fn has_call_ops(ops: &[Op]) -> bool {
     })
 }
 
+/// Whether this trace emits a host `jit_call` / `jit_call_compact` trampoline
+/// invocation.  CA frames are movable nursery objects, while the host
+/// trampoline writes its result back through the pre-call frame pointer, so
+/// `compile_bridge` uses this exact lowering census to keep such traces off a
+/// live CA frame.
+///
+/// Keep this in lockstep with the individual emission arms below: the uniform
+/// i64 residual family, `New*`, and write barriers are direct under
+/// `WASM_DIRECT_RESIDUAL_CALL`; non-uniform CALLs and string allocation retain
+/// the trampoline.  When the direct family is disabled, all of the existing
+/// call-area users return to the trampoline baseline.
+pub fn has_trampoline_calls(inputargs: &[InputArg], ops: &[Op], emit_ca: bool) -> bool {
+    let ref_values = RefValues::collect(inputargs, ops);
+    if !WASM_DIRECT_RESIDUAL_CALL {
+        return has_call_ops(ops) || has_ref_store_op(ops, &ref_values);
+    }
+
+    ops.iter().any(|op| match op.opcode {
+        // `build_function` handles an enabled CA `CallAssemblerR` before the
+        // generic CALL arm, lowering it directly to the source-loop table
+        // slot. It therefore never uses the host call area.
+        OpCode::CallAssemblerR if emit_ca => false,
+        // These arms have no direct helper lowering.
+        OpCode::Newstr | OpCode::Newunicode => true,
+        // Every residual CALL uses the trampoline unless its exact lowering
+        // predicate supplies an i64 helper ABI.
+        _ if op.opcode.is_call() => direct_helper_i64_arity(op, &ref_values).is_none(),
+        // `New*` and ref-store write barriers are covered by
+        // `direct_helper_i64_arity`, so their direct-family arms do not touch
+        // the frame call area.
+        _ => false,
+    })
+}
+
 fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit>, u32) {
     let mut guards = Vec::new();
     let mut max_var: u32 = 0;
@@ -988,10 +1076,13 @@ pub struct CaParams {
     /// into the source loop). Only set by `compile_bridge` for a self-recursive
     /// single-int bridge; `compile_loop` never sets it.
     pub emit_ca: bool,
-    /// Bytes to reserve per callee frame (the GC `JitFrame`'s data region, i.e.
-    /// its Signed item area). Sized for the SOURCE loop, widened to also fit THIS
-    /// bridge (which reuses the frame when the loop's guard-exit chains back into
-    /// it). The alloc trampoline derives the JitFrame item count from it.
+    /// Bytes to reserve per CA callee frame (the GC `JitFrame`'s data region,
+    /// i.e. its Signed item area). This is the source geometry's prefix through
+    /// the Ref homes, excluding its tail call area. The trampoline-decline
+    /// floor in `WasmBackend::compile_bridge` (`source_ca_active &&
+    /// bridge_has_trampoline_calls`) guarantees that no trampoline-lowered op
+    /// runs on this movable frame, so the omitted tail is unreachable. The alloc
+    /// trampoline derives the JitFrame item count from this exact byte count.
     pub callee_frame_bytes: u32,
     /// `fail_index` the SOURCE loop's DoneWithThisFrame Finish writes to frame[0]
     /// on the base-case return. The CA arm treats this — or this bridge's own
@@ -1022,6 +1113,11 @@ pub struct CaParams {
     /// called after the recursive call to recover this level's possibly-moved
     /// nursery frame from the jitframe shadow stack.
     pub ca_reload_fn_ptr: i64,
+    /// Address of the active jitframe shadow-stack top cell, baked for every
+    /// trace body so post-collecting-call local-0 reloads can match
+    /// assembler.py without a helper round trip. `None` keeps the existing
+    /// helper/trampoline behavior when compilation has no active GC.
+    pub jf_top_addr: Option<u32>,
     /// `__indirect_function_table` slot of
     /// `lib.rs::wasm_jit_ca_reload_caller_frame`, called while the callee is
     /// still pushed to recover this invocation's possibly-moved local-0 frame.
@@ -1030,6 +1126,19 @@ pub struct CaParams {
     /// callee frame's CA input + home Ref slots; baked into each frame's
     /// `jf_gcmap` field at alloc time.
     pub callee_gcmap_ptr: i64,
+    /// Active-GC state for the direct CA-only inline allocation/frame path.
+    /// `None` retains the helpers (including under gc_stress).
+    pub inline: Option<CaInlineParams>,
+}
+
+/// Direct CA fast-path values baked at bridge compilation time.
+#[derive(Clone, Copy)]
+pub struct CaInlineParams {
+    pub nursery_free_addr: u32,
+    pub nursery_top_addr: u32,
+    pub jf_top_addr: u32,
+    pub jf_limit_addr: u32,
+    pub jitframe_tid: u32,
 }
 
 /// Inline nursery-bump fast-path parameters for `New`/`NewWithVtable`
@@ -1121,11 +1230,10 @@ pub fn build_wasm_module(
     let bridge_dispatch = cells_base != 0;
 
     // Frame value slots (inputs at entry, fail-arg spills at guard exit) occupy
-    // `[1, 1 + max(num inputs, max fail args))`. They sit below the fixed call
-    // area and the Ref-home region, which are at constant offsets; a trace whose
-    // value slots would reach the call area must be declined, or those stores
-    // silently clobber the call trampoline / home roots. (Pre-existing for the
-    // call area; the home region inherits the same bound.)
+    // `[1, 1 + max(num inputs, max fail args))`. They precede the dispatch key,
+    // Ref homes, and the always-present tail call area; a chained bridge must
+    // fit the source token's frozen value-slot count before it can share that
+    // frame.
     let max_fail_args = guards
         .iter()
         .map(|g| g.fail_arg_refs.len())
@@ -1166,17 +1274,11 @@ pub fn build_wasm_module(
     // geometry.  `compile_bridge` rejects a bridge that needs more slots, so
     // no global floor or speculative slack is needed here.
 
-    // A ref-storing store needs the `jit_call` import for its write barrier,
-    // even when the trace has no `New*`/CALL of its own. The CA arm needs it too
-    // for the callee-frame GC-alloc / shadow-stack-pop trampolines (an emit_ca
-    // bridge always materializes its callee frame via NewWithVtable, so this is
-    // already true in practice — stated explicitly for robustness).
-    let needs_call = has_call_ops(ops) || has_ref_store_op(ops, &ref_values) || ca.emit_ca;
-    // The shared indirect-function table is imported for `jit_call`'s residual
-    // dispatch, the epilogue's bridge `call_indirect`, and the CA arm's
-    // self-recursive `call_indirect`.
-    let needs_table = needs_call || bridge_dispatch || ca.emit_ca;
-
+    // This exact lowering census controls the host-trampoline import. Direct
+    // residual helpers, including the CA arm's inline fast path, use
+    // `call_indirect` and need no import, although their frozen frame still
+    // keeps the tail call area for future bridges.
+    let needs_call = has_trampoline_calls(inputargs, ops, ca.emit_ca);
     // In-module residual calls (`WASM_DIRECT_RESIDUAL_CALL`): the largest
     // eligible `(i64×n)->i64` arity in this trace — residual CALLs (word
     // result or word-ABI void) plus the `New*` / write-barrier helper
@@ -1205,6 +1307,12 @@ pub fn build_wasm_module(
     } else {
         None
     };
+    // The shared indirect-function table backs direct residual helpers as well
+    // as host-trampoline dispatch, chained bridges, and CA recursion.
+    let needs_table = needs_call || bridge_dispatch || residual_max_arity.is_some() || ca.emit_ca;
+    // `ca.emit_ca` forces the direct helper family to include arities 0..=2,
+    // so all CA frame-helper trampoline `else` arms below are baseline-only.
+    debug_assert!(!ca.emit_ca || residual_max_arity.is_some());
 
     let mut module = Module::new();
 
@@ -1385,6 +1493,10 @@ fn build_function(
     // `ca.deopt_helper_slot` for a deopted callee.
     ca_helper_type_idx: u32,
 ) -> Result<Function, BackendError> {
+    // The CA arm requires residual types (the setup above forces arity >= 2
+    // while `WASM_DIRECT_RESIDUAL_CALL` is enabled). Its `jit_call` fallback
+    // branches are retained solely for the direct-family-disabled baseline.
+    debug_assert!(!ca.emit_ca || residual_type_base.is_some());
     // Value locals occupy `1 ..= num_vars`; reserve `UMULHI_SCRATCH` extra i64
     // locals past them (`num_vars+1 ..= num_vars+UMULHI_SCRATCH`) as scratch for
     // the `UintMulHigh` 32-bit-split expansion (`emit_umulhi`). One i32 local
@@ -1407,7 +1519,12 @@ fn build_function(
     let mut func = Function::new(vec![
         (num_vars + UMULHI_SCRATCH, ValType::I64),
         (
-            base_i32_locals + if nursery.is_some() { 2 } else { 0 },
+            base_i32_locals
+                + if nursery.is_some() || ca.inline.is_some() {
+                    2
+                } else {
+                    0
+                },
             ValType::I32,
         ),
     ]);
@@ -2632,7 +2749,103 @@ fn build_function(
                 // `ca_cfp_local = frame_base + FIRST_ITEM_OFFSET` is the
                 // bespoke-layout frame pointer — every `mem64(OFS)` below is
                 // relative to it, exactly as the source loop reads its local 0.
-                if let Some(base) = residual_type_base {
+                let ca_depth = ca.callee_frame_bytes as usize / std::mem::size_of::<isize>();
+                let ca_payload_size = majit_backend::jitframe::JitFrame::alloc_size(ca_depth);
+                let ca_total_size =
+                    ((GcHeader::SIZE + ca_payload_size).max(GcHeader::MIN_NURSERY_OBJ_SIZE) + 7)
+                        & !7;
+                if let (Some(base), Some(inline)) = (residual_type_base, ca.inline) {
+                    // rewrite.py's nursery fast path plus assembler.py's inline
+                    // shadow-stack header. The `memory.fill` is deliberate:
+                    // home slots are read as roots before every definition, and
+                    // guard/deopt fail slots may be read by the host. Do not rely
+                    // on nursery reset's pre-existing memset for either class.
+                    sink.i32_const(inline.nursery_free_addr as i32);
+                    sink.i32_load(mem32(0));
+                    sink.local_tee(alloc_scratch_local);
+                    sink.i32_const(ca_total_size as i32);
+                    sink.i32_add();
+                    sink.i32_const(inline.nursery_top_addr as i32);
+                    sink.i32_load(mem32(0));
+                    sink.i32_gt_u();
+                    sink.i32_const(inline.jf_top_addr as i32);
+                    sink.i32_load(mem32(0));
+                    sink.local_tee(alloc_size_local);
+                    sink.i32_const(8);
+                    sink.i32_add();
+                    sink.i32_const(inline.jf_limit_addr as i32);
+                    sink.i32_load(mem32(0));
+                    sink.i32_gt_u();
+                    sink.i32_or();
+                    sink.if_(BlockType::Result(ValType::I64));
+                    // Slow path collects/allocates and performs init + push.
+                    sink.i64_const(ca.callee_frame_bytes as i64);
+                    sink.i64_const(ca.callee_gcmap_ptr);
+                    sink.i32_const(ca.ca_alloc_fn_ptr as i32);
+                    sink.call_indirect(0, base + 2);
+                    sink.else_();
+                    // Commit the nursery bump, then write the exact young
+                    // `GcHeader::new(jitframe_tid)` word (flags are clear).
+                    sink.i32_const(inline.nursery_free_addr as i32);
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(ca_total_size as i32);
+                    sink.i32_add();
+                    sink.i32_store(mem32(0));
+                    sink.local_get(alloc_scratch_local);
+                    sink.i64_const(inline.jitframe_tid as i64);
+                    sink.i64_store(mem64(0));
+                    // Explicitly initialise the complete JitFrame payload and
+                    // item area, then replicate JitFrame::init + jf_gcmap.
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(GcHeader::SIZE as i32);
+                    sink.i32_add();
+                    sink.i32_const(0);
+                    sink.i32_const(ca_payload_size as i32);
+                    sink.memory_fill(0);
+                    for offset in [
+                        majit_backend::jitframe::JF_FRAME_INFO_OFS,
+                        majit_backend::jitframe::JF_DESCR_OFS,
+                        majit_backend::jitframe::JF_FORCE_DESCR_OFS,
+                        majit_backend::jitframe::JF_SAVEDATA_OFS,
+                        majit_backend::jitframe::JF_GUARD_EXC_OFS,
+                        majit_backend::jitframe::JF_FORWARD_OFS,
+                    ] {
+                        sink.local_get(alloc_scratch_local);
+                        sink.i32_const(0);
+                        sink.i32_store(mem32(GcHeader::SIZE as u64 + offset as u64));
+                    }
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(ca.callee_gcmap_ptr as i32);
+                    sink.i32_store(mem32(
+                        GcHeader::SIZE as u64 + majit_backend::jitframe::JF_GCMAP_OFS as u64,
+                    ));
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(ca_depth as i32);
+                    sink.i32_store(mem32(
+                        GcHeader::SIZE as u64 + majit_backend::jitframe::JF_FRAME_OFS as u64,
+                    ));
+                    // Push `[is_minor=1, jf_ptr]`; the limit check above made
+                    // these stores safe, so the helper's overflow assertion is
+                    // retained only on the slow path.
+                    sink.local_get(alloc_size_local);
+                    sink.i32_const(1);
+                    sink.i32_store(mem32(0));
+                    sink.local_get(alloc_size_local);
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(GcHeader::SIZE as i32);
+                    sink.i32_add();
+                    sink.i32_store(mem32(4));
+                    sink.i32_const(inline.jf_top_addr as i32);
+                    sink.local_get(alloc_size_local);
+                    sink.i32_const(8);
+                    sink.i32_add();
+                    sink.i32_store(mem32(0));
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(GcHeader::SIZE as i32);
+                    sink.i32_add();
+                    sink.i64_extend_i32_u();
+                    sink.end();
+                } else if let Some(base) = residual_type_base {
                     sink.i64_const(ca.callee_frame_bytes as i64);
                     sink.i64_const(ca.callee_gcmap_ptr);
                     sink.i32_const(ca.ca_alloc_fn_ptr as i32);
@@ -2667,9 +2880,12 @@ fn build_function(
                 // resolving inputs through local-0-relative homes. The
                 // trampoline path intentionally keeps the A0-era assumption:
                 // its scratch writes themselves dereference stale local 0.
-                if let Some(base) = residual_type_base {
+                if let (Some(_base), Some(inline)) = (residual_type_base, ca.inline) {
+                    emit_ca_reload_caller(&mut sink, inline.jf_top_addr);
+                    sink.local_set(0);
+                } else if let Some(base) = residual_type_base {
                     sink.i32_const(ca.ca_reload_caller_fn_ptr as i32);
-                    sink.call_indirect(0, base + 0);
+                    sink.call_indirect(0, base);
                     sink.i32_wrap_i64();
                     sink.local_set(0);
                 }
@@ -2696,7 +2912,10 @@ fn build_function(
                 // callee frame. Deeper levels have already popped, so the
                 // jitframe shadow-stack top is this level's frame; reload its
                 // ITEMS base before reading F'[0] or F'[1].
-                if let Some(base) = residual_type_base {
+                if let (Some(_base), Some(inline)) = (residual_type_base, ca.inline) {
+                    emit_ca_reload_top(&mut sink, inline.jf_top_addr);
+                    sink.i64_extend_i32_u();
+                } else if let Some(base) = residual_type_base {
                     sink.i32_const(ca.ca_reload_fn_ptr as i32);
                     sink.call_indirect(0, base + 0);
                 } else {
@@ -2753,9 +2972,12 @@ fn build_function(
                 // the trampoline-only configuration retains its A0-era stale-
                 // local-0 limitation because its scratch writes cannot reload it
                 // safely.
-                if let Some(base) = residual_type_base {
+                if let (Some(_base), Some(inline)) = (residual_type_base, ca.inline) {
+                    emit_ca_reload_caller(&mut sink, inline.jf_top_addr);
+                    sink.local_set(0);
+                } else if let Some(base) = residual_type_base {
                     sink.i32_const(ca.ca_reload_caller_fn_ptr as i32);
-                    sink.call_indirect(0, base + 0);
+                    sink.call_indirect(0, base);
                     sink.i32_wrap_i64();
                     sink.local_set(0);
                 }
@@ -2769,7 +2991,14 @@ fn build_function(
                 // LIFO) via `wasm_jit_ca_pop_frame` — same direct-vs-trampoline
                 // split as the alloc above (the pop only shrinks the shadow
                 // stack; it never allocates or collects).
-                if let Some(base) = residual_type_base {
+                if let (Some(_base), Some(inline)) = (residual_type_base, ca.inline) {
+                    sink.i32_const(inline.jf_top_addr as i32);
+                    sink.i32_const(inline.jf_top_addr as i32);
+                    sink.i32_load(mem32(0));
+                    sink.i32_const(8);
+                    sink.i32_sub();
+                    sink.i32_store(mem32(0));
+                } else if let Some(base) = residual_type_base {
                     sink.local_get(ca_cfp_local);
                     sink.i64_extend_i32_u();
                     sink.i32_const(ca.ca_pop_fn_ptr as i32);
@@ -2797,7 +3026,12 @@ fn build_function(
                 // and its home is not written until the store-on-def below, so a
                 // reload would clobber it with the home's pre-call (stale) value.
                 let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
-                emit_reload_frame_if_necessary(&mut sink, residual_type_base, ca.ca_reload_fn_ptr);
+                emit_reload_ca_frame_if_necessary(
+                    &mut sink,
+                    residual_type_base,
+                    ca.ca_reload_fn_ptr,
+                    ca.inline,
+                );
                 emit_reload_refs_from_homes(&mut sink, ref_homes, &liveness, op_idx, skip, frame);
             }
 
@@ -2856,6 +3090,7 @@ fn build_function(
                         &mut sink,
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -2885,6 +3120,7 @@ fn build_function(
                         &mut sink,
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink, ref_homes, &liveness, op_idx, None, frame,
@@ -3000,6 +3236,7 @@ fn build_function(
                         &mut sink,
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -3115,6 +3352,7 @@ fn build_function(
                         &mut sink,
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink, ref_homes, &liveness, op_idx, skip, frame,
@@ -3218,6 +3456,7 @@ fn build_function(
                         &mut sink,
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -3286,6 +3525,7 @@ fn build_function(
                         &mut sink,
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -3349,6 +3589,7 @@ fn build_function(
                         &mut sink,
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -3464,6 +3705,7 @@ fn build_function(
                         &mut sink,
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink, ref_homes, &liveness, op_idx, skip, frame,
@@ -4162,5 +4404,21 @@ fn emit_unary_vi(
         emit_resolve(sink, constants, op.arg(0).to_opref());
         suffix(sink);
         sink.local_set(1 + vi);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_geometry_keeps_tail_call_area_out_of_ca_prefix() {
+        let frame = FrameGeometry::compact(32, 16);
+        assert_eq!(frame.dispatch_key_ofs, 32 * SLOT_SIZE);
+        assert_eq!(frame.home_slot_base, 33 * SLOT_SIZE);
+        assert_eq!(frame.ca_frame_bytes, 392);
+        assert_eq!(frame.call_result_ofs, frame.ca_frame_bytes as u64);
+        assert_eq!(frame.call_args_ofs, 416);
+        assert_eq!(frame.frame_bytes, 544);
     }
 }

@@ -30,7 +30,8 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 /// decline (TEMP, for the resume-at-last-label measurement): 8 = JUMP descr
 /// did not resolve (target_ord None), 9 = target_ord Some but != last label,
 /// 10 = arity mismatch, 11 = loop-closing bridge advances no loop-carried value
-/// (guard side-trace that would livelock the chained loop).
+/// (guard side-trace that would livelock the chained loop), 15 = declined CA
+/// because a trace would use the host call trampoline on a movable CA frame.
 pub static BRIDGE_DIAG: [AtomicU64; 16] = {
     const Z: AtomicU64 = AtomicU64::new(0);
     [Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z]
@@ -53,7 +54,9 @@ fn diag_bump(i: usize) {
 // A source token is compiled before a later guard may become a CA bridge.
 // Freeze modest room for that bridge at first compilation; a later trace that
 // exceeds either bound is declined rather than changing the live frame's
-// offsets. Fib's bridge needs about 20 positional slots and 8 homes.
+// offsets. The fib CA path measured raw maxima of 9 positional slots and 15
+// Ref homes, but that is not a bridge fail-arg census for the full suite; keep
+// both existing floors until such a census establishes smaller safe bounds.
 const FROZEN_CHAIN_VALUE_SLOTS: usize = 32;
 const FROZEN_CHAIN_REF_HOMES: usize = 16;
 
@@ -378,6 +381,53 @@ fn nursery_alloc_params(ops: &[Op]) -> Option<codegen::NurseryAllocParams> {
     })?
 }
 
+/// Assemble the direct CA arm's fixed-size nursery/frame parameters. This is
+/// deliberately separate from ordinary `New*` eligibility: a CA frame needs
+/// both the nursery words and the JitFrame shadow-stack top/limit cells.
+/// Missing active GC (or gc_stress) leaves the pre-existing helper path intact.
+fn ca_inline_params(frame_bytes: u32) -> Option<codegen::CaInlineParams> {
+    if majit_gc::gc_stress_enabled() {
+        return None;
+    }
+    let jitframe_tid = wasm_jitframe_tid();
+    let depth = frame_bytes as usize / std::mem::size_of::<isize>();
+    let total = ((majit_gc::header::GcHeader::SIZE
+        + majit_backend::jitframe::JitFrame::alloc_size(depth))
+    .max(majit_gc::header::GcHeader::MIN_NURSERY_OBJ_SIZE)
+        + 7)
+        & !7;
+    with_wasm_active_gc(|gc| {
+        assert_ne!(
+            jitframe_tid, 0,
+            "wasm CA inline frame path requires the registered JitFrame type id"
+        );
+        if total > gc.max_nursery_object_size() || !gc.type_alloc_is_plain(jitframe_tid) {
+            return None;
+        }
+        let nursery_free_addr = gc.nursery_free_addr();
+        let nursery_top_addr = gc.nursery_top_addr();
+        let jf_top_addr = majit_gc::shadow_stack::get_root_stack_top_addr();
+        let jf_limit_addr = majit_gc::shadow_stack::get_root_stack_limit_addr();
+        (nursery_free_addr != 0 && nursery_top_addr != 0 && jf_top_addr != 0 && jf_limit_addr != 0)
+            .then_some(codegen::CaInlineParams {
+                nursery_free_addr: nursery_free_addr as u32,
+                nursery_top_addr: nursery_top_addr as u32,
+                jf_top_addr: jf_top_addr as u32,
+                jf_limit_addr: jf_limit_addr as u32,
+                jitframe_tid,
+            })
+    })?
+}
+
+/// Address of the active jitframe shadow-stack top cell for ordinary trace
+/// body reloads. This does not depend on nursery fast-path eligibility: the
+/// reload is valid whenever a GC is active at compilation time.
+fn jf_top_addr() -> Option<u32> {
+    with_wasm_active_gc(|_| majit_gc::shadow_stack::get_root_stack_top_addr())
+        .and_then(|addr| u32::try_from(addr).ok())
+        .filter(|&addr| addr != 0)
+}
+
 /// `majit_gc::CollectOldgenFn` installed by `set_gc_allocator`. Drives the
 /// interpreter-safepoint non-moving old-gen major (`gc_interp::safepoint`,
 /// default-on on wasm) through the active GC. Needs mutable access, so it
@@ -523,6 +573,8 @@ pub extern "C" fn wasm_jit_write_barrier(obj: i64) -> i64 {
 /// frame's interior as a smaller frame's slots.
 pub extern "C" fn wasm_jit_ca_alloc_frame(frame_bytes: i64, gcmap_ptr: i64) -> i64 {
     use majit_backend::jitframe::JitFrame;
+    assert!(frame_bytes >= 0);
+    assert_eq!(frame_bytes as usize % std::mem::size_of::<isize>(), 0);
     let depth = frame_bytes as usize / std::mem::size_of::<isize>();
     // Slice A1: collecting nursery allocation, matching rewrite.py's
     // `gen_malloc_nursery_varsize_frame`. The caller frame remains rooted at
@@ -601,6 +653,14 @@ fn build_callee_gcmap(
         indices.push((frame.home_slot_base as usize + h * 8) / sign);
     }
     let max_index = indices.iter().copied().max().unwrap_or(0);
+    // `wasm_jit_ca_alloc_frame` sets `jf_frame` from `ca_frame_bytes`, not the
+    // full geometry. Inputs and homes must therefore fit that actual item
+    // allocation; fail/deopt outputs live in the low value slots and are
+    // covered by the same bound.
+    debug_assert!(
+        max_index < frame.ca_frame_bytes as usize / sign,
+        "CA gcmap exceeds the allocated JitFrame item area"
+    );
     let num_words = max_index / bits_per_word + 1;
     let mut buf = vec![0usize; 1 + num_words];
     buf[0] = num_words;
@@ -1164,6 +1224,9 @@ impl majit_backend::Backend for WasmBackend {
         }
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let ops: &[Op] = &ops_owned;
+        // This must use the same direct-vs-trampoline predicates as codegen:
+        // a CA callee runs this source-loop body on a movable nursery frame.
+        let has_trampoline_calls = codegen::has_trampoline_calls(inputargs, ops, false);
 
         // Decline traces the wasm backend cannot compile correctly, so the
         // metainterp falls back to the interpreter (correct, if unaccelerated)
@@ -1193,12 +1256,13 @@ impl majit_backend::Backend for WasmBackend {
         let alloc_array_fn_ptr = wasm_jit_alloc_array as *const () as usize as i64;
         let wb_fn_ptr = wasm_jit_write_barrier as *const () as usize as i64;
         // Freeze this token's generated frame layout at first compilation.
-        // `jitframe.py` sizes native JitFrames as `JITFRAME_FIXED_SIZE +
-        // frame_depth`; wasm CA frames follow the same per-token depth instead
-        // of inheriting the host arena's call-area floor.
+        // Every geometry retains its tail call area for later bridges. CA
+        // callee frames use only the homes prefix (`ca_frame_bytes`) below.
+        let raw_frame_value_slots = codegen::frame_value_slots(inputargs, ops);
+        let raw_num_ref_homes = codegen::count_ref_homes(inputargs, ops);
         let frame = codegen::FrameGeometry::compact(
-            codegen::frame_value_slots(inputargs, ops).max(FROZEN_CHAIN_VALUE_SLOTS),
-            codegen::count_ref_homes(inputargs, ops).max(FROZEN_CHAIN_REF_HOMES),
+            raw_frame_value_slots.max(FROZEN_CHAIN_VALUE_SLOTS),
+            raw_num_ref_homes.max(FROZEN_CHAIN_REF_HOMES),
         );
         // Exit indices come from the global fail-index space so a cross-trace
         // chain's `frame[0]` resolves regardless of which module wrote it
@@ -1224,6 +1288,7 @@ impl majit_backend::Backend for WasmBackend {
                     // Loops do not emit the CA arm, but they can run on a
                     // nursery CA frame and must reload local 0 after a collect.
                     ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
+                    jf_top_addr: jf_top_addr(),
                     ..codegen::CaParams::default()
                 },
             )?;
@@ -1382,6 +1447,7 @@ impl majit_backend::Backend for WasmBackend {
             max_output_slots,
             num_ref_homes,
             frame,
+            has_trampoline_calls: std::cell::Cell::new(has_trampoline_calls),
             bridge_cells_base,
             num_guard_cells: guard_exits.len(),
             has_preamble,
@@ -1436,7 +1502,6 @@ impl majit_backend::Backend for WasmBackend {
         // and `previous_tokens` are unused.
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let ops: &[Op] = &ops_owned;
-
         diag_bump(0); // compile_bridge entered
 
         // is_loop=false: a bridge's terminal JUMP with no LABEL is a loop-closing
@@ -1447,12 +1512,12 @@ impl majit_backend::Backend for WasmBackend {
         // The CA arm must be able to complete a callee deopt; without the
         // registered `wasm_ca_resume_deopt` slot it could not, so decline the
         // lift (the host round-trip path still handles the CALL_ASSEMBLER).
-        let allow_ca = ca_deopt_helper_slot() != 0
+        let ca_candidate = ca_deopt_helper_slot() != 0
             && bridge_is_self_recursive_int_ca(ops, original_token.number);
-        if let Some(reason) = wasm_unsupported_trace_reason(ops, false, allow_ca) {
-            diag_bump(1); // declined: CALL_ASSEMBLER
-            return Err(BackendError::Unsupported(reason));
-        }
+        // The CA candidate's `CallAssemblerR` is a dedicated direct arm; all
+        // other ops are scanned against their normal emission paths.
+        let bridge_has_trampoline_calls =
+            codegen::has_trampoline_calls(inputargs, ops, ca_candidate);
 
         // Decline exception-resume bridges (`GuardException`): the guarded call
         // raised, so the bridge resumes into the exception handler by re-entering
@@ -1497,7 +1562,7 @@ impl majit_backend::Backend for WasmBackend {
             source_loop_finish_fi,
             source_compiled_ptr,
             source_ca_active,
-            _source_has_bridges,
+            source_has_trampoline_calls,
         ) = {
             let source_loop = original_token
                 .compiled
@@ -1569,7 +1634,7 @@ impl majit_backend::Backend for WasmBackend {
                 // with a stale pointer.
                 source_loop as *const CompiledWasmLoop as usize as u64,
                 source_loop.ca_active.get(),
-                !source_loop.bridge_descr_ranges.borrow().is_empty(),
+                source_loop.has_trampoline_calls.get(),
             )
         };
 
@@ -1595,13 +1660,27 @@ impl majit_backend::Backend for WasmBackend {
         // restrict it to direct loop guards. A CA-shaped bridge on a nested
         // guard then fails codegen's CALL_ASSEMBLER handling — a deterministic
         // decline.
-        let allow_ca = allow_ca && source_is_direct;
-        if !allow_ca && source_ca_active {
-            diag_bump(14); // declined: source recursion is CA-active
+        let mut allow_ca = ca_candidate && source_is_direct;
+        let ca_trampoline_decline = if allow_ca && source_has_trampoline_calls {
+            Some(
+                "wasm backend: self-recursive CA source token or chained bridge \
+                 uses the host call trampoline",
+            )
+        } else if allow_ca && bridge_has_trampoline_calls {
+            Some("wasm backend: self-recursive CA bridge uses the host call trampoline")
+        } else {
+            None
+        };
+        if ca_trampoline_decline.is_some() {
+            // Let the ordinary non-CA CALL_ASSEMBLER decline path retain the
+            // interpreter fallback, but make this soundness floor observable.
+            diag_bump(15);
+            allow_ca = false;
+        }
+        if let Some(reason) = wasm_unsupported_trace_reason(ops, false, allow_ca) {
+            diag_bump(1); // declined: CALL_ASSEMBLER
             return Err(BackendError::Unsupported(
-                "wasm backend: source recursion is CA-active; further bridge \
-                 chaining declined"
-                    .into(),
+                ca_trampoline_decline.unwrap_or(reason.as_str()).to_string(),
             ));
         }
 
@@ -1615,7 +1694,19 @@ impl majit_backend::Backend for WasmBackend {
         let bridge_ref_homes = codegen::count_ref_homes(inputargs, ops);
         if bridge_value_slots > source_frame.value_slots
             || bridge_ref_homes > source_frame.home_slots
+            || (source_ca_active && bridge_has_trampoline_calls)
         {
+            if source_ca_active && bridge_has_trampoline_calls {
+                // Guard exits in a CA-active token execute on movable callee
+                // frames. Do not chain a later bridge whose own body would
+                // re-enter the stale-pointer host trampoline.
+                diag_bump(15);
+                return Err(BackendError::Unsupported(
+                    "wasm backend: CA-active source cannot chain a bridge that \
+                     uses the host call trampoline"
+                        .into(),
+                ));
+            }
             diag_bump(4);
             return Err(BackendError::Unsupported(format!(
                 "wasm backend: bridge frame needs values={bridge_value_slots}, homes={bridge_ref_homes}; \
@@ -1825,7 +1916,10 @@ impl majit_backend::Backend for WasmBackend {
                 Box::leak(build_callee_gcmap(&source_input_types, source_frame)).as_ptr() as i64;
             codegen::CaParams {
                 emit_ca: true,
-                callee_frame_bytes: source_frame.frame_bytes,
+                // `compile_bridge`'s trampoline-decline floor above guarantees
+                // no trampoline-lowered op executes on this movable CA callee
+                // frame, so its tail call area is never touched.
+                callee_frame_bytes: source_frame.ca_frame_bytes,
                 loop_finish_fi: source_loop_finish_fi,
                 deopt_helper_slot: ca_deopt_helper_slot(),
                 source_compiled_ptr,
@@ -1835,10 +1929,13 @@ impl majit_backend::Backend for WasmBackend {
                 ca_reload_caller_fn_ptr: wasm_jit_ca_reload_caller_frame as *const () as usize
                     as i64,
                 callee_gcmap_ptr,
+                inline: ca_inline_params(source_frame.ca_frame_bytes),
+                jf_top_addr: jf_top_addr(),
             }
         } else {
             codegen::CaParams {
                 ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
+                jf_top_addr: jf_top_addr(),
                 ..codegen::CaParams::default()
             }
         };
@@ -1932,6 +2029,7 @@ impl majit_backend::Backend for WasmBackend {
                     count,
                 ));
             }
+            source_loop.record_chained_bridge_trampoline_calls(bridge_has_trampoline_calls);
             // Publish this bridge's own guard-dispatch metadata so a hot guard
             // INSIDE it can chain a nested sub-bridge (same resolution the
             // loop's own guards get, keyed by this bridge's trace_id).
@@ -2170,24 +2268,10 @@ impl majit_backend::Backend for WasmBackend {
             .downcast_ref::<CompiledWasmLoop>()
             .expect("not CompiledWasmLoop");
 
-        // Allocate frame area large enough for slots + call trampoline area +
-        // the Ref-home region. MIN_FRAME_BYTES accommodates the call area at
-        // offset 2000+; the Ref-home region (`codegen::HOME_SLOT_BASE`) follows
-        // it, one slot per Ref value live across a collecting call
-        // (`num_ref_homes`).
-        let min_slots = codegen::MIN_FRAME_BYTES / 8;
-        let base_slots = min_slots.max(1 + compiled.max_output_slots.max(compiled.num_inputs));
-        // +1 for the resume-at-LABEL dispatch-key slot (codegen::DISPATCH_KEY_OFS
-        // = MIN_FRAME_BYTES, slot `min_slots`), which sits between the call area
-        // and the Ref-home region (now at HOME_SLOT_BASE = MIN_FRAME_BYTES + 8).
-        // `vec![0i64]` zeroes it, so a fresh host entry reads key 0 (preamble).
-        //
-        // The host/arena allocation deliberately retains its historical floor:
-        // any token may run here. Generated code, however, addresses only the
-        // compact offsets frozen on `compiled.frame`; all chained bridges use
-        // that same geometry or are declined at compile time.
-        let _ = base_slots;
-        let frame_size = min_slots.max((compiled.frame.frame_bytes as usize).div_ceil(8));
+        // Host entry allocates the complete frozen geometry, including the tail
+        // call area. Chained bridges share these exact offsets; only CA callee
+        // frames use the smaller homes prefix (`ca_frame_bytes`).
+        let frame_size = (compiled.frame.frame_bytes as usize).div_ceil(8);
         #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
         {
             let _ = (frame_size, args);
