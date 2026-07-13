@@ -708,6 +708,11 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// Read by [`walker_capture_snapshot_for_last_guard`] to stamp the
     /// snapshot frame's Python PC.
     pub entry_py_pc: u32,
+    /// Codewrite-time resume-marker twin for the outer snapshot coordinate
+    /// (`entry_py_pc`), carried by the arm-path snapshot word under
+    /// `PYRE_M73_ARMPATH_CARRY`. `None` when the creation site has no
+    /// jitcode-native outer coordinate.
+    pub outer_resume_marker_jit_pc: Option<usize>,
     /// JitCode index of the **outer** `PyJitCode.jitcode` — the Python
     /// bytecode jitcode whose Python opcode is currently being
     /// dispatched.  Pyre's blackhole resume only re-enters Python-
@@ -891,6 +896,10 @@ pub enum DispatchOutcome {
     CloseLoop {
         jump_args: Vec<OpRef>,
         loop_header_pc: usize,
+        /// Codewrite-time resume-marker twin at the merge point op's jitcode
+        /// offset, carried into the loop-close guards' snapshot words under
+        /// `PYRE_M73_LOOPCLOSE_CARRY`.
+        loop_header_marker_jit_pc: Option<usize>,
     },
     /// `jit_merge_point/cIRFIRF` reached a loop header that already has
     /// compiled targets, and the in-walk `compile_trace` attempt
@@ -2697,6 +2706,7 @@ pub fn dispatch_via_miframe(
             last_exc_value: initial_last_exc_value,
             last_exc_value_concrete: initial_last_exc_value_concrete,
             entry_py_pc,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             // This entry (test/fixture) hard-codes
@@ -2785,6 +2795,7 @@ fn compute_bridge_root_parent_frame(
     root_sym: &crate::state::PyreSym,
     trace_ctx: &mut TraceCtx,
     root_pc: usize,
+    root_carried_jitcode_pc: i32,
 ) -> Option<InlineParentFrame> {
     if root_sym.jitcode.is_null() {
         return None;
@@ -2817,6 +2828,19 @@ fn compute_bridge_root_parent_frame(
             regs_r[result_color] = trace_ctx.const_ref(pyre_object::PY_NULL as i64);
         }
     }
+    let root_word = (root_carried_jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC
+        && root_carried_jitcode_pc >= 0)
+        .then_some(root_carried_jitcode_pc as usize);
+    m73_outercap_census(
+        "bridgeroot",
+        jitcode_index as i32,
+        resume_py_pc as i32,
+        root_word,
+    );
+    let root_liveness_word = match root_word.filter(|_| m73_outercap_carry_enabled()) {
+        Some(w) => w as i32,
+        None => majit_ir::resumedata::NO_JITCODE_PC,
+    };
     let boxes = collect_outer_active_boxes(
         root_sym,
         trace_ctx,
@@ -2826,25 +2850,20 @@ fn compute_bridge_root_parent_frame(
         jitcode_index,
         resume_py_pc,
         None,
-        // Paused ROOT (outermost caller) frame: the sentinel is
-        // correct-by-construction, not a lossy deferral.  `resume_py_pc` is a
-        // CALL-return fallthrough opcode boundary where the py_pc→jitcode
-        // translation is lossless
-        // (no kept operand-stack temp), so the frame resumes through the plain
-        // `py_pc → resume_jitcode_pc_for` path — matching the emit-side sentinel
-        // the paused
-        // caller word carries elsewhere.  It must NOT be "upgraded" to a direct
-        // pc without a real per-frame `MIFrame.pc` for the whole caller chain
-        // (the `#124`/task#50 register↔value-stack rework); the only
-        // translation-independent carried coordinate today is the kept-stack
-        // branch guard's own `op.pc`.
-        majit_ir::resumedata::NO_JITCODE_PC,
+        // Key the query off the same carried root-frame word the snapshot and
+        // decode side read from `frames[0].jitcode_pc`, so both resolve the
+        // identical liveness window. `PYRE_M73_OUTERCAP_CARRY=0` falls back to
+        // the sentinel + `resume_jitcode_pc_for(root_pc)` translation.
+        root_liveness_word,
         None,
         &[],
     );
     Some(InlineParentFrame {
         jitcode_index,
         resume_py_pc,
+        // Parent-frame words are never branch-tagged; negative tags belong to
+        // a branch guard's own top-frame word.
+        resume_marker_jit_pc: root_word,
         boxes,
     })
 }
@@ -2876,6 +2895,7 @@ pub(crate) fn drive_bridge_carrier_subwalk(
     session: &std::cell::RefCell<WalkSession>,
     root_sym: &crate::state::PyreSym,
     root_pc: usize,
+    root_jitcode_pc: i32,
     callee_pjc: &std::sync::Arc<crate::PyJitCode>,
     callee_code_key: usize,
     callee_w_globals: usize,
@@ -2974,7 +2994,7 @@ pub(crate) fn drive_bridge_carrier_subwalk(
     }
 
     // Paused root portal frame for the multi-frame guard snapshot.
-    let root_frame = compute_bridge_root_parent_frame(root_sym, ctx, root_pc)?;
+    let root_frame = compute_bridge_root_parent_frame(root_sym, ctx, root_pc, root_jitcode_pc)?;
     let outer_jitcode_index = root_frame.jitcode_index;
     let outer_active_boxes = root_frame.boxes.clone();
 
@@ -3041,6 +3061,7 @@ pub(crate) fn drive_bridge_carrier_subwalk(
             last_exc_value_concrete: ConcreteValue::Null,
             // The outer Python frame is the root, paused at `root_pc`.
             entry_py_pc: root_pc as u32,
+            outer_resume_marker_jit_pc: root_frame.resume_marker_jit_pc,
             outer_jitcode_index,
             outer_active_boxes,
         };
@@ -3090,6 +3111,7 @@ pub(crate) fn drive_outer_frame_continuation(
     root_code_key: usize,
     root_w_globals: usize,
     root_pc: usize,
+    root_jitcode_pc: i32,
     entry: usize,
     frame_box: OpRef,
     frame_reg: usize,
@@ -3165,7 +3187,7 @@ pub(crate) fn drive_outer_frame_continuation(
         regs_f[num_regs_f + i] = ctx.const_float(v);
     }
 
-    let root_frame = compute_bridge_root_parent_frame(root_sym, ctx, root_pc)?;
+    let root_frame = compute_bridge_root_parent_frame(root_sym, ctx, root_pc, root_jitcode_pc)?;
     let outer_jitcode_index = root_frame.jitcode_index;
     let outer_active_boxes = root_frame.boxes.clone();
 
@@ -3185,10 +3207,17 @@ pub(crate) fn drive_outer_frame_continuation(
     // walker banks.  Only live colors are touched; dead slots stay
     // `OpRef::NONE` so a later guard snapshot cannot capture a stale operand.
     {
+        let root_word = (root_jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC
+            && root_jitcode_pc >= 0)
+            .then_some(root_jitcode_pc as usize);
+        // Mirror `compute_bridge_root_parent_frame` so scatter reads the banks in collection order.
         let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
             outer_jitcode_index as i32,
             root_pc as i32,
-            majit_ir::resumedata::NO_JITCODE_PC,
+            match root_word.filter(|_| m73_outercap_carry_enabled()) {
+                Some(w) => w as i32,
+                None => majit_ir::resumedata::NO_JITCODE_PC,
+            },
         );
         let mut cursor = 0usize;
         for &color in &banks.int {
@@ -3300,6 +3329,7 @@ pub(crate) fn drive_outer_frame_continuation(
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: root_pc as u32,
+            outer_resume_marker_jit_pc: root_frame.resume_marker_jit_pc,
             outer_jitcode_index,
             outer_active_boxes,
         };
@@ -3509,6 +3539,10 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
             last_exc_value: initial_last_exc_value,
             last_exc_value_concrete: initial_last_exc_value_concrete,
             entry_py_pc,
+            // `entry_py_pc` is `miframe.orgpc` — an interpreter-driven Python
+            // pc with no jitcode-native producer at this seam, so the outer
+            // coordinate has no twin here.
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index,
             outer_active_boxes,
             store_subscr_fn_addr: bh_store_subscr_fn_addr_cached(),
@@ -7336,6 +7370,10 @@ struct InlineParentFrame {
     /// plain py_pc (`< AFTER_RESIDUAL_CALL_PC_FLAG`); a CALL inside a
     /// try-block (catch marker) declines multi-frame.
     resume_py_pc: u32,
+    /// Codewrite-time jitcode-keyed marker for the CALL fallthrough resume
+    /// point, queried at the CALL site.  Bridge-root frames have no CALL
+    /// offset in hand and carry `None`.
+    resume_marker_jit_pc: Option<usize>,
     /// The caller's `in_a_call` active boxes at `resume_py_pc` — the liveness
     /// at the return point with the not-yet-produced call-result slot nulled
     /// (`get_list_of_active_boxes(in_a_call=true)` parity, trace_opcode.rs:1779).
@@ -9749,11 +9787,269 @@ pub(crate) fn m73_entry_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_ENTRY_AUDIT").is_some())
 }
 
+/// #73 S5 p5-s5: terminal call census for `resume_jitcode_pc_for` — counts
+/// every remaining runtime entry into the translation so the deletion scope
+/// can be certified by a corpus sweep. Pure eprintln; off in production.
+pub(crate) fn m73_translate_census_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_TRANSLATE_CENSUS").is_some())
+}
+
+/// `PYRE_M73_MARKER_AUDIT` (#73 S5 phase-0, default OFF): compare the
+/// codewrite-time jitcode-keyed resume-marker twin with runtime derivation.
+pub(crate) fn m73_marker_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_MARKER_AUDIT").is_some())
+}
+
+/// `PYRE_M73_MARKER_CARRY` (#73 S5 phase-1, default ON): source the
+/// nonbranch-marker keystone from the codewrite-time jitcode-keyed twin at the
+/// guard's own jitcode offset, retaining runtime resume-marker derivation as
+/// the fallback for twin-`None` rows (the synthetic loop-close overshoot whose
+/// `entry_py_pc` rebind is runtime-only). Certified by `PYRE_M73_MARKER_AUDIT`
+/// (100% eq=1 across the bench corpus) and check.py (161×2, on and off).
+/// Disable with `PYRE_M73_MARKER_CARRY=0`.
+pub(crate) fn m73_marker_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_MARKER_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
+/// `PYRE_M73_S1MARKER_CARRY` (#73 S5 phase-3 slice-1, default ON): source
+/// the remaining nonbranch guard resume words from the codewrite-time
+/// jitcode-keyed resume-marker twin. Twin-`None` rows retain the sentinel.
+/// Certified by the `M73_S1MARKER` census (100% eq=1, 1575 captures across
+/// 119 bench+synth programs) and check.py (161×2, on and off). Disable with
+/// `PYRE_M73_S1MARKER_CARRY=0`.
+pub(crate) fn m73_s1marker_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_S1MARKER_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
+/// `PYRE_M73_PFMARKER_CARRY` (#73 S5 phase-3 slice-3, default ON): carry
+/// each paused parent frame's codewrite-time resume-marker twin in its frame
+/// word. Certified by the `M73_PFMARKER` census (inline rows 447/447 eq=1;
+/// twin-`None` rows keep the sentinel) and check.py (162×2, on and off).
+/// Disable with `PYRE_M73_PFMARKER_CARRY=0`.
+pub(crate) fn m73_pfmarker_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_PFMARKER_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
+/// `PYRE_M73_ARMPATH_CARRY` (#73 S5 phase-3 slice-4, default ON): carry
+/// the outer snapshot coordinate's codewrite-time resume-marker twin in the
+/// per-opcode arm-path snapshot word. Certified by the `M73_ARMPATH` census
+/// (2105 captures across 8 bench+synth programs, 100% eq=1; twin-`None`
+/// rows keep the sentinel) and check.py (162×2, on and off). Disable with
+/// `PYRE_M73_ARMPATH_CARRY=0`.
+pub(crate) fn m73_armpath_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_ARMPATH_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
+/// `PYRE_M73_LOOPCLOSE_CARRY` (#73 S5 phase-3 slice-6, default ON): carry
+/// the merge-point resume-marker twin into the `GuardEvalBreaker` and
+/// `GuardFutureCondition` loop-close snapshot words. Certified by the
+/// `M73_LOOPCLOSE` census (362 captures across pyre/bench + synth, 100%
+/// eq=1) and check.py (162×2, on and off). Disable with
+/// `PYRE_M73_LOOPCLOSE_CARRY=0`.
+pub(crate) fn m73_loopclose_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_LOOPCLOSE_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
+/// `PYRE_M73_ARMDST_CARRY` (#73 S5 phase-5 slice-1, default ON): key the
+/// `compare_box_provably_dead` branch-arm liveness queries (`arm_dst_live`)
+/// on the resume-marker twin at the arm offset instead of the
+/// `resume_jitcode_pc_for` translation of the inverted py pc. Certified by
+/// the `M73_ARMDST` census (858 queries across pyre/bench + synth, 100%
+/// bank-equal) and check.py (162×2, on and off). Disable with
+/// `PYRE_M73_ARMDST_CARRY=0`.
+pub(crate) fn m73_armdst_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_ARMDST_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
+/// `PYRE_M73_LCLIVE_CARRY` (#73 S5 phase-5 slice-2, default ON): resolve
+/// the loop-close guards' liveness coordinate in
+/// `get_list_of_active_boxes` from the merge-point resume-marker twin
+/// (`MIFrame::loop_close_marker_jit_pc`) instead of the
+/// `resume_jitcode_pc_for(live_pc)` translation. Certified by the
+/// `M73_LCLIVE` census (362 captures across pyre/bench + synth, 100%
+/// eq=1) and check.py (162×2, on and off). Disable with
+/// `PYRE_M73_LCLIVE_CARRY=0`.
+pub(crate) fn m73_lclive_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_LCLIVE_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
+/// #73 S5 p5-s6: key the paused inline-caller frame's liveness query off the
+/// after-residual marker twin already carried in the frame's snapshot word
+/// (`resume_marker_jit_pc`), instead of the sentinel +
+/// `resume_jitcode_pc_for(fallthrough)` translation. Certified by the
+/// M73_INLCALLER census (bank equality) and the p3-s2 M73_PFMARKER identity.
+/// `PYRE_M73_INLCALLER_CARRY=0` opts out.
+pub(crate) fn m73_inlcaller_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_INLCALLER_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
+/// #73 S5 p5-s7: key the remaining outer-frame capture liveness queries
+/// (bridge-root parent frame + its register scatter, inline-call outer capture,
+/// list-append outer capture) off the jitcode-keyed word already in hand
+/// (carried root frame word / call-site marker twin) instead of the sentinel +
+/// resume_jitcode_pc_for translation. Certified by the M73_OUTERCAP census
+/// (bank equality). `PYRE_M73_OUTERCAP_CARRY=0` opts out.
+fn m73_outercap_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_OUTERCAP_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
+/// #73 S5 p5-s7 census: under the marker audit, compare the liveness banks the
+/// jitcode-keyed word resolves against the py-translation resolution.
+fn m73_outercap_census(site: &str, jitcode_index: i32, py_pc: i32, word: Option<usize>) {
+    if !m73_marker_audit_enabled() {
+        return;
+    }
+    match word {
+        Some(twin) => {
+            let with_twin = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                jitcode_index,
+                py_pc,
+                twin as i32,
+            );
+            let via_py = crate::state::frame_liveness_reg_indices_by_bank_at(jitcode_index, py_pc);
+            eprintln!(
+                "M73_OUTERCAP site={site} eq={} idx={jitcode_index} py_pc={py_pc} twin={twin}",
+                (with_twin == via_py) as u8
+            );
+        }
+        None => eprintln!("M73_OUTERCAP site={site} eq=notwin idx={jitcode_index} py_pc={py_pc}"),
+    }
+}
+
+/// #73 S5 phase-3 slice-5: attribution census for the residual decode-side
+/// resume-translation traffic (`bucket=sentinel_plain` in
+/// `PYRE_M369_RECOVER_AUDIT`). Under the audit gate, print one line per
+/// snapshot word that is still written as the `NO_JITCODE_PC` sentinel,
+/// tagged with the write site.
+fn m73_sentinel_word_census(site: &str, jitcode_index: u32, py_pc: u32, word: i32) {
+    if word == majit_ir::resumedata::NO_JITCODE_PC && m73_marker_audit_enabled() {
+        eprintln!("M73_SENTINEL site={site} idx={jitcode_index} py_pc={py_pc}");
+    }
+}
+
+/// `PYRE_M73_MFCALLEE_CARRY` (#73 S5 phase-3 slice-3, default ON): carry
+/// the multi-frame callee's codewrite-time resume-marker twin in its top-frame
+/// word. Certified by the `M73_MFRAW`/`M73_MFAR` censuses (legacy==twin
+/// 2197/2197 and 44/44) and check.py (162×2, on and off). Disable with
+/// `PYRE_M73_MFCALLEE_CARRY=0`.
+pub(crate) fn m73_mfcallee_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_MFCALLEE_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
+/// `PYRE_M73_ARMARKER_CARRY` (#73 S5 phase-2, default ON): source the plain
+/// after-residual-call marker from the codewrite-time fallthrough-marker twin
+/// at the guard's own jitcode offset, retaining runtime resume-marker
+/// derivation as the fallback for twin-`None` rows (the fallthrough-past-end
+/// overshoot whose `entry_py_pc` rebind is runtime-only). Certified by the
+/// `M73_ARMARKER` census (100% eq=1, 2178 captures across 89 bench+synth
+/// programs) and check.py (161×2, on and off). Disable with
+/// `PYRE_M73_ARMARKER_CARRY=0`.
+pub(crate) fn m73_armarker_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_ARMARKER_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
 /// `PYRE_M73_ENTRY_CARRY` (#73 entry-carry E1, default ON): source a plain
 /// portal loop-header walk's entry coordinate from the codewrite-time sidecar.
 pub(crate) fn m73_entry_carry_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_ENTRY_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
+/// #73 S5 p5-s3: decline-convert the entry/recipe derived legs — under
+/// entry-carry, a walk entry whose carried resolution fails DECLINES the
+/// walk instead of falling back to the `resume_jitcode_pc_for` translation.
+/// Certified by the p4 entry census: `RecipeDerivedTaken` /
+/// `EntryDerivedTaken` / `RecipeMismatch` / `BridgeNoCarry` all 0 across the
+/// 151-program corpus, so the retired fallback leg is unreached and the flip
+/// is byte-identical. Default ON; `PYRE_M73_ENTRY_DECLINE=0` opts out.
+pub(crate) fn m73_entry_decline_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_ENTRY_DECLINE") {
         Some(v) => {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
@@ -9854,7 +10150,7 @@ fn fbw_foriter_body_pc_from_op_pc(
 /// points at trivia is advanced.  A resume coordinate must be a real
 /// opcode boundary; the resume reader's own backtrack walks trivia
 /// BACKWARD, which is wrong for a `NOT_TAKEN` branch-target coordinate.
-fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc: usize) -> usize {
+pub fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc: usize) -> usize {
     use pyre_interpreter::bytecode::Instruction;
     loop {
         match pyre_interpreter::decode_instruction_at(code, py_pc) {
@@ -10607,6 +10903,12 @@ fn walker_capture_inline_nonstandard_vable_guard(
     // boundary (`entry_py_pc`), re-executing the whole call on deopt —
     // there is no kept-stack JitCode coordinate to preserve, so the
     // frame resumes through the Python pc → jitcode resume-translation path.
+    m73_sentinel_word_census(
+        "nsvable",
+        ctx.outer_jitcode_index,
+        ctx.entry_py_pc,
+        majit_ir::resumedata::NO_JITCODE_PC,
+    );
     ctx.trace_ctx
         .capture_snapshot_for_last_guard_op_with_vable_vref(
             &ctx.outer_active_boxes,
@@ -11169,9 +11471,47 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 // different
                 // offset.  Fall back to the sentinel if `py_pc` has no resume
                 // entry (portal-bridge / out-of-range).
-                let marker = unsafe {
-                    let jc = &*sym.jitcode;
-                    jc.payload.resume_jitcode_pc_for(py_pc as usize)
+                // #73 S5 phase-5 slice-4: the translation is evaluated lazily —
+                // under the (default-ON) twin carry it runs only for the
+                // twin-`None` overshoot rows (0 across the certified corpus),
+                // so the carried path no longer calls `resume_jitcode_pc_for`.
+                let legacy_marker = || unsafe {
+                    if m73_translate_census_enabled() {
+                        eprintln!("M73_TRANSLATE site=arm2-legacy py_pc={py_pc}");
+                    }
+                    (&*sym.jitcode)
+                        .payload
+                        .resume_jitcode_pc_for(py_pc as usize)
+                };
+                if m73_marker_audit_enabled() {
+                    match legacy_marker() {
+                        Some(m) => {
+                            let twin = unsafe {
+                                (&*sym.jitcode).payload.resume_marker_for_jitcode_pc(op_pc)
+                            };
+                            match twin {
+                                Some(t) if t == m => eprintln!(
+                                    "M73_MARKER eq=1 py_pc={} op_pc={} m={}",
+                                    py_pc, op_pc, m
+                                ),
+                                Some(t) => eprintln!(
+                                    "M73_MARKER eq=0 py_pc={} op_pc={} m={} twin={}",
+                                    py_pc, op_pc, m, t
+                                ),
+                                None => eprintln!(
+                                    "M73_MARKER eq=notwin py_pc={} op_pc={} m={}",
+                                    py_pc, op_pc, m
+                                ),
+                            }
+                        }
+                        None => eprintln!("M73_MARKER eq=nomarker py_pc={} op_pc={}", py_pc, op_pc),
+                    }
+                }
+                let marker = if m73_marker_carry_enabled() {
+                    unsafe { (&*sym.jitcode).payload.resume_marker_for_jitcode_pc(op_pc) }
+                        .or_else(legacy_marker)
+                } else {
+                    legacy_marker()
                 };
                 // #73 S2 census: for a specialization guard measure whether the
                 // per-op `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
@@ -11582,12 +11922,109 @@ fn walker_capture_snapshot_for_last_guard_impl(
                         Some(call_py_pc) => jc
                             .payload
                             .after_residual_call_resume_pc_for(call_py_pc as usize),
-                        None => jc.payload.resume_jitcode_pc_for(py_pc as usize),
+                        None => {
+                            // #73 S5 phase-5 slice-4: translation evaluated
+                            // lazily — under the (default-ON) twin carry it
+                            // runs only for twin-`None` overshoot rows.
+                            let legacy = || {
+                                if m73_translate_census_enabled() {
+                                    eprintln!("M73_TRANSLATE site=arm3-legacy py_pc={py_pc}");
+                                }
+                                jc.payload.resume_jitcode_pc_for(py_pc as usize)
+                            };
+                            if m73_marker_audit_enabled() {
+                                let twin = jc.payload.after_residual_marker_for_jitcode_pc(op_pc);
+                                match legacy() {
+                                    Some(m) => match twin {
+                                        Some(t) if t == m => eprintln!(
+                                            "M73_ARMARKER eq=1 py_pc={} op_pc={} m={}",
+                                            py_pc, op_pc, m
+                                        ),
+                                        Some(t) => eprintln!(
+                                            "M73_ARMARKER eq=0 py_pc={} op_pc={} m={} twin={}",
+                                            py_pc, op_pc, m, t
+                                        ),
+                                        None => eprintln!(
+                                            "M73_ARMARKER eq=notwin py_pc={} op_pc={} m={}",
+                                            py_pc, op_pc, m
+                                        ),
+                                    },
+                                    None => eprintln!(
+                                        "M73_ARMARKER eq=nomarker py_pc={} op_pc={}",
+                                        py_pc, op_pc
+                                    ),
+                                }
+                            }
+                            if m73_armarker_carry_enabled() {
+                                jc.payload
+                                    .after_residual_marker_for_jitcode_pc(op_pc)
+                                    .or_else(legacy)
+                            } else {
+                                legacy()
+                            }
+                        }
                     }
                 };
                 match marker {
                     Some(jp) => jp as i32,
                     None => majit_ir::resumedata::NO_JITCODE_PC,
+                }
+            } else if m366_nonbranch_pc_enabled()
+                && (m73_marker_audit_enabled() || m73_s1marker_carry_enabled())
+            {
+                // #73 S5 p3-s1: the remaining nonbranch guards (outside the
+                // arm-2 allow-list, not after-residual) carry the same
+                // block-head marker as arm-2, sourced from the jitcode-keyed
+                // twin at the guard's own `op_pc`.  Nested under the #366
+                // nonbranch opt-out so `PYRE_M366_NONBRANCH_PC=0` keeps the
+                // sentinel for every nonbranch guard.
+                let twin = unsafe { (&*sym.jitcode).payload.resume_marker_for_jitcode_pc(op_pc) };
+                if m73_marker_audit_enabled() {
+                    let legacy = unsafe {
+                        (&*sym.jitcode)
+                            .payload
+                            .resume_jitcode_pc_for(py_pc as usize)
+                    };
+                    match legacy {
+                        Some(m) => match twin {
+                            Some(t) if t == m => eprintln!(
+                                "M73_S1MARKER eq=1 guard={:?} py_pc={} op_pc={} m={}",
+                                ctx.trace_ctx.last_guard_opcode(),
+                                py_pc,
+                                op_pc,
+                                m
+                            ),
+                            Some(t) => eprintln!(
+                                "M73_S1MARKER eq=0 guard={:?} py_pc={} op_pc={} m={} twin={}",
+                                ctx.trace_ctx.last_guard_opcode(),
+                                py_pc,
+                                op_pc,
+                                m,
+                                t
+                            ),
+                            None => eprintln!(
+                                "M73_S1MARKER eq=notwin guard={:?} py_pc={} op_pc={} m={}",
+                                ctx.trace_ctx.last_guard_opcode(),
+                                py_pc,
+                                op_pc,
+                                m
+                            ),
+                        },
+                        None => eprintln!(
+                            "M73_S1MARKER eq=nomarker guard={:?} py_pc={} op_pc={}",
+                            ctx.trace_ctx.last_guard_opcode(),
+                            py_pc,
+                            op_pc
+                        ),
+                    }
+                }
+                if m73_s1marker_carry_enabled() {
+                    match twin {
+                        Some(jp) => jp as i32,
+                        None => majit_ir::resumedata::NO_JITCODE_PC,
+                    }
+                } else {
+                    majit_ir::resumedata::NO_JITCODE_PC
                 }
             } else {
                 majit_ir::resumedata::NO_JITCODE_PC
@@ -11631,6 +12068,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 ctx.vstack_valid.then_some(ctx.vstack_boxes.as_slice()),
                 scope.branch_guard_kept_recovered,
             );
+            m73_sentinel_word_census("main", jitcode_index, resume_py_pc, guard_jitcode_pc);
             ctx.trace_ctx
                 .capture_snapshot_for_last_guard_with_vable_vref(
                     &active,
@@ -11649,13 +12087,51 @@ fn walker_capture_snapshot_for_last_guard_impl(
     // resumes via the Python pc → jitcode resume-translation path (no JitCode
     // coordinate).
     let _ = op_pc;
+    if m73_marker_audit_enabled() {
+        match crate::state::pyjitcode_for_jitcode_index(ctx.outer_jitcode_index as i32) {
+            Some(pjc) if pjc.is_populated() => {
+                match pjc.resume_jitcode_pc_for(ctx.entry_py_pc as usize) {
+                    Some(legacy) => match ctx.outer_resume_marker_jit_pc {
+                        Some(twin) if twin == legacy => eprintln!(
+                            "M73_ARMPATH eq=1 idx={} py_pc={} m={}",
+                            ctx.outer_jitcode_index, ctx.entry_py_pc, legacy
+                        ),
+                        Some(twin) => eprintln!(
+                            "M73_ARMPATH eq=0 idx={} py_pc={} m={} twin={}",
+                            ctx.outer_jitcode_index, ctx.entry_py_pc, legacy, twin
+                        ),
+                        None => eprintln!(
+                            "M73_ARMPATH eq=notwin idx={} py_pc={} m={}",
+                            ctx.outer_jitcode_index, ctx.entry_py_pc, legacy
+                        ),
+                    },
+                    None => eprintln!(
+                        "M73_ARMPATH eq=nomarker idx={} py_pc={}",
+                        ctx.outer_jitcode_index, ctx.entry_py_pc
+                    ),
+                }
+            }
+            _ => eprintln!(
+                "M73_ARMPATH eq=nopjc idx={} py_pc={}",
+                ctx.outer_jitcode_index, ctx.entry_py_pc
+            ),
+        }
+    }
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
+    let arm_word = if m73_armpath_carry_enabled() {
+        ctx.outer_resume_marker_jit_pc
+            .map(|m| m as i32)
+            .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC)
+    } else {
+        majit_ir::resumedata::NO_JITCODE_PC
+    };
+    m73_sentinel_word_census("arm", ctx.outer_jitcode_index, ctx.entry_py_pc, arm_word);
     ctx.trace_ctx
         .capture_snapshot_for_last_guard_with_vable_vref(
             &ctx.outer_active_boxes,
             ctx.outer_jitcode_index,
             ctx.entry_py_pc,
-            majit_ir::resumedata::NO_JITCODE_PC,
+            arm_word,
             &vable_boxes,
             &vref_boxes,
         );
@@ -11725,7 +12201,7 @@ fn compute_inline_caller_frame(
     if caller_sym.jitcode.is_null() {
         return Err(InlineCallerFrameDecline::Unavailable);
     }
-    let (jitcode_index, fallthrough_py_pc, code_ptr) = unsafe {
+    let (jitcode_index, fallthrough_py_pc, resume_marker_jit_pc, code_ptr) = unsafe {
         let jc = &*caller_sym.jitcode;
         if jc.payload.code_ptr.is_null() || !jc.payload.is_populated() {
             return Err(InlineCallerFrameDecline::Unavailable);
@@ -11739,7 +12215,12 @@ fn compute_inline_caller_frame(
         )?;
         let code = &*jc.payload.code_ptr;
         let fallthrough = crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32;
-        (jc.index as u32, fallthrough, jc.payload.code_ptr)
+        (
+            jc.index as u32,
+            fallthrough,
+            jc.payload.after_residual_marker_for_jitcode_pc(call_jit_pc),
+            jc.payload.code_ptr,
+        )
     };
     // The call result is the top operand-stack slot at the return point.
     let depth = unsafe {
@@ -11767,6 +12248,38 @@ fn compute_inline_caller_frame(
     if result_color < ctx.registers_r.len() {
         ctx.registers_r[result_color] = null_ref;
     }
+    if m73_marker_audit_enabled() {
+        if let Some(twin) = resume_marker_jit_pc {
+            let with_twin = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                jitcode_index as i32,
+                fallthrough_py_pc as i32,
+                twin as i32,
+            );
+            let via_py = crate::state::frame_liveness_reg_indices_by_bank_at(
+                jitcode_index as i32,
+                fallthrough_py_pc as i32,
+            );
+            eprintln!(
+                "M73_INLCALLER eq={} idx={} py_pc={} twin={}",
+                (with_twin == via_py) as u8,
+                jitcode_index,
+                fallthrough_py_pc,
+                twin
+            );
+        } else {
+            eprintln!(
+                "M73_INLCALLER eq=notwin idx={} py_pc={}",
+                jitcode_index, fallthrough_py_pc
+            );
+        }
+    }
+    // The after-residual marker names the same `-live-` the fallthrough
+    // translation resolves to (M73_PFMARKER identity), bypassing the py channel.
+    let caller_liveness_word = match resume_marker_jit_pc.filter(|_| m73_inlcaller_carry_enabled())
+    {
+        Some(m) => m as i32,
+        None => majit_ir::resumedata::NO_JITCODE_PC,
+    };
     let boxes = collect_outer_active_boxes(
         caller_sym,
         ctx.trace_ctx,
@@ -11776,7 +12289,7 @@ fn compute_inline_caller_frame(
         jitcode_index,
         fallthrough_py_pc,
         None,
-        majit_ir::resumedata::NO_JITCODE_PC,
+        caller_liveness_word,
         None,
         &[],
     );
@@ -11786,6 +12299,7 @@ fn compute_inline_caller_frame(
     Ok(InlineParentFrame {
         jitcode_index,
         resume_py_pc: fallthrough_py_pc,
+        resume_marker_jit_pc,
         boxes,
     })
 }
@@ -11810,6 +12324,7 @@ fn compute_nested_inline_caller_frame(
         return Err(InlineCallerFrameDecline::Unavailable);
     }
     let call_py = python_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
+    let resume_marker_jit_pc = pjc.after_residual_marker_for_jitcode_pc(call_jit_pc);
     // A CALL inside a try-block resumes at its own catch via a bit-14 marker
     // pc, which the multi-frame capture's `py_pc < FLAG` assert rejects.
     decline_inline_caller_frame_for_catch_marker(pjc.after_residual_call_resume_pc_for(call_py))?;
@@ -11842,11 +12357,39 @@ fn compute_nested_inline_caller_frame(
     if result_color < ctx.registers_r.len() {
         ctx.registers_r[result_color] = null_ref;
     }
-    // A paused caller frame resumes at the CALL return point via the
-    // Python-pc → jitcode resume-translation path; no kept-stack jitcode
-    // coordinate is carried for
-    // it (mirrors the caller-frame handling at the depth-2 callee site), so it
-    // queries liveness through the `fallthrough_py_pc` window with the sentinel.
+    if m73_marker_audit_enabled() {
+        if let Some(twin) = resume_marker_jit_pc {
+            let with_twin = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                jitcode_index as i32,
+                fallthrough_py_pc as i32,
+                twin as i32,
+            );
+            let via_py = crate::state::frame_liveness_reg_indices_by_bank_at(
+                jitcode_index as i32,
+                fallthrough_py_pc as i32,
+            );
+            eprintln!(
+                "M73_INLCALLER eq={} idx={} py_pc={} twin={}",
+                (with_twin == via_py) as u8,
+                jitcode_index,
+                fallthrough_py_pc,
+                twin
+            );
+        } else {
+            eprintln!(
+                "M73_INLCALLER eq=notwin idx={} py_pc={}",
+                jitcode_index, fallthrough_py_pc
+            );
+        }
+    }
+    // The after-residual marker names the same `-live-` the fallthrough
+    // translation resolves to (M73_PFMARKER identity), bypassing the py channel.
+    // `PYRE_M73_INLCALLER_CARRY=0` falls back to the sentinel + translation.
+    let caller_liveness_word = match resume_marker_jit_pc.filter(|_| m73_inlcaller_carry_enabled())
+    {
+        Some(m) => m as i32,
+        None => majit_ir::resumedata::NO_JITCODE_PC,
+    };
     let boxes = collect_callee_active_boxes(
         ctx.registers_i,
         ctx.registers_r,
@@ -11854,7 +12397,7 @@ fn compute_nested_inline_caller_frame(
         jitcode_index,
         fallthrough_py_pc,
         call_jit_pc,
-        majit_ir::resumedata::NO_JITCODE_PC,
+        caller_liveness_word,
     );
     if let (Some(saved), true) = (saved, result_color < ctx.registers_r.len()) {
         ctx.registers_r[result_color] = saved;
@@ -11866,6 +12409,7 @@ fn compute_nested_inline_caller_frame(
     Ok(InlineParentFrame {
         jitcode_index,
         resume_py_pc: fallthrough_py_pc,
+        resume_marker_jit_pc,
         boxes,
     })
 }
@@ -11972,20 +12516,30 @@ fn walker_capture_multi_frame_inline_snapshot(
             }
         }
     }
-    // #124 Approach B (M2): the callee (top) frame carries the guard's raw
-    // JitCode byte offset as the resume coordinate (mirror of the single-frame
-    // path). A branch guard supplies its own callee pc in
-    // `GuardCaptureScope::branch_guard_jitcode_pc`; otherwise the guard's own offset is
-    // `callee_op_pc`.  `after_residual_call` guards resume BEFORE the call and
-    // keep the sentinel.  The paused caller frames resume at the CALL return
-    // point via the Python pc → jitcode resume-translation path, so they keep
-    // the sentinel too (no
-    // kept-stack coordinate is carried for them in M2).  Computed BEFORE the box
-    // collection so it queries liveness at the SAME coordinate the decoder
-    // resumes at.
+    // #124 Approach B (M2), mirror of the single-frame path: the callee (top)
+    // frame carries a branch guard's supplied pc
+    // (`GuardCaptureScope::branch_guard_jitcode_pc`) unchanged.  With
+    // `PYRE_M73_MFCALLEE_CARRY`, other guards source their word from the callee
+    // payload's resume-marker twin: after-residual guards use the fallthrough
+    // twin and retain the sentinel on a miss, while plain guards retain the raw
+    // `callee_op_pc` on a miss.  Computed BEFORE box collection so encoder
+    // liveness and decoder resume use the same coordinate.
     let callee_jitcode_pc: i32 = match scope.branch_guard_jitcode_pc {
         Some(g) => g as i32,
-        None if after_residual_call => majit_ir::resumedata::NO_JITCODE_PC,
+        None if after_residual_call => {
+            if m73_mfcallee_carry_enabled() {
+                callee_pjc
+                    .after_residual_marker_for_jitcode_pc(callee_op_pc)
+                    .map(|m| m as i32)
+                    .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC)
+            } else {
+                majit_ir::resumedata::NO_JITCODE_PC
+            }
+        }
+        None if m73_mfcallee_carry_enabled() => callee_pjc
+            .resume_marker_for_jitcode_pc(callee_op_pc)
+            .map(|m| m as i32)
+            .unwrap_or(callee_op_pc as i32),
         None => callee_op_pc as i32,
     };
     let callee_boxes = collect_callee_active_boxes(
@@ -12047,13 +12601,81 @@ fn walker_capture_multi_frame_inline_snapshot(
     // top frame last (innermost).
     let mut frames: Vec<(u32, u32, i32, &[OpRef])> = Vec::with_capacity(parent_frames.len() + 1);
     for pf in &parent_frames {
+        if m73_marker_audit_enabled() {
+            match crate::state::pyjitcode_for_jitcode_index(pf.jitcode_index as i32) {
+                Some(pjc) if pjc.is_populated() => {
+                    match pjc.resume_jitcode_pc_for(pf.resume_py_pc as usize) {
+                        Some(legacy) => match pf.resume_marker_jit_pc {
+                            Some(twin) if twin == legacy => eprintln!(
+                                "M73_PFMARKER eq=1 idx={} py_pc={} m={}",
+                                pf.jitcode_index, pf.resume_py_pc, legacy
+                            ),
+                            Some(twin) => eprintln!(
+                                "M73_PFMARKER eq=0 idx={} py_pc={} m={} twin={}",
+                                pf.jitcode_index, pf.resume_py_pc, legacy, twin
+                            ),
+                            None => eprintln!(
+                                "M73_PFMARKER eq=notwin idx={} py_pc={} m={}",
+                                pf.jitcode_index, pf.resume_py_pc, legacy
+                            ),
+                        },
+                        None => eprintln!(
+                            "M73_PFMARKER eq=nomarker idx={} py_pc={}",
+                            pf.jitcode_index, pf.resume_py_pc
+                        ),
+                    }
+                }
+                _ => eprintln!(
+                    "M73_PFMARKER eq=nopjc idx={} py_pc={}",
+                    pf.jitcode_index, pf.resume_py_pc
+                ),
+            }
+        }
+        let pf_word = if m73_pfmarker_carry_enabled() {
+            pf.resume_marker_jit_pc
+                .map(|m| m as i32)
+                .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC)
+        } else {
+            majit_ir::resumedata::NO_JITCODE_PC
+        };
+        m73_sentinel_word_census("mfparent", pf.jitcode_index, pf.resume_py_pc, pf_word);
         frames.push((
             pf.jitcode_index,
             pf.resume_py_pc,
-            majit_ir::resumedata::NO_JITCODE_PC,
+            pf_word,
             pf.boxes.as_slice(),
         ));
     }
+    if m73_marker_audit_enabled() {
+        if after_residual_call {
+            // `callee_py_pc` was advanced to semantic fallthrough above; the
+            // audit prints that derived pc together with the raw CALL offset.
+            let legacy = callee_pjc.resume_jitcode_pc_for(callee_py_pc as usize);
+            let twin = callee_pjc.after_residual_marker_for_jitcode_pc(callee_op_pc);
+            eprintln!(
+                "M73_MFAR py_pc={callee_py_pc} op_pc={callee_op_pc} legacy={legacy:?} twin={twin:?}"
+            );
+        } else if callee_jitcode_pc == callee_op_pc as i32 {
+            let decodable = callee_pjc
+                .jitcode
+                .can_decode_live_vars(callee_op_pc, crate::state::op_live());
+            // For the undecodable rows the decoder falls back to the plain
+            // translation of `callee_py_pc`; print it next to the marker twin
+            // so a word swap can be certified as value-equal.
+            let legacy = callee_pjc.resume_jitcode_pc_for(callee_py_pc as usize);
+            let twin = callee_pjc.resume_marker_for_jitcode_pc(callee_op_pc);
+            eprintln!(
+                "M73_MFRAW decodable={decodable} py_pc={callee_py_pc} op_pc={callee_op_pc} \
+                 legacy={legacy:?} twin={twin:?}"
+            );
+        }
+    }
+    m73_sentinel_word_census(
+        "mfcallee",
+        callee_jitcode_index as u32,
+        callee_py_pc,
+        callee_jitcode_pc,
+    );
     frames.push((
         callee_jitcode_index as u32,
         callee_py_pc,
@@ -14121,66 +14743,88 @@ fn try_walker_inline_user_call(
     // the CALL site but stamping the walk-entry header desyncs the two windows
     // (count-mismatch assert / wrong slot layout), so carry the box coordinate
     // to the header alongside the boxes.
-    let (inline_outer_active_boxes, inline_outer_py_pc, inline_outer_jc_index) =
-        if ctx.is_full_body_walk && ctx.outer_active_boxes.is_empty() {
-            let sym_ptr = ctx.fbw_mode.snapshot_sym;
-            if sym_ptr.is_null() {
-                (
-                    ctx.outer_active_boxes.clone(),
-                    ctx.entry_py_pc,
-                    ctx.outer_jitcode_index,
-                )
-            } else {
-                let sym = unsafe { &*sym_ptr };
-                if sym.jitcode.is_null() {
-                    (
-                        ctx.outer_active_boxes.clone(),
-                        ctx.entry_py_pc,
-                        ctx.outer_jitcode_index,
-                    )
-                } else {
-                    // Liveness coordinate is the CALL op's own (jitcode index,
-                    // py_pc) — NOT the `ctx` sentinels.  `dispatch_via_miframe`
-                    // initializes `ctx.outer_jitcode_index` to 0 and
-                    // `ctx.entry_py_pc` to the walk-entry py_pc, so for a CALL in
-                    // a non-root jitcode, or a CALL not at the walk-entry pc,
-                    // those select the wrong liveness window and the callee guard
-                    // snapshot encodes the wrong frame boxes.  Derive the
-                    // coordinate from the snapshot sym's jitcode at the CALL op's
-                    // pc, matching `orthodox_list_append_commit`.
-                    let (call_site_py_pc, call_site_jc_index) = unsafe {
-                        let jc = &*sym.jitcode;
-                        let jc_index = jc.index as u32;
-                        let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc);
-                        if !jc.payload.code_ptr.is_null() {
-                            let codeobj = &*jc.payload.code_ptr;
-                            py = skip_python_trivia_forward(codeobj, py as usize) as u32;
-                        }
-                        (py, jc_index)
-                    };
-                    let boxes = collect_outer_active_boxes(
-                        sym,
-                        ctx.trace_ctx,
-                        ctx.registers_i,
-                        ctx.registers_r,
-                        ctx.registers_f,
-                        call_site_jc_index,
-                        call_site_py_pc,
-                        None,
-                        majit_ir::resumedata::NO_JITCODE_PC,
-                        None,
-                        &[],
-                    );
-                    (boxes, call_site_py_pc, call_site_jc_index)
-                }
-            }
-        } else {
+    let (
+        inline_outer_active_boxes,
+        inline_outer_py_pc,
+        inline_outer_jc_index,
+        inline_outer_resume_marker_jit_pc,
+    ) = if ctx.is_full_body_walk && ctx.outer_active_boxes.is_empty() {
+        let sym_ptr = ctx.fbw_mode.snapshot_sym;
+        if sym_ptr.is_null() {
             (
                 ctx.outer_active_boxes.clone(),
                 ctx.entry_py_pc,
                 ctx.outer_jitcode_index,
+                ctx.outer_resume_marker_jit_pc,
             )
-        };
+        } else {
+            let sym = unsafe { &*sym_ptr };
+            if sym.jitcode.is_null() {
+                (
+                    ctx.outer_active_boxes.clone(),
+                    ctx.entry_py_pc,
+                    ctx.outer_jitcode_index,
+                    ctx.outer_resume_marker_jit_pc,
+                )
+            } else {
+                // Liveness coordinate is the CALL op's own (jitcode index,
+                // py_pc) — NOT the `ctx` sentinels.  `dispatch_via_miframe`
+                // initializes `ctx.outer_jitcode_index` to 0 and
+                // `ctx.entry_py_pc` to the walk-entry py_pc, so for a CALL in
+                // a non-root jitcode, or a CALL not at the walk-entry pc,
+                // those select the wrong liveness window and the callee guard
+                // snapshot encodes the wrong frame boxes.  Derive the
+                // coordinate from the snapshot sym's jitcode at the CALL op's
+                // pc, matching `orthodox_list_append_commit`.
+                let (call_site_py_pc, call_site_jc_index, call_site_marker) = unsafe {
+                    let jc = &*sym.jitcode;
+                    let jc_index = jc.index as u32;
+                    let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc);
+                    if !jc.payload.code_ptr.is_null() {
+                        let codeobj = &*jc.payload.code_ptr;
+                        py = skip_python_trivia_forward(codeobj, py as usize) as u32;
+                    }
+                    (py, jc_index, jc.payload.resume_marker_for_jitcode_pc(op.pc))
+                };
+                m73_outercap_census(
+                    "inlinecall",
+                    call_site_jc_index as i32,
+                    call_site_py_pc as i32,
+                    call_site_marker,
+                );
+                let call_site_word = match call_site_marker.filter(|_| m73_outercap_carry_enabled())
+                {
+                    Some(m) => m as i32,
+                    None => majit_ir::resumedata::NO_JITCODE_PC,
+                };
+                let boxes = collect_outer_active_boxes(
+                    sym,
+                    ctx.trace_ctx,
+                    ctx.registers_i,
+                    ctx.registers_r,
+                    ctx.registers_f,
+                    call_site_jc_index,
+                    call_site_py_pc,
+                    None,
+                    call_site_word,
+                    None,
+                    &[],
+                );
+                (boxes, call_site_py_pc, call_site_jc_index, call_site_marker)
+            }
+        }
+    } else {
+        // No CALL-site coordinate is derived in these fallbacks; the outer
+        // coordinate is inherited from `ctx` verbatim, so the twin is too
+        // (e.g. an inline CALL inside a carrier sub-walk whose outer
+        // coordinate is the paused root).
+        (
+            ctx.outer_active_boxes.clone(),
+            ctx.entry_py_pc,
+            ctx.outer_jitcode_index,
+            ctx.outer_resume_marker_jit_pc,
+        )
+    };
     let callee_outcome = {
         let mut sub_wc = WalkContext {
             callee_shadow: Some(Default::default()),
@@ -14228,6 +14872,7 @@ fn try_walker_inline_user_call(
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: inline_outer_py_pc,
+            outer_resume_marker_jit_pc: inline_outer_resume_marker_jit_pc,
             outer_jitcode_index: inline_outer_jc_index,
             outer_active_boxes: inline_outer_active_boxes,
         };
@@ -17095,11 +17740,12 @@ fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_r
     }
     // SAFETY: same contract as walker_capture_snapshot_for_last_guard_impl —
     // pointer live for the full-body walk, immutable layout fields only.
-    let (code, metadata, jitcode_index, code_ptr): (
+    let (code, metadata, jitcode_index, code_ptr, payload): (
         &[u8],
         &crate::PyJitCodeMetadata,
         i32,
         *const _,
+        &crate::PyJitCode,
     ) = unsafe {
         let sym = &*full_body_sym;
         if sym.jitcode.is_null() {
@@ -17114,6 +17760,7 @@ fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_r
             &jc.payload.metadata,
             jc.index as i32,
             jc.payload.code_ptr,
+            &jc.payload,
         )
     };
     let Some(start) = crate::jitcode_runtime::decode_op_at(code, compare_pc) else {
@@ -17208,21 +17855,56 @@ fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_r
     // SAFETY: code_ptr captured non-null above, live for the walk.
     let code_obj = unsafe { &*code_ptr };
     // The `jc_pc` here is a branch ARM's op-start (`gin_op.next_pc` /
-    // `read_label`), NOT the guard's resume marker, so it does not satisfy
-    // the carried-coordinate contract (`can_decode_live_vars` may hold at an
-    // interior arm offset whose liveness window differs from the py opcode's
-    // representative resume window). The resume-translation normalization to
-    // the py
-    // opcode's resume liveness is the intended behavior here, so this reader
-    // keeps the py_pc channel and is excluded from the jitcode-pc liveness
-    // twin — verified: querying the carried offset directly drops live
-    // colors (e.g. `ref_ [0,1,4]` vs `[0,1]`) across the branch-arm corpus.
+    // `read_label`), NOT the guard's resume marker, so the RAW offset does
+    // not satisfy the carried-coordinate contract (`can_decode_live_vars`
+    // may hold at an interior arm offset whose liveness window differs from
+    // the py opcode's representative resume window — verified: querying the
+    // raw offset directly drops live colors, e.g. `ref_ [0,1,4]` vs `[0,1]`).
+    // The normalization this reader wants — the containing py opcode's
+    // resume `-live-` — IS the resume-marker twin at `jc_pc`
+    // (`resume_marker_for_jitcode_pc`, the invert→trivia-skip→resolve
+    // composition built at codewrite time), so under
+    // `PYRE_M73_ARMDST_CARRY` the liveness is keyed on the twin and the
+    // py_pc translation channel is bypassed.
     let arm_dst_live = |jc_pc: usize| -> bool {
         let py = skip_python_trivia_forward(
             code_obj,
             python_pc_for_jitcode_pc(metadata, jc_pc) as usize,
         );
-        let banks = crate::state::frame_liveness_reg_indices_by_bank_at(jitcode_index, py as i32);
+        let twin = payload.resume_marker_for_jitcode_pc(jc_pc);
+        if m73_marker_audit_enabled() {
+            let via_py =
+                crate::state::frame_liveness_reg_indices_by_bank_at(jitcode_index, py as i32);
+            match twin {
+                Some(t) => {
+                    let via_twin =
+                        crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                            jitcode_index,
+                            py as i32,
+                            t as i32,
+                        );
+                    if via_twin == via_py {
+                        eprintln!(
+                            "M73_ARMDST eq=1 idx={jitcode_index} jc_pc={jc_pc} py={py} m={t}"
+                        );
+                    } else {
+                        eprintln!(
+                            "M73_ARMDST eq=0 idx={jitcode_index} jc_pc={jc_pc} py={py} m={t} \
+                             via_py={via_py:?} via_twin={via_twin:?}"
+                        );
+                    }
+                }
+                None => eprintln!("M73_ARMDST eq=notwin idx={jitcode_index} jc_pc={jc_pc} py={py}"),
+            }
+        }
+        let banks = match twin.filter(|_| m73_armdst_carry_enabled()) {
+            Some(t) => crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                jitcode_index,
+                py as i32,
+                t as i32,
+            ),
+            None => crate::state::frame_liveness_reg_indices_by_bank_at(jitcode_index, py as i32),
+        };
         banks.ref_.iter().any(|&c| c as u8 == dst_reg)
     };
     if arm_dst_live(fallthrough_jc) || arm_dst_live(target_jc) {
@@ -18193,12 +18875,13 @@ fn orthodox_list_append_commit(
     // collapse to (mirror the full-body path's last_instr / valuestackdepth
     // publication, keyed to the append op's py_pc — the CALL for the method
     // form, the LIST_APPEND for the opcode form).
-    let (call_site_py_pc, vsd_value, outer_jitcode_index) = unsafe {
+    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = unsafe {
         let jc = &*sym.jitcode;
         let jc_index = jc.index as u32;
+        let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
         let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc);
         if jc.payload.code_ptr.is_null() {
-            (py, sym.valuestackdepth as i64, jc_index)
+            (py, sym.valuestackdepth as i64, jc_index, marker)
         } else {
             let codeobj = &*jc.payload.code_ptr;
             py = skip_python_trivia_forward(codeobj, py as usize) as u32;
@@ -18207,7 +18890,7 @@ fn orthodox_list_append_commit(
                 Some(d) => (sym.nlocals + d as usize) as i64,
                 None => sym.valuestackdepth as i64,
             };
-            (py, vsd, jc_index)
+            (py, vsd, jc_index, marker)
         }
     };
     if sym.owns_virtualizable_shadow() {
@@ -18227,6 +18910,16 @@ fn orthodox_list_append_commit(
             Value::Int(vsd_value),
         );
     }
+    m73_outercap_census(
+        "listappend",
+        outer_jitcode_index as i32,
+        call_site_py_pc as i32,
+        call_site_marker,
+    );
+    let call_site_word = match call_site_marker.filter(|_| m73_outercap_carry_enabled()) {
+        Some(m) => m as i32,
+        None => majit_ir::resumedata::NO_JITCODE_PC,
+    };
     let active = collect_outer_active_boxes(
         sym,
         ctx.trace_ctx,
@@ -18236,7 +18929,7 @@ fn orthodox_list_append_commit(
         outer_jitcode_index,
         call_site_py_pc,
         None,
-        majit_ir::resumedata::NO_JITCODE_PC,
+        call_site_word,
         None,
         &[],
     );
@@ -18248,12 +18941,14 @@ fn orthodox_list_append_commit(
     // parent loop's per-fn pool (which mis-resolves the first residual_call
     // descr → `ResidualCallDescrNotCallDescr`).
     let saved_entry = ctx.entry_py_pc;
+    let saved_marker = ctx.outer_resume_marker_jit_pc;
     let saved_oji = ctx.outer_jitcode_index;
     let saved_active = std::mem::take(&mut ctx.outer_active_boxes);
     let saved_descr_refs = ctx.descr_refs;
     let saved_raw_descrs = ctx.raw_descrs;
     let saved_lookup = ctx.sub_jitcode_lookup;
     ctx.entry_py_pc = call_site_py_pc;
+    ctx.outer_resume_marker_jit_pc = call_site_marker;
     ctx.outer_jitcode_index = outer_jitcode_index;
     ctx.outer_active_boxes = active;
     ctx.descr_refs = crate::jitcode_runtime::all_descr_refs();
@@ -18277,6 +18972,7 @@ fn orthodox_list_append_commit(
     ctx.fbw_mode = saved_fbw_mode;
 
     ctx.entry_py_pc = saved_entry;
+    ctx.outer_resume_marker_jit_pc = saved_marker;
     ctx.outer_jitcode_index = saved_oji;
     ctx.outer_active_boxes = saved_active;
     ctx.descr_refs = saved_descr_refs;
@@ -20480,6 +21176,7 @@ fn run_sub_jitcode_walk(
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: ctx.entry_py_pc,
+            outer_resume_marker_jit_pc: ctx.outer_resume_marker_jit_pc,
             outer_jitcode_index: ctx.outer_jitcode_index,
             outer_active_boxes: ctx.outer_active_boxes.clone(),
             store_subscr_fn_addr: ctx.store_subscr_fn_addr,
@@ -22890,10 +23587,26 @@ fn handle(
                 // the top-level walk is gated — a sub-walk keeps the prior
                 // close-on-match behaviour.
                 if !ctx.is_top_level || key == ctx.trace_ctx.root_green_key() {
+                    let loop_header_marker_jit_pc = {
+                        let sym_ptr = ctx.fbw_mode.snapshot_sym;
+                        if sym_ptr.is_null() {
+                            None
+                        } else {
+                            let sym = unsafe { &*sym_ptr };
+                            if sym.jitcode.is_null() {
+                                None
+                            } else {
+                                unsafe {
+                                    (&*sym.jitcode).payload.resume_marker_for_jitcode_pc(op.pc)
+                                }
+                            }
+                        }
+                    };
                     Ok((
                         DispatchOutcome::CloseLoop {
                             jump_args: live_args,
                             loop_header_pc: next_instr,
+                            loop_header_marker_jit_pc,
                         },
                         op.next_pc,
                     ))
@@ -23076,6 +23789,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -23146,6 +23860,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -23206,6 +23921,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -23281,6 +23997,7 @@ mod tests {
                 last_exc_value: None,
                 last_exc_value_concrete: ConcreteValue::Null,
                 entry_py_pc: 0,
+                outer_resume_marker_jit_pc: None,
                 outer_jitcode_index: 0,
                 raw_descrs: RawDescrPool::Global,
                 is_authoritative_executor: false,
@@ -23473,6 +24190,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -23534,6 +24252,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -23594,6 +24313,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -23663,6 +24383,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -23724,6 +24445,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -23784,6 +24506,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -24053,6 +24776,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -24226,6 +24950,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -24347,6 +25072,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -24462,6 +25188,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -24566,6 +25293,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -24667,6 +25395,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -24749,6 +25478,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -24810,6 +25540,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -24867,6 +25598,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -24933,6 +25665,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -24997,6 +25730,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25064,6 +25798,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25147,6 +25882,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25218,6 +25954,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25290,6 +26027,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25350,6 +26088,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25413,6 +26152,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25476,6 +26216,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25587,6 +26328,7 @@ mod tests {
             last_exc_value: Some(active_exc),
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25646,6 +26388,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25718,6 +26461,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25822,6 +26566,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25910,6 +26655,7 @@ mod tests {
             last_exc_value: Some(active_exc),
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25993,6 +26739,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26051,6 +26798,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26173,6 +26921,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26299,6 +27048,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26372,6 +27122,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26442,6 +27193,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26503,6 +27255,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26563,6 +27316,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26643,6 +27397,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26711,6 +27466,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26770,6 +27526,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26828,6 +27585,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26897,6 +27655,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27092,6 +27851,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27233,6 +27993,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27326,6 +28087,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27397,6 +28159,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27493,6 +28256,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27569,6 +28333,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27628,6 +28393,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27689,6 +28455,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27758,6 +28525,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27819,6 +28587,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27907,6 +28676,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27977,6 +28747,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -28063,6 +28834,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -28162,6 +28934,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -28333,6 +29106,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -28421,6 +29195,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -28482,6 +29257,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -28558,6 +29334,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -28658,6 +29435,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -28762,6 +29540,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -28841,6 +29620,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -28908,6 +29688,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -28970,6 +29751,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -29041,6 +29823,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -29114,6 +29897,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -29207,6 +29991,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -29289,6 +30074,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -29370,6 +30156,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -29433,6 +30220,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -29534,6 +30322,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -29632,6 +30421,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -29740,6 +30530,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -29878,6 +30669,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -29952,6 +30744,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -30014,6 +30807,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -30100,6 +30894,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -30231,6 +31026,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -30338,6 +31134,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -30444,6 +31241,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -30529,6 +31327,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -30617,6 +31416,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -30703,6 +31503,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -30794,6 +31595,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -30883,6 +31685,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -30961,6 +31764,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31060,6 +31864,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31137,6 +31942,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31202,6 +32008,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31279,6 +32086,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31376,6 +32184,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31463,6 +32272,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31528,6 +32338,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31619,6 +32430,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31693,6 +32505,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31778,6 +32591,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31851,6 +32665,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31922,6 +32737,7 @@ mod tests {
             pending_result_type: None,
             pending_inline_frame: None,
             residual_call_pc: None,
+            loop_close_marker_jit_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -32004,6 +32820,7 @@ mod tests {
             pending_result_type: None,
             pending_inline_frame: None,
             residual_call_pc: None,
+            loop_close_marker_jit_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -32092,6 +32909,7 @@ mod tests {
             pending_result_type: None,
             pending_inline_frame: None,
             residual_call_pc: None,
+            loop_close_marker_jit_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -32172,6 +32990,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -32255,6 +33074,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -32298,6 +33118,7 @@ mod tests {
             DispatchOutcome::CloseLoop {
                 jump_args,
                 loop_header_pc,
+                ..
             } => {
                 assert_eq!(loop_header_pc, 42);
                 assert_eq!(jump_args.len(), 2);
@@ -32348,6 +33169,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -32416,6 +33238,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
