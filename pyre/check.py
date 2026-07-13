@@ -945,6 +945,61 @@ class Check:
                 wasm_float_tol=wasm_float_tol,
             )
 
+    # ── self-checking regression guard ──
+
+    def run_selfcheck(self, name, script, timeout, expect="PASS", skip_backends=()):
+        """Run a self-checking regression script on each enabled backend.
+
+        The script asserts its own invariant (exit 0 AND prints *expect*);
+        check.py only honors the exit code and the required marker. Used for
+        guards whose signal is a timing ratio, not byte-identical output, so
+        they cannot go through `run_bench` or the synthetic suite.
+
+        *skip_backends* names backends the guard does not apply to (e.g. a
+        `time`-module timing guard cannot run on the wasm guest, which has no
+        `time` module).
+        """
+        print(f"  {name}")
+        for backend in ALL_BACKENDS:
+            if not self.enabled(backend):
+                continue
+            if backend in skip_backends:
+                sys.stdout.write(f"    {backend:<10s}")
+                print(dim("skip"))
+                self._append_comparison(backend, name, "-", "-", "skip")
+                continue
+            effective_timeout = scaled_timeout(timeout, self._timeout_scale(backend))
+            sys.stdout.write(f"    {backend:<10s}")
+            sys.stdout.flush()
+            output, elapsed, code, stderr = run_timed(
+                [self._pyre(backend), script],
+                timeout_s=effective_timeout,
+                env=pyre_env(),
+            )
+            panic_reason = _jit_panic_reason(stderr)
+            if panic_reason:
+                self._record(backend, False, name, panic_reason)
+                print(f"{red('JIT-PANIC')}  {panic_reason}")
+                self._append_comparison(backend, name, "-", "-", "FAIL")
+                continue
+            if code != 0:
+                detail = (
+                    f"timeout (>{effective_timeout}s)" if code == 124
+                    else f"exit {code}"
+                )
+                self._record(backend, False, name, detail)
+                print(f"{red('FAIL')}  {detail}")
+                self._append_comparison(backend, name, "-", "-", "FAIL")
+                continue
+            if expect not in output:
+                self._record(backend, False, name, f"missing '{expect}'")
+                print(f"{red('FAIL')}  missing '{expect}'")
+                self._append_comparison(backend, name, "-", "-", "FAIL")
+                continue
+            self._record(backend, True, name, "")
+            print(f"{green('PASS')}  {elapsed:.2f}s")
+            self._append_comparison(backend, name, "-", "-", f"{elapsed:.2f}s")
+
     # ── synthetic parity suite ──
 
     def run_synthetic_bench(self, path, timeout):
@@ -1275,6 +1330,15 @@ def main():
         chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",        5,       2,       7,       2,       7)
         chk.run_bench("nbody",          f"{B}/nbody.py",               10,       3,       None,    3,       None,    wasm_float_tol=True)
         chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       1,       5,       2,       None)
+        # Skipped on wasm: the guard times calls with `time.perf_counter()`, and
+        # the wasm guest has no `time` module (import fails before any output),
+        # so the guard is native-JIT-backend only.
+        chk.run_selfcheck(
+            "loop_reentry",
+            f"{B}/loop_reentry_regression.py",
+            15,
+            skip_backends=("wasm",),
+        )
 
     if not args.no_synthetic:
         print()

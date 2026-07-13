@@ -2134,6 +2134,7 @@ pub struct PyreMeta {
     #[vable(num_locals)]
     pub num_locals: usize,
     pub ns_len: usize,
+    pub namespace_dependent: bool,
     #[vable(valuestackdepth)]
     pub valuestackdepth: usize,
     /// Full `locals_cells_stack_w` length on the heap object
@@ -7804,6 +7805,7 @@ impl JitState for PyreJitState {
         PyreMeta {
             num_locals,
             ns_len: self.namespace_len(),
+            namespace_dependent: crate::trace::trace_reads_module_global(),
             valuestackdepth: vsd,
             array_capacity: capacity,
             // virtualizable_gen.rs:24-31 wires `extra_reds = { ec: Ref }` per
@@ -8051,8 +8053,13 @@ impl JitState for PyreJitState {
         // warmstate.py:503-511: RPython enters assembler unconditionally
         // when procedure_token exists. No next_instr check —
         // the compiled code's preamble handles entry from any PC.
-        // Shape checks (nlocals, namespace) ensure frame layout matches.
-        self.local_count() == meta.num_locals && self.namespace_len() == meta.ns_len
+        // Shape checks ensure the frame layout matches.  Namespace length is
+        // load-bearing only for traces that read module globals: pure-compute
+        // and builtin-only loops do not depend on later top-level binds, while
+        // module-global reads still need this conservative gate because
+        // same-key value rebinds are not value-guarded yet.
+        self.local_count() == meta.num_locals
+            && (!meta.namespace_dependent || self.namespace_len() == meta.ns_len)
     }
 
     fn setup_bridge_sym(
@@ -9106,6 +9113,7 @@ impl JitState for PyreJitState {
         PyreMeta {
             num_locals: provisional.num_locals,
             ns_len: provisional.ns_len,
+            namespace_dependent: provisional.namespace_dependent,
             valuestackdepth: provisional.valuestackdepth,
             array_capacity,
             trace_extra_reds: provisional.trace_extra_reds,
@@ -10077,6 +10085,7 @@ mod tests {
         PyreMeta {
             num_locals: 0,
             ns_len: 0,
+            namespace_dependent: false,
             valuestackdepth: 0,
             array_capacity: 0,
             trace_extra_reds: 0,
@@ -10110,6 +10119,32 @@ mod tests {
                 .map(|(instruction, _)| predicate(instruction))
                 .unwrap_or(false)
         })
+    }
+
+    #[test]
+    fn is_compatible_ignores_namespace_length_when_not_namespace_dependent() {
+        // A pure-compute / builtin-only trace does not fold a module global, so
+        // its compiled code is independent of the globals dict: a later
+        // top-level bind (namespace growth) must not refuse re-entry.
+        let state = empty_state();
+        let mut meta = empty_meta();
+        meta.num_locals = state.local_count();
+        meta.namespace_dependent = false;
+        meta.ns_len = state.namespace_len() + 5;
+        assert!(<PyreJitState as JitState>::is_compatible(&state, &meta));
+    }
+
+    #[test]
+    fn is_compatible_enforces_namespace_length_when_namespace_dependent() {
+        // A trace that read a module global keeps the conservative length gate,
+        // since same-key value rebinds are not value-guarded: a namespace-length
+        // mismatch must refuse re-entry.
+        let state = empty_state();
+        let mut meta = empty_meta();
+        meta.num_locals = state.local_count();
+        meta.namespace_dependent = true;
+        meta.ns_len = state.namespace_len() + 5;
+        assert!(!<PyreJitState as JitState>::is_compatible(&state, &meta));
     }
 
     #[test]
@@ -10931,6 +10966,7 @@ mod tests {
         let meta = PyreMeta {
             num_locals: 2,
             ns_len: 0,
+            namespace_dependent: false,
             valuestackdepth: 3,
             array_capacity: 4,
             trace_extra_reds: 1,
@@ -10989,6 +11025,7 @@ mod tests {
         let meta = PyreMeta {
             num_locals: 2,
             ns_len: 0,
+            namespace_dependent: false,
             valuestackdepth: 4,
             array_capacity: 5,
             trace_extra_reds: 1,
@@ -11048,6 +11085,7 @@ mod tests {
         let meta = PyreMeta {
             num_locals: 4,
             ns_len: 0,
+            namespace_dependent: false,
             valuestackdepth: 4,
             array_capacity: 4,
             trace_extra_reds: 1,
