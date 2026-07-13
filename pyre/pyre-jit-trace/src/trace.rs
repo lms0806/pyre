@@ -2070,6 +2070,65 @@ fn run_perfn_walk(
                     crate::jitcode_dispatch::fbw_abort_carrier_clear();
                 }
             }
+            if let Err(
+                crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported { pc },
+            ) = &walk_result
+            {
+                let abort_jit_pc = *pc;
+                if !crate::jitcode_dispatch::fbw_executed_nonpure_residual() {
+                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
+                             (no executed non-pure residual) — legacy replay kept"
+                        );
+                    }
+                } else if crate::jitcode_dispatch::fbw_has_unjournaled_effect() {
+                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
+                             (unjournaled effect) — legacy replay kept"
+                        );
+                    }
+                } else if let Some(resume_py_pc) =
+                    crate::jitcode_dispatch::fbw_abort_outer_resume_take()
+                {
+                    // Flush while the overrides stay rooted in
+                    // FBW_ABORT_OUTER_STACK_OVERRIDES (the flush boxes Int/Float
+                    // locals — an allocation that can move the nursery-resident
+                    // override refs; the area walker forwards them in place),
+                    // then clear the cell.
+                    let committed = crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_with(
+                        |stack_overrides| {
+                            crate::state::flush_walk_end_state_to_frame_with_stack_overrides(
+                                ctx,
+                                cf_addr,
+                                resume_py_pc,
+                                stack_overrides,
+                            )
+                        },
+                    );
+                    crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_clear();
+                    if committed {
+                        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[fbw-abort-flush] COMMIT abort_jit_pc={abort_jit_pc} \
+                                 resume_py_pc={resume_py_pc} (nested inline decline)"
+                            );
+                        }
+                        WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                    } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
+                             (shadow slot without concrete / depth / lastblock) — legacy replay kept"
+                        );
+                    }
+                } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
+                         (no outer caller resume pc) — legacy replay kept"
+                    );
+                }
+            }
         }
 
         // #32 S2: a kept-stack branch guard whose not-taken arm cannot be
@@ -2114,51 +2173,44 @@ fn run_perfn_walk(
                 } else if let Some(resume_py_pc) =
                     crate::jitcode_dispatch::fbw_abort_resume_py_pc(sym, abort_jit_pc)
                 {
-                    // Shape A — the abort resumes AT a FOR_ITER header whose
-                    // consumed item is in flight (`body_pc == resume_py_pc + 1`,
-                    // and the opcode there really is a FOR_ITER): the walk
-                    // advanced the iterator but the item is not yet on the
-                    // flushed (header) stack, so deliver it (push + reposition to
-                    // the body) so the body runs once.
-                    let push = crate::jitcode_dispatch::fbw_foriter_inflight_take_for_resume(
-                        cf_addr,
-                        resume_py_pc,
-                    );
-                    // Commit ONLY for Shape A — the abort resumes at an
-                    // in-flight FOR_ITER header and an item is delivered.  This
-                    // keeps the leg strictly a FOR_ITER-continuation delivery: a
-                    // `BranchGuardUnrestorableKeptStackPermanent` that is not at
-                    // such a header (a non-FOR_ITER trace, or an in-flight item
-                    // whose header is not the resume pc — the consumed item then
-                    // sits between the header and the resume pc but is not on the
-                    // shadow stack, so adopting it would resume with a stale TOS
-                    // and re-run the loop) keeps the legacy drop byte-identically
-                    // (the residual S3 case).  So every other abort shape is
-                    // untouched, including the entire flag-OFF path.
-                    // Shape A' (#493, `Unsupported` variant only) — the abort
-                    // resumes AT a FOR_ITER header whose in-flight entry is
-                    // body-COMPLETED: the abort fired during the NEXT consume
-                    // attempt (a kept-stack guard on the FOR_ITER arms after
-                    // the `for_iter_next` residual), so the item's body already
-                    // ran and delivery would double it.  The walk end state at
-                    // the header is the complete post-body state — adopt it
-                    // WITHOUT delivery; the interpreter re-attempts the consume
-                    // against the advanced iterator.  Replaces the legacy
-                    // replay-from-entry, which re-executes every residual the
-                    // walk already ran.
-                    let flush_completed_header = push.is_none()
-                        && is_unsupported
-                        && crate::jitcode_dispatch::fbw_foriter_inflight_completed_at_resume(
+                    // Two kept-stack branch aborts reach this leg (`is_unsupported`
+                    // came from the `kept_stack_abort_pc` match).  Both resume at a
+                    // FOR_ITER header whose walk already advanced the iterator; they
+                    // differ in whether the consumed item's body ran.
+                    let committed = if is_unsupported {
+                        // `BranchGuardKeptStackUnsupported` aborts AFTER the body
+                        // ran for the consumed item (the depth>1 kept operand stack
+                        // the COMPILED trace could not restore); the walk's
+                        // symbolic shadow already counted that iteration.  Resume
+                        // at the FOR_ITER header on the flushed end state WITHOUT
+                        // re-delivering the in-flight item — delivering it would
+                        // re-run the body and double-count the value.  A plain
+                        // end-state flush, gated the same as the marker leg.
+                        crate::state::flush_walk_end_state_to_frame(ctx, cf_addr, resume_py_pc)
+                    } else {
+                        // Shape A — a `BranchGuardUnrestorableKeptStackPermanent`
+                        // abort resumes AT a FOR_ITER header whose consumed item is
+                        // in flight (`body_pc == resume_py_pc + 1`, the opcode
+                        // there really is a FOR_ITER): the walk advanced the
+                        // iterator but the item is not yet on the flushed (header)
+                        // stack, so deliver it (push + reposition to the body) so
+                        // the body runs once.  Commit ONLY when an item is
+                        // delivered — a Permanent abort not at such a header keeps
+                        // the legacy drop byte-identically (the residual S3 case),
+                        // so every other abort shape (and the whole flag-OFF path)
+                        // is untouched.
+                        let push = crate::jitcode_dispatch::fbw_foriter_inflight_take_for_resume(
                             cf_addr,
                             resume_py_pc,
                         );
-                    let committed = (push.is_some() || flush_completed_header)
-                        && crate::state::flush_walk_end_state_to_frame_with_item(
-                            ctx,
-                            cf_addr,
-                            resume_py_pc,
-                            push,
-                        );
+                        push.is_some()
+                            && crate::state::flush_walk_end_state_to_frame_with_item(
+                                ctx,
+                                cf_addr,
+                                resume_py_pc,
+                                push,
+                            )
+                    };
                     if committed {
                         // The flush owns the iteration count; drop any remaining
                         // in-flight items so the legacy deliver cannot re-apply
@@ -2629,6 +2681,8 @@ fn full_body_walk_trace(
     // aborted walk's top-level `*_return` arm may have stashed, so a stale
     // value cannot leak into this walk's `Terminate` handling.
     crate::jitcode_dispatch::fbw_finish_payload_reset();
+    crate::jitcode_dispatch::fbw_executed_nonpure_residual_reset();
+    crate::jitcode_dispatch::fbw_abort_outer_resume_py_pc_reset();
     // Clear the prior walk's store journal + unjournaled-effect flag so
     // dropped (aborted) entries cannot be applied by this walk's commit.
     crate::jitcode_dispatch::fbw_store_journal_reset();
