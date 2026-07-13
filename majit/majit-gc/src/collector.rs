@@ -9,6 +9,7 @@
 use indexmap::{IndexMap, IndexSet};
 use majit_ir::GcRef;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::flags;
 use crate::header::{GcHeader, header_of};
@@ -350,6 +351,15 @@ struct FinalizerHandler {
 pub struct MiniMarkGC {
     /// The nursery (young generation).
     nursery: Nursery,
+    /// gc.py:525-531 published nursery-top slot read by generated inline
+    /// allocation paths. Kept separately from the real top so free-threaded
+    /// execution can pin the published limit to zero without changing the
+    /// Rust allocator's nursery bounds. The atomic publishes limit changes to
+    /// generated code and Rust-side readers. The Box keeps its baked address
+    /// stable even if the containing GC value moves.
+    published_nursery_top: Box<AtomicUsize>,
+    /// Whether generated code may use the shared nursery bump fast path.
+    inline_alloc_enabled: bool,
     /// The old generation.
     oldgen: OldGen,
     /// Type registry for tracing objects.
@@ -568,8 +578,12 @@ impl MiniMarkGC {
         // nursery_size * major_collection_threshold.
         min_heap_size = min_heap_size.max(nursery_size as f64 * major_collection_threshold);
 
+        let nursery = Nursery::new(config.nursery_size);
+        let published_nursery_top = Box::new(AtomicUsize::new(nursery.top_ptr() as usize));
         let mut gc = MiniMarkGC {
-            nursery: Nursery::new(config.nursery_size),
+            nursery,
+            published_nursery_top,
+            inline_alloc_enabled: true,
             oldgen: OldGen::new(),
             types: TypeRegistry::new(),
             roots: RootSet::new(),
@@ -628,6 +642,20 @@ impl MiniMarkGC {
         gc.set_major_threshold_from(0.0, 0.0);
         gc._setup_guard_is_object();
         gc
+    }
+
+    /// Refresh the gc.py:525-531 published nursery-top slot from the real
+    /// allocator bound, unless free-threading has disabled the non-atomic
+    /// shared bump fast path.
+    fn refresh_published_nursery_top(&mut self) {
+        self.published_nursery_top.store(
+            if self.inline_alloc_enabled {
+                self.nursery.top_ptr() as usize
+            } else {
+                0
+            },
+            Ordering::Release,
+        );
     }
 
     // ── incminimark.py:1292-1308 card marking geometry ──
@@ -971,6 +999,12 @@ impl MiniMarkGC {
     /// 3. Iteratively process newly discovered references until stable.
     /// 4. Reset nursery.
     pub fn do_collect_nursery(&mut self) {
+        let _stw = if crate::gc_sync::stw_required() {
+            Some(crate::gc_sync::quiesce_mutators())
+        } else {
+            None
+        };
+        let walk_all_mutators = crate::gc_sync::mutators_quiesced();
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
                 "[gc][minor] start count={} remembered={} cards_set={}",
@@ -999,9 +1033,14 @@ impl MiniMarkGC {
         // Phase 1b: Process shadow stack roots.
         // RPython gc.py: GcRootMap_shadowstack — walk the thread-local
         // shadow stack to find GC refs pushed by compiled JIT code.
-        crate::shadow_stack::walk_roots(|gcref| {
+        let mut visit_shadow_root = |gcref: &mut GcRef| {
             self.drag_out_root(gcref);
-        });
+        };
+        if walk_all_mutators {
+            crate::shadow_stack::walk_all_roots(&mut visit_shadow_root);
+        } else {
+            crate::shadow_stack::walk_roots(&mut visit_shadow_root);
+        }
 
         // Phase 1c: Process jitframe shadow stack roots.
         // RPython root_walker.walk_roots with jitframe entries —
@@ -1012,7 +1051,7 @@ impl MiniMarkGC {
         // after the walk finishes without reborrowing `self` inside the
         // tracer callback.
         let mut libc_jf_slots: Vec<*mut majit_ir::GcRef> = Vec::new();
-        crate::shadow_stack::walk_jf_roots(|gcref| {
+        let mut visit_jf_root = |gcref: &mut GcRef| {
             if self.is_nursery_object_start(gcref.0) {
                 self.drag_out_root(gcref);
             } else if !gcref.is_null() && self.oldgen.contains(gcref.0) {
@@ -1029,7 +1068,12 @@ impl MiniMarkGC {
                     libc_jf_slots.push(slot_ptr);
                 });
             }
-        });
+        };
+        if walk_all_mutators {
+            crate::shadow_stack::walk_all_jf_roots(&mut visit_jf_root);
+        } else {
+            crate::shadow_stack::walk_jf_roots(&mut visit_jf_root);
+        }
         for slot_ptr in libc_jf_slots {
             let field_ref = unsafe { &mut *slot_ptr };
             self.drag_out_root(field_ref);
@@ -1041,18 +1085,28 @@ impl MiniMarkGC {
         // root set. RPython traces these via the RPython object graph
         // (Box arrays); pyre stores raw i64 in Vec<i64> so we walk the
         // explicit thread-local stack of register banks.
-        crate::shadow_stack::walk_bh_regs(|gcref| {
+        let mut visit_bh_root = |gcref: &mut GcRef| {
             self.drag_out_root(gcref);
-        });
+        };
+        if walk_all_mutators {
+            crate::shadow_stack::walk_all_bh_regs(&mut visit_bh_root);
+        } else {
+            crate::shadow_stack::walk_bh_regs(&mut visit_bh_root);
+        }
 
         // blackhole resume construction roots (`resume.py:1312`): the
         // virtuals_cache + each frame's registers_r are filled by lazily
         // materializing virtuals before `run()` re-roots them via
         // `push_bh_regs`; forward any already-materialized nursery refs so a
         // later materialization's collection does not strand them.
-        crate::shadow_stack::walk_resume_ref_roots(|gcref| {
+        let mut visit_resume_root = |gcref: &mut GcRef| {
             self.drag_out_root(gcref);
-        });
+        };
+        if walk_all_mutators {
+            crate::shadow_stack::walk_all_resume_ref_roots(&mut visit_resume_root);
+        } else {
+            crate::shadow_stack::walk_resume_ref_roots(&mut visit_resume_root);
+        }
 
         // Phase 1e: framework.py `root_walker.walk_roots` parity — the
         // embedding runtime plugs a walker that visits
@@ -1068,6 +1122,14 @@ impl MiniMarkGC {
         crate::shadow_stack::set_extra_root_walk_kind(
             crate::shadow_stack::ExtraRootWalkKind::Minor,
         );
+        let mut visit_extra_area = |gcref: &mut GcRef| {
+            self.drag_out_root(gcref);
+        };
+        if walk_all_mutators {
+            crate::shadow_stack::walk_all_extra_areas(&mut visit_extra_area);
+        } else {
+            crate::shadow_stack::walk_my_extra_areas(&mut visit_extra_area);
+        }
         crate::walk_active_extra_roots(&mut |gcref| {
             self.drag_out_root(gcref);
         });
@@ -1201,6 +1263,7 @@ impl MiniMarkGC {
         } else {
             self.reset_nursery_with_pinned();
         }
+        self.refresh_published_nursery_top();
 
         // Minor collections must also drive incremental major-collection
         // progress. Like incminimark, take one or more major steps until
@@ -1726,12 +1789,18 @@ impl MiniMarkGC {
             self.seed_major_root(gcref);
         }
 
-        crate::shadow_stack::walk_roots(|gcref| {
+        let walk_all_mutators = crate::gc_sync::mutators_quiesced();
+        let mut visit_shadow_root = |gcref: &mut GcRef| {
             self.seed_major_root(*gcref);
-        });
+        };
+        if walk_all_mutators {
+            crate::shadow_stack::walk_all_roots(&mut visit_shadow_root);
+        } else {
+            crate::shadow_stack::walk_roots(&mut visit_shadow_root);
+        }
 
         let mut libc_jf_refs: Vec<GcRef> = Vec::new();
-        crate::shadow_stack::walk_jf_roots(|gcref| {
+        let mut visit_jf_root = |gcref: &mut GcRef| {
             if !gcref.is_null() && crate::shadow_stack::is_libc_jitframe(gcref.0) {
                 crate::shadow_stack::trace_libc_jitframe(gcref.0, &mut |slot_ptr| {
                     let field_ref = unsafe { *slot_ptr };
@@ -1742,21 +1811,45 @@ impl MiniMarkGC {
             } else {
                 self.seed_major_root(*gcref);
             }
-        });
+        };
+        if walk_all_mutators {
+            crate::shadow_stack::walk_all_jf_roots(&mut visit_jf_root);
+        } else {
+            crate::shadow_stack::walk_jf_roots(&mut visit_jf_root);
+        }
         for gcref in libc_jf_refs {
             self.seed_major_root(gcref);
         }
 
-        crate::shadow_stack::walk_bh_regs(|gcref| {
+        let mut visit_bh_root = |gcref: &mut GcRef| {
             self.seed_major_root(*gcref);
-        });
+        };
+        if walk_all_mutators {
+            crate::shadow_stack::walk_all_bh_regs(&mut visit_bh_root);
+        } else {
+            crate::shadow_stack::walk_bh_regs(&mut visit_bh_root);
+        }
 
         // blackhole resume construction roots (`resume.py:1312`): see the
         // minor-collection path for why the in-flight virtuals_cache /
         // registers_r slices must be seeded as roots.
-        crate::shadow_stack::walk_resume_ref_roots(|gcref| {
+        let mut visit_resume_root = |gcref: &mut GcRef| {
             self.seed_major_root(*gcref);
-        });
+        };
+        if walk_all_mutators {
+            crate::shadow_stack::walk_all_resume_ref_roots(&mut visit_resume_root);
+        } else {
+            crate::shadow_stack::walk_resume_ref_roots(&mut visit_resume_root);
+        }
+
+        let mut visit_extra_area = |gcref: &mut GcRef| {
+            self.seed_major_root(*gcref);
+        };
+        if walk_all_mutators {
+            crate::shadow_stack::walk_all_extra_areas(&mut visit_extra_area);
+        } else {
+            crate::shadow_stack::walk_my_extra_areas(&mut visit_extra_area);
+        }
 
         crate::walk_active_extra_roots(&mut |gcref| {
             self.seed_major_root(*gcref);
@@ -2289,6 +2382,11 @@ impl MiniMarkGC {
     /// 2. Mark phase: trace all roots and transitively mark reachable objects.
     /// 3. Sweep phase: free all unmarked old-gen objects.
     pub fn do_collect_full(&mut self) {
+        let _stw = if crate::gc_sync::stw_required() {
+            Some(crate::gc_sync::quiesce_mutators())
+        } else {
+            None
+        };
         // Minor collection first to empty the nursery.
         // Note: do_collect_nursery may itself start/advance an incremental
         // cycle, but we need a complete mark-sweep here regardless.
@@ -2342,6 +2440,11 @@ impl MiniMarkGC {
     /// remembered set is left untouched: a non-moving major does not consume
     /// `old -> young` edges, so the next minor still finds them.
     pub fn do_collect_oldgen_nonmoving(&mut self) {
+        let _stw = if crate::gc_sync::stw_required() {
+            Some(crate::gc_sync::quiesce_mutators())
+        } else {
+            None
+        };
         self.oldgen_nonmoving_active = true;
         self.oldgen_nonmoving_nursery_marks.clear();
 
@@ -3199,7 +3302,12 @@ impl GcAllocator for MiniMarkGC {
     }
 
     fn nursery_top_addr(&self) -> usize {
-        self.nursery.top_addr()
+        self.published_nursery_top.as_ptr() as usize
+    }
+
+    fn set_inline_alloc_enabled(&mut self, enabled: bool) {
+        self.inline_alloc_enabled = enabled;
+        self.refresh_published_nursery_top();
     }
 
     fn max_nursery_object_size(&self) -> usize {
@@ -3479,6 +3587,61 @@ mod tests {
         let obj = gc.alloc_with_type(0, 16);
         assert!(!obj.is_null());
         assert!(gc.is_in_nursery(obj.0));
+    }
+
+    #[test]
+    fn published_nursery_top_tracks_real_top_across_minor_collection() {
+        let mut gc = test_gc(4096);
+        gc.register_type(TypeInfo::simple(16));
+
+        let published_addr = gc.nursery_top_addr();
+        let real_top = gc.nursery_top() as usize;
+        assert_eq!(
+            unsafe { &*(published_addr as *const AtomicUsize) }.load(Ordering::Acquire),
+            real_top
+        );
+
+        // Prove the collection reset republishes the real limit instead of
+        // merely leaving the construction-time value untouched.
+        unsafe { &*(published_addr as *const AtomicUsize) }.store(0, Ordering::Release);
+        gc.collect_nursery();
+        assert_eq!(gc.nursery_top_addr(), published_addr);
+        assert_eq!(
+            unsafe { &*(published_addr as *const AtomicUsize) }.load(Ordering::Acquire),
+            real_top
+        );
+
+        let obj = gc.alloc_nursery(16);
+        assert!(!obj.is_null());
+        assert!(gc.is_in_nursery(obj.0));
+    }
+
+    #[test]
+    fn disabled_inline_alloc_keeps_published_top_zero_without_disabling_allocator() {
+        let mut gc = test_gc(4096);
+        gc.register_type(TypeInfo::simple(16));
+        let published_addr = gc.nursery_top_addr();
+
+        gc.set_inline_alloc_enabled(false);
+        assert_eq!(
+            unsafe { &*(published_addr as *const AtomicUsize) }.load(Ordering::Acquire),
+            0
+        );
+        assert!(!gc.alloc_nursery(16).is_null());
+        assert!(!gc.alloc_with_type(0, 16).is_null());
+
+        gc.collect_nursery();
+        assert_eq!(
+            unsafe { &*(published_addr as *const AtomicUsize) }.load(Ordering::Acquire),
+            0
+        );
+        assert!(!gc.alloc_nursery(16).is_null());
+
+        gc.set_inline_alloc_enabled(true);
+        assert_eq!(
+            unsafe { &*(published_addr as *const AtomicUsize) }.load(Ordering::Acquire),
+            gc.nursery_top() as usize
+        );
     }
 
     #[test]

@@ -134,15 +134,6 @@ fn pyre_object_gc_finalizer_next_dead_trampoline(fq_index: usize) -> pyre_object
         .unwrap_or(pyre_object::PY_NULL)
 }
 
-/// Heap-stats trampoline for the interpreter GC safepoint
-/// (`pyre_object::gc_interp`). Bridges pyre-object's heap-stats hook to
-/// `majit_gc::active_heap_stats`, so the safepoint can gate its
-/// collection on an empty nursery (where the embedded minor cycle moves
-/// nothing and is safe without a shadowstack pass).
-fn pyre_object_gc_heap_stats_trampoline() -> (usize, usize) {
-    majit_gc::active_heap_stats()
-}
-
 /// Jitframe-empty trampoline for the interpreter GC safepoint. Bridges
 /// pyre-object's hook to `majit_gc::jitframe_shadow_stack_empty`, so the
 /// safepoint can skip collecting while a compiled trace is suspended.
@@ -863,10 +854,27 @@ type JitDriverPair = (
 );
 
 thread_local! {
-    /// Per-thread flag: TLS hooks (backend GC handle, majit_gc
-    /// set_active_* fn-ptrs, pyre_object gc_hook cells) installed.
-    /// Each thread must install its own hooks because they are TLS cells.
+    /// Per-thread flag: this thread has registered with the gc_sync
+    /// mutator registry and installed the backend GC handle into the
+    /// backend's per-thread TLS box. The majit_gc set_active_* fn-ptrs and
+    /// pyre_object gc_hook cells are now process-global (#396), so they are
+    /// installed once (not gated by this flag); only the per-thread backend
+    /// box and mutator registration remain per-thread here.
     static GC_TLS_INSTALLED: Cell<bool> = const { Cell::new(false) };
+
+    /// Initialized after shadow_stack::register_mutator has captured all four
+    /// root TLS slots. Its destructor therefore removes the registry entry
+    /// before those slots are destroyed, then removes the thread from RUNNING.
+    static GC_MUTATOR_REGISTRATION: GcMutatorRegistration = const { GcMutatorRegistration };
+}
+
+struct GcMutatorRegistration;
+
+impl Drop for GcMutatorRegistration {
+    fn drop(&mut self) {
+        majit_gc::shadow_stack::unregister_mutator();
+        majit_gc::gc_sync::unregister_thread();
+    }
 }
 
 /// Build and configure the MiniMarkGC with all type registrations,
@@ -2339,77 +2347,61 @@ fn install_gc_into_backend() {
     majit_backend_dynasm::runner::install_gc_standalone();
 }
 
-/// Install TLS hooks: backend GC handle + pyre-object hook trampolines.
-///
-/// The 4 JIT-only root walkers (`rd_consts`, `partial_trace`,
-/// `active_trace`, `compile_snapshot`) are NOT registered here — they
-/// call `driver_pair()` which would trigger recursive `JIT_DRIVER` init.
-fn install_gc_hooks() {
-    install_gc_into_backend();
-    install_pyre_object_hooks();
-}
-
 /// Phase B: root walkers that reference interpreter state (immortal dicts,
 /// mapdict side table, etc.).  Called on first eval entry, after the
 /// interpreter is initialized.
 fn install_gc_root_walkers() {
     pyre_interpreter::eval::register_pyframe_root_walker();
-    // framework.py `root_walker.walk_roots` parity for the boxed `Ref`
-    // constants in every live jitcode's `constants_r` pool. RPython
-    // traces these through the `JitCode` GC object; pyre's jitcodes
-    // live in Rust `Arc` memory, so a constant boxed object reachable
-    // only from `jitcode.constants_r` (copied into the blackhole
-    // register file at `init_register_files_from_runtime_jitcode`) is
-    // swept by a major collection unless walked here, and the next
-    // guard-failure resume dereferences the freed pointer. See
-    // `pyre_jit_trace::state::walk_jitcode_constants_refs`.
-    majit_gc::shadow_stack::register_extra_root_walker(
-        pyre_jit_trace::state::walk_jitcode_constants_refs,
+}
+
+fn register_thread_root_areas() {
+    let register = majit_gc::shadow_stack::register_mutator_extra_area;
+    register(
+        pyframe_root_walker_area,
+        pyre_interpreter::eval::capture_pyframe_root_area(),
     );
-    // framework.py `root_walker.walk_roots` parity for the full-body
-    // walk's store-undo journal: the `(list, key, displaced)` triples
-    // hold nursery refs across the rest of the walk (residual calls
-    // allocate, and a minor collection moves nursery objects). See
-    // `pyre_jit_trace::jitcode_dispatch::fbw_store_journal_root_walker`.
-    majit_gc::shadow_stack::register_extra_root_walker(
-        pyre_jit_trace::jitcode_dispatch::fbw_store_journal_root_walker,
+    register(
+        pyre_object_root_walker_area,
+        pyre_object::gc_roots::capture_shadow_stack_area(),
     );
-    // The no-replay portal exit stashes a `Ref` return value (the
-    // walk's concrete result) that must survive the post-walk compile's
-    // allocations until the portal consumes it. See
-    // `pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_root_walker`.
-    majit_gc::shadow_stack::register_extra_root_walker(
-        pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_root_walker,
+    register(
+        jitcode_constants_root_walker_area,
+        pyre_jit_trace::state::capture_jitcode_constants_root_area(),
     );
-    // pyre's temporary mapdict side table mirrors PyPy fields that are
-    // normally traced by the translated GC. Walk its value slots
-    // explicitly until the table is folded into the object layout.
-    majit_gc::shadow_stack::register_extra_root_walker(pyre_interpreter_side_table_root_walker);
-    // Signal handler dict walker — the dict may not exist yet (null-check
-    // in walk_signal_handler_roots guards this), but the walker must be
-    // registered here so PYRE_JIT=0 paths also get it.
+    register(
+        fbw_store_journal_root_walker_area,
+        pyre_jit_trace::jitcode_dispatch::capture_fbw_store_journal_root_area(),
+    );
+    register(
+        fbw_finish_concrete_root_walker_area,
+        pyre_jit_trace::jitcode_dispatch::capture_fbw_finish_concrete_root_area(),
+    );
+    register(
+        mapdict_root_walker_area,
+        pyre_interpreter::objspace::std::mapdict::capture_mapdict_root_area(),
+    );
     #[cfg(not(target_arch = "wasm32"))]
-    majit_gc::shadow_stack::register_extra_root_walker(signal_handler_root_walker);
-    // `GcWeakrefBox` instances are immortal, so the collector never
-    // relocates / retains their inline `inner` Weakref pointer. Walk
-    // those slots as roots so a cached weakref's boxed Weakref stays
-    // coherent across collections (otherwise `get_or_make_weakref`'s
-    // cache returns a dangling pointer after a minor cycle).
-    majit_gc::shadow_stack::register_extra_root_walker(weakref_box_inner_root_walker);
-    // `W_SRE_Pattern` instances are immortal, so the collector never
-    // traces their GC-heap `w_pattern` / `w_groupindex` / `w_indexgroup`
-    // slots. Walk them as roots so a compiled pattern's named-group dict
-    // stays live (otherwise `groupdict()` iterates a reclaimed dict).
-    majit_gc::shadow_stack::register_extra_root_walker(sre_pattern_root_walker);
-    // JIT-created callee frames (frame arena + heap fallbacks) hold
-    // GC refs in their locals arrays but sit on no
-    // `CURRENT_FRAME`/`f_backref` chain while compiled code runs,
-    // so `walk_pyframe_roots` never reaches them. See
-    // `call_jit::walk_jit_callee_frame_roots`.
-    majit_gc::shadow_stack::register_extra_root_walker(
-        crate::call_jit::walk_jit_callee_frame_roots,
+    register(
+        signal_handler_root_walker_area,
+        pyre_interpreter::module::signal::interp_signal::capture_signal_handler_root_area(),
     );
-    majit_gc::shadow_stack::register_extra_root_walker(pyre_object_root_walker);
+    register(
+        weakref_box_inner_root_walker_area,
+        pyre_object::weakref::capture_gc_weakref_box_root_area(),
+    );
+    register(
+        sre_pattern_root_walker_area,
+        pyre_object::interp_sre::capture_sre_pattern_root_area(),
+    );
+    register(
+        jit_callee_frame_root_walker_area,
+        crate::call_jit::capture_jit_callee_frame_root_area(),
+    );
+    let jit_driver = JIT_DRIVER.with(|cell| cell as *const _ as *const ());
+    register(rd_consts_root_walker_area, jit_driver);
+    register(partial_trace_root_walker_area, jit_driver);
+    register(active_trace_root_walker_area, jit_driver);
+    register(compile_snapshot_root_walker_area, jit_driver);
 }
 
 /// pyre-object GC hook trampolines — safe to install at boot because
@@ -2434,7 +2426,6 @@ fn install_pyre_object_hooks() {
         pyre_object_gc_register_finalizer_trampoline,
         pyre_object_gc_finalizer_next_dead_trampoline,
     );
-    pyre_object::gc_hook::register_gc_heap_stats_hook(pyre_object_gc_heap_stats_trampoline);
     pyre_object::gc_hook::register_gc_jitframe_empty_hook(pyre_object_gc_jitframe_empty_trampoline);
     pyre_object::register_gc_root_hooks(
         pyre_object_gc_add_root_trampoline,
@@ -2474,17 +2465,32 @@ pub fn reset_gc_fresh_for_test() {
 ///
 /// Phase 1 (process-global, once): build MiniMarkGC, type registry,
 /// subclass ranges, store in gc_sync singleton.
-/// Phase 2 (per-thread, idempotent): install TLS hooks so the backend
-/// trampolines and pyre_object hooks reach the global GC via gc_sync.
+/// Phase 2a (per-thread): register this thread with the gc_sync mutator
+/// registry and install the backend GC handle. `install_gc_into_backend`
+/// also registers the `majit_gc::set_active_*` fn-pointer cells (add_root,
+/// write_barrier, guard hooks, …). The backend still keeps a per-thread TLS
+/// box (removed by #396 R4), so this part stays per-thread.
+/// Phase 2b (process-global, once): install the pyre-object hook
+/// trampolines. These are process-global fn-pointer cells (#396), so a
+/// single install is visible to every thread. They route pyre-object
+/// through the `set_active_*` cells from phase 2a, so phase 2a runs first —
+/// a thread never publishes the pyre-object hooks before its own backend
+/// `set_active_*` install.
 pub fn init_gc_subsystem() {
     build_gc_global();
-    if GC_TLS_INSTALLED.with(|c| c.get()) {
-        return;
+    if !GC_TLS_INSTALLED.with(|c| c.get()) {
+        majit_gc::gc_sync::register_thread();
+        majit_gc::shadow_stack::register_mutator();
+        register_thread_root_areas();
+        GC_MUTATOR_REGISTRATION.with(|_| {});
+        install_gc_into_backend();
+        GC_TLS_INSTALLED.with(|c| c.set(true));
     }
-    majit_gc::gc_sync::register_thread();
-    install_gc_hooks();
-    GC_TLS_INSTALLED.with(|c| c.set(true));
+    PYRE_OBJECT_HOOKS_INSTALLED.call_once(install_pyre_object_hooks);
 }
+
+/// Guards the one-time install of the process-global pyre-object GC hooks.
+static PYRE_OBJECT_HOOKS_INSTALLED: std::sync::Once = std::sync::Once::new();
 
 thread_local! {
     static GC_ROOT_WALKERS_INSTALLED: Cell<bool> = const { Cell::new(false) };
@@ -2503,42 +2509,46 @@ pub fn init_gc_root_walkers() {
 }
 
 thread_local! {
-    static JIT_DRIVER: UnsafeCell<JitDriverPair> = UnsafeCell::new({
-        let info = build_pyframe_virtualizable_info();
-        let mut d = JitDriver::new(JIT_THRESHOLD);
-        d.set_virtualizable_info(info.clone());
-        d.meta_interp_mut().num_scalar_inputargs =
-            pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-        // info.py:810-822 `ConstPtrInfo.getstrlen1(mode)` — install pyre's
-        // `W_UnicodeObject` length reader so constant STRLEN / UNICODELEN ops
-        // fold to `IntBound::from_constant(len)` during intbounds
-        // postprocessing.
-        //
-        // PyPy returns the exact length for both modes:
-        //
-        //     def getstrlen1(self, mode):
-        //         from rpython.jit.metainterp.optimizeopt import vstring
-        //         if mode is vstring.mode_string:
-        //             s = self._unpack_str(vstring.mode_string)
-        //             ...
-        //             return len(s)
-        //         elif mode is vstring.mode_unicode:
-        //             s = self._unpack_str(vstring.mode_unicode)
-        //             ...
-        //             return len(s)
-        //
-        // Pyre's `W_UnicodeObject.value` is a Rust `String` whose
-        // `len()` returns the UTF-8 BYTE length and whose
-        // `chars().count()` returns the codepoint count, so the resolver
-        // needs different reads per mode:
-        //
-        //   * mode == 0 (`vstring.mode_string`, byte string) — return the
-        //     UTF-8 byte length, which is what PyPy's `str.len()` would
-        //     produce for an RPython byte string.
-        //   * mode == 1 (`vstring.mode_unicode`, unicode string) — return
-        //     the codepoint count, which is what Python 3's
-        //     `len(str_object)` produces.
-        d.meta_interp_mut().set_string_length_resolver(std::sync::Arc::new(
+    static JIT_DRIVER: UnsafeCell<Option<JitDriverPair>> = const { UnsafeCell::new(None) };
+}
+
+fn build_jit_driver_pair() -> JitDriverPair {
+    let info = build_pyframe_virtualizable_info();
+    let mut d = JitDriver::new(JIT_THRESHOLD);
+    d.set_virtualizable_info(info.clone());
+    d.meta_interp_mut().num_scalar_inputargs =
+        pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+    // info.py:810-822 `ConstPtrInfo.getstrlen1(mode)` — install pyre's
+    // `W_UnicodeObject` length reader so constant STRLEN / UNICODELEN ops
+    // fold to `IntBound::from_constant(len)` during intbounds
+    // postprocessing.
+    //
+    // PyPy returns the exact length for both modes:
+    //
+    //     def getstrlen1(self, mode):
+    //         from rpython.jit.metainterp.optimizeopt import vstring
+    //         if mode is vstring.mode_string:
+    //             s = self._unpack_str(vstring.mode_string)
+    //             ...
+    //             return len(s)
+    //         elif mode is vstring.mode_unicode:
+    //             s = self._unpack_str(vstring.mode_unicode)
+    //             ...
+    //             return len(s)
+    //
+    // Pyre's `W_UnicodeObject.value` is a Rust `String` whose
+    // `len()` returns the UTF-8 BYTE length and whose
+    // `chars().count()` returns the codepoint count, so the resolver
+    // needs different reads per mode:
+    //
+    //   * mode == 0 (`vstring.mode_string`, byte string) — return the
+    //     UTF-8 byte length, which is what PyPy's `str.len()` would
+    //     produce for an RPython byte string.
+    //   * mode == 1 (`vstring.mode_unicode`, unicode string) — return
+    //     the codepoint count, which is what Python 3's
+    //     `len(str_object)` produces.
+    d.meta_interp_mut()
+        .set_string_length_resolver(std::sync::Arc::new(
             |gcref: majit_ir::GcRef, mode: u8| -> Option<i64> {
                 if gcref.is_null() {
                     return None;
@@ -2563,85 +2573,59 @@ thread_local! {
                 }
             },
         ));
-        init_gc_subsystem();
-
-        // framework.py `root_walker.walk_roots` parity for JIT-side const
-        // pools: every compiled guard's `rd_consts` (resume.py:451) may
-        // hold nursery-resident GC refs for TAGCONST-encoded Ref values.
-        // Without this walker, minor collection would leave stale
-        // pointers in `rd_consts` and the next guard failure would
-        // dereference freed memory. See
-        // `majit_metainterp::MetaInterp::walk_rd_consts_refs`.
-        majit_gc::shadow_stack::register_extra_root_walker(rd_consts_root_walker);
-        // framework.py `root_walker.walk_roots` parity for the stashed
-        // retrace state: `MetaInterp.partial_trace.ops` carries the
-        // recorded `Op`s between a failed bridge compile and the
-        // subsequent `compile_retrace`. Any `OpRef::ConstPtr(GcRef)`
-        // in `op.args[j]` / `op.fail_args[j]` (history.py:314
-        // `ConstPtr.value`) holds a nursery-resident Ref that must
-        // survive minor collection in that window. RPython traces these
-        // through the `TreeLoop.operations` Python object graph; pyre's
-        // `Vec<Op>` storage needs the explicit walker. See
-        // `majit_metainterp::MetaInterp::walk_partial_trace_refs`.
-        majit_gc::shadow_stack::register_extra_root_walker(partial_trace_root_walker);
-        // framework.py `root_walker.walk_roots` parity for the active
-        // recorder's op-graph: any `OpRef::ConstPtr(GcRef)` stored
-        // in `op.args[j]` or `op.fail_args[j]` (history.py:314
-        // `ConstPtr.value`) holds a nursery-resident Ref that must
-        // survive minor collection during tracing. RPython traces these
-        // through the `MetaInterp.history` Python object graph
-        // automatically; pyre's recorder is in Rust storage so the
-        // embedder registers the walker. See
-        // `majit_metainterp::MetaInterp::walk_active_trace_refs`.
-        majit_gc::shadow_stack::register_extra_root_walker(active_trace_root_walker);
-        majit_gc::shadow_stack::register_extra_root_walker(compile_snapshot_root_walker);
-        d.set_vtable_offset(Some(pyre_object::pyobject::OB_TYPE_OFFSET));
-        // resume.py:1367 — BlackholeAllocator for virtual materialization.
-        d.register_blackhole_allocator(PyreBlackholeAllocator);
-        // warmspot.py:1039 handle_jitexception_from_blackhole parity:
-        // portal_runner is called when ContinueRunningNormally is raised
-        // at a recursive portal level during blackhole execution.
-        d.register_portal_runner(pyre_portal_runner);
-        // pypy/module/pypyjit/interp_jit.py:72-78 PyPyJitDriver(..., is_recursive=True).
-        // Drives MetaInterp.is_main_jitcode() / is_portal_jitcode dispatch
-        // — without this flag the recursive-portal bookkeeping stays
-        // disabled while is_main_jitcode() callers still assume it was
-        // set, leaving the metadata internally inconsistent.
-        d.set_is_recursive(true);
-        // warmspot.py:449 — jd.result_type = getkind(portal.getreturnvar().concretetype)[0]
-        // PyPy dispatch() returns W_Root → Ref.
-        d.set_result_type(majit_ir::Type::Ref);
-        // rlib/jit.py:842 set_user_param — the translation-time `--jit STR`
-        // option's analog. `PYRE_JIT="vec_all=1"` opts vectorization in the
-        // PyPy way (parameter; the defaults stay off). `PYRE_JIT=0` keeps its
-        // existing disable meaning (handled on the can_enter_jit gate), so it
-        // is skipped here.
-        if let Ok(text) = std::env::var("PYRE_JIT") {
-            let text = text.trim();
-            if !text.is_empty() && text != "0" {
-                let ws = d.meta_interp_mut().warm_state_mut();
-                let _ = apply_jit_param_string(ws, text);
-            }
+    d.set_vtable_offset(Some(pyre_object::pyobject::OB_TYPE_OFFSET));
+    // resume.py:1367 — BlackholeAllocator for virtual materialization.
+    d.register_blackhole_allocator(PyreBlackholeAllocator);
+    // warmspot.py:1039 handle_jitexception_from_blackhole parity:
+    // portal_runner is called when ContinueRunningNormally is raised
+    // at a recursive portal level during blackhole execution.
+    d.register_portal_runner(pyre_portal_runner);
+    // pypy/module/pypyjit/interp_jit.py:72-78 PyPyJitDriver(..., is_recursive=True).
+    // Drives MetaInterp.is_main_jitcode() / is_portal_jitcode dispatch
+    // — without this flag the recursive-portal bookkeeping stays
+    // disabled while is_main_jitcode() callers still assume it was
+    // set, leaving the metadata internally inconsistent.
+    d.set_is_recursive(true);
+    // warmspot.py:449 — jd.result_type = getkind(portal.getreturnvar().concretetype)[0]
+    // PyPy dispatch() returns W_Root → Ref.
+    d.set_result_type(majit_ir::Type::Ref);
+    // rlib/jit.py:842 set_user_param — the translation-time `--jit STR`
+    // option's analog. `PYRE_JIT="vec_all=1"` opts vectorization in the
+    // PyPy way (parameter; the defaults stay off). `PYRE_JIT=0` keeps its
+    // existing disable meaning (handled on the can_enter_jit gate), so it
+    // is skipped here.
+    if let Ok(text) = std::env::var("PYRE_JIT") {
+        let text = text.trim();
+        if !text.is_empty() && text != "0" {
+            let ws = d.meta_interp_mut().warm_state_mut();
+            let _ = apply_jit_param_string(ws, text);
         }
-        // Publish the wasm CA deopt-helper's `__indirect_function_table` slot so
-        // `compile_bridge` can lift a self-recursive CALL_ASSEMBLER bridge: the
-        // CA arm `call_indirect`s it to blackhole-resume a callee that left its
-        // trace through a guard. Taking the function's address keeps it in the
-        // table; on wasm32 the address IS the table index. Done here (not only in
-        // `init_jit_hooks`) because the wasm entry path reaches `driver_pair`
-        // without `init_jit_hooks`.
-        #[cfg(target_arch = "wasm32")]
-        majit_backend_wasm::set_ca_deopt_helper_slot(
-            crate::call_jit::wasm_ca_resume_deopt as *const () as usize as u32,
-        );
-        (d, info)
-    });
+    }
+    // Publish the wasm CA deopt-helper's `__indirect_function_table` slot so
+    // `compile_bridge` can lift a self-recursive CALL_ASSEMBLER bridge: the
+    // CA arm `call_indirect`s it to blackhole-resume a callee that left its
+    // trace through a guard. Taking the function's address keeps it in the
+    // table; on wasm32 the address IS the table index. Done here (not only in
+    // `init_jit_hooks`) because the wasm entry path reaches `driver_pair`
+    // without `init_jit_hooks`.
+    #[cfg(target_arch = "wasm32")]
+    majit_backend_wasm::set_ca_deopt_helper_slot(
+        crate::call_jit::wasm_ca_resume_deopt as *const () as usize as u32,
+    );
+    (d, info)
 }
 
 // dont_look_inside: JIT-driver global accessor (JIT_DRIVER TLS).
 #[majit_macros::dont_look_inside]
 pub fn driver_pair() -> &'static mut JitDriverPair {
-    JIT_DRIVER.with(|cell| unsafe { &mut *cell.get() })
+    init_gc_subsystem();
+    JIT_DRIVER.with(|cell| unsafe {
+        let slot = &mut *cell.get();
+        if slot.is_none() {
+            *slot = Some(build_jit_driver_pair());
+        }
+        slot.as_mut().unwrap()
+    })
 }
 
 /// framework.py `root_walker.walk_roots` hook for
@@ -2662,6 +2646,15 @@ fn rd_consts_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     pair.0.walk_rd_consts_refs(visitor);
 }
 
+unsafe fn rd_consts_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
+        pair.0.walk_rd_consts_refs(visitor);
+    }
+}
+
 /// framework.py `root_walker.walk_roots` hook for the inline-Const
 /// `ConstPtr` slots inside `MetaInterp.partial_trace.ops` —
 /// history.py:314 `ConstPtr.value` lives on the OpRef itself, so the
@@ -2674,6 +2667,15 @@ fn partial_trace_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     // thread-local invariant.
     let pair = driver_pair();
     pair.0.walk_partial_trace_refs(visitor);
+}
+
+unsafe fn partial_trace_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
+        pair.0.walk_partial_trace_refs(visitor);
+    }
 }
 
 /// framework.py `root_walker.walk_roots` hook for the active recorder's
@@ -2689,6 +2691,15 @@ fn active_trace_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     pair.0.walk_active_trace_refs(visitor);
 }
 
+unsafe fn active_trace_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
+        pair.0.walk_active_trace_refs(visitor);
+    }
+}
+
 /// GC walker for ConstPtr GcRefs extracted from snapshot maps
 /// during compilation. history.py:314 ConstPtr.value is traced through
 /// the Python object graph; pyre's SnapshotBox.opref slots in Rust Vecs
@@ -2696,6 +2707,20 @@ fn active_trace_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 fn compile_snapshot_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     let pair = driver_pair();
     pair.0.walk_compile_snapshot_refs(visitor);
+}
+
+unsafe fn compile_snapshot_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
+        pair.0.walk_compile_snapshot_refs(visitor);
+    }
+}
+
+unsafe fn jit_driver_pair_from_root_area(data: *const ()) -> Option<&'static mut JitDriverPair> {
+    let cell = unsafe { &*(data as *const UnsafeCell<Option<JitDriverPair>>) };
+    unsafe { (&mut *cell.get()).as_mut() }
 }
 
 /// `framework.shadowstack walk_stack_root` adapter — walk every
@@ -2717,6 +2742,94 @@ fn pyre_object_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             unsafe { &mut *(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef) };
         visitor(gcref);
     });
+}
+
+unsafe fn pyre_object_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    unsafe {
+        pyre_object::gc_roots::walk_shadow_stack_area(data, |slot| {
+            visit_pyobject_root(slot, visitor);
+        });
+    }
+}
+
+unsafe fn pyframe_root_walker_area(data: *const (), visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    unsafe { pyre_interpreter::eval::walk_pyframe_roots_area(data, visitor) };
+}
+
+unsafe fn jitcode_constants_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    unsafe { pyre_jit_trace::state::walk_jitcode_constants_refs_area(data, visitor) };
+}
+
+unsafe fn fbw_store_journal_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    unsafe { pyre_jit_trace::jitcode_dispatch::fbw_store_journal_root_walker_area(data, visitor) };
+}
+
+unsafe fn fbw_finish_concrete_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    unsafe {
+        pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_root_walker_area(data, visitor)
+    };
+}
+
+unsafe fn mapdict_root_walker_area(data: *const (), visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::walk_mapdict_roots_area(data, |slot| {
+            visit_pyobject_root(slot, visitor);
+        });
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn signal_handler_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    unsafe {
+        pyre_interpreter::module::signal::interp_signal::walk_signal_handler_roots_area(
+            data,
+            |slot| visit_pyobject_root(slot, visitor),
+        );
+    }
+}
+
+unsafe fn weakref_box_inner_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    unsafe {
+        pyre_object::weakref::walk_gc_weakref_box_inner_roots_area(data, |slot| {
+            visit_pyobject_root(slot, visitor);
+        });
+    }
+}
+
+unsafe fn sre_pattern_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    unsafe {
+        pyre_object::interp_sre::walk_sre_pattern_roots_area(data, |slot| {
+            visit_pyobject_root(slot, visitor);
+        });
+    }
+}
+
+unsafe fn jit_callee_frame_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    unsafe { crate::call_jit::walk_jit_callee_frame_roots_area(data, visitor) };
 }
 
 fn visit_pyobject_root(
@@ -2920,6 +3033,7 @@ impl __extend__ {
         next_instr: usize,
         _ec: *const PyExecutionContext,
     ) -> PyResult {
+        majit_gc::gc_sync::safepoint_poll();
         frame.set_last_instr_from_next_instr(next_instr);
         // interp_jit.py:79-96 dispatch: the while-True loop runs until
         // Yield or ExitFrame. ContinueRunningNormally means portal
@@ -3458,7 +3572,7 @@ fn init_callbacks() {
                     crate::call_jit::jit_create_self_recursive_callee_frame_1 as *const (),
                 jit_create_self_recursive_callee_frame_1_raw_int:
                     crate::call_jit::jit_create_self_recursive_callee_frame_1_raw_int as *const (),
-                driver_pair: || JIT_DRIVER.with(|cell| cell.get() as *mut u8),
+                driver_pair: || driver_pair() as *mut JitDriverPair as *mut u8,
                 ensure_majit_jitcode: |code, w_code| {
                     if !code.is_null() {
                         let _ =
