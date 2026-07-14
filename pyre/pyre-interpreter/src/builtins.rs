@@ -2586,8 +2586,8 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         }
     }
     Err(crate::PyError::type_error(format!(
-        "bad operand type for abs(): '{}'",
-        unsafe { (*(*obj).ob_type).name }
+        "unsupported operand type for unary abs: '{}'",
+        crate::baseobjspace::object_functionstr_type_name(obj)
     )))
 }
 
@@ -3403,8 +3403,7 @@ fn builtin_issubclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     )?))
 }
 
-// Descroperation helpers (lookup_type_special, should_try_reverse_first,
-// try_dispatch_binary_special, try_dispatch_ternary_special,
+// Descroperation helpers (lookup_type_special, try_dispatch_binary_special,
 // try_int_long_pow_with_modulo, binary_builtin_type_error,
 // box_bigint_result, issubtype_w) live in `crate::baseobjspace` because
 // they are space-level semantics shared between the builtin module,
@@ -7292,9 +7291,10 @@ fn builtin_ord(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             return Ok(w_int_new(data[0] as i64));
         }
     }
-    Err(crate::PyError::type_error(
-        "ord() expected string of length 1, but other type found",
-    ))
+    Err(crate::PyError::type_error(format!(
+        "ord() expected string of length 1, but {} found",
+        crate::baseobjspace::object_functionstr_type_name(obj)
+    )))
 }
 
 /// `chr(i)` — PyPy: operation.py chr
