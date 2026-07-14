@@ -804,6 +804,11 @@ pub(crate) struct CompiledEntry<M> {
     /// Front-end loop-version state, mirroring RPython's
     /// jitcell_token.target_tokens ownership across recompilations.
     pub(crate) front_target_tokens: Vec<crate::history::TargetToken>,
+    /// Direct TargetToken LABEL entry source positions in the root/full entry
+    /// vector. For unrolled loops this is the position of every non-constant
+    /// `ExportedState.end_args` entry, matching `VirtualState.make_inputargs`'
+    /// compact non-virtual LABEL order.
+    pub(crate) front_target_source_positions: Option<Vec<usize>>,
     /// Trace id of the root compiled loop.
     pub(crate) root_trace_id: u64,
     /// Metadata for the root loop and any attached bridges, keyed by trace id.
@@ -1091,14 +1096,37 @@ pub struct MetaInterp<M: Clone> {
     /// `live_arg_boxes += virtualizable_boxes` (pyjitpl.py:2982-2989). `None`
     /// outside single-pass or when the state has no virtualizable array.
     pub(crate) single_pass_virt_array_values: Option<Vec<i64>>,
+    /// Single-pass tracing: concrete values for a direct TargetToken LABEL
+    /// entry, in that LABEL's compact argument order.  RPython's backend records
+    /// `TargetToken._x86_arglocs` in `regalloc.py:consider_label` and
+    /// `consider_jump` remaps every JUMP arg into those target locations before
+    /// `assembler.py:closing_jump`; Cranelift's host-side LABEL dispatch must
+    /// receive the same compact per-LABEL vector, not the root-loop inputarg
+    /// vector.
+    pub(crate) single_pass_compact_label_values: Option<(u64, Vec<Value>)>,
+    /// Single-pass tracing: full walk-final `raise_continue_running_normally`
+    /// values in root inputarg order.  Consumed during `compile_loop_body` only
+    /// to resolve `InputArg*` entries in a compact LABEL contract; op-result
+    /// LABEL args still read their concrete value from the recorded Box object.
+    pub(crate) single_pass_full_live_values: Option<Vec<Value>>,
     /// Single-pass tracing: the green key the CloseLoop arm compiled the
     /// (cross-loop-cut) inner loop under, captured after a `Compiled`
-    /// outcome so the merge-point hook can DIRECTLY enter that freshly
-    /// compiled loop with the walk-final state (S_{k+1}) instead of
-    /// re-interpreting the walked body — the compiled steady-state runs
-    /// iteration N+1 onward (the walk's draw was the peeled preamble).
+    /// outcome so the merge-point hook can publish a CRN/lazy back-edge
+    /// handoff for that freshly compiled loop with the walk-final state
+    /// (S_{k+1}). The compiled steady-state runs iteration N+1 onward
+    /// because the walk's draw was the peeled preamble.
     /// `None` outside single-pass or when compilation did not succeed.
     pub(crate) single_pass_compiled_key: Option<u64>,
+    /// Single-pass CRN/lazy handoff: the first matching back-edge after the
+    /// parity resume must enter the loop body LABEL rather than dispatch key 0,
+    /// because pyre's single-pass walker has already executed the peeled
+    /// preamble's side effects. This is consumed once by the matching compiled
+    /// back-edge. RPython grounding: `pyjitpl.py:3072-3085` returns to the
+    /// interpreter after successful compilation, while `compile.py:320-328`
+    /// keeps the peeled preamble before the body LABEL; the later assembler
+    /// entry corresponds to the TargetToken LABEL address, not replaying the
+    /// preamble.
+    pub(crate) single_pass_label_entry_key: Option<u64>,
     pub(crate) next_trace_id: u64,
     /// JIT hooks for profiling and debugging.
     pub(crate) hooks: JitHooks,
@@ -2302,7 +2330,10 @@ impl<M: Clone> MetaInterp<M> {
             single_pass_outcome: None,
             single_pass_scalar_values: None,
             single_pass_virt_array_values: None,
+            single_pass_compact_label_values: None,
+            single_pass_full_live_values: None,
             single_pass_compiled_key: None,
+            single_pass_label_entry_key: None,
             next_trace_id: 1,
             hooks: JitHooks::default(),
             pending_token: None,
@@ -3053,6 +3084,18 @@ impl<M: Clone> MetaInterp<M> {
             &vable_values,
             &array_lengths,
         );
+        if crate::callee_rca_enabled() {
+            eprintln!(
+                "[callee-rca][init-vable] total_vable={} has_expanded_tail={} \
+                 values={} oprefs={} identity_ref_bank_index={:?} array_lengths={:?}",
+                total_vable,
+                has_expanded_tail,
+                vable_values.len(),
+                vable_oprefs.len(),
+                info.identity_ref_bank_index,
+                array_lengths,
+            );
+        }
         // pyjitpl.py:3446 synchronize_virtualizable parity: TraceCtx needs
         // the live heap pointer to mirror shadow writes. Mirror here — the
         // MetaInterp `vable_ptr` was cached before `tracing` existed, so
@@ -5003,6 +5046,8 @@ impl<M: Clone> MetaInterp<M> {
 
     fn compile_loop_body(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
         let _snapshot_guard = CompileSnapshotRootsGuard::new(&mut self.compile_snapshot_refs);
+        self.single_pass_compact_label_values = None;
+        let single_pass_full_live_values = self.single_pass_full_live_values.take();
         // pyjitpl.py:2995 `assert len(self.virtualref_boxes) == 0,
         // "missing virtual_ref_finish()?"` — every `opimpl_virtual_ref`
         // must have a matching `opimpl_virtual_ref_finish` before the
@@ -5855,6 +5900,11 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             unroll_opt.target_tokens.clone()
         };
+        let front_target_source_positions = if retried_without_unroll {
+            None
+        } else {
+            unroll_opt.final_exported_label_source_positions.clone()
+        };
         // `compile.py:237` / `compile.py:289`
         // `target_token.original_jitcell_token = jitcell_token`. Backfill the
         // owning JitCellToken.number on every TargetToken now that the token
@@ -5867,6 +5917,28 @@ impl<M: Clone> MetaInterp<M> {
         for target_token in &front_target_tokens {
             target_token.set_original_jitcell_token_number(token_num);
             token.record_target_token(target_token.as_jump_target_descr());
+        }
+        // RPython backend contract: `consider_label` records the compact
+        // TargetToken argument locations, and `consider_jump` feeds each JUMP
+        // arg into the corresponding location.  The Cranelift host direct-entry
+        // path bypasses that in-code closing jump, so stash the same compact
+        // LABEL-ordered concrete values for `execute_token_with_dispatch_key`.
+        self.single_pass_compact_label_values = Self::compact_label_values_for_selected_target(
+            green_key,
+            &front_target_tokens,
+            &compiled_ops,
+            &trace,
+            single_pass_full_live_values.as_deref(),
+        );
+        if crate::callee_rca_enabled() {
+            eprintln!(
+                "[callee-rca][direct-entry-capture] key={green_key} compact_len={:?} \
+                 full_len={:?}",
+                self.single_pass_compact_label_values
+                    .as_ref()
+                    .map(|(_, values)| values.len()),
+                single_pass_full_live_values.as_ref().map(Vec::len),
+            );
         }
 
         // compile.py:504-511 send_loop_to_backend — unconditional virtualizable
@@ -6077,6 +6149,7 @@ impl<M: Clone> MetaInterp<M> {
                         token: Arc::downgrade(&token),
                         meta,
                         front_target_tokens,
+                        front_target_source_positions,
                         root_trace_id: trace_id,
                         traces,
                         previous_tokens,
@@ -6983,6 +7056,7 @@ impl<M: Clone> MetaInterp<M> {
                         } else {
                             unroll_opt.target_tokens.clone()
                         },
+                        front_target_source_positions: None,
                         root_trace_id: trace_id,
                         traces,
                         previous_tokens,
@@ -7510,6 +7584,7 @@ impl<M: Clone> MetaInterp<M> {
                             token: Arc::downgrade(&token),
                             meta,
                             front_target_tokens: ft,
+                            front_target_source_positions: None,
                             root_trace_id: trace_id,
                             traces,
                             previous_tokens,
@@ -7832,6 +7907,7 @@ impl<M: Clone> MetaInterp<M> {
                         token: Arc::downgrade(&token),
                         meta,
                         front_target_tokens: vec![target_token],
+                        front_target_source_positions: None,
                         root_trace_id: trace_id,
                         traces,
                         previous_tokens,
@@ -7900,6 +7976,145 @@ impl<M: Clone> MetaInterp<M> {
     /// for cross-loop cuts, otherwise the tracing key.
     pub fn last_compiled_key(&self) -> Option<u64> {
         self.last_compiled_key
+    }
+
+    /// Cranelift direct body-entry selector for the first compiled loop LABEL.
+    ///
+    /// PyPy x86 stores each TargetToken's machine-code LABEL address in
+    /// `_ll_loop_code`. Cranelift exposes one function entry instead, so the
+    /// LABEL address is represented as `label_block_id + 1`; key 0 remains the
+    /// peeled preamble host entry.
+    pub fn front_target_dispatch_key(&self, green_key: u64) -> Option<u32> {
+        let compiled = self.compiled_loops.get(&green_key)?;
+        let target = Self::selected_front_target_token(compiled)?;
+        let target_descr = target.as_jump_target_descr();
+        target_descr
+            .as_loop_target_descr()
+            .map(|target| target.label_block_id() + 1)
+    }
+
+    pub fn pack_front_target_live_values(
+        &self,
+        green_key: u64,
+        full_live_values: &[Value],
+    ) -> Option<Vec<Value>> {
+        let compiled = self.compiled_loops.get(&green_key)?;
+        let source_positions = match compiled.front_target_source_positions.as_ref() {
+            Some(positions) => positions,
+            None => {
+                if crate::callee_rca_enabled() {
+                    eprintln!(
+                        "[callee-rca][direct-entry-pack-detail] key={green_key} \
+                         missing_source_positions"
+                    );
+                }
+                return None;
+            }
+        };
+        let expected = self.front_target_inputarg_types(green_key)?.len();
+        if source_positions.len() != expected {
+            if crate::callee_rca_enabled() {
+                eprintln!(
+                    "[callee-rca][direct-entry-pack-detail] key={green_key} \
+                     source_len={} label_len={expected} sources={:?}",
+                    source_positions.len(),
+                    source_positions,
+                );
+            }
+            return None;
+        }
+        let mut packed = Vec::with_capacity(source_positions.len());
+        for &source in source_positions {
+            let Some(value) = full_live_values.get(source).copied() else {
+                if crate::callee_rca_enabled() {
+                    eprintln!(
+                        "[callee-rca][direct-entry-pack-detail] key={green_key} \
+                         source_oob={source} full_len={} sources={:?}",
+                        full_live_values.len(),
+                        source_positions,
+                    );
+                }
+                return None;
+            };
+            packed.push(value);
+        }
+        Some(packed)
+    }
+
+    fn selected_front_target_token<'a>(
+        compiled: &'a CompiledEntry<M>,
+    ) -> Option<&'a crate::history::TargetToken> {
+        compiled
+            .front_target_tokens
+            .iter()
+            .find(|target| !target.is_preamble_target)
+            .or_else(|| compiled.front_target_tokens.first())
+    }
+
+    fn selected_front_target_token_from_slice<'a>(
+        front_target_tokens: &'a [crate::history::TargetToken],
+    ) -> Option<&'a crate::history::TargetToken> {
+        front_target_tokens
+            .iter()
+            .find(|target| !target.is_preamble_target)
+            .or_else(|| front_target_tokens.first())
+    }
+
+    fn compact_label_values_for_selected_target(
+        green_key: u64,
+        front_target_tokens: &[crate::history::TargetToken],
+        compiled_ops: &[majit_ir::OpRc],
+        trace: &TreeLoop,
+        full_live_values: Option<&[Value]>,
+    ) -> Option<(u64, Vec<Value>)> {
+        let front_target = Self::selected_front_target_token_from_slice(front_target_tokens)?;
+        let target_descr = front_target.as_jump_target_descr();
+        let label = compiled_ops.iter().find(|op| {
+            op.opcode == OpCode::Label
+                && op
+                    .getdescr()
+                    .is_some_and(|descr| descr.index() == target_descr.index())
+        })?;
+        let mut values = Vec::with_capacity(label.num_args());
+        for arg in label.getarglist() {
+            let opref = arg.to_opref();
+            let value = opref
+                .inline_const_to_value()
+                .or_else(|| Self::full_live_value_for_inputarg(opref, full_live_values))
+                .or_else(|| Self::compiled_ops_concrete_at(compiled_ops, opref.raw()))
+                .or_else(|| Self::trace_concrete_at(trace, opref.raw()))?;
+            values.push(value);
+        }
+        Some((green_key, values))
+    }
+
+    fn full_live_value_for_inputarg(
+        opref: OpRef,
+        full_live_values: Option<&[Value]>,
+    ) -> Option<Value> {
+        match opref {
+            OpRef::InputArgInt(index) | OpRef::InputArgFloat(index) | OpRef::InputArgRef(index) => {
+                full_live_values.and_then(|values| values.get(index as usize).copied())
+            }
+            _ => None,
+        }
+    }
+
+    fn trace_concrete_at(trace: &TreeLoop, raw: u32) -> Option<Value> {
+        let pos = raw as usize;
+        let n = trace.inputargs.len();
+        if pos < n {
+            trace.inputargs[pos].get_value()
+        } else {
+            trace.ops.get(pos - n).and_then(|op| op.get_value())
+        }
+    }
+
+    fn compiled_ops_concrete_at(compiled_ops: &[majit_ir::OpRc], raw: u32) -> Option<Value> {
+        compiled_ops
+            .iter()
+            .find(|op| op.pos.get().raw() == raw)
+            .and_then(|op| op.get_value())
     }
 
     /// warmstate.py:437-444 `cell.flags |= JC_TRACING ... try ... finally:
@@ -8196,11 +8411,27 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         live_values: &[Value],
     ) -> Option<CompileResult<'_, M>> {
+        self.run_compiled_detailed_with_values_at_dispatch_key(green_key, live_values, 0)
+    }
+
+    /// Typed-input runner for Cranelift's direct LABEL entry.
+    ///
+    /// Dispatch key 0 is the ordinary host entry through the peeled preamble.
+    /// Dispatch key `label_block_id + 1` enters the corresponding loop LABEL
+    /// loader, matching PyPy's per-TargetToken `_ll_loop_code` entry.
+    pub fn run_compiled_detailed_with_values_at_dispatch_key(
+        &mut self,
+        green_key: u64,
+        live_values: &[Value],
+        dispatch_key: u32,
+    ) -> Option<CompileResult<'_, M>> {
         let compiled = self.compiled_loops.get(&green_key)?;
         let token = compiled.live_token()?;
 
         Self::prepare_compiled_run_io();
-        let frame = self.backend.execute_token(&token, live_values);
+        let frame = self
+            .backend
+            .execute_token_with_dispatch_key(&token, live_values, dispatch_key);
         // RPython: bridge compilation happens synchronously inside
         // assembler_call_helper (called from compiled code). No deferred queue.
 
@@ -8707,7 +8938,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn front_target_inputarg_types(&self, green_key: u64) -> Option<Vec<Type>> {
         let compiled = self.compiled_loops.get(&green_key)?;
         let root_trace = compiled.traces.get(&compiled.root_trace_id)?;
-        if let Some(front_target) = compiled.front_target_tokens.first() {
+        if let Some(front_target) = Self::selected_front_target_token(compiled) {
             let target_descr = front_target.as_jump_target_descr();
             // Rebuild the type index from the stored trace's `inputargs`
             // and `ops`; the typed `OpRef` operands carry their type, so
@@ -9907,6 +10138,7 @@ impl<M: Clone> MetaInterp<M> {
                         token: Arc::downgrade(&token),
                         meta,
                         front_target_tokens,
+                        front_target_source_positions: None,
                         root_trace_id: trace_id,
                         traces,
                         previous_tokens,
@@ -18957,6 +19189,7 @@ mod tests {
                 token: std::sync::Arc::downgrade(&token),
                 meta: (),
                 front_target_tokens: vec![start_token],
+                front_target_source_positions: None,
                 root_trace_id: trace_id,
                 traces,
                 previous_tokens: Vec::new(),
@@ -19133,6 +19366,7 @@ mod tests {
                 token: std::sync::Arc::downgrade(&token),
                 meta: (),
                 front_target_tokens: Vec::new(),
+                front_target_source_positions: None,
                 root_trace_id: trace_id,
                 traces,
                 previous_tokens: Vec::new(),
@@ -19229,6 +19463,7 @@ mod tests {
                 token: std::sync::Arc::downgrade(&token),
                 meta: (),
                 front_target_tokens: Vec::new(),
+                front_target_source_positions: None,
                 root_trace_id: trace_id,
                 traces,
                 previous_tokens: Vec::new(),
@@ -19532,6 +19767,7 @@ mod tests {
                 token: std::sync::Arc::downgrade(&token_arc),
                 meta: (),
                 front_target_tokens: Vec::new(),
+                front_target_source_positions: None,
                 root_trace_id: trace_id,
                 traces,
                 previous_tokens: Vec::new(),
@@ -20348,6 +20584,7 @@ mod tests {
                 token: std::sync::Arc::downgrade(&token),
                 meta: (),
                 front_target_tokens: Vec::new(),
+                front_target_source_positions: None,
                 root_trace_id: 0,
                 traces: indexmap::IndexMap::new(),
                 previous_tokens: Vec::new(),

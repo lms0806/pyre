@@ -1792,6 +1792,21 @@ pub trait Backend: Send {
     /// Execute compiled code starting at the given token.
     fn execute_token(&self, token: &JitCellToken, args: &[Value]) -> DeadFrame;
 
+    /// Execute compiled code starting at a backend-specific dispatch key.
+    ///
+    /// Default backends have a single token entry and ignore `dispatch_key`.
+    /// Cranelift uses key 0 for the peeled preamble and `label_block_id + 1`
+    /// for direct LABEL entry.
+    fn execute_token_with_dispatch_key(
+        &self,
+        token: &JitCellToken,
+        args: &[Value],
+        dispatch_key: u32,
+    ) -> DeadFrame {
+        let _ = dispatch_key;
+        self.execute_token(token, args)
+    }
+
     /// Execute compiled code with integer-only arguments.
     ///
     /// Avoids the `Value::Int` wrapping/unwrapping overhead when all

@@ -1291,6 +1291,9 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
             __driver.merge_point(|__meta, __sym| {
                 use majit_metainterp::JitCodeSym;
                 if __sym.trace_started && __pc == __sym.loop_header_pc() {
+                    if let Some(__ctx) = __meta.trace_ctx() {
+                        __ctx.walk_final_pc = Some(__pc);
+                    }
                     return majit_metainterp::TraceAction::CloseLoop;
                 }
                 // Slice X-D production wire-up: split-borrow the active
@@ -2029,13 +2032,11 @@ fn rewrite_body(
                                     // sym inside the CloseLoop arm (the arm clears
                                     // the sym before returning, so they cannot be
                                     // re-read here) and stashed on the MetaInterp;
-                                    // this consumes the stash. Must precede both
-                                    // `recover` (which refines storage-backed
-                                    // caches from the current scalars) and
-                                    // `try_resume_into_compiled_loop` (which reads
-                                    // the native scalars to seed the compiled
-                                    // loop). No-op with no scalar state fields
-                                    // or when no CloseLoop stashed values.
+                                    // this consumes the stash. Must precede
+                                    // `recover`, which refines storage-backed
+                                    // caches from the current scalars. No-op with
+                                    // no scalar state fields or when no CloseLoop
+                                    // stashed values.
                                     #driver.writeback_scalar_state_fields(
                                         &mut #state,
                                     );
@@ -2076,20 +2077,22 @@ fn rewrite_body(
                                     majit_metainterp::JitState::recover_after_compiled_run(
                                         &mut #state,
                                     );
-                                    // Direct-entry: run the loop the walk just
-                                    // compiled with the walk-final state so the
-                                    // compiled steady-state advances PAST the
-                                    // walked span instead of re-interpreting it
-                                    // (the native back-edges never key the walk's
-                                    // merge-point header, so the compiled inner
-                                    // loop is otherwise unreachable). Falls back to
-                                    // the close pc when nothing compiled / the run
-                                    // could not start.
-                                    #pc = #driver
-                                        .try_resume_into_compiled_loop(
-                                            __sp_pc, &mut #state, #env,
-                                        )
-                                        .unwrap_or(__sp_pc);
+                                    #driver.log_single_pass_parity_resume(
+                                        __sp_pc,
+                                        &#state,
+                                        #env,
+                                    );
+                                    #driver.arm_single_pass_label_entry_on_next_back_edge(
+                                        &#state,
+                                    );
+                                    // RPython pyjitpl.py:3119-3123 ->
+                                    // 3072-3091 parity: a successful translated
+                                    // CloseLoop raises ContinueRunningNormally,
+                                    // returning to the interpreter. The compiled
+                                    // loop is entered later via can_enter_jit /
+                                    // warmstate, not by immediate direct entry.
+                                    #driver.discard_single_pass_resume();
+                                    #pc = __sp_pc;
                                     continue;
                                 }
                             }
