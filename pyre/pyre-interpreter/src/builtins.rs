@@ -3120,6 +3120,13 @@ pub(crate) fn type_new_wrap_special_methods(ns: &mut crate::DictStorage) {
     }
 }
 
+/// A class that supplies equality but no hash is explicitly unhashable.
+pub(crate) fn type_new_set_hash_if_eq(ns: &mut crate::DictStorage) {
+    if ns.get("__eq__").is_some() && ns.get("__hash__").is_none() {
+        crate::dict_storage_store(ns, "__hash__", pyre_object::w_none());
+    }
+}
+
 fn type_descr_new_with_metaclass(
     args: &[PyObjectRef],
     w_metaclass: PyObjectRef,
@@ -3212,6 +3219,7 @@ fn type_descr_new_with_metaclass(
             }
         }
         let ns_ptr = Box::into_raw(class_ns);
+        unsafe { type_new_set_hash_if_eq(&mut *ns_ptr) };
         unsafe { type_new_wrap_special_methods(&mut *ns_ptr) };
 
         // Default bases to (object,) if empty
@@ -3227,6 +3235,7 @@ fn type_descr_new_with_metaclass(
             } else {
                 bases
             };
+        unsafe { crate::baseobjspace::validate_c3_mro(w_effective_bases)? };
 
         // CPython: calculate_metaclass — delegate to winner if different
         let default_meta = if w_metaclass.is_null() {
@@ -5233,35 +5242,52 @@ fn parse_int_from_str(s: &str, base: u32) -> Result<PyObjectRef, crate::PyError>
     } else {
         (1i64, s)
     };
-    let (radix, digits) = if base == 0 {
+    let (radix, digits, had_base_prefix) = if base == 0 {
         if let Some(r) = rest.strip_prefix("0x").or(rest.strip_prefix("0X")) {
-            (16u32, r)
+            (16u32, r, true)
         } else if let Some(r) = rest.strip_prefix("0b").or(rest.strip_prefix("0B")) {
-            (2u32, r)
+            (2u32, r, true)
         } else if let Some(r) = rest.strip_prefix("0o").or(rest.strip_prefix("0O")) {
-            (8u32, r)
+            (8u32, r, true)
         } else {
-            (10u32, rest)
+            (10u32, rest, false)
         }
     } else {
-        let stripped = match base {
-            16 => rest
-                .strip_prefix("0x")
-                .or(rest.strip_prefix("0X"))
-                .unwrap_or(rest),
-            2 => rest
-                .strip_prefix("0b")
-                .or(rest.strip_prefix("0B"))
-                .unwrap_or(rest),
-            8 => rest
-                .strip_prefix("0o")
-                .or(rest.strip_prefix("0O"))
-                .unwrap_or(rest),
-            _ => rest,
+        let (stripped, had_base_prefix) = match base {
+            16 => match rest.strip_prefix("0x").or(rest.strip_prefix("0X")) {
+                Some(r) => (r, true),
+                None => (rest, false),
+            },
+            2 => match rest.strip_prefix("0b").or(rest.strip_prefix("0B")) {
+                Some(r) => (r, true),
+                None => (rest, false),
+            },
+            8 => match rest.strip_prefix("0o").or(rest.strip_prefix("0O")) {
+                Some(r) => (r, true),
+                None => (rest, false),
+            },
+            _ => (rest, false),
         };
-        (base, stripped)
+        (base, stripped, had_base_prefix)
     };
-    let cleaned: String = digits.chars().filter(|&c| c != '_').collect();
+    let is_digit = |c: char| c.to_digit(radix).is_some();
+    let digit_chars: Vec<char> = digits.chars().collect();
+    let mut cleaned = String::with_capacity(digits.len());
+    for (i, &c) in digit_chars.iter().enumerate() {
+        if c == '_' {
+            let after_prefix = had_base_prefix && i == 0;
+            let prev_is_digit = i > 0 && is_digit(digit_chars[i - 1]);
+            let next_is_digit = i + 1 < digit_chars.len() && is_digit(digit_chars[i + 1]);
+            if next_is_digit && (prev_is_digit || after_prefix) {
+                continue;
+            }
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::ValueError,
+                format!("invalid literal for int() with base {base}: '{s}'"),
+            ));
+        }
+        cleaned.push(c);
+    }
     if let Ok(v) = i64::from_str_radix(&cleaned, radix) {
         return Ok(w_int_new(sign * v));
     }
@@ -7619,21 +7645,48 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         .map(|v| crate::baseobjspace::is_true(v))
         .transpose()?
         .unwrap_or(false);
-    let mut items = collect_iterable(iterable)?;
-    // `pypy/objspace/std/listobject.py W_ListObject.descr_sort` →
-    // build (key, item) pairs, sort by key, optionally reverse.
-    let keyed: Vec<(PyObjectRef, PyObjectRef)> = if let Some(kf) = key_fn {
-        items
-            .iter()
-            .map(|&item| {
-                let k = crate::call_function(kf, &[item]);
-                (k, item)
-            })
-            .collect()
-    } else {
-        items.iter().map(|&item| (item, item)).collect()
-    };
-    let mut keyed = keyed;
+    let items = collect_iterable(iterable)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let item_base = pyre_object::gc_roots::shadow_stack_len();
+    for item in items {
+        pyre_object::gc_roots::pin_root(item);
+    }
+    let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
+    let order = sort_rooted_items(item_base, item_len, key_fn, reverse)?;
+    let result = order
+        .into_iter()
+        .map(|index| pyre_object::gc_roots::shadow_stack_get(item_base + index))
+        .collect();
+    Ok(w_list_new(result))
+}
+
+/// Sort rooted item slots and return the resulting permutation.  All object
+/// references that survive a Python call live in the shadow stack; the sort
+/// itself only moves integer indices.
+pub(crate) fn sort_rooted_items(
+    item_base: usize,
+    item_len: usize,
+    key_fn: Option<PyObjectRef>,
+    reverse: bool,
+) -> Result<Vec<usize>, crate::PyError> {
+    let _key_roots = pyre_object::gc_roots::push_roots();
+    let key_base = pyre_object::gc_roots::shadow_stack_len();
+    let key_fn_slot = key_fn.map(|key| {
+        pyre_object::gc_roots::pin_root(key);
+        key_base
+    });
+    let key_base = key_base + usize::from(key_fn_slot.is_some());
+    if let Some(key_fn_slot) = key_fn_slot {
+        for index in 0..item_len {
+            let key = crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(key_fn_slot),
+                &[pyre_object::gc_roots::shadow_stack_get(item_base + index)],
+            )?;
+            pyre_object::gc_roots::pin_root(key);
+        }
+    }
+
+    let mut order: Vec<usize> = (0..item_len).collect();
     // `rpython/rlib/listsort.py listsort.lt` defers to
     // `space.lt(a, b)` and propagates exceptions; if the user's
     // `__lt__` raises, sort halts with that error.  Rust's
@@ -7644,10 +7697,10 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     // original relative order (a stable descending sort). A single
     // post-sort reverse would instead flip ties.
     if reverse {
-        keyed.reverse();
+        order.reverse();
     }
     let sort_error: std::cell::Cell<Option<crate::PyError>> = std::cell::Cell::new(None);
-    let sort_lt = |ka: PyObjectRef, kb: PyObjectRef| -> bool {
+    let sort_lt = |left: usize, right: usize| -> bool {
         if sort_error
             .take()
             .map(|e| {
@@ -7658,7 +7711,17 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         {
             return false;
         }
-        match crate::baseobjspace::compare(ka, kb, crate::baseobjspace::CompareOp::Lt) {
+        let left = pyre_object::gc_roots::shadow_stack_get(if key_fn_slot.is_some() {
+            key_base + left
+        } else {
+            item_base + left
+        });
+        let right = pyre_object::gc_roots::shadow_stack_get(if key_fn_slot.is_some() {
+            key_base + right
+        } else {
+            item_base + right
+        });
+        match crate::baseobjspace::compare(left, right, crate::baseobjspace::CompareOp::Lt) {
             Ok(r) => crate::baseobjspace::is_true(r).unwrap_or_else(|e| {
                 sort_error.set(Some(e));
                 false
@@ -7669,12 +7732,12 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
             }
         }
     };
-    keyed.sort_by(|(ka, _), (kb, _)| {
-        let ab = sort_lt(*ka, *kb);
+    order.sort_by(|left, right| {
+        let ab = sort_lt(*left, *right);
         if ab {
             return std::cmp::Ordering::Less;
         }
-        let ba = sort_lt(*kb, *ka);
+        let ba = sort_lt(*right, *left);
         if ba {
             return std::cmp::Ordering::Greater;
         }
@@ -7682,15 +7745,25 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         // `False` for both directions (legacy unhashable / unorderable
         // pairs that pyre still has) — preserves prior behaviour.
         unsafe {
-            if is_int(*ka) && is_int(*kb) {
-                return w_int_get_value(*ka).cmp(&w_int_get_value(*kb));
+            let left = pyre_object::gc_roots::shadow_stack_get(if key_fn_slot.is_some() {
+                key_base + *left
+            } else {
+                item_base + *left
+            });
+            let right = pyre_object::gc_roots::shadow_stack_get(if key_fn_slot.is_some() {
+                key_base + *right
+            } else {
+                item_base + *right
+            });
+            if is_int(left) && is_int(right) {
+                return w_int_get_value(left).cmp(&w_int_get_value(right));
             }
-            if is_str(*ka) && is_str(*kb) {
-                return w_str_get_value(*ka).cmp(w_str_get_value(*kb));
+            if is_str(left) && is_str(right) {
+                return w_str_get_value(left).cmp(w_str_get_value(right));
             }
-            if is_float(*ka) && is_float(*kb) {
-                return pyre_object::w_float_get_value(*ka)
-                    .partial_cmp(&pyre_object::w_float_get_value(*kb))
+            if is_float(left) && is_float(right) {
+                return pyre_object::w_float_get_value(left)
+                    .partial_cmp(&pyre_object::w_float_get_value(right))
                     .unwrap_or(std::cmp::Ordering::Equal);
             }
             std::cmp::Ordering::Equal
@@ -7701,10 +7774,9 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     }
     // Second half of the `reverse=True` double-reverse (see above).
     if reverse {
-        keyed.reverse();
+        order.reverse();
     }
-    items = keyed.into_iter().map(|(_, v)| v).collect();
-    Ok(w_list_new(items))
+    Ok(order)
 }
 
 /// `any(iterable)` — PyPy: operation.py any
@@ -7719,13 +7791,15 @@ fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    let items = collect_iterable(args[0])?;
-    for item in items {
-        if crate::baseobjspace::is_true(item)? {
-            return Ok(w_bool_from(true));
+    let it = crate::baseobjspace::iter(args[0])?;
+    loop {
+        match crate::baseobjspace::next(it) {
+            Ok(item) if crate::baseobjspace::is_true(item)? => return Ok(w_bool_from(true)),
+            Ok(_) => {}
+            Err(e) if e.kind == crate::PyErrorKind::StopIteration => return Ok(w_bool_from(false)),
+            Err(e) => return Err(e),
         }
     }
-    Ok(w_bool_from(false))
 }
 
 /// `all(iterable)` — PyPy: operation.py all
@@ -8997,13 +9071,15 @@ fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    let items = collect_iterable(args[0])?;
-    for item in items {
-        if !crate::baseobjspace::is_true(item)? {
-            return Ok(w_bool_from(false));
+    let it = crate::baseobjspace::iter(args[0])?;
+    loop {
+        match crate::baseobjspace::next(it) {
+            Ok(item) if !crate::baseobjspace::is_true(item)? => return Ok(w_bool_from(false)),
+            Ok(_) => {}
+            Err(e) if e.kind == crate::PyErrorKind::StopIteration => return Ok(w_bool_from(true)),
+            Err(e) => return Err(e),
         }
     }
-    Ok(w_bool_from(true))
 }
 
 /// `sum(sequence, start=0)` — PyPy `__builtin__/app_functional.py sum`.

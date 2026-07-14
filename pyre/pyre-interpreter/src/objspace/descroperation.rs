@@ -1357,6 +1357,34 @@ unsafe fn complex_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     Ok(w_complex_new(real, imag))
 }
 
+unsafe fn complex_powi(a: PyObjectRef, exponent: i64) -> PyResult {
+    let (mut base_real, mut base_imag) = complex_val(a).unwrap();
+    let mut result_real = 1.0;
+    let mut result_imag = 0.0;
+    let mut n = exponent.unsigned_abs();
+    while n != 0 {
+        if n & 1 != 0 {
+            let real = result_real * base_real - result_imag * base_imag;
+            result_imag = result_real * base_imag + result_imag * base_real;
+            result_real = real;
+        }
+        n >>= 1;
+        if n != 0 {
+            let real = base_real * base_real - base_imag * base_imag;
+            base_imag = base_real * base_imag + base_imag * base_real;
+            base_real = real;
+        }
+    }
+    if exponent < 0 {
+        complex_truediv(
+            w_complex_new(1.0, 0.0),
+            w_complex_new(result_real, result_imag),
+        )
+    } else {
+        Ok(w_complex_new(result_real, result_imag))
+    }
+}
+
 /// `complexobject.c _Py_c_pow`.
 unsafe fn complex_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let (ar, ai) = complex_val(a).unwrap();
@@ -1368,6 +1396,8 @@ unsafe fn complex_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             return Err(PyError::zero_division("0.0 to a negative or complex power"));
         }
         (0.0, 0.0)
+    } else if bi == 0.0 && (-100.0..=100.0).contains(&br) && br == br.trunc() {
+        return complex_powi(a, br as i64);
     } else {
         let vabs = ar.hypot(ai);
         let mut len = vabs.powf(br);
@@ -1606,6 +1636,7 @@ fn reverse_dunder(dunder: &str) -> Option<&'static str> {
         "__truediv__" => "__rtruediv__",
         "__floordiv__" => "__rfloordiv__",
         "__mod__" => "__rmod__",
+        "__matmul__" => "__rmatmul__",
         "__pow__" => "__rpow__",
         "__lshift__" => "__rlshift__",
         "__rshift__" => "__rrshift__",
@@ -1906,6 +1937,21 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for +: '{}' and '{}'",
             a_name, b_name,
+        )))
+    }
+}
+
+pub fn matmul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
+    unsafe {
+        if let Some(result) = try_dispatch_binary_special(a, b, "__matmul__", "__rmatmul__")? {
+            return Ok(result);
+        }
+        let a_name = (*ll_type(a)).name;
+        let b_name = (*ll_type(b)).name;
+        Err(PyError::type_error(format!(
+            "unsupported operand type(s) for @: '{a_name}' and '{b_name}'"
         )))
     }
 }

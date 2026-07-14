@@ -3319,23 +3319,11 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                         // since we are already iterating the full MRO ourselves.
                         let found = crate::type_dict_lookup(t, name);
                         if let Some(attr) = found {
-                            // descriptor.py W_Super.getattribute:
-                            // Invoke descriptor __get__ protocol.
-                            // classmethod.__get__(obj, type) binds the class
-                            // (`w_obj_type`); staticmethod.__get__ unwraps to
-                            // the plain function; a plain function binds `obj`.
-                            // `__new__` is implicitly static — never bind.
-                            if pyre_object::is_classmethod(attr) {
-                                let func = pyre_object::w_classmethod_get_func(attr);
-                                return Ok(pyre_object::w_method_new(func, w_obj_type, w_obj_type));
-                            }
-                            if pyre_object::is_staticmethod(attr) {
-                                return Ok(pyre_object::w_staticmethod_get_func(attr));
-                            }
-                            if name != "__new__" && crate::is_function(attr) {
-                                return Ok(pyre_object::w_method_new(attr, bound_obj, w_obj_type));
-                            }
-                            return Ok(attr);
+                            // W_Super.getattribute binds every descriptor,
+                            // rather than only the three builtin method
+                            // wrapper shapes.  This also covers property,
+                            // getset, member, and user-defined descriptors.
+                            return Ok(get(attr, bound_obj, w_obj_type)?.unwrap_or(attr));
                         }
                     }
                 }
@@ -6575,6 +6563,70 @@ pub unsafe fn compute_default_mro(w_type: PyObjectRef) -> Vec<PyObjectRef> {
     compute_mro(w_type)
 }
 
+/// Reject a base tuple whose C3 merge has no valid next head.
+///
+/// Type construction calls this before allocating the new type or running
+/// descriptor/class-subclass hooks, so an invalid hierarchy cannot escape as
+/// a later and unrelated lookup failure.
+pub unsafe fn validate_c3_mro(bases: PyObjectRef) -> Result<(), crate::PyError> {
+    if bases.is_null() || !is_tuple(bases) {
+        return Ok(());
+    }
+    let n = w_tuple_len(bases);
+    let mut lists: Vec<Vec<PyObjectRef>> = Vec::with_capacity(n + 1);
+    let mut bases_list = Vec::with_capacity(n);
+    for i in 0..n {
+        let Some(base) = w_tuple_getitem(bases, i as i64) else {
+            continue;
+        };
+        if is_type_like_w(base) {
+            let mro = w_type_get_mro(base);
+            lists.push(if mro.is_null() {
+                compute_mro(base)
+            } else {
+                (*mro).to_vec()
+            });
+        }
+        bases_list.push(base);
+    }
+    lists.push(bases_list);
+
+    loop {
+        lists.retain(|list| !list.is_empty());
+        if lists.is_empty() {
+            return Ok(());
+        }
+        let next = lists.iter().find_map(|list| {
+            let candidate = list[0];
+            (!lists.iter().any(|other| {
+                other.len() > 1 && other[1..].iter().any(|&item| std::ptr::eq(item, candidate))
+            }))
+            .then_some(candidate)
+        });
+        let Some(next) = next else {
+            let names = (0..n)
+                .filter_map(|i| w_tuple_getitem(bases, i as i64))
+                .map(|base| {
+                    if is_type_like_w(base) {
+                        w_type_get_name(base).to_string()
+                    } else {
+                        "?".to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(crate::PyError::type_error(format!(
+                "Cannot create a consistent method resolution\norder (MRO) for bases {names}"
+            )));
+        };
+        for list in &mut lists {
+            if !list.is_empty() && std::ptr::eq(list[0], next) {
+                list.remove(0);
+            }
+        }
+    }
+}
+
 /// C3 linearization core (typeobject.py:1687 `compute_C3_mro`).
 ///
 /// `dont_look_inside` — MRO computation is opaque, MRO iteration stays traced.
@@ -7166,6 +7218,9 @@ fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> PyResult {
 pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
     let value = unwrap_cell(value);
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
+    // `super` proxies only `__getattribute__` (descriptor.py W_Super); it has
+    // no `__setattr__`, so `super().name = value` uses the object default and
+    // raises AttributeError rather than resolving a descriptor setter.
     // descroperation.py:247 — space.lookup for __setattr__ through MRO,
     // then get_and_call_function which applies descriptor binding.
     unsafe {
@@ -10560,13 +10615,30 @@ fn generator_send_ex(gen_obj: PyObjectRef, w_arg: PyObjectRef, operr: Option<PyE
         w_generator_set_started(gen_obj);
         w_generator_set_running(gen_obj, true);
 
+        // A suspended `yield from` owns the next resume operation.  Keep the
+        // outer frame parked until its delegate either yields again or is
+        // exhausted, so a value or exception never takes the bytecode path
+        // intended for an awaitable resume.
+        let mut pending_operr = operr;
+        let mut delegated_completion = false;
+        if already_started && !frame.w_yielding_from.is_null() {
+            match resume_yield_from(frame, w_arg, pending_operr.take()) {
+                Ok(Some(value)) => {
+                    w_generator_set_running(gen_obj, false);
+                    return Ok(value);
+                }
+                Ok(None) => delegated_completion = true,
+                Err(err) => pending_operr = Some(err),
+            }
+        }
+
         // generator.py:104 — w_result = frame.execute_frame(w_arg, operr)
-        let w_inputvalue = if already_started && operr.is_none() {
+        let w_inputvalue = if already_started && pending_operr.is_none() && !delegated_completion {
             Some(w_arg)
         } else {
             None
         };
-        let result = frame.execute_frame(w_inputvalue, operr);
+        let result = frame.execute_frame(w_inputvalue, pending_operr);
 
         w_generator_set_running(gen_obj, false);
 
@@ -10602,6 +10674,123 @@ fn generator_send_ex(gen_obj: PyObjectRef, w_arg: PyObjectRef, operr: Option<PyE
             }
         }
     }
+}
+
+/// Resume the iterator recorded by a suspended `yield from`.
+///
+/// `Some` is a value yielded by the delegate and is therefore also the
+/// outer generator's result.  `None` means the delegate completed and the
+/// outer frame has been positioned at the completion path.
+fn resume_yield_from(
+    frame: &mut crate::pyframe::PyFrame,
+    w_arg: PyObjectRef,
+    operr: Option<PyError>,
+) -> Result<Option<PyObjectRef>, PyError> {
+    let w_yf = frame.w_yielding_from;
+    debug_assert!(!w_yf.is_null());
+
+    let result = match operr {
+        Some(err) if err.kind == PyErrorKind::GeneratorExit => {
+            close_yield_from(w_yf)?;
+            frame.w_yielding_from = pyre_object::PY_NULL;
+            return Err(err);
+        }
+        Some(err) => throw_yield_from(w_yf, err),
+        None if unsafe { pyre_object::is_none(w_arg) } => next(w_yf),
+        None => {
+            let send = getattr_str(w_yf, "send")?;
+            crate::call::call_function_impl_result(send, &[w_arg])
+        }
+    };
+
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if err.kind == PyErrorKind::StopIteration => {
+            frame.w_yielding_from = pyre_object::PY_NULL;
+            finish_yield_from(frame, err)?;
+            Ok(None)
+        }
+        Err(err) => {
+            frame.w_yielding_from = pyre_object::PY_NULL;
+            Err(err)
+        }
+    }
+}
+
+/// Delegate a thrown exception, preserving the original exception when the
+/// iterator has no `throw` method.
+fn throw_yield_from(w_yf: PyObjectRef, err: PyError) -> PyResult {
+    unsafe {
+        if pyre_object::generator::is_generator(w_yf) {
+            return generator_send_ex(w_yf, w_none(), Some(err));
+        }
+    }
+    let throw = match getattr_str(w_yf, "throw") {
+        Ok(method) => method,
+        Err(attr_err) if attr_err.kind == PyErrorKind::AttributeError => return Err(err),
+        Err(attr_err) => return Err(attr_err),
+    };
+    let w_exc = err.to_exc_object();
+    let w_type = crate::typedef::r#type(w_exc).unwrap_or(pyre_object::PY_NULL);
+    crate::call::call_function_impl_result(throw, &[w_type, w_exc])
+}
+
+/// Run a delegated iterator's close operation.  A generator close is kept
+/// in the same resume path so nested delegation unwinds one frame at a time.
+fn close_yield_from(w_yf: PyObjectRef) -> PyResult {
+    unsafe {
+        if pyre_object::generator::is_generator(w_yf) {
+            let exit = PyError::new(PyErrorKind::GeneratorExit, String::new());
+            return match generator_send_ex(w_yf, w_none(), Some(exit)) {
+                Ok(_) => Err(PyError::runtime_error("generator ignored GeneratorExit")),
+                Err(err)
+                    if err.kind == PyErrorKind::StopIteration
+                        || err.kind == PyErrorKind::GeneratorExit =>
+                {
+                    Ok(w_none())
+                }
+                Err(err) => Err(err),
+            };
+        }
+    }
+    let close = match getattr_str(w_yf, "close") {
+        Ok(method) => method,
+        Err(err) if err.kind == PyErrorKind::AttributeError => return Ok(w_none()),
+        Err(err) => return Err(err),
+    };
+    crate::call::call_function_impl_result(close, &[])
+}
+
+/// Put the stopped delegate's return value through the `SEND` completion
+/// edge.  The iterator remains on the operand stack until `END_SEND` removes
+/// it, exactly as it does when exhaustion happens during bytecode dispatch.
+fn finish_yield_from(frame: &mut crate::pyframe::PyFrame, err: PyError) -> Result<(), PyError> {
+    use crate::bytecode::Instruction;
+
+    let value = if !err.exc_object.is_null() && unsafe { pyre_object::is_exception(err.exc_object) }
+    {
+        getattr_str(err.exc_object, "value").unwrap_or_else(|_| w_none())
+    } else {
+        w_none()
+    };
+    frame.pushvalue(value);
+
+    let code = frame.code();
+    let last_instr = frame.last_instr.max(0) as usize;
+    let mut completion_target = None;
+    for pc in 0..=last_instr {
+        let Some((instruction, op_arg)) = crate::pyopcode::decode_instruction_at(code, pc) else {
+            continue;
+        };
+        if let Instruction::Send { delta } = instruction {
+            let next = pc + instruction.cache_entries() + 1;
+            completion_target = Some(next + delta.get(op_arg).as_usize());
+        }
+    }
+    let target = completion_target
+        .ok_or_else(|| PyError::runtime_error("yield from completion has no SEND instruction"))?;
+    frame.set_last_instr_from_next_instr(target);
+    Ok(())
 }
 
 /// Build a `StopIteration` carrying `value` on `.value` / `args[0]`.
@@ -10922,7 +11111,7 @@ fn generator_throw_method(args: &[PyObjectRef]) -> PyResult {
     };
     // w_tb (args[3]) ignored for now — traceback not yet supported
 
-    let err = normalize_throw_args(w_type, w_val);
+    let err = normalize_throw_args(w_type, w_val)?;
     generator_send_ex(gen_obj, w_none(), Some(err))
 }
 
@@ -10964,30 +11153,30 @@ fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
 ///   throw(TypeError)         — type → creates instance
 ///   throw(TypeError("msg"))  — instance → derives type
 ///   throw(TypeError, "msg")  — type + value → creates instance
-fn normalize_throw_args(w_type: PyObjectRef, w_val: PyObjectRef) -> PyError {
+fn normalize_throw_args(w_type: PyObjectRef, w_val: PyObjectRef) -> Result<PyError, PyError> {
     unsafe {
         // If w_type is an exception instance, use it directly
         if !w_type.is_null() && pyre_object::interp_exceptions::is_exception(w_type) {
-            return PyError::from_exc_object(w_type);
+            return Ok(PyError::from_exc_object(w_type));
         }
 
-        // If w_type is a type (class), try to create exception from it
-        if !w_type.is_null() && pyre_object::is_type(w_type) {
-            let type_name = pyre_object::w_type_get_name(w_type);
-            if let Some(kind) = pyre_object::interp_exceptions::exc_kind_from_name(type_name) {
-                let msg = if w_val.is_null() || pyre_object::is_none(w_val) {
-                    String::new()
-                } else if pyre_object::is_str(w_val) {
-                    pyre_object::w_str_get_value(w_val).to_string()
-                } else {
-                    String::new()
-                };
-                return PyError::new(PyError::kind_from_exc(kind), msg);
+        // generator.py throw(): a valid exception class is called to make
+        // the exception instance, including user-defined subclasses.
+        if !w_type.is_null() && exception_is_valid_obj_as_class_w(w_type) {
+            let w_exc = if w_val.is_null() || pyre_object::is_none(w_val) {
+                crate::call::call_function_impl_result(w_type, &[])?
+            } else {
+                crate::call::call_function_impl_result(w_type, &[w_val])?
+            };
+            if pyre_object::interp_exceptions::is_exception(w_exc) {
+                return Ok(PyError::from_exc_object(w_exc));
             }
         }
 
         // Fallback: TypeError
-        PyError::type_error("exceptions must be classes or instances deriving from BaseException")
+        Err(PyError::type_error(
+            "exceptions must be classes or instances deriving from BaseException",
+        ))
     }
 }
 
