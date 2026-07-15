@@ -5661,14 +5661,37 @@ pub(crate) fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
 
 pub fn collect_iterable(obj: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
     let it = crate::baseobjspace::iter(obj)?;
-    let mut items = Vec::new();
+    // Each `next` runs arbitrary allocating code (a generator body, a JIT
+    // callee that boxes a fresh int) which can trigger a moving minor
+    // collection. A raw `Vec<PyObjectRef>` on the malloc heap is invisible to
+    // the collector, so already-collected nursery elements would be stranded /
+    // not forwarded. Pin the iterator and each yielded element onto the shadow
+    // stack (a real GC root the collector walks and updates on relocation),
+    // then read the forwarded slots back out — the manual equivalent of the
+    // translator's shadowstack save/restore around a collecting call
+    // (framework.py:853-856).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(it);
+    let mut count = 0usize;
     loop {
-        match crate::baseobjspace::next(it) {
-            Ok(v) => items.push(v),
+        // The iterator may itself have moved during a prior `next`; reload it
+        // from its (post-relocation) shadow-stack slot before each call.
+        let it_now = pyre_object::gc_roots::shadow_stack_get(base);
+        match crate::baseobjspace::next(it_now) {
+            Ok(v) => {
+                pyre_object::gc_roots::pin_root(v);
+                count += 1;
+            }
             Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
             Err(e) => return Err(e),
         }
     }
+    // Read the forwarded element slots back out. The elements sit at
+    // `base + 1 ..= base + count` (the iterator occupies `base`).
+    let items = (0..count)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(base + 1 + i))
+        .collect();
     Ok(items)
 }
 
@@ -5682,11 +5705,28 @@ pub fn collect_iterable(obj: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyE
 /// dedup, and the hash itself is not used for storage.
 pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let set = pyre_object::w_set_new();
-    for &item in items {
-        try_hash_value(item)?;
-        unsafe { pyre_object::w_set_add(set, item) };
+    unsafe {
+        // `try_hash_value` may run a user `__hash__` that allocates and
+        // triggers a moving minor collection; `set` and every not-yet-added
+        // item are rooted for the whole loop and reloaded after each hash,
+        // matching `set_update_value`.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(set);
+        let item_base = sp + 1;
+        for &item in items {
+            pyre_object::gc_roots::pin_root(item);
+        }
+        let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
+        for i in 0..item_len {
+            let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+            try_hash_value(item)?;
+            let set = pyre_object::gc_roots::shadow_stack_get(sp);
+            let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+            pyre_object::w_set_add(set, item);
+        }
+        Ok(pyre_object::gc_roots::shadow_stack_get(sp))
     }
-    Ok(set)
 }
 
 /// `dict()` — PyPy: dictmultiobject.py W_DictMultiObject.descr_init
@@ -5720,10 +5760,37 @@ pub(crate) fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
         let dict = w_dict_new();
         let keys_obj = crate::call_function(keys_method, &[]);
         let keys = collect_iterable(keys_obj)?;
-        for key in keys {
-            let val = crate::baseobjspace::getitem(src, key)?;
-            unsafe { w_dict_store(dict, key, val) };
-        }
+        // `getitem` (arbitrary `__getitem__`) and `try_hash_value`
+        // (arbitrary `__hash__`) may both allocate and move `dict`, `src`,
+        // and any collected key, so all of them are rooted for the loop's
+        // duration and reloaded before each use — mirrors
+        // `opcode_ops::dict_update_value`.
+        let dict = unsafe {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let sp = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(dict);
+            pyre_object::gc_roots::pin_root(src);
+            let key_base = sp + 2;
+            for key in keys {
+                pyre_object::gc_roots::pin_root(key);
+            }
+            let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
+            for i in 0..key_len {
+                let src = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+                let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
+                let val = crate::baseobjspace::getitem(src, key)?;
+                let _val_root = pyre_object::gc_roots::push_roots();
+                let val_slot = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(val);
+                let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
+                try_hash_value(key)?;
+                let dict = pyre_object::gc_roots::shadow_stack_get(sp);
+                let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
+                let val = pyre_object::gc_roots::shadow_stack_get(val_slot);
+                w_dict_store(dict, key, val);
+            }
+            pyre_object::gc_roots::shadow_stack_get(sp)
+        };
         return Ok(dict);
     }
     // Construct from iterable of (key, value) pairs — dictmultiobject.py
@@ -5731,16 +5798,39 @@ pub(crate) fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
     // iterable), not just tuple/list.
     let dict = w_dict_new();
     let items = collect_iterable(src)?;
-    for (i, pair) in items.into_iter().enumerate() {
-        let elems = collect_iterable(pair)?;
-        if elems.len() != 2 {
-            return Err(crate::PyError::value_error(format!(
-                "dictionary update sequence element #{i} has length {}; 2 is required",
-                elems.len()
-            )));
+    // `dict` and every collected pair-source need the same treatment: each
+    // pair's own `collect_iterable` and `try_hash_value` are collection
+    // points that can move `dict` and any not-yet-processed pair.
+    let dict = unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(dict);
+        let item_base = sp + 1;
+        for item in &items {
+            pyre_object::gc_roots::pin_root(*item);
         }
-        unsafe { w_dict_store(dict, elems[0], elems[1]) };
-    }
+        let item_len = items.len();
+        for i in 0..item_len {
+            let pair = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+            let elems = collect_iterable(pair)?;
+            if elems.len() != 2 {
+                return Err(crate::PyError::value_error(format!(
+                    "dictionary update sequence element #{i} has length {}; 2 is required",
+                    elems.len()
+                )));
+            }
+            let _pair_roots = pyre_object::gc_roots::push_roots();
+            let pair_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(elems[0]);
+            pyre_object::gc_roots::pin_root(elems[1]);
+            try_hash_value(elems[0])?;
+            let dict = pyre_object::gc_roots::shadow_stack_get(sp);
+            let key = pyre_object::gc_roots::shadow_stack_get(pair_slot);
+            let val = pyre_object::gc_roots::shadow_stack_get(pair_slot + 1);
+            w_dict_store(dict, key, val);
+        }
+        pyre_object::gc_roots::shadow_stack_get(sp)
+    };
     Ok(dict)
 }
 

@@ -4737,22 +4737,53 @@ fn setarrayitem_vable_via_metainterp(
         shadow.set_concrete(code[op.pc + 1] as u16, index_value, concrete);
     }
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;
-    // #73 (SLICE 1, INERT): a Ref stored to the operand-stack region of the
-    // vable array is an operand-stack PUSH (portal `pyframe.pushvalue`
-    // lowers to `setarrayitem_vable_r(locals_cells_stack_w, depth, w_obj)`).
-    // Capture it as the current opcode's TOS box for the walk-level
-    // operand-stack mirror — this is the chokepoint that catches pushes which
-    // never go through `write_ref_reg` (notably COPY, whose duplicate is
-    // emitted as a bare pushvalue with no compute step).  Gate on the stack
-    // region (`index >= nlocals`) so a STORE_FAST/local-slot store does not
-    // masquerade as a stack TOS.  Writes ONLY `vstack_last_ref` (side-data);
-    // consumed only when the mirror is valid.
+    // A Ref stored to the operand-stack region of the vable array is an
+    // operand-stack push (`pyframe.pushvalue` lowers to
+    // `setarrayitem_vable_r(locals_cells_stack_w, depth, w_obj)`). Retain the
+    // last-write TOS candidate for ordinary single-result opcodes. Method-form
+    // LOAD_ATTR is the one two-result shape that also needs its exact lower
+    // slot mirrored: it writes `[method, self]`, and retaining only `self`
+    // made boundary reconciliation refill the method hole from the stale
+    // pre-LOAD_ATTR receiver. A later guard then resumed CALL with that
+    // receiver as its callee. Scope the positional write to that opcode; the
+    // general boundary model remains authoritative for other push/pop shapes.
+    // Local/cell stores remain excluded by the `index >= nlocals` gate.
     if value_bank == 'r' && ctx.vstack_valid {
         let full_body_sym = ctx.fbw_mode.snapshot_sym;
         if !full_body_sym.is_null() {
             // SAFETY: pointer live for the full-body walk; read-only.
             let nlocals = unsafe { (*full_body_sym).nlocals } as i64;
             if index_value >= nlocals {
+                let method_load = unsafe {
+                    let jitcode = (*full_body_sym).jitcode;
+                    if jitcode.is_null() {
+                        false
+                    } else {
+                        let jitcode = &*jitcode;
+                        if jitcode.payload.code_ptr.is_null() {
+                            false
+                        } else {
+                            pyre_interpreter::decode_instruction_at(
+                                &*jitcode.payload.code_ptr,
+                                ctx.vstack_cur_pypc as usize,
+                            )
+                            .is_some_and(|(instr, op_arg)| match instr
+                            {
+                                pyre_interpreter::Instruction::LoadAttr { namei } => {
+                                    namei.get(op_arg).is_method()
+                                }
+                                _ => false,
+                            })
+                        }
+                    }
+                };
+                if method_load {
+                    let stack_slot = (index_value - nlocals) as usize;
+                    if ctx.vstack_boxes.len() <= stack_slot {
+                        ctx.vstack_boxes.resize(stack_slot + 1, OpRef::NONE);
+                    }
+                    ctx.vstack_boxes[stack_slot] = value;
+                }
                 ctx.vstack_last_ref = value;
             }
         }
@@ -10922,7 +10953,7 @@ fn kept_stack_has_boxed_int_hazard(
         if depth == 0 {
             return false;
         }
-        let nlocals = code.varnames.len();
+        let stack_base = pjc.metadata.stack_base;
         let pcdep = pjc.metadata.pcdep_color_slots.get(py);
         let consts = pjc.metadata.const_ref_slots_at_pc.get(py);
         // The concrete shadow unboxes exact ints, so a kept slot that holds a
@@ -10935,7 +10966,7 @@ fn kept_stack_has_boxed_int_hazard(
                 && !(0..256).contains(&pyre_object::w_int_get_value(p))
         };
         for s in 0..depth {
-            let slot = (nlocals + s) as u16;
+            let slot = (stack_base + s) as u16;
             // Live Variable slot: inspect its concrete register value.
             if let Some(color) = pcdep.and_then(|e| {
                 e.iter()
@@ -13997,6 +14028,32 @@ fn try_walker_call_assembler_self_recursive(
     // make_result_of_lastop before handle_possible_exception for
     // get_list_of_active_boxes).
     write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, ca_result)?;
+
+    // The CALL_ASSEMBLER fold records both post-call guards before the walk
+    // reaches the next Python-opcode boundary, so advance the caller's stack
+    // mirror here.  Keep any operands below the call, discard the callable,
+    // NULL marker, and arguments, then put the assembler result on the new
+    // TOS.  The register writeback above already carries the same result, but
+    // guard snapshotting sources operand-stack slots from this mirror.
+    if ctx.vstack_valid {
+        let caller_jitcode = unsafe { &*sym.jitcode };
+        let caller_code = unsafe { &*caller_jitcode.payload.code_ptr };
+        let call_py_pc = python_pc_for_jitcode_pc(&caller_jitcode.payload.metadata, op.pc) as usize;
+        let resume_py_pc = crate::pyjitpl::semantic_fallthrough_pc(caller_code, call_py_pc) as u32;
+        let resume_depth = crate::liveness::liveness_for(caller_jitcode.payload.code_ptr)
+            .depth_at_py_pc()
+            .get(resume_py_pc as usize)
+            .copied()
+            .unwrap_or(0) as usize;
+        ctx.vstack_boxes.truncate(resume_depth);
+        ctx.vstack_boxes.resize(resume_depth, OpRef::NONE);
+        if resume_depth > 0 {
+            ctx.vstack_boxes[resume_depth - 1] = ca_result;
+        }
+        ctx.vstack_cur_pypc = resume_py_pc;
+        ctx.vstack_depth = resume_depth;
+        ctx.vstack_last_ref = OpRef::NONE;
+    }
 
     // pyjitpl.py:2079: GUARD_NOT_FORCED + resume snapshot advanced past
     // the call (`capture_resumedata(after_residual_call=True)`).
@@ -17353,6 +17410,9 @@ fn try_walker_specialize_unpack(
 ///   * `guard_class(obj, &INSTANCE_TYPE)` — the receiver is a `W_ObjectObject`
 ///     (so the `map`/`storage` field reads below are valid; `mapdict.py:1495`
 ///     `if map is not None:` also filters non-instances at trace time).
+///   * `guard_value(getfield_gc_i(w_type, version_tag), C_version_tag)` — pins
+///     the class lookup result so a later descriptor or `__getattribute__`
+///     mutation deopts on trace re-entry.
 ///   * `guard_value(getfield_gc_i(obj, map), C_map)` — `jit.promote(self.map)`
 ///     (`mapdict.py:905`); pins the exact instance shape so `find_map_attr`
 ///     const-folds `storageindex` to a green constant.
@@ -17394,7 +17454,7 @@ fn try_walker_specialize_load_attr(
     };
     // `mapdict.py:1495-1533` resolution, returning the fold ingredients (the
     // read is left to the caller so it can be folded to a guarded inline read).
-    let Some((_w_type, _version_tag, map, storageindex)) = (unsafe {
+    let Some((w_type, version_tag, map, storageindex)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::load_attr_fast_path(concrete_obj, &name)
     }) else {
         return Ok(None);
@@ -17412,6 +17472,27 @@ fn try_walker_specialize_load_attr(
             .heap_cache_mut()
             .class_now_known(obj, instance_type_addr);
     }
+
+    // The instance map pins the storage layout, but class mutation can change
+    // lookup precedence without changing that map. Re-read the receiver type's
+    // live version tag at every trace entry and deopt before the inline storage
+    // read when it changes.
+    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    let version_op = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        w_type_const,
+        crate::descr::type_version_tag_descr(),
+    );
+    let version_const = ctx.trace_ctx.const_int(version_tag as i64);
+    walker_emit_fold_guard_with_snapshot(
+        ctx,
+        op_pc,
+        OpCode::GuardValue,
+        &[version_op, version_const],
+    )?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(version_op, version_const);
 
     // guard_value(getfield_gc_i(obj, map), C_map): `jit.promote(self.map)`
     // (`mapdict.py:905-906`).  The map nodes are interned + immortal, so the

@@ -3862,6 +3862,16 @@ enum UnsupportedJitShape {
     None,
     CurrentFrameOnly,
     StructuralRegion,
+    /// The frame's constant pool plus register file would exceed the
+    /// single-byte (`< 256`) register-or-constant index encoding
+    /// (`assembler.py:72 chr()`, `assembler.py:132-133`
+    /// `count_regs + len(constants) < 256`). RPython builds jitcodes at
+    /// translation time from the hand-written interpreter, where this
+    /// ceiling is a bounded programming invariant; pyre builds a jitcode
+    /// per *user* Python frame at runtime, so a data-heavy frame (e.g. a
+    /// module body with thousands of literal constants) genuinely exceeds
+    /// it. Such a frame cannot be encoded and must run in the interpreter.
+    ConstEncodingOverflow,
 }
 
 /// True for opcodes that may appear in a `FOR_ITER` loop body without ever
@@ -3869,10 +3879,10 @@ enum UnsupportedJitShape {
 /// walk-abort silently drops an iteration (#57). This is an ALLOW-LIST:
 /// arithmetic/comparison (implicit dunder dispatch resumes past the call on
 /// abort — verified), local/const reads and frame-slot writes, stack
-/// manipulation, and intra-body control flow. Every other opcode — explicit
-/// `CALL`, heap-mutating stores, nested `FOR_ITER`, list/set/dict builders and
-/// mutators — is treated as unsafe so the frame keeps running in the
-/// interpreter. Unknown/future opcodes default to unsafe.
+/// manipulation, read-only attribute loads, and intra-body control flow. Every
+/// other opcode — heap-mutating stores outside the direct-store widening and
+/// unsupported mutators — is treated as unsafe so the frame keeps running in
+/// the interpreter. Unknown/future opcodes default to unsafe.
 fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
     use pyre_interpreter::Instruction as I;
     matches!(
@@ -3937,6 +3947,8 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
             | I::PopIter
             | I::DeleteFast { .. }
             | I::LoadDeref { .. }
+            // An aborting method call resumes exactly via forward-exc-delivery / CALL-forward.
+            | I::LoadAttr { .. }
             // function calls and global reads: the Layer 2 dynamic defense
             // (body_effect_candidate + fbw_foriter_inflight_take) handles
             // walk-abort safety, and inline sub-walks are declined when a
@@ -3956,70 +3968,36 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
     )
 }
 
-/// True when the `FOR_ITER` body in `[body_start, exit)` is straight-line with
-/// respect to walk aborts: it contains no call, no nested-loop iterator setup,
-/// and no conditional or forward branch. Such a body has no reachable trigger
-/// for the mid-loop walk abort that hands control to the Option-C
-/// deliver/refuse path, so any eager heap store performed inside it is always
-/// committed exactly once and can never be dropped or doubled (#57).
-/// `JumpBackward` is the loop's own back edge and does not introduce an abort.
-fn for_iter_body_is_abort_free(
-    instructions: &[pyre_interpreter::bytecode::CodeUnit],
-    body_start: usize,
-    exit: usize,
-) -> bool {
-    use pyre_interpreter::Instruction as I;
-    let mut body_state = pyre_interpreter::OpArgState::default();
-    let mut body_pc = body_start;
-    while body_pc < exit && body_pc < instructions.len() {
-        let (body_instr, _) = body_state.get(instructions[body_pc]);
-        if matches!(
-            body_instr,
-            I::Call { .. }
-                | I::CallKw { .. }
-                | I::ForIter { .. }
-                | I::GetIter
-                | I::PopJumpIfFalse { .. }
-                | I::PopJumpIfTrue { .. }
-                | I::PopJumpIfNone { .. }
-                | I::PopJumpIfNotNone { .. }
-                | I::JumpForward { .. }
-        ) {
-            return false;
-        }
-        body_pc += 1;
-    }
-    true
-}
-
 /// True iff every `FOR_ITER` loop body in `code` is admissible. The BASE rule is
 /// `for_iter_body_op_is_jit_safe`. A nested `FOR_ITER` appears as a body
-/// instruction of its enclosing loop and is not allow-listed, so nested loops
-/// are rejected without recursion. The iterable setup (`range(n)`, `GET_ITER`)
-/// precedes the `FOR_ITER` and is therefore not part of any body range.
+/// instruction of its enclosing loop, and its own body is scanned when the
+/// outer instruction walk reaches it. The iterable setup (`range(n)`,
+/// `GET_ITER`) precedes the `FOR_ITER` and is therefore not part of any body
+/// range.
 ///
-/// This whole gate is a conservative adaptation, not an upstream mechanism. The
-/// FBW single-pass walker recovers from a mid-body walk abort by REFUSING to
-/// re-deliver the in-flight `FOR_ITER` item (Option-C deliver/refuse), which
-/// drops the rest of that iteration. The register-machine metainterp instead
-/// resumes exactly: it reads the precise `(jitcode, pc)` from the guard's resume
-/// data, `setposition`s a blackhole interpreter there and runs the body to its
-/// end (`blackhole_from_resumedata`, resume.py:1312), so it never drops or
-/// doubles. Until that exact-resume path is ported (#215 P2 / #73 / task#50), a
-/// body is admitted only where the refuse-drop deviation cannot be observed.
+/// This whole gate is a conservative adaptation, not an upstream mechanism.
+/// Mid-body walk aborts now resume exactly through `try_commit_midbody_abort`:
+/// forward-exception-delivery handles propagated exceptions and CALL-forward
+/// re-runs the outer call, instead of using the FBW refuse-drop path. This
+/// matches the forward-only resume of `blackhole_from_resumedata`
+/// (resume.py:1312), which never drops or doubles an iteration.
 ///
-/// A straight-line body — one that `for_iter_body_is_abort_free` accepts — may
-/// ADDITIONALLY carry the direct heap-store opcodes `STORE_SUBSCR`,
-/// `STORE_ATTR`, `STORE_NAME`, `STORE_GLOBAL` and the `LOAD_NAME` that reads
-/// module globals. That widening is sound precisely because an abort-free body
-/// cannot reach the deliver/refuse path at all: with no call, branch or nested
-/// loop there is no abort after the store, so the store commits exactly once and
-/// its result coincides with the exact-resume result (#57). Bodies with a call
-/// or a branch stay on the base allow-list. `LOAD_ATTR` is deliberately
-/// excluded: it admits a method load whose call declines-to-abort while an item
-/// is in flight, and if an earlier body effect has already committed, the
-/// refuse-drop skips the rest of that iteration — a partial-iteration wrong
-/// answer, not a clean drop.
+/// The direct heap-mutation opcodes `STORE_SUBSCR`, `STORE_ATTR`, `STORE_NAME`,
+/// `STORE_GLOBAL`, `STORE_DEREF`, `DELETE_SUBSCR`, `DELETE_ATTR`, and the
+/// `LOAD_NAME` that reads module globals are admitted in any body, including one
+/// with a call, branch or nested loop. A mid-body abort after a committed
+/// un-journaled store, cell write, or delete now resumes exactly through
+/// `try_commit_midbody_abort`:
+/// forward-exception-delivery or CALL-forward replaces the FBW refuse-drop that
+/// skipped the iteration tail. The mutation therefore commits exactly once and
+/// the tail is never dropped, matching the forward-only resume of
+/// `blackhole_from_resumedata`. STORE_DEREF's cell slot and every subsequent
+/// operand-stack slot are reconstructed independently, including both method
+/// slots consumed by a tail CALL. A mutation that raises, or a later exception
+/// after the cell write, propagates through forward-exception-delivery; Fix A's
+/// exit-frame traceback recording preserves its traceback exactly. `LOAD_ATTR`
+/// is admitted because a mid-body abort from its method call follows the same
+/// exact-resume path rather than dropping the remainder of the iteration.
 fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
     use pyre_interpreter::Instruction as I;
     let instructions = &code.instructions;
@@ -4032,21 +4010,22 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
                 pc + 1,
                 delta.get(op_arg).as_usize(),
             );
-            let abort_free = for_iter_body_is_abort_free(instructions, pc + 1, exit);
             let mut body_state = pyre_interpreter::OpArgState::default();
             let mut body_pc = pc + 1;
             while body_pc < exit && body_pc < instructions.len() {
                 let (body_instr, _) = body_state.get(instructions[body_pc]);
                 let permitted = for_iter_body_op_is_jit_safe(body_instr)
-                    || (abort_free
-                        && matches!(
-                            body_instr,
-                            I::StoreSubscr
-                                | I::StoreAttr { .. }
-                                | I::StoreName { .. }
-                                | I::StoreGlobal { .. }
-                                | I::LoadName { .. }
-                        ));
+                    || matches!(
+                        body_instr,
+                        I::StoreSubscr
+                            | I::StoreAttr { .. }
+                            | I::StoreName { .. }
+                            | I::StoreGlobal { .. }
+                            | I::StoreDeref { .. }
+                            | I::DeleteSubscr
+                            | I::DeleteAttr { .. }
+                            | I::LoadName { .. }
+                    );
                 if !permitted {
                     return false;
                 }
@@ -4094,6 +4073,34 @@ fn for_iter_frame_is_finally_duplicated(code: &pyre_interpreter::CodeObject) -> 
     for_iter_count > 1 && any_in_handler
 }
 
+/// Upper bound on the constant-pool slots one code-object constant can
+/// contribute to the assembled jitcode. A `Tuple`/`Frozenset`/`Slice`
+/// constant can be unpacked into its elements during graph construction —
+/// e.g. a `BUILD_CONST_KEY_MAP` keys tuple lowered to one `ConstRef` per key,
+/// which is how a module body like `html.entities` turns a handful of literal
+/// `code.constants` entries into thousands of pool slots — so every nested
+/// leaf is counted. A `Code` constant belongs to a *separate* callee frame
+/// with its own pool, so it counts as a single ref here (its inner constants
+/// never enter this frame's pool).
+fn const_pool_slot_upper_bound(c: &pyre_interpreter::ConstantData) -> usize {
+    use pyre_interpreter::ConstantData;
+    match c {
+        ConstantData::Tuple { elements } | ConstantData::Frozenset { elements } => {
+            1 + elements
+                .iter()
+                .map(const_pool_slot_upper_bound)
+                .sum::<usize>()
+        }
+        ConstantData::Slice { elements } => {
+            1 + elements
+                .iter()
+                .map(const_pool_slot_upper_bound)
+                .sum::<usize>()
+        }
+        _ => 1,
+    }
+}
+
 fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitShape {
     // Structural adaptation: RPython/PyPy traces these bytecodes with
     // fully translated support. Pyre's codewriter still lowers
@@ -4119,6 +4126,42 @@ fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitS
     // iteration is silently dropped (#57). Bodies with no explicit
     // mutation/call and no nested `FOR_ITER` cannot reach that path — verified
     // against the battery and adversarial mutation probes.
+
+    // Single-byte register-or-constant index ceiling (`assembler.py:72`
+    // `chr(reg)`; `assembler.py:132-133` / `check_result` assert
+    // `count_regs[kind] + len(constants) <= 256`). RPython assembles jitcodes
+    // at translation time from the hand-written interpreter, where the ceiling
+    // is a bounded invariant; pyre assembles a jitcode per *user* Python frame
+    // at runtime, so a data-heavy frame (a module body with thousands of
+    // literal constants — e.g. `html.entities`, whose `<module>` frame carries
+    // ~4000 string constants) genuinely overruns it and the assembler asserts
+    // mid-emission. Decline such a frame to the interpreter before tracing.
+    //
+    // The predicate over-approximates the assembled counts, so it never admits
+    // an unencodable frame: the per-kind constant pool is bounded above by the
+    // whole constant table (flattened through nestable constants, see
+    // `const_pool_slot_upper_bound`) plus the name table, and each kind's
+    // register file is bounded above by the frame's live-slot capacity — the
+    // operand stack plus every local/cell/free slot, padded for the always-live
+    // vable red args and the transient temporaries one opcode lowering keeps
+    // live at once. When even this loose sum cannot fit in a byte, no assembler
+    // kind bank can encode the frame.
+    const SYNTHESIZED_REG_HEADROOM: usize = 16;
+    let register_slots_upper_bound = SYNTHESIZED_REG_HEADROOM
+        + code.max_stackdepth as usize
+        + code.varnames.len()
+        + code.cellvars.len()
+        + code.freevars.len();
+    let constant_slots_upper_bound = code
+        .constants
+        .iter()
+        .map(const_pool_slot_upper_bound)
+        .sum::<usize>()
+        + code.names.len();
+    if register_slots_upper_bound + constant_slots_upper_bound > 256 {
+        return UnsupportedJitShape::ConstEncodingOverflow;
+    }
+
     let mut arg_state = pyre_interpreter::OpArgState::default();
     let mut has_for_iter = false;
     for unit in code.instructions.iter().copied() {
@@ -4196,6 +4239,20 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
                 "FrameShape::StructuralRegion",
             );
             let _guard = JitSuppressionGuard::new();
+            return frame_root.frame().execute_frame(None, None);
+        }
+        UnsupportedJitShape::ConstEncodingOverflow => {
+            // The frame's constant pool plus register file overruns the
+            // single-byte register-or-constant index encoding, so no jitcode
+            // can be assembled for it (`unsupported_jit_shape`).  Run this frame
+            // in the plain interpreter; nested callees stay JIT-eligible (the
+            // overflow is per-frame), so no `JitSuppressionGuard`.  Record the
+            // decline in the census so the interpreted frame is visible, not a
+            // silent no-token gap.
+            pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
+                code as *const _ as usize,
+                "FrameShape::ConstEncodingOverflow",
+            );
             return frame_root.frame().execute_frame(None, None);
         }
     }
@@ -4419,7 +4476,9 @@ pub(crate) fn portal_runner_result(frame: &mut PyFrame) -> PyResult {
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     let _suppression = match unsupported_jit_shape(code) {
         UnsupportedJitShape::StructuralRegion => Some(JitSuppressionGuard::new()),
-        UnsupportedJitShape::None | UnsupportedJitShape::CurrentFrameOnly => None,
+        UnsupportedJitShape::None
+        | UnsupportedJitShape::CurrentFrameOnly
+        | UnsupportedJitShape::ConstEncodingOverflow => None,
     };
     portal_runner_dispatch(frame_root.frame())
 }
@@ -8854,31 +8913,31 @@ mod tests {
     }
 
     #[test]
-    fn for_iter_nested_append_body_is_not_jit_safe() {
-        // nested FOR_ITER with a direct append = the s3_append dropper -> excluded.
+    fn for_iter_nested_append_body_is_jit_safe() {
+        // Both loop bodies are scanned; the inner LOAD_ATTR+CALL is admitted now
+        // that a mid-body method-call abort resumes exactly.
         use pyre_interpreter::compile_exec;
         let module = compile_exec(
             "def g(n, acc):\n    for a in range(n):\n        for b in range(a):\n            acc.append(a)\n    return len(acc)\n",
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "g");
-        assert!(!for_iter_bodies_all_jit_safe(&code));
-        assert_eq!(
-            unsupported_jit_shape(&code),
-            UnsupportedJitShape::CurrentFrameOnly
-        );
+        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
     }
 
     #[test]
-    fn for_iter_single_level_explicit_append_body_is_not_jit_safe() {
-        // explicit list.append in a body is conservatively excluded (LOAD_METHOD+CALL).
+    fn for_iter_single_level_explicit_append_body_is_jit_safe() {
+        // LOAD_ATTR followed by CALL is admitted now that a mid-body method-call
+        // abort resumes exactly instead of dropping the remainder of the iteration.
         use pyre_interpreter::compile_exec;
         let module = compile_exec(
             "def k(src, acc):\n    for x in src:\n        acc.append(x)\n    return len(acc)\n",
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "k");
-        assert!(!for_iter_bodies_all_jit_safe(&code));
+        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
     }
 
     #[test]
@@ -8886,7 +8945,7 @@ mod tests {
         // A subscript LOAD (`tbl[i]`) lowers to `BinaryOp(Subscr)`, a dispatching
         // op: `__getitem__` runs in a separate user frame and recovers on a walk
         // abort like any other `BinaryOp`, so the body is admitted. Only the
-        // mutating write `STORE_SUBSCR` is the excluded dropper (next test).
+        // mutating write `STORE_SUBSCR` is admitted by the direct-store widening.
         use pyre_interpreter::compile_exec;
         let module = compile_exec(
             "def s(src, tbl):\n    acc = 0\n    for i in src:\n        acc = acc + tbl[i]\n    return acc\n",
@@ -8899,9 +8958,8 @@ mod tests {
 
     #[test]
     fn for_iter_straight_line_store_subscr_body_is_jit_safe() {
-        // A straight-line body `buf[i] = i` (no call, no branch, no nested loop)
-        // is abort-free, so the direct STORE_SUBSCR is admitted: the mid-loop
-        // walk abort that could drop or double the store is unreachable (#57).
+        // The direct STORE_SUBSCR is admitted; a later mid-body abort resumes
+        // exactly, so the store commits once and the iteration tail is preserved.
         use pyre_interpreter::compile_exec;
         let module = compile_exec(
             "def w(src, buf):\n    for i in src:\n        buf[i] = i\n    return len(buf)\n",
@@ -8913,49 +8971,98 @@ mod tests {
     }
 
     #[test]
-    fn for_iter_store_subscr_with_branch_body_is_not_jit_safe() {
-        // A conditional `if i & 1: buf[i] = i` makes the body non-abort-free, so
-        // the direct STORE_SUBSCR is NOT admitted through the widening; the frame
-        // stays interpreted.
+    fn for_iter_store_subscr_with_branch_body_is_jit_safe() {
+        // Exact resume makes STORE_SUBSCR safe even in a body with a branch.
         use pyre_interpreter::compile_exec;
         let module = compile_exec(
             "def w(src, buf):\n    for i in src:\n        if i & 1:\n            buf[i] = i\n    return len(buf)\n",
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(!for_iter_bodies_all_jit_safe(&code));
-        assert_eq!(
-            unsupported_jit_shape(&code),
-            UnsupportedJitShape::CurrentFrameOnly
-        );
+        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
     }
 
     #[test]
-    fn for_iter_store_subscr_with_call_body_is_not_jit_safe() {
-        // A body that both calls and stores (`buf[i] = abs(i)`) is non-abort-free
-        // because of the call, so the STORE_SUBSCR is NOT admitted: this is the
-        // hazardous shape whose aborted walk could drop/double the store (#57).
+    fn for_iter_store_subscr_with_call_body_is_jit_safe() {
+        // Exact resume preserves the committed store and the tail when the call
+        // aborts the walk in a body containing both STORE_SUBSCR and append.
         use pyre_interpreter::compile_exec;
         let module = compile_exec(
-            "def w(src, buf):\n    for i in src:\n        buf[i] = abs(i)\n    return len(buf)\n",
+            "def w(src, d, fn, acc):\n    total = 0\n    for i in src:\n        d[i % 8] = i\n        total += fn(i)\n        acc.append(i)\n    return total\n",
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(!for_iter_bodies_all_jit_safe(&code));
-        assert_eq!(
-            unsupported_jit_shape(&code),
-            UnsupportedJitShape::CurrentFrameOnly
+        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+    }
+
+    #[test]
+    fn for_iter_store_deref_with_branch_and_call_body_is_jit_safe() {
+        use pyre_interpreter::{Instruction, compile_exec};
+        let module = compile_exec(
+            "def outer(src, fn, acc):\n    n = -1\n    def read():\n        return n\n    for i in src:\n        if i & 1:\n            n = i * 17 + 3\n        n += fn(i)\n        acc.append((i, n))\n    return n, read()\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "outer");
+        let mut arg_state = pyre_interpreter::OpArgState::default();
+        assert!(
+            code.instructions
+                .iter()
+                .copied()
+                .any(|unit| { matches!(arg_state.get(unit).0, Instruction::StoreDeref { .. }) })
         );
+        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+    }
+
+    #[test]
+    fn for_iter_delete_subscr_with_branch_and_call_body_is_jit_safe() {
+        // Exact resume preserves a committed delete and the tail when a call
+        // aborts the walk in a body that also contains a branch.
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def w(src, d, fn, acc):\n    for i in src:\n        if i & 1:\n            del d[i]\n        fn(i)\n        acc.append(i)\n    return len(d)\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "w");
+        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+    }
+
+    #[test]
+    fn for_iter_delete_attr_with_branch_and_call_body_is_jit_safe() {
+        // DELETE_ATTR uses the same exact-resume path in a body containing a
+        // branch, an aborting user call, and an append tail.
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def w(src, o, fn, acc):\n    for i in src:\n        if i & 1:\n            del o.x\n        fn(i)\n        acc.append(i)\n    return len(acc)\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "w");
+        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
     }
 
     #[test]
     fn for_iter_straight_line_store_attr_body_is_jit_safe() {
-        // A straight-line body `o.x = i` is abort-free, so the direct STORE_ATTR
-        // is admitted. (LOAD_ATTR reads stay excluded — see the allow-list.)
+        // The direct STORE_ATTR is admitted through the direct-store widening.
         use pyre_interpreter::compile_exec;
         let module =
             compile_exec("def w(src, o):\n    for i in src:\n        o.x = i\n    return o.x\n")
                 .expect("test code should compile");
+        let code = function_code_from_module(&module, "w");
+        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+    }
+
+    #[test]
+    fn for_iter_load_attr_method_body_is_jit_safe() {
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def w(objs):\n    s = 0\n    for o in objs:\n        s += o.bump()\n    return s\n",
+        )
+        .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
         assert!(for_iter_bodies_all_jit_safe(&code));
         assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
@@ -9027,7 +9134,7 @@ mod tests {
         local_slots: &[u32],
         stack_depths: &[usize],
     ) -> (usize, Vec<u32>, Vec<u32>) {
-        let nlocals = code.varnames.len();
+        let stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
         (0..code.instructions.len())
             .find_map(|pc| {
                 let colors: Vec<u32> = local_slots
@@ -9036,7 +9143,7 @@ mod tests {
                     .chain(
                         stack_depths
                             .iter()
-                            .map(|&d| pcdep_color_for_slot(jitcode_index, pc, nlocals + d)),
+                            .map(|&d| pcdep_color_for_slot(jitcode_index, pc, stack_base + d)),
                     )
                     .collect::<Option<Vec<u32>>>()?;
                 let live =

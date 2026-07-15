@@ -265,7 +265,7 @@ fn try_commit_midbody_abort(
             frame.locals_w_mut().as_mut_slice()[slot] = *value;
         }
     }
-    let stack_base = code.varnames.len();
+    let stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
     for (rel, value) in current.live_stack.iter().enumerate() {
         let crate::state::ConcreteValue::Ref(value) = value else {
             return false;
@@ -1617,6 +1617,12 @@ fn run_perfn_walk(
                             // `NonStandardVableFinishPortalUnsupported`).  The EC
                             // color carries no such identity — the EC stays
                             // recoverable from the frame — so reseeding it is safe.
+                            // This applies regardless of tagged-int state: a leaf
+                            // callee whose LOAD_DEREF result is colored onto the EC
+                            // register (`return CELL + 1`) strands `ConstPtr(ec)` in
+                            // the add's LHS when the cell payload's class flips and a
+                            // guard-failure bridge resumes here — the residual add
+                            // then dereferences the stale pointer and SIGSEGVs.
                             let is_frame_color =
                                 reserved_red_colors.first().copied() == Some(color);
                             let bridge_names_operand =
@@ -2060,15 +2066,31 @@ fn run_perfn_walk(
                     // FOR_ITER header whose walk already advanced the iterator; they
                     // differ in whether the consumed item's body ran.
                     let committed = if is_unsupported {
-                        // `BranchGuardKeptStackUnsupported` aborts AFTER the body
-                        // ran for the consumed item (the depth>1 kept operand stack
-                        // the COMPILED trace could not restore); the walk's
-                        // symbolic shadow already counted that iteration.  Resume
-                        // at the FOR_ITER header on the flushed end state WITHOUT
-                        // re-delivering the in-flight item — delivering it would
-                        // re-run the body and double-count the value.  A plain
-                        // end-state flush, gated the same as the marker leg.
-                        crate::state::flush_walk_end_state_to_frame(ctx, cf_addr, resume_py_pc)
+                        if crate::jitcode_dispatch::fbw_foriter_inflight_completed_at_resume(
+                            cf_addr,
+                            resume_py_pc,
+                        ) {
+                            // The consumed item's body already ran, so resume at
+                            // the FOR_ITER header without re-delivering it.
+                            crate::state::flush_walk_end_state_to_frame(ctx, cf_addr, resume_py_pc)
+                        } else {
+                            // A nested inner FOR_ITER can carry the enclosing
+                            // iterator as its kept stack before the consumed
+                            // item's body runs.  Mirror Shape A and deliver that
+                            // in-flight item exactly once.
+                            let push =
+                                crate::jitcode_dispatch::fbw_foriter_inflight_take_for_resume(
+                                    cf_addr,
+                                    resume_py_pc,
+                                );
+                            push.is_some()
+                                && crate::state::flush_walk_end_state_to_frame_with_item(
+                                    ctx,
+                                    cf_addr,
+                                    resume_py_pc,
+                                    push,
+                                )
+                        }
                     } else {
                         // Shape A — a `BranchGuardUnrestorableKeptStackPermanent`
                         // abort resumes AT a FOR_ITER header whose consumed item is
