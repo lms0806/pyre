@@ -51,6 +51,11 @@ thread_local! {
     /// `WALK_END_PROPAGATED_EXCEPTION`. Bridge tracing leaves this false and
     /// conservatively retains its legacy preflight.
     static WALK_END_PROPAGATE_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Interpreter restart pc for a full-body walk that closes at a JitCode
+    /// marker inside a Python opcode. The compiled-loop key stays at the
+    /// merge point's green pc, but the interpreter fallback must resume at
+    /// the opcode whose entry stack matches the restored live boxes.
+    static WALK_END_RESTART_PC: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// Take-and-reset the walk-end flush flag for the trace that just
@@ -61,6 +66,10 @@ pub fn take_walk_end_flush_committed() -> bool {
 
 pub fn take_walk_end_propagated_exception() -> Option<pyre_interpreter::PyError> {
     WALK_END_PROPAGATED_EXCEPTION.with(|c| c.borrow_mut().take())
+}
+
+pub fn take_walk_end_restart_pc() -> Option<usize> {
+    WALK_END_RESTART_PC.with(|c| c.replace(None))
 }
 
 /// Copy the walk-accumulated `TraceCtx.reads_module_global` flag into the
@@ -370,6 +379,7 @@ pub fn trace_bytecode(
     WALK_END_FLUSH_COMMITTED.with(|c| c.set(false));
     WALK_END_PROPAGATED_EXCEPTION.with(|c| *c.borrow_mut() = None);
     WALK_END_PROPAGATE_ALLOWED.with(|c| c.set(allow_propagate_out));
+    WALK_END_RESTART_PC.with(|c| c.set(None));
     // `TraceCtx.reads_module_global` needs no reset here: a fresh TraceCtx is
     // built per trace (zero-init `false`), unlike the walk-end TLS flags above.
     // Likewise clear any no-replay finish payload a prior trace left
@@ -803,39 +813,16 @@ fn dispatch_perfn_frame(
 /// to the same JitCode body that will drive the walk. Pyre permits multiple
 /// JitCode bodies per code object, so the carried offset is invalid in another
 /// body's coordinate space. Upstream `resume.py:1050-1051` uses the same
-/// snapshot-selected jitcode for frame construction and its PC. Fall back to
-/// the runtime `resume_jitcode_pc_for` derivation supplied by `derived`.
-/// Gated by `PYRE_M73_ENTRY_CARRY` (off → derivation only). Under
-/// `PYRE_M73_ENTRY_DECLINE`, entry-carry failures decline instead of deriving.
+/// snapshot-selected jitcode for frame construction and its PC. A missing
+/// carried coordinate declines at the caller before a bridge is published.
 fn select_recipe_entry(
     jitcode_index: i32,
     body_index: i32,
-    py_pc: usize,
     carried_jitcode_pc: i32,
-    derived: impl Fn() -> Option<usize>,
 ) -> Option<usize> {
-    let carried = (carried_jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC
-        && jitcode_index == body_index)
-        .then(|| {
-            crate::state::resolve_bridge_walk_entry_at(
-                jitcode_index,
-                py_pc as i32,
-                carried_jitcode_pc,
-            )
-        })
-        .flatten();
-    if crate::jitcode_dispatch::m73_entry_carry_enabled() {
-        if crate::jitcode_dispatch::m73_entry_decline_enabled() {
-            // p5-s3: carried-only. A failed carried resolution aborts/declines
-            // at the caller (each `select_recipe_entry` caller routes `None`
-            // to a graceful abort), instead of re-deriving from py_pc.
-            carried
-        } else {
-            carried.or_else(derived)
-        }
-    } else {
-        derived()
-    }
+    (carried_jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_index == body_index)
+        .then(|| crate::state::resolve_bridge_walk_entry_at(jitcode_index, 0, carried_jitcode_pc))
+        .flatten()
 }
 
 /// Issue #215 item 2 (P2 drain): drive a multiframe bridge-carrier resume via
@@ -867,6 +854,16 @@ fn inject_root_call_result(sym: &mut PyreSym, root_pc: usize, result: majit_ir::
     }
     let jitcode_index = unsafe { (*sym.jitcode).index as i32 };
     let root_py_pc = crate::state::backxlat_py_pc(jitcode_index, root_pc as i32) as usize;
+    if crate::jitcode_dispatch::result_color_audit_enabled() {
+        let payload = unsafe { &(*sym.jitcode).payload };
+        let py_pc =
+            crate::jitcode_dispatch::python_pc_for_jitcode_pc(&payload.metadata, root_pc) as usize;
+        assert_eq!(
+            payload.result_color_for_jitcode_pc_pred(root_pc),
+            payload.metadata.result_color_at_pc.get(py_pc).copied(),
+            "result_color_by_jit_pc diverges from result_color_at_pc at jit_pc={root_pc}"
+        );
+    }
     let Some(result_color) = crate::state::result_color_at_pc_at(jitcode_index, root_py_pc) else {
         return false;
     };
@@ -934,14 +931,7 @@ fn drive_bridge_carrier_walk(
     let entry = select_recipe_entry(
         recipe.jitcode_index,
         callee_pjc.jitcode.index() as i32,
-        crate::state::backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc) as usize,
         recipe.jitcode_pc,
-        || {
-            callee_pjc.resume_jitcode_pc_for(crate::state::backxlat_py_pc(
-                recipe.jitcode_index,
-                recipe.jitcode_pc,
-            ) as usize)
-        },
     );
     let Some(entry) = entry else {
         ctx.cut_trace(pre_pos);
@@ -1106,14 +1096,7 @@ fn drive_bridge_framestack_walk(
     let entry = select_recipe_entry(
         recipe.jitcode_index,
         callee_pjc.jitcode.index() as i32,
-        crate::state::backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc) as usize,
         recipe.jitcode_pc,
-        || {
-            callee_pjc.resume_jitcode_pc_for(crate::state::backxlat_py_pc(
-                recipe.jitcode_index,
-                recipe.jitcode_pc,
-            ) as usize)
-        },
     );
     let Some(entry) = entry else {
         ctx.cut_trace(pre_pos);
@@ -1126,9 +1109,9 @@ fn drive_bridge_framestack_walk(
     let pos_after_setup = ctx.get_trace_position();
     if std::env::var_os("PYRE_P2_DIAG").is_some() {
         let root_entry = crate::state::pyjitcode_for_code(w_code).and_then(|pjc| {
-            let root_py_pc =
-                crate::state::backxlat_py_pc(pjc.jitcode.index() as i32, root_pc as i32) as usize;
-            pjc.resume_jitcode_pc_for(root_py_pc)
+            pjc.jitcode
+                .can_decode_live_vars(root_pc, crate::state::op_live())
+                .then_some(root_pc)
         });
         eprintln!(
             "[p2-fs] callee_entry(jit)={entry} callee.pc(py)={} root_pc(jit)={root_pc} root_entry(jit)={root_entry:?} pos_pre={pre_pos:?} pos_after_setup={pos_after_setup:?}",
@@ -1219,14 +1202,7 @@ fn drive_bridge_framestack_walk(
             let middle_entry = select_recipe_entry(
                 middle.jitcode_index,
                 middle_pjc.jitcode.index() as i32,
-                crate::state::backxlat_py_pc(middle.jitcode_index, middle.jitcode_pc) as usize,
                 middle.jitcode_pc,
-                || {
-                    middle_pjc.resume_jitcode_pc_for(crate::state::backxlat_py_pc(
-                        middle.jitcode_index,
-                        middle.jitcode_pc,
-                    ) as usize)
-                },
             );
             let Some(middle_entry) = middle_entry else {
                 ctx.cut_trace(pre_pos);
@@ -1312,14 +1288,10 @@ fn drive_outer_continuation_and_map(
     pre_pos: majit_metainterp::recorder::TracePosition,
 ) -> Option<TraceAction> {
     let root_pjc = crate::state::pyjitcode_for_code(w_code)?;
-    let root_py_pc =
-        crate::state::backxlat_py_pc(root_pjc.jitcode.index() as i32, root_pc as i32) as usize;
     let entry = select_recipe_entry(
         root_pjc.jitcode.index() as i32,
         root_pjc.jitcode.index() as i32,
-        root_py_pc,
         root_pc as i32,
-        || root_pjc.resume_jitcode_pc_for(root_py_pc),
     )?;
     // Decode the call-dst register: the op whose `next_pc == entry` is the
     // residual call the outer resumes after; its `>r` dst is the last operand
@@ -1466,28 +1438,16 @@ fn run_perfn_walk(
     let is_entry_green = start_pc == 0 || is_loop_header;
     let uses_entry_sidecar = is_plain_portal && is_entry_green;
     let sidecar_entry = pjc.merge_entry_for(start_pc);
-    let carry = crate::jitcode_dispatch::m73_entry_carry_enabled();
-    let pc_map_entry = if carry && sym.bridge_walk_entry_pc.is_some() {
+    let pc_map_entry = if sym.bridge_walk_entry_pc.is_some() {
         // Guard resume with a carried jitcode coordinate: the walk enters at
-        // the carried offset (override below); the entry-marker derivation is
-        // unused, so a py_pc the tables cannot encode must not decline the walk.
+        // the carried offset (override below).
         sym.bridge_walk_entry_pc
-    } else if carry && uses_entry_sidecar {
+    } else if uses_entry_sidecar {
         sidecar_entry
     } else {
-        // Bridge resume: `start_pc` is the guard's py_pc, not a loop-header
-        // green — outside the sidecar by construction. The carried coordinate
-        // for this leg is `sym.bridge_walk_entry_pc` (used below when present);
-        // under `PYRE_M73_ENTRY_DECLINE` the residual derivation is
-        // decline-converted, and only opt-out states reach it.
-        if carry && crate::jitcode_dispatch::m73_entry_decline_enabled() {
-            // p5-s3: under entry-carry this leg is certified unreached
-            // (EntryDerivedTaken = 0 corpus-wide); route it to the existing
-            // `fbw_decline` below instead of the py_pc translation.
-            None
-        } else {
-            pjc.resume_jitcode_pc_for(start_pc)
-        }
+        // Every non-entry resume carries its own JitCode coordinate. Without
+        // one the existing `None` path below declines the walk.
+        None
     };
     let Some(pc_map_entry) = pc_map_entry else {
         // The frozen pc_map of this already-built body does not encode
@@ -1514,6 +1474,30 @@ fn run_perfn_walk(
     // (recolored / already consumed) at the guard, which the guard's resume
     // data never preserved. See the field doc on `PyreSym::bridge_walk_entry_pc`.
     let entry = sym.bridge_walk_entry_pc.unwrap_or(pc_map_entry);
+    if let Some(entry_depth) = pjc.depth_for_jitcode_pc_pred(entry) {
+        let stack_base = crate::state::concrete_nlocals(cf_addr).unwrap_or(sym.nlocals);
+        let live_stack = sym.valuestackdepth.saturating_sub(stack_base);
+        // A mismatch is unsound only when the carried coordinate IS the
+        // resume marker.  That is the marker-inside-super-instruction shape:
+        // the live frame has advanced through the super-instruction while the
+        // predecessor depth twin still describes the marker's pre-op stack.
+        // An interior branch resume resolves *through* a marker but carries
+        // its own jitcode offset, so it may legitimately have a different
+        // live depth and must continue walking.
+        let entry_is_resume_marker = pjc.resume_marker_for_jitcode_pc(entry) == Some(entry);
+        if live_stack != entry_depth as usize && entry_is_resume_marker {
+            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                let marker_py =
+                    crate::jitcode_dispatch::python_pc_for_jitcode_pc(&pjc.metadata, entry);
+                eprintln!(
+                    "[fbw-abort] start_pc={start_pc} entry={entry} live_stack={live_stack} \\
+                     entry_depth={entry_depth} marker_py={marker_py}; declining marker-entry walk"
+                );
+            }
+            fbw_decline(crate::driver::make_green_key(w_code, start_pc));
+            return None;
+        }
+    }
     // The full-body walk drives a PORTAL trace, so the body must carry the
     // portal entry INPUT SHAPE (`FrameInputs::Portal`: `[frame, ec]` red inputs
     // + the frame-vable locals prologue). Every drained per-code jitcode is
@@ -1820,6 +1804,19 @@ fn run_perfn_walk(
         )) = &mut walk_result
         {
             let loop_header_pc = *loop_header_pc;
+            let restart_pc = loop_header_marker_jit_pc.map_or(loop_header_pc, |marker| {
+                let marker_py =
+                    crate::jitcode_dispatch::python_pc_for_jitcode_pc(&pjc.metadata, marker)
+                        as usize;
+                if marker_py == loop_header_pc
+                    && pjc.merge_entry_for(loop_header_pc) != Some(marker)
+                {
+                    loop_header_pc + 1
+                } else {
+                    marker_py
+                }
+            });
+            WALK_END_RESTART_PC.with(|c| c.set(Some(restart_pc)));
             // `close_loop_args_at` reads `self.orgpc` for the last_instr anchor; the merge point
             // closes at the loop header, so anchor orgpc there.
             mi.orgpc = loop_header_pc;
@@ -1848,8 +1845,22 @@ fn run_perfn_walk(
             if let Ok((outcome, _end_pc)) = &walk_result {
                 let header_pc = match outcome {
                     crate::jitcode_dispatch::DispatchOutcome::CloseLoop {
-                        loop_header_pc, ..
-                    } => Some(*loop_header_pc),
+                        loop_header_pc,
+                        loop_header_marker_jit_pc,
+                        ..
+                    } => Some(loop_header_marker_jit_pc.map_or(*loop_header_pc, |marker| {
+                        let marker_py = crate::jitcode_dispatch::python_pc_for_jitcode_pc(
+                            &pjc.metadata,
+                            marker,
+                        ) as usize;
+                        if marker_py == *loop_header_pc
+                            && pjc.merge_entry_for(*loop_header_pc) != Some(marker)
+                        {
+                            *loop_header_pc + 1
+                        } else {
+                            marker_py
+                        }
+                    })),
                     crate::jitcode_dispatch::DispatchOutcome::CompileTracePending {
                         loop_header_pc,
                     } => Some(*loop_header_pc),
@@ -2936,7 +2947,7 @@ fn dump_perfn_jitcode_for_trace(w_code: *const (), start_pc: usize) {
         return;
     };
     let code = pjc.jitcode.code.as_slice();
-    let entry = pjc.resume_jitcode_pc_for(start_pc);
+    let entry = pjc.merge_entry_for(start_pc);
     eprintln!(
         "[perfn-jitcode] code_len={} pc_map_len={} start_pc={} entry_jitcode_pc={:?} \
          num_regs_r={} num_regs_i={} num_regs_f={} portal_frame_reg={} portal_ec_reg={} \

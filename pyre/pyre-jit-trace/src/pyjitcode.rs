@@ -58,20 +58,11 @@ use std::ops::{Deref, DerefMut};
 /// translation maps live here instead of polluting either upstream's
 /// canonical `JitCode` or pyre's eventual single-store replacement.
 pub struct PyJitCodeMetadata {
-    /// py_pc → jitcode byte offset of the post-`residual_call` `-live-`
-    /// marker (the one immediately preceding the opcode's own
-    /// `catch_exception`).  RPython keeps `frame.pc` at this position for
-    /// `capture_resumedata(after_residual_call=True, resumepc=-1)`
-    /// (`pyjitpl.py:2610-2624`); pyre stores Python PCs in the snapshot
-    /// and translates through `resume_jitcode_pc_for` (derived from
-    /// `first_jit_pc_by_py_pc` / `block_head_py_by_jit_pc` + the
-    /// `carryfwd_resume_pc` sidecar), so after-residual-call resume
-    /// needs this second map to reach the call's own catch rather than
-    /// the next opcode's start marker (`blackhole.py:396-410
-    /// handle_exception_in_frame`).  Sparse `(py_pc, offset)` pairs sorted
-    /// ascending by py_pc for binary search; only residual-call PCs appear
-    /// (most PCs have no entry), empty for skeleton / fixture metadata.
-    pub after_residual_call_resume_pc: Vec<(u32, usize)>,
+    /// Post-residual-call catch resume twin, split into the exact
+    /// block-head-marker and predecessor op-start tiers used by
+    /// `python_pc_for_jitcode_pc`. Empty for skeleton / fixture metadata.
+    pub after_residual_call_resume_marker_by_jit_pc: Vec<(usize, Option<usize>)>,
+    pub after_residual_call_resume_pred_by_jit_pc: Vec<(usize, Option<usize>)>,
     /// py_pc → jitcode byte offset of the FIRST instruction the opcode
     /// emitted (`usize::MAX` for PCs that emit no jitcode of their own:
     /// trivia, folded ops).  The dense marker resolution that
@@ -80,7 +71,6 @@ pub struct PyJitCodeMetadata {
     /// positions and that resolution is not invertible; the full-body walk needs
     /// the exact inverse (jitcode pc → containing Python opcode) for
     /// guard resume coordinates, which this table provides.  Same length
-    /// as `after_residual_call_resume_pc`.
     pub first_jit_pc_by_py_pc: Vec<usize>,
     /// Inverse of the derived marker resolution's block-head case: each distinct
     /// `-live-` marker byte offset that some PC resolves to → the first Python PC
@@ -101,8 +91,7 @@ pub struct PyJitCodeMetadata {
     /// — uncond-jump forward-carry to a jump TARGET, can-raise / branch re-keys
     /// keyed off the stream position — diverges and is stored here. Built by
     /// comparing the derivation against the dense map at compile time and
-    /// keeping exactly the divergences, so `resume_jitcode_pc_for` reproduces
-    /// the dense value without the dense Vec. Sorted ascending by py_pc for
+    /// keeping exactly the divergences. Sorted ascending by py_pc for
     /// binary search; sparse (most graphs need zero entries, the majority a
     /// handful); empty for skeleton / fixture metadata.
     pub carryfwd_resume_pc: Vec<(u32, usize)>,
@@ -152,8 +141,7 @@ pub struct PyJitCodeMetadata {
     /// (`resume_marker_marker_by_jit_pc`, block-head precedence) and a
     /// PREDECESSOR op-start table (`resume_marker_pred_by_jit_pc`, markers
     /// EXCLUDED). Each records the block-head `-live-` resume-marker JitCode byte
-    /// offset for its resolving py — the value `resume_jitcode_pc_for(py)`
-    /// computes. A single merged predecessor table would mis-resolve an interior
+    /// offset for its resolving py. A single merged predecessor table would mis-resolve an interior
     /// coordinate onto a marker byte inside a preceding op's emitted region, so
     /// the tiers stay separate. Empty for skeleton / fixture.
     pub resume_marker_marker_by_jit_pc: Vec<(usize, Option<usize>)>,
@@ -179,6 +167,11 @@ pub struct PyJitCodeMetadata {
     /// color. Same length as `depth_at_py_pc`; empty for non-compiled skeleton
     /// metadata.
     pub result_color_at_pc: Vec<u16>,
+    /// #73 metadata-inventory twin of `result_color_at_pc`, keyed by JitCode
+    /// byte offset. Entries retain the first Python PC for each shared resume
+    /// marker and are sorted for predecessor lookup. Audit-only for now; the
+    /// py_pc-keyed table remains the runtime source of truth.
+    pub result_color_by_jit_pc: Vec<(usize, u16)>,
     /// Post-regalloc Ref-bank color of the portal jitdriver's first red
     /// argument (`frame`).  RPython parity: `pypy/module/pypyjit/
     /// interp_jit.py:67 reds = ['frame', 'ec']` declares the portal
@@ -515,36 +508,6 @@ impl PyJitCode {
         self.metadata.is_drained
     }
 
-    /// Resolve a Python bytecode PC to the JitCode byte offset where
-    /// blackhole resume / inline call tracing should restart execution.
-    /// Returns `None` if `py_pc` falls outside the populated range.
-    ///
-    /// This is pyre's analog of `blackhole.py:1712 self.setposition(
-    /// miframe.jitcode, miframe.pc)` where upstream stores the JitCode
-    /// PC directly in resume data (`miframe.pc`); pyre's resume data
-    /// stores the Python bytecode PC and translates here.  This
-    /// translation is permanent: pyre interprets Python bytecode while
-    /// upstream interprets JitCode, so an *entry* py_pc (an inline-callee's
-    /// translated recipe pc, or root-portal / walk-entry `start_pc`) has no genuine
-    /// JitCode coordinate in hand and must be resolved through the
-    /// tables.  The dense `pc_map` this once read has been deleted; the
-    /// offset now derives from the two surviving exact tables plus the
-    /// sparse `carryfwd_resume_pc` sidecar.
-    pub fn resume_jitcode_pc_for(&self, py_pc: usize) -> Option<usize> {
-        // The sparse sidecar takes precedence: it captures exactly the PCs
-        // whose dense marker the on-demand derivation cannot reproduce
-        // (uncond-jump forward-carry to a jump target, can-raise / branch
-        // re-keys). Everything else derives from the two surviving tables.
-        if let Some(off) = self.carryfwd_resume_pc_for(py_pc) {
-            return Some(off);
-        }
-        derive_resume_marker(
-            &self.metadata.first_jit_pc_by_py_pc,
-            &self.metadata.block_head_py_by_jit_pc,
-            py_pc,
-        )
-    }
-
     /// Codewrite-time trace-entry offset for a function-entry or loop-header
     /// green py_pc.
     pub fn merge_entry_for(&self, py_pc: usize) -> Option<usize> {
@@ -553,19 +516,6 @@ impl PyJitCode {
             .binary_search_by_key(&(py_pc as u32), |&(py, _)| py)
             .ok()
             .map(|i| table[i].1 as usize)
-    }
-
-    /// task#50: the sparse carry-forward sidecar lookup — the `-live-` marker
-    /// offset for a py_pc whose dense marker [`derive_resume_marker`] cannot
-    /// reproduce from the two surviving tables (uncond-jump forward-carry to a
-    /// jump target, can-raise / branch re-keys). `None` when py_pc has no
-    /// sidecar entry (its marker is derivable, or it falls outside the range).
-    fn carryfwd_resume_pc_for(&self, py_pc: usize) -> Option<usize> {
-        let table = &self.metadata.carryfwd_resume_pc;
-        table
-            .binary_search_by_key(&(py_pc as u32), |&(py, _)| py)
-            .ok()
-            .map(|i| table[i].1)
     }
 
     /// task#50 phase-1: predecessor index into a jitcode-pc twin — the entry
@@ -603,6 +553,18 @@ impl PyJitCode {
     /// index (largest offset ≤ jit_pc).
     pub fn depth_for_jitcode_pc_pred(&self, jit_pc: usize) -> Option<u16> {
         let table = &self.metadata.depth_pred_by_jit_pc;
+        if table.is_empty() {
+            return None;
+        }
+        let search = table.binary_search_by_key(&jit_pc, |&(off, _)| off);
+        Self::predecessor_index(search).map(|i| table[i].1)
+    }
+
+    /// #73 metadata-inventory predecessor twin of `result_color_at_pc`.
+    /// Returns the value for the largest JitCode byte offset at or before
+    /// `jit_pc`, or `None` when the audit-only twin is empty.
+    pub fn result_color_for_jitcode_pc_pred(&self, jit_pc: usize) -> Option<u16> {
+        let table = &self.metadata.result_color_by_jit_pc;
         if table.is_empty() {
             return None;
         }
@@ -687,6 +649,22 @@ impl PyJitCode {
         Self::predecessor_index(search).and_then(|i| pred[i].1)
     }
 
+    /// Post-`residual_call` catch resume marker keyed by a JitCode byte
+    /// offset, resolved with the SAME exact-marker / predecessor-op-start
+    /// tiers as `python_pc_for_jitcode_pc`.
+    pub fn after_residual_call_resume_for_jitcode_pc(&self, jit_pc: usize) -> Option<usize> {
+        let marker = &self.metadata.after_residual_call_resume_marker_by_jit_pc;
+        let pred = &self.metadata.after_residual_call_resume_pred_by_jit_pc;
+        if marker.is_empty() && pred.is_empty() {
+            return None;
+        }
+        if let Ok(i) = marker.binary_search_by_key(&jit_pc, |&(off, _)| off) {
+            return marker[i].1;
+        }
+        let search = pred.binary_search_by_key(&jit_pc, |&(off, _)| off);
+        Self::predecessor_index(search).and_then(|i| pred[i].1)
+    }
+
     /// task#50 #73-core: whether the trivia depth twin carries entries. `false`
     /// for skeleton / fixture installs where both tiers are
     /// empty. The audit uses this to distinguish an in-table `None` (overshoot,
@@ -697,51 +675,10 @@ impl PyJitCode {
             || !self.metadata.depth_trivia_pred_by_jit_pc.is_empty()
     }
 
-    /// JitCode byte offset of `py_pc`'s post-`residual_call` `-live-`
-    /// (the marker preceding the opcode's own `catch_exception`), or
-    /// `None` if `py_pc` makes no residual call.  After-residual-call
-    /// guard resume (`blackhole.py:396-410 handle_exception_in_frame`)
-    /// uses this instead of [`Self::resume_jitcode_pc_for`] so it lands
-    /// on the call's own catch rather than the next opcode's start
-    /// marker (`resume_jitcode_pc_for(next_pc)`).
-    pub fn after_residual_call_resume_pc_for(&self, py_pc: usize) -> Option<usize> {
-        let table = &self.metadata.after_residual_call_resume_pc;
-        table
-            .binary_search_by_key(&(py_pc as u32), |&(py, _)| py)
-            .ok()
-            .map(|i| table[i].1)
-    }
-
-    /// Translate a resume-data pc word (as carried in rd_numb / RebuiltFrame)
-    /// to a JitCode byte offset, honoring the after-residual-call marker:
-    /// flagged words route through [`Self::after_residual_call_resume_pc_for`],
-    /// plain words through [`Self::resume_jitcode_pc_for`].  Every decode-side
-    /// py_pc→jitcode translation funnels through here so the marker is
-    /// interpreted consistently.
-    pub fn resolve_resume_pc(&self, raw_pc: i32) -> Option<usize> {
-        let (py_pc, after_residual_call) = majit_ir::resumedata::decode_resume_pc(raw_pc);
-        if py_pc < 0 {
-            return None;
-        }
-        if after_residual_call {
-            self.after_residual_call_resume_pc_for(py_pc as usize)
-        } else {
-            self.resume_jitcode_pc_for(py_pc as usize)
-        }
-    }
-
-    /// `#124` Approach B resolver: translate a guard frame's resume
-    /// coordinate, preferring the carried direct JitCode pc (`carried`,
-    /// the rd_numb per-frame `jitcode_pc` word populated by M2) over the
-    /// lossy [`Self::resume_jitcode_pc_for`] translation of the stored Python pc.
-    ///
-    /// `resolve_resume_pc(raw_pc)` routes the Python pc through
-    /// [`Self::resume_jitcode_pc_for`],
-    /// which collapses every kept-operand-stack-across-branch state at one
-    /// Python pc to a single JitCode offset — the precision loss `#124`
-    /// fixes.  When `carried` names a valid startpoint, it IS the
-    /// kept-stack-precise coordinate `setposition(jitcode, miframe.pc)`
-    /// preserves upstream, so it is returned directly.
+    /// Resolve a guard frame from its carried direct JitCode coordinate.
+    /// A missing or non-decodable coordinate is unrepresentable and returns
+    /// `None`; callers must decline the guard/trace before publishing resume
+    /// data rather than reconstructing a coordinate from a Python pc.
     ///
     /// The encoder (box collection) and decoder (box count + setposition)
     /// both funnel through this with identical `(raw_pc, carried, op_live)`,
@@ -749,15 +686,10 @@ impl PyJitCode {
     /// by construction.
     ///
     /// The carried word is preferred only when it is a `-live-`-anchored
-    /// coordinate ([`JitCode::can_decode_live_vars`]).  A guard with no
-    /// carried coordinate (`NO_JITCODE_PC`, set by every non-branch guard)
-    /// or a startpoint that is not so anchored (a synthesized specialization
-    /// guard's `may_force` CALL op) falls through to the
-    /// [`Self::resume_jitcode_pc_for`] translation
-    /// so `get_live_vars_info` never hits `_missing_liveness`.
+    /// coordinate ([`JitCode::can_decode_live_vars`]).
     pub fn resolve_resume_pc_with_jitcode_pc(
         &self,
-        raw_pc: i32,
+        _raw_pc: i32,
         carried: i32,
         op_live: u8,
     ) -> Option<usize> {
@@ -772,7 +704,7 @@ impl PyJitCode {
         if used_carried {
             Some(carried as usize)
         } else {
-            self.resolve_resume_pc(raw_pc)
+            None
         }
     }
 
@@ -801,7 +733,8 @@ impl PyJitCode {
         Self::from_parts(
             std::sync::Arc::new(RuntimeJitCode::default()),
             PyJitCodeMetadata {
-                after_residual_call_resume_pc: Vec::new(),
+                after_residual_call_resume_marker_by_jit_pc: Vec::new(),
+                after_residual_call_resume_pred_by_jit_pc: Vec::new(),
                 first_jit_pc_by_py_pc: Vec::new(),
                 block_head_py_by_jit_pc: Vec::new(),
                 carryfwd_resume_pc: Vec::new(),
@@ -816,6 +749,7 @@ impl PyJitCode {
                 after_residual_marker_pred_by_jit_pc: Vec::new(),
                 depth_at_py_pc: Vec::new(),
                 result_color_at_pc: Vec::new(),
+                result_color_by_jit_pc: Vec::new(),
                 // Encoder/decoder readers in
                 // `get_list_of_active_boxes`, `regalloc::external/input_indices`,
                 // and `setup_bridge_sym::portal_red_regs_at` sentinel-skip both

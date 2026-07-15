@@ -4728,6 +4728,25 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             }
         }
         let mut next_instr = frame_root.frame().next_instr();
+        let raw_arg: u32 = op_arg.into();
+        let delta = instruction.stack_effect(raw_arg);
+        if delta > 0 {
+            let frame = frame_root.frame();
+            let pushed_top = frame.valuestackdepth.saturating_add(delta as usize);
+            let next_pc = opcode_pc + 1;
+            // A JIT handoff can arrive with the stack depth for the point just
+            // after a super-instruction while `last_instr` still names the
+            // super-instruction itself. If metadata proves the current depth
+            // belongs to the next opcode, advance the pc instead of re-running
+            // pushes that are already reflected in the frame stack.
+            if pushed_top > frame.locals_w().len()
+                && pyre_jit_trace::state::depth_based_vsd_for_wcode(frame.pycode as usize, next_pc)
+                    == Some(frame.valuestackdepth)
+            {
+                frame_root.frame().set_last_instr_from_next_instr(next_pc);
+                continue;
+            }
+        }
         let step_result =
             execute_opcode_step(frame_root.frame(), code, instruction, op_arg, next_instr);
         match step_result {
@@ -5009,8 +5028,12 @@ fn jit_merge_point_hook(
             // iteration's end instead of replaying it (re-applying every
             // concretely executed side effect).  An uncommitted flush
             // leaves the snapshot at entry state — adopting it is a no-op.
-            if pyre_jit_trace::trace::take_walk_end_flush_committed() {
+            let walk_end_flushed = pyre_jit_trace::trace::take_walk_end_flush_committed();
+            let walk_end_restart_pc = pyre_jit_trace::trace::take_walk_end_restart_pc();
+            if walk_end_flushed {
                 frame.restore_resume_state_from(&executed_frame);
+            } else if let Some(restart_pc) = walk_end_restart_pc {
+                frame.set_last_instr_from_next_instr(restart_pc);
             }
             propagated_exception = pyre_jit_trace::trace::take_walk_end_propagated_exception();
             action
@@ -5115,6 +5138,13 @@ fn maybe_compile_and_run(
         || unsupported_jit_shape(code) != UnsupportedJitShape::None
     {
         return None;
+    }
+    if let Some(expected_vsd) =
+        pyre_jit_trace::state::depth_based_vsd_for_wcode(frame.pycode as usize, loop_header_pc)
+    {
+        if frame.valuestackdepth != expected_vsd {
+            return None;
+        }
     }
     // warmstate.py:473-477: JC_TRACING → skip entirely (no counter tick)
     if driver.is_tracing() {
@@ -5829,10 +5859,16 @@ fn bound_reached(
                     );
                     // raise_continue_running_normally seam — see the
                     // jit_merge_point_hook tracing site for the contract.
-                    if pyre_jit_trace::trace::take_walk_end_flush_committed() {
+                    let walk_end_flushed = pyre_jit_trace::trace::take_walk_end_flush_committed();
+                    let walk_end_restart_pc = pyre_jit_trace::trace::take_walk_end_restart_pc();
+                    if walk_end_flushed {
                         frame_root
                             .frame()
                             .restore_resume_state_from(&executed_frame);
+                    } else if let Some(restart_pc) = walk_end_restart_pc {
+                        frame_root
+                            .frame()
+                            .set_last_instr_from_next_instr(restart_pc);
                     }
                     propagated_exception =
                         pyre_jit_trace::trace::take_walk_end_propagated_exception();
@@ -9127,11 +9163,11 @@ mod tests {
             .map(|&(_, c, _)| u32::from(c))
     }
 
-    /// Find the first Python PC where every requested local slot and
-    /// operand-stack depth carries a per-PC color AND the compiled
-    /// `-live-` set at that PC contains all of those colors. Returns the
-    /// pc, its full live set, and the mapped colors (locals first, then
-    /// stack depths in order).
+    /// Find the first JitCode `-live-` offset where every requested local
+    /// slot and operand-stack depth carries a color AND the compiled live set
+    /// contains all of those colors. Returns that JitCode offset, its full
+    /// live set, and the mapped colors (locals first, then stack depths in
+    /// order).
     fn live_pc_with_slot_colors(
         jitcode_index: i32,
         code: &pyre_interpreter::CodeObject,
@@ -9139,27 +9175,40 @@ mod tests {
         stack_depths: &[usize],
     ) -> (usize, Vec<u32>, Vec<u32>) {
         let stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
-        (0..code.instructions.len())
-            .find_map(|pc| {
+        let payload = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)
+            .expect("compiled trace-side jitcode must be registered");
+        let op_live = pyre_jit_trace::state::op_live();
+        (0..payload.jitcode.body().code.len())
+            .filter(|&jit_pc| payload.jitcode.can_decode_live_vars(jit_pc, op_live))
+            .find_map(|jit_pc| {
+                let pcdep = payload.pcdep_for_jitcode_pc(jit_pc)?;
                 let colors: Vec<u32> = local_slots
                     .iter()
-                    .map(|&slot| pcdep_color_for_slot(jitcode_index, pc, slot as usize))
-                    .chain(
-                        stack_depths
+                    .map(|&slot| {
+                        pcdep
                             .iter()
-                            .map(|&d| pcdep_color_for_slot(jitcode_index, pc, stack_base + d)),
-                    )
+                            .find(|&&(b, _, s)| b == 1 && s as usize == slot as usize)
+                            .map(|&(_, c, _)| u32::from(c))
+                    })
+                    .chain(stack_depths.iter().map(|&d| {
+                        pcdep
+                            .iter()
+                            .find(|&&(b, _, s)| b == 1 && s as usize == stack_base + d)
+                            .map(|&(_, c, _)| u32::from(c))
+                    }))
                     .collect::<Option<Vec<u32>>>()?;
-                let live =
-                    pyre_jit_trace::state::frame_liveness_reg_indices_at(jitcode_index, pc as i32);
+                let live = pyre_jit_trace::state::frame_liveness_reg_indices_at(
+                    jitcode_index,
+                    jit_pc as i32,
+                );
                 colors
                     .iter()
                     .all(|c| live.contains(c))
-                    .then_some((pc, live, colors))
+                    .then_some((jit_pc, live, colors))
             })
             .unwrap_or_else(|| {
                 panic!(
-                    "no Python PC carries live per-PC colors for local slots \
+                    "no JitCode -live- offset carries colors for local slots \
                      {local_slots:?} + stack depths {stack_depths:?}"
                 )
             })
@@ -9167,27 +9216,33 @@ mod tests {
 
     fn live_pc_containing_all(
         jitcode_index: i32,
-        code: &pyre_interpreter::CodeObject,
+        _code: &pyre_interpreter::CodeObject,
         regs: &[u32],
     ) -> (usize, Vec<u32>) {
-        let live_by_pc: Vec<(usize, Vec<u32>)> = (0..code.instructions.len())
-            .map(|pc| {
-                let live =
-                    pyre_jit_trace::state::frame_liveness_reg_indices_at(jitcode_index, pc as i32);
-                (pc, live)
+        let payload = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)
+            .expect("compiled trace-side jitcode must be registered");
+        let op_live = pyre_jit_trace::state::op_live();
+        let live_by_jit_pc: Vec<(usize, Vec<u32>)> = (0..payload.jitcode.body().code.len())
+            .filter(|&jit_pc| payload.jitcode.can_decode_live_vars(jit_pc, op_live))
+            .map(|jit_pc| {
+                let live = pyre_jit_trace::state::frame_liveness_reg_indices_at(
+                    jitcode_index,
+                    jit_pc as i32,
+                );
+                (jit_pc, live)
             })
             .collect();
-        live_by_pc
+        live_by_jit_pc
             .iter()
-            .find_map(|(pc, live)| {
+            .find_map(|(jit_pc, live)| {
                 regs.iter()
                     .all(|reg| live.contains(reg))
-                    .then_some((*pc, live.clone()))
+                    .then_some((*jit_pc, live.clone()))
             })
             .unwrap_or_else(|| {
                 panic!(
-                    "compiled liveness should expose regs {regs:?}; got {:?}",
-                    live_by_pc
+                    "compiled JitCode liveness should expose regs {regs:?}; got {:?}",
+                    live_by_jit_pc
                 )
             })
     }
@@ -9502,6 +9557,7 @@ mod tests {
         let ec_ref = ctx.const_ref(frame.execution_context as usize as i64);
         sym.set_test_execution_context(ec_ref);
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
+        state.set_resume_marker_for_test(resume_pc);
 
         let fail_args = state.capture_current_fail_args();
 
@@ -9624,6 +9680,7 @@ mod tests {
             &[(0, stack0), (1, stack1)],
         );
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
+        state.set_resume_marker_for_test(resume_pc);
 
         let fail_args = state.capture_current_fail_args();
 
@@ -9804,6 +9861,7 @@ mod tests {
             vable_w_globals: ctx.const_ref(0),
         });
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
+        state.set_resume_marker_for_test(resume_pc);
 
         state.capture_guard_class(obj, &INT_TYPE as *const _);
 
@@ -9869,6 +9927,7 @@ mod tests {
             vable_w_globals: ctx.const_ref(0),
         });
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
+        state.set_resume_marker_for_test(resume_pc);
 
         let _ = state.capture_trace_guarded_int_payload(int_obj);
 
@@ -9993,6 +10052,9 @@ mod tests {
                 &[(0, deep_slot), (1, lower_stack), (2, truth), (3, top_slot)],
             );
             let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
+            // `record_branch_guard` captures at its `other_target`, which this
+            // fixture passes as the same JitCode `-live-` resume coordinate.
+            state.set_resume_marker_for_test(resume_pc);
             if record_branch_guard {
                 state.capture_record_branch_guard(OpRef::NONE, truth, true, resume_pc);
             } else {
@@ -10146,6 +10208,7 @@ mod tests {
             &[(0, deep_slot), (1, lower_stack), (2, truth), (3, top_slot)],
         );
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
+        state.set_resume_marker_for_test(resume_pc);
 
         state.capture_generate_guard(OpCode::GuardTrue, &[truth]);
         assert_eq!(
