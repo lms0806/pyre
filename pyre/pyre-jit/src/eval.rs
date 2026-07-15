@@ -2461,52 +2461,57 @@ fn install_gc_root_walkers() {
 
 fn register_thread_root_areas() {
     let register = majit_gc::shadow_stack::register_mutator_extra_area;
-    register(
-        pyframe_root_walker_area,
-        pyre_interpreter::eval::capture_pyframe_root_area(),
-    );
-    register(
-        pyre_object_root_walker_area,
-        pyre_object::gc_roots::capture_shadow_stack_area(),
-    );
-    register(
-        jitcode_constants_root_walker_area,
-        pyre_jit_trace::state::capture_jitcode_constants_root_area(),
-    );
-    register(
-        fbw_store_journal_root_walker_area,
-        pyre_jit_trace::jitcode_dispatch::capture_fbw_store_journal_root_area(),
-    );
-    register(
-        fbw_finish_concrete_root_walker_area,
-        pyre_jit_trace::jitcode_dispatch::capture_fbw_finish_concrete_root_area(),
-    );
-    register(
-        mapdict_root_walker_area,
-        pyre_interpreter::objspace::std::mapdict::capture_mapdict_root_area(),
-    );
-    #[cfg(not(target_arch = "wasm32"))]
-    register(
-        signal_handler_root_walker_area,
-        pyre_interpreter::module::signal::interp_signal::capture_signal_handler_root_area(),
-    );
-    register(
-        weakref_box_inner_root_walker_area,
-        pyre_object::weakref::capture_gc_weakref_box_root_area(),
-    );
-    register(
-        sre_pattern_root_walker_area,
-        pyre_object::interp_sre::capture_sre_pattern_root_area(),
-    );
-    register(
-        jit_callee_frame_root_walker_area,
-        crate::call_jit::capture_jit_callee_frame_root_area(),
-    );
     let jit_driver = JIT_DRIVER.with(|cell| cell as *const _ as *const ());
-    register(rd_consts_root_walker_area, jit_driver);
-    register(partial_trace_root_walker_area, jit_driver);
-    register(active_trace_root_walker_area, jit_driver);
-    register(compile_snapshot_root_walker_area, jit_driver);
+    // SAFETY: every `data` pointer is this thread's own TLS / `'static` root
+    // area, valid for the thread's registered lifetime, and every walk fn
+    // dereferences addresses derived solely from its supplied `data` pointer.
+    unsafe {
+        register(
+            pyframe_root_walker_area,
+            pyre_interpreter::eval::capture_pyframe_root_area(),
+        );
+        register(
+            pyre_object_root_walker_area,
+            pyre_object::gc_roots::capture_shadow_stack_area(),
+        );
+        register(
+            jitcode_constants_root_walker_area,
+            pyre_jit_trace::state::capture_jitcode_constants_root_area(),
+        );
+        register(
+            fbw_store_journal_root_walker_area,
+            pyre_jit_trace::jitcode_dispatch::capture_fbw_store_journal_root_area(),
+        );
+        register(
+            fbw_finish_concrete_root_walker_area,
+            pyre_jit_trace::jitcode_dispatch::capture_fbw_finish_concrete_root_area(),
+        );
+        register(
+            mapdict_root_walker_area,
+            pyre_interpreter::objspace::std::mapdict::capture_mapdict_root_area(),
+        );
+        #[cfg(not(target_arch = "wasm32"))]
+        register(
+            signal_handler_root_walker_area,
+            pyre_interpreter::module::signal::interp_signal::capture_signal_handler_root_area(),
+        );
+        register(
+            weakref_box_inner_root_walker_area,
+            pyre_object::weakref::capture_gc_weakref_box_root_area(),
+        );
+        register(
+            sre_pattern_root_walker_area,
+            pyre_object::interp_sre::capture_sre_pattern_root_area(),
+        );
+        register(
+            jit_callee_frame_root_walker_area,
+            crate::call_jit::capture_jit_callee_frame_root_area(),
+        );
+        register(rd_consts_root_walker_area, jit_driver);
+        register(partial_trace_root_walker_area, jit_driver);
+        register(active_trace_root_walker_area, jit_driver);
+        register(compile_snapshot_root_walker_area, jit_driver);
+    }
 }
 
 /// pyre-object GC hook trampolines — safe to install at boot because
@@ -2552,6 +2557,12 @@ fn build_gc_global() {
         return;
     }
     let gc = build_gc();
+    // Publish the eval-breaker word address before store_singleton flips the
+    // GC-initialized flag (Release). A concurrent initializer that observes the
+    // flag set (Acquire) early-returns above; ordering the publish first makes
+    // that observer also see a non-zero poll address, so its compiled
+    // GuardEvalBreaker ops are not baked inert.
+    majit_ir::eval_breaker_word::publish_addr();
     majit_gc::gc_sync::store_singleton(gc);
 }
 
@@ -2738,19 +2749,10 @@ pub fn driver_pair() -> &'static mut JitDriverPair {
 /// trace.
 ///
 /// Registered once during `JIT_DRIVER` init (see
-/// `register_extra_root_walker` call above). Routes into the
-/// thread-local `JitDriver`'s `walk_rd_consts_refs`, which in turn
-/// iterates `MetaInterp::compiled_loops` and visits the Ref-typed
-/// entries in every `StoredExitLayout::rd_consts`.
-fn rd_consts_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    // SAFETY: the GC collection happens on the same thread that owns
-    // `JIT_DRIVER`; no re-entrant collection touches the MetaInterp
-    // concurrently. `driver_pair()` returns a `&'static mut`, which is
-    // fine because the thread-local `UnsafeCell` is single-owner.
-    let pair = driver_pair();
-    pair.0.walk_rd_consts_refs(visitor);
-}
-
+/// `register_thread_root_areas`). Routes into the thread-local
+/// `JitDriver`'s `walk_rd_consts_refs`, which in turn iterates
+/// `MetaInterp::compiled_loops` and visits the Ref-typed entries in
+/// every `StoredExitLayout::rd_consts`.
 unsafe fn rd_consts_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
@@ -2767,13 +2769,6 @@ unsafe fn rd_consts_root_walker_area(
 /// arg / fail-arg directly. Routes into
 /// `JitDriver::walk_partial_trace_refs`, which forwards to
 /// `MetaInterp::walk_partial_trace_refs`.
-fn partial_trace_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    // SAFETY: see `rd_consts_root_walker` above — same single-owner
-    // thread-local invariant.
-    let pair = driver_pair();
-    pair.0.walk_partial_trace_refs(visitor);
-}
-
 unsafe fn partial_trace_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
@@ -2789,13 +2784,6 @@ unsafe fn partial_trace_root_walker_area(
 /// No-op when no trace is in progress. Routes into
 /// `JitDriver::walk_active_trace_refs`, which forwards to
 /// `MetaInterp::walk_active_trace_refs`.
-fn active_trace_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    // SAFETY: see `rd_consts_root_walker` above — same single-owner
-    // thread-local invariant.
-    let pair = driver_pair();
-    pair.0.walk_active_trace_refs(visitor);
-}
-
 unsafe fn active_trace_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
@@ -2809,11 +2797,6 @@ unsafe fn active_trace_root_walker_area(
 /// during compilation. history.py:314 ConstPtr.value is traced through
 /// the Python object graph; pyre's SnapshotBox.opref slots in Rust Vecs
 /// need explicit walking. See `MetaInterp::walk_compile_snapshot_refs`.
-fn compile_snapshot_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    let pair = driver_pair();
-    pair.0.walk_compile_snapshot_refs(visitor);
-}
-
 unsafe fn compile_snapshot_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
@@ -2823,6 +2806,22 @@ unsafe fn compile_snapshot_root_walker_area(
     }
 }
 
+/// Re-derives the thread-local `JitDriverPair` for a GC root walk from the
+/// registered `JIT_DRIVER` cell pointer.
+///
+/// # Safety / aliasing
+///
+/// This mints a `&mut JitDriverPair` from the `JIT_DRIVER` cell. When a
+/// collection is triggered by an allocation inside a `MetaInterp` method that
+/// is itself reached through a live `driver_pair()` `&mut`, that outer borrow
+/// and this one both alias the same cell — formally undefined under
+/// stacked/tree borrows. It holds in practice because the collection runs at a
+/// safepoint with the mutator paused and the walker only rewrites `GcRef`
+/// slots in place (moving-GC forwarding), which the outer borrow re-reads as
+/// forwarded pointers when it resumes. The orthodox fix is to move the
+/// GC-visible root fields (`compiled_loops` / `partial_trace` /
+/// `exported_state` / `framestack` / `tracing`) behind interior mutability so
+/// the walker forwards them without re-borrowing the whole driver.
 unsafe fn jit_driver_pair_from_root_area(data: *const ()) -> Option<&'static mut JitDriverPair> {
     let cell = unsafe { &*(data as *const UnsafeCell<Option<JitDriverPair>>) };
     unsafe { (&mut *cell.get()).as_mut() }
@@ -4508,6 +4507,12 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // here. A no-op unless the flag is on and enough interpreter objects
         // have accumulated to warrant a collection.
         pyre_object::gc_interp::safepoint();
+
+        // Stop-the-world safepoint: a compiled loop's back-edge poll deopts
+        // here when a collector has requested STW; park until it completes.
+        // Between opcodes no bytecode handler holds a Rust-stack ref (see the
+        // note above), so this is a walkable safepoint.
+        majit_gc::gc_sync::safepoint_poll();
 
         if frame_root.frame().next_instr() >= code.instructions.len() {
             return LoopResult::Done(Ok(w_none()));

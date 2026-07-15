@@ -1943,6 +1943,30 @@ impl ActionFlag {
     pub fn ticker_addr(&mut self) -> *mut isize {
         &mut self._ticker
     }
+
+    /// True when `self._ticker` is the signal-registered ticker cell — the
+    /// single cell compiled-loop back-edges poll. Only that ticker drives the
+    /// shared async bit; per-EC flags that are not the registered breaker
+    /// source must not touch the shared word, or one context's dispatch clear
+    /// would drop another context's pending async. wasm builds have no signal
+    /// module (no registered ticker), so the mirror is inert there.
+    ///
+    /// The cell identity is compared as `usize` rather than via
+    /// `ptr::eq`: this runs inside the traced eval loop (`decrement_ticker`),
+    /// and a raw-pointer equality on `*const isize` can lower to an
+    /// `int_eq/ir>i` kind shape that has no blackhole handler; casting both
+    /// addresses to `usize` keeps the comparison an int/int equality.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn is_registered_ticker(&self) -> bool {
+        let here = &self._ticker as *const isize as usize;
+        let registered = crate::module::signal::signalstate::registered_ticker_ptr() as usize;
+        here == registered
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn is_registered_ticker(&self) -> bool {
+        false
+    }
 }
 
 /// pypy/interpreter/executioncontext.py:566-585 — `class ActionFlag(AbstractActionFlag)`.
@@ -1966,6 +1990,23 @@ impl ActionFlagOps for ActionFlag {
     /// `p.c_value = value`.
     fn reset_ticker(&mut self, value: isize) {
         self._ticker = value;
+        if self.is_registered_ticker() {
+            if value < 0 {
+                majit_ir::eval_breaker_word::set_async();
+            } else {
+                majit_ir::eval_breaker_word::clear_async();
+                // A signal delivered between the ticker store and this clear
+                // rearms the ticker to -1 and re-sets the async bit; the clear
+                // would then drop it, leaving a negative ticker with the bit
+                // clear so a non-allocating compiled loop misses the signal.
+                // Re-read the ticker — the handler writes it through the
+                // registered pointer, so force a fresh load — and restore the
+                // bit if it was rearmed.
+                if unsafe { std::ptr::read_volatile(&self._ticker) } < 0 {
+                    majit_ir::eval_breaker_word::set_async();
+                }
+            }
+        }
     }
 
     /// interp_signal.py:42-51 `SignalActionFlag.decrement_ticker`.
@@ -1990,6 +2031,11 @@ impl ActionFlagOps for ActionFlag {
     fn decrement_ticker(&mut self, by: isize) -> isize {
         if self.base.has_bytecode_counter {
             self._ticker -= by;
+            // This path bypasses reset_ticker, so mirror a future periodic
+            // decrement that crosses negative.
+            if self.is_registered_ticker() && self._ticker < 0 {
+                majit_ir::eval_breaker_word::set_async();
+            }
         }
         self._ticker
     }
