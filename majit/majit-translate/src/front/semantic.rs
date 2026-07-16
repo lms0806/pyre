@@ -326,9 +326,8 @@ pub struct SemanticProgram {
     )>,
 }
 
-/// Graph lookup table built from a `SemanticProgram` so the
-/// registration loops in `lib.rs` and the opcode-dispatch extractor in
-/// `front::mir_dispatch` can fetch the MIR-built graph for a given
+/// Graph lookup table built from a `SemanticProgram` so registration and
+/// codewriter graph discovery can fetch the MIR-built graph for a given
 /// (impl_type or trait_root, method) pair by name.
 ///
 /// Callers spell `self_ty_root` two ways: a qualified owner
@@ -353,9 +352,8 @@ pub struct MirGraphLookup<'a> {
     /// Free functions (no impl owner, no trait root): keyed by bare name.
     /// `Ok(&graph)` is a unique hit; `Err(())` marks the slot ambiguous
     /// (two or more free functions share a bare name across modules).
-    /// Lets the opcode-dispatch extractor resolve `execute_opcode_step`
-    /// and each `execute_<op>` handler graph from the MIR program by
-    /// name.
+    /// Lets ordinary free-function registration and graph discovery resolve
+    /// a unique MIR-built graph by its unqualified name.
     free_functions: HashMap<&'a str, Result<&'a FunctionGraph, ()>>,
 }
 
