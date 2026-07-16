@@ -13872,6 +13872,17 @@ fn residual_call_helper_kind_in_body(
     d: &DecodedOp,
     callee_descr_refs: &[DescrRef],
 ) -> Option<majit_ir::PyreHelperKind> {
+    let descr_index = residual_call_descr_index_in_body(body_code, d)?;
+    callee_descr_refs
+        .get(descr_index)
+        .and_then(|descr| descr.as_call_descr())
+        .map(|cd| cd.get_extra_info().pyre_helper)
+}
+
+/// Return the per-function descriptor-pool index carried by a residual call
+/// in a callee jitcode body.  The layouts mirror the residual dispatchers:
+/// the descriptor follows the one or two variable-length argument lists.
+fn residual_call_descr_index_in_body(body_code: &[u8], d: &DecodedOp) -> Option<usize> {
     let descr_offset = match d.key {
         "residual_call_r_r/iRd>r" | "residual_call_r_i/iRd>i" | "residual_call_r_v/iRd" => {
             let r_len_pc = d.pc + 2;
@@ -13887,11 +13898,151 @@ fn residual_call_helper_kind_in_body(
         }
         _ => return None,
     };
-    let descr_index = decode_descr_index(body_code, d, descr_offset);
-    callee_descr_refs
-        .get(descr_index)
-        .and_then(|descr| descr.as_call_descr())
-        .map(|cd| cd.get_extra_info().pyre_helper)
+    Some(decode_descr_index(body_code, d, descr_offset))
+}
+
+/// Whether an inline callee can be replayed from its caller's CALL boundary
+/// without duplicating a live-heap effect.  The inline sub-walk's deopt
+/// snapshot does not yet carry its own callee frame, so this is deliberately
+/// stricter than ordinary inlining: unknown calls and every live-heap write
+/// decline up front.
+///
+/// A `new_with_vtable/d>r` result is fresh within this body.  Its
+/// initialization write is benign only when the target field is immutable;
+/// `wrapint` is the important instance (`W_IntObject.intval`).  Freshness may
+/// pass through `ref_copy`, but every other Ref-producing instruction clears
+/// it, so a later `setfield_gc` cannot accidentally be classified as an
+/// initialization of an earlier allocation.
+fn fbw_callee_body_side_effect_free(
+    body_code: &[u8],
+    args_all_numeric: bool,
+    num_regs_i: usize,
+    constants_i: &[i64],
+    callee_descr_refs: &[DescrRef],
+) -> bool {
+    let mut fresh_ref_regs = [false; u8::MAX as usize + 1];
+    let mut pc = 0usize;
+    while pc < body_code.len() {
+        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
+            return false;
+        };
+
+        if d.opname.starts_with("residual_call") {
+            let Some(descr_index) = residual_call_descr_index_in_body(body_code, &d) else {
+                return false;
+            };
+            let Some(call_descr) = callee_descr_refs
+                .get(descr_index)
+                .and_then(|descr| descr.as_call_descr())
+            else {
+                return false;
+            };
+            let ei = call_descr.get_extra_info();
+            let provably_side_effect_free = ei.check_is_elidable()
+                || ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant
+                || ei.pyre_helper == majit_ir::PyreHelperKind::ForIterNext;
+            if !provably_side_effect_free
+                && !residual_call_is_specialized_plain_int_add(
+                    body_code,
+                    args_all_numeric,
+                    &d,
+                    num_regs_i,
+                    constants_i,
+                    callee_descr_refs,
+                )
+            {
+                return false;
+            }
+        } else if d.opname.starts_with("setfield_gc") {
+            // Canonical setfield shapes are `r<value>d`: the target ref is
+            // operand 0 and the field descr is operand 2.
+            let Some(&target_reg) = body_code.get(d.pc + 1) else {
+                return false;
+            };
+            let descr_index = decode_descr_index(body_code, &d, 2);
+            let immutable_field = callee_descr_refs
+                .get(descr_index)
+                .and_then(|descr| descr.as_field_descr())
+                .is_some_and(|field| field.is_immutable());
+            if !fresh_ref_regs[target_reg as usize] || !immutable_field {
+                return false;
+            }
+        } else if d.opname.starts_with("setarrayitem_gc")
+            || d.opname.starts_with("setinteriorfield_gc")
+            || d.opname.starts_with("raw_store")
+            || d.opname.starts_with("cond_call")
+            || d.opname.starts_with("call_assembler")
+            || d.opname.starts_with("inline_call")
+        {
+            // Array/interior/raw stores and non-residual call forms cannot be
+            // proven replay-safe from this single callee body.
+            return false;
+        }
+
+        // The result byte is always the final operand for `>r` forms.
+        if d.argcodes.ends_with(">r") {
+            let Some(&dst) = body_code.get(d.next_pc.saturating_sub(1)) else {
+                return false;
+            };
+            fresh_ref_regs[dst as usize] = d.key == "new_with_vtable/d>r"
+                || (d.key == "ref_copy/r>r"
+                    && body_code
+                        .get(d.pc + 1)
+                        .is_some_and(|src| fresh_ref_regs[*src as usize]));
+        }
+        pc = d.next_pc;
+    }
+    true
+}
+
+/// `BINARY_OP Add` has the generic residual shape in a per-function jitcode,
+/// but the walker replaces a statically tagged plain add with `IntAddOvf` or
+/// `FloatAdd` before the generic residual executor (and its nested-residual
+/// decline) is reached when every incoming callee argument is int or float.
+/// Non-numeric operands stay an impure residual, so admitting them here would
+/// trigger the nested-residual 6421 abort storm.  Accept only the constant
+/// `Add` tag with numeric arguments; every in-place tag and every dynamic or
+/// different binary operation remains conservative.
+fn residual_call_is_specialized_plain_int_add(
+    body_code: &[u8],
+    args_all_numeric: bool,
+    d: &DecodedOp,
+    num_regs_i: usize,
+    constants_i: &[i64],
+    callee_descr_refs: &[DescrRef],
+) -> bool {
+    if !args_all_numeric
+        || !matches!(
+            d.key,
+            "residual_call_ir_r/iIRd>r" | "residual_call_ir_i/iIRd>i" | "residual_call_ir_v/iIRd"
+        )
+        || residual_call_helper_kind_in_body(body_code, d, callee_descr_refs)
+            != Some(majit_ir::PyreHelperKind::BinaryOp)
+    {
+        return false;
+    }
+    // `iIR`: funcptr i-reg, then the I-list.  The first I-list item is the
+    // BINARY_OP tag.  It must be in the callee's immutable constants window;
+    // a runtime tag could select an in-place or user-defined operation.
+    let Some(&i_len) = body_code.get(d.pc + 2) else {
+        return false;
+    };
+    if i_len == 0 {
+        return false;
+    }
+    let Some(&tag_reg) = body_code.get(d.pc + 3) else {
+        return false;
+    };
+    let Some(&tag) = (tag_reg as usize)
+        .checked_sub(num_regs_i)
+        .and_then(|constant_index| constants_i.get(constant_index))
+    else {
+        return false;
+    };
+    matches!(
+        pyre_interpreter::runtime_ops::binary_op_from_tag(tag),
+        Some(pyre_interpreter::bytecode::BinaryOperator::Add)
+    )
 }
 
 fn method_form_callee_body_supported(body_code: &[u8], callee_descr_refs: &[DescrRef]) -> bool {
@@ -14619,14 +14770,6 @@ fn try_walker_inline_user_call(
     if pyre_helper != majit_ir::PyreHelperKind::CallFn {
         return Ok(None);
     }
-    // An inline sub-walk inside a FOR_ITER body captures guards with
-    // the loop-header outer_active_boxes, but vable sync writes mid-body
-    // shadow state. On deopt the mismatch replays the last body
-    // iteration. Decline the inline; the call still executes concretely
-    // as a normal residual.
-    if fbw_foriter_inflight_active() {
-        return Ok(None);
-    }
     if r_args.is_empty() {
         return Ok(None);
     }
@@ -14695,6 +14838,31 @@ fn try_walker_inline_user_call(
     else {
         return Ok(None);
     };
+    let args_all_numeric = callee_arg_concretes.iter().all(|concrete| match concrete {
+        ConcreteValue::Int(_) | ConcreteValue::Float(_) | ConcreteValue::Bool(_) => true,
+        ConcreteValue::Ref(obj) if !obj.is_null() => unsafe {
+            pyre_object::is_int(*obj) || pyre_object::is_float(*obj)
+        },
+        ConcreteValue::Ref(_) | ConcreteValue::Null => false,
+    });
+    // An inline sub-walk inside a FOR_ITER body resumes a guard at the
+    // caller's CALL boundary, so deopt re-executes the whole callee.  Replaying
+    // a live-heap mutation would double it; the nested-residual decline catches
+    // that only after an abort storm.  A side-effect-free callee replays
+    // benignly, so admit it.  `PYRE_FBW_FORITER_INLINE=0` restores the former
+    // blanket decline as a rollback escape hatch.
+    if fbw_foriter_inflight_active()
+        && (std::env::var("PYRE_FBW_FORITER_INLINE").as_deref() == Ok("0")
+            || !fbw_callee_body_side_effect_free(
+                body.code,
+                args_all_numeric,
+                body.num_regs_i,
+                body.constants_i,
+                callee_descr_refs,
+            ))
+    {
+        return Ok(None);
+    }
     if method_form && !method_form_callee_body_supported(body.code, callee_descr_refs) {
         return Ok(None);
     }
@@ -14711,7 +14879,6 @@ fn try_walker_inline_user_call(
             shown += 1;
         }
     }
-
     // The inlined callee body is entered at pc=0 with the fast-path
     // register convention `registers_r[0..nparams] = positional args` —
     // the same seeding `dispatch_inline_call_dr_kind` uses for `n_*`
@@ -15897,6 +16064,24 @@ fn dispatch_residual_call_iRd_kind(
                  (specialization declined — unjournaled concrete store)",
                 op.pc
             );
+        }
+    }
+
+    // Range FOR_ITER is a C-level iterator advance.  Re-emit its field
+    // updates so the opaque ForIterNext residual cannot invalidate optheap;
+    // other iterator families retain the residual and its Python semantics.
+    // The specialization supplies the same Ref result that the residual would,
+    // including NULL for exhaustion, so the codewriter's trailing
+    // GuardNonnull remains the only loop-exit guard.
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && ei.pyre_helper == majit_ir::PyreHelperKind::ForIterNext
+    {
+        if let Some(item_op) =
+            try_walker_specialize_for_iter_next(ctx, op.pc, &r_args, dst, dst_bank)?
+        {
+            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, item_op)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
         }
     }
 
@@ -20730,6 +20915,218 @@ fn try_walker_specialize_store_subscr(
         "store_subscr specialization: in-bounds store failed"
     );
     Ok(Some(()))
+}
+
+/// Walker-native `ForIterNext` for `W_IntRangeIterator`.
+///
+/// The generic residual advances the shared iterator before an abort can
+/// occur, and forward-delivery preserves that consumed item.  This inline
+/// path keeps that deliberately irreversible advance: it never journals or
+/// rolls the cursor back.  It instead emits the `W_IntRangeIterator.next`
+/// field-update shape with a branchless continuation mask, leaving the
+/// codewriter's existing trailing `GuardNonnull` to select loop exit.
+///
+/// The Phase 1 result remains a normal `W_IntObject` allocation.  Its mask is
+/// only for the exhaustion result; item virtualization is intentionally not
+/// attempted here.
+fn try_walker_specialize_for_iter_next(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    r_args: &[OpRef],
+    _dst: usize,
+    dst_bank: char,
+) -> Result<Option<OpRef>, DispatchError> {
+    if !ctx.is_authoritative_executor
+        || !ctx.is_full_body_walk
+        || dst_bank != 'r'
+        || r_args.len() != 1
+    {
+        return Ok(None);
+    }
+
+    // The snapshot root represents the caller during an inline sub-walk, so
+    // it cannot supply the callee's FOR_ITER green key for demotion.  Leave
+    // that shape on the generic residual until every inlined frame threads
+    // its own snapshot root.
+    if ctx.fbw_mode.inline_subwalk {
+        return Ok(None);
+    }
+
+    // A range class-guard failure at this FOR_ITER green key is a definitive
+    // polymorphism witness.  Once the failure path has demoted it, retain the
+    // generic residual rather than recreating the range guard on retrace.
+    let range_green_key = walker_foriter_green_key(ctx, op_pc);
+    if range_green_key.is_some_and(crate::trace::range_foriter_demoted) {
+        return Ok(None);
+    }
+
+    let iter_op = r_args[0];
+    let Some(iter_obj) = walker_concrete_ref_object(ctx, iter_op) else {
+        return Ok(None);
+    };
+    let (concrete_current, concrete_remaining, concrete_step) = unsafe {
+        if !pyre_object::functional::is_range_iter(iter_obj) {
+            return Ok(None);
+        }
+        pyre_object::functional::w_range_iter_fields(iter_obj)
+    };
+    let concrete_continues = concrete_remaining != 0;
+
+    // A new consume attempt completes the prior in-flight iteration before
+    // this irreversible concrete advance, matching the residual executor.
+    let body_pc = fbw_foriter_body_pc_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc)
+        .unwrap_or(ctx.entry_py_pc as usize + 1);
+    fbw_foriter_inflight_mark_attempt(body_pc);
+
+    // guard_class W_IntRangeIterator, unless the operand is already known.
+    let range_iter_type_addr = &pyre_object::functional::RANGE_ITER_TYPE as *const _ as i64;
+    if !iter_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(iter_op) {
+        let guard_fail_index = ctx.trace_ctx.num_guards() as u32;
+        let type_const = ctx.trace_ctx.const_int(range_iter_type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[iter_op, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        // `handle_fail` receives only the compiled guard's synthesized
+        // FailDescr. Keep this trace's guard ordinal with the corresponding
+        // FOR_ITER loop key so its failure can demote the specialization.
+        if let Some(green_key) = range_green_key {
+            crate::trace::record_range_foriter_specialization(green_key, guard_fail_index);
+        }
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(iter_op, range_iter_type_addr);
+
+    // Emit the cursor update without a separate exhaustion guard.  `continues`
+    // is 0/1, so the exhausted path writes the existing cursor values and the
+    // masked item becomes NULL for the pre-existing GuardNonnull.
+    let current = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        iter_op,
+        crate::descr::range_iter_current_descr(),
+    );
+    let remaining = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        iter_op,
+        crate::descr::range_iter_remaining_descr(),
+    );
+    let step = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        iter_op,
+        crate::descr::range_iter_step_descr(),
+    );
+    let zero = ctx.trace_ctx.const_int(0);
+    let continues = ctx.trace_ctx.record_op(OpCode::IntGt, &[remaining, zero]);
+    ctx.trace_ctx
+        .set_opref_concrete(continues, Value::Int(concrete_continues as i64));
+    let delta = ctx.trace_ctx.record_op(OpCode::IntMul, &[step, continues]);
+    ctx.trace_ctx.set_opref_concrete(
+        delta,
+        Value::Int(concrete_step.wrapping_mul(concrete_continues as i64)),
+    );
+    let next_current = ctx.trace_ctx.record_op(OpCode::IntAdd, &[current, delta]);
+    let next_current_concrete =
+        concrete_current.wrapping_add(concrete_step.wrapping_mul(concrete_continues as i64));
+    ctx.trace_ctx
+        .set_opref_concrete(next_current, Value::Int(next_current_concrete));
+    let current_descr = crate::descr::range_iter_current_descr();
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[iter_op, next_current],
+        current_descr.clone(),
+    );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(iter_op, current_descr.index(), next_current);
+
+    let next_remaining = ctx
+        .trace_ctx
+        .record_op(OpCode::IntSub, &[remaining, continues]);
+    let next_remaining_concrete = concrete_remaining.wrapping_sub(concrete_continues as i64);
+    ctx.trace_ctx
+        .set_opref_concrete(next_remaining, Value::Int(next_remaining_concrete));
+    let remaining_descr = crate::descr::range_iter_remaining_descr();
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[iter_op, next_remaining],
+        remaining_descr.clone(),
+    );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(iter_op, remaining_descr.index(), next_remaining);
+
+    // Phase 1 keeps the item boxed.  Mask its pointer through an Int word so
+    // exhaustion produces a NULL Ref without an additional guard or side exit.
+    let boxed = crate::state::wrapint(ctx.trace_ctx, current);
+    let boxed_as_int = ctx.trace_ctx.record_op(OpCode::CastPtrToInt, &[boxed]);
+    let mask = ctx.trace_ctx.record_op(OpCode::IntSub, &[zero, continues]);
+    let mask_concrete = 0i64.wrapping_sub(concrete_continues as i64);
+    ctx.trace_ctx
+        .set_opref_concrete(mask, Value::Int(mask_concrete));
+    let masked_as_int = ctx
+        .trace_ctx
+        .record_op(OpCode::IntAnd, &[boxed_as_int, mask]);
+    let masked_item = ctx
+        .trace_ctx
+        .record_op(OpCode::CastIntToPtr, &[masked_as_int]);
+
+    // Tracing executes the real range cursor advance.  The direct helper is
+    // the same `W_IntRangeIterator.next` implementation used by the residual;
+    // do not journal it, because abort recovery forwards this exact item.
+    let concrete_item = unsafe { pyre_object::functional::w_range_iter_next(iter_obj) };
+    debug_assert_eq!(concrete_item.is_some(), concrete_continues);
+    let concrete_item_ptr = concrete_item.unwrap_or(pyre_object::PY_NULL);
+    let concrete_box_ptr = if concrete_continues {
+        concrete_item_ptr as usize
+    } else {
+        0
+    };
+    ctx.trace_ctx
+        .set_opref_concrete(boxed, Value::Ref(majit_ir::GcRef(concrete_box_ptr)));
+    ctx.trace_ctx
+        .set_opref_concrete(boxed_as_int, Value::Int(concrete_box_ptr as i64));
+    let masked_concrete = (concrete_box_ptr as i64) & mask_concrete;
+    ctx.trace_ctx
+        .set_opref_concrete(masked_as_int, Value::Int(masked_concrete));
+    ctx.trace_ctx.set_opref_concrete(
+        masked_item,
+        Value::Ref(majit_ir::GcRef(masked_concrete as usize)),
+    );
+
+    if concrete_continues {
+        fbw_foriter_inflight_capture(concrete_item_ptr, body_pc);
+        // Range iteration stays at the C level, so the operand-stack mirror
+        // remains valid and must receive the item produced by FOR_ITER.
+        ctx.vstack_last_ref = masked_item;
+    }
+
+    Ok(Some(masked_item))
+}
+
+/// Return the driver green key for this top-level FOR_ITER residual.
+///
+/// `op_pc` belongs to the current per-CodeObject JitCode, while the driver
+/// key is `(W_Code, python FOR_ITER pc)`.  The full-body snapshot root owns
+/// the outer JitCode metadata needed for that inversion.  Inlined sub-walks
+/// have a distinct callee JitCode but deliberately share the root snapshot;
+/// decline their range fold rather than associating a callee guard with the
+/// caller's key.
+fn walker_foriter_green_key(ctx: &WalkContext<'_, '_>, op_pc: usize) -> Option<u64> {
+    if ctx.fbw_mode.inline_subwalk || ctx.fbw_mode.snapshot_sym.is_null() {
+        return None;
+    }
+    // SAFETY: snapshot-root mode keeps the outer `PyreSym` live throughout
+    // the full-body walk.  This reads immutable code metadata only.
+    let sym = unsafe { &*ctx.fbw_mode.snapshot_sym };
+    if sym.jitcode.is_null() {
+        return None;
+    }
+    let jitcode = unsafe { &*sym.jitcode };
+    let raw_code = unsafe { jitcode.raw_code() };
+    let w_code = pyre_interpreter::live_code_wrapper(raw_code as *const ()) as *const ();
+    if w_code.is_null() {
+        return None;
+    }
+    let foriter_start_pc = python_pc_for_jitcode_pc(&jitcode.payload.metadata, op_pc) as usize;
+    Some(crate::driver::make_green_key(w_code, foriter_start_pc))
 }
 
 /// #57 SLICE 3c (compare): walker-native speculative float specialization
