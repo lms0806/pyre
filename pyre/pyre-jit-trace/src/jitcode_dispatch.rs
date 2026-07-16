@@ -6668,12 +6668,12 @@ fn try_execute_residual_call_via_executor(
     // virtualizable, or unit-test init disabled the heap pointer) — nothing
     // the callee could force.  The token is armed further below, past every
     // decline gate.
-    let vable_obj_ptr = if is_may_force {
+    let mut vable_obj_root = if is_may_force {
         ctx.trace_ctx
             .standard_virtualizable_box()
             .and_then(|_| ctx.trace_ctx.virtualizable_heap_ptr())
             .filter(|p| !p.is_null())
-            .map(|p| p as *mut u8)
+            .map(|p| Box::new(p as usize as i64))
     } else {
         None
     };
@@ -6776,10 +6776,17 @@ fn try_execute_residual_call_via_executor(
     // `vable_and_vrefs_before_residual_call` (pyjitpl.py:2017) runs only past
     // the OS_NOT_IN_TRACE / force-virtual short-circuits.  Trait mirror:
     // `MIFrame::vable_and_vrefs_before_residual_call` (trace_opcode.rs:2602).
-    if let Some(obj_ptr) = vable_obj_ptr {
+    let vable_root_depth = if let Some(obj) = vable_obj_root.as_mut() {
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
-        unsafe { info.tracing_before_residual_call(obj_ptr) };
-    }
+        let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+        unsafe {
+            majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut **obj));
+            info.tracing_before_residual_call(**obj as usize as *mut u8);
+        }
+        Some(root_depth)
+    } else {
+        None
+    };
     let body_effect_candidate =
         !provably_side_effect_free && writes_live_heap && fbw_foriter_inflight_active();
     // #57 Option C (Finding #1, user-frame signal): the Void/helper-tag write
@@ -6839,8 +6846,13 @@ fn try_execute_residual_call_via_executor(
             fbw_mark_executed_body_residual();
         }
     }
+    let restored_vable_heap_ptr = vable_obj_root
+        .as_ref()
+        .map(|obj| **obj as usize as *const u8)
+        .or(saved_vable_heap_ptr)
+        .unwrap_or(std::ptr::null());
     ctx.trace_ctx
-        .set_virtualizable_heap_ptr(saved_vable_heap_ptr.unwrap_or(std::ptr::null()));
+        .set_virtualizable_heap_ptr(restored_vable_heap_ptr);
     // pyjitpl.py:3349-3353 `vinfo.tracing_after_residual_call(virtualizable)`
     // heap half: a cleared token means the callee forced the virtualizable —
     // the frame escaped, the trace must abort (pyjitpl.py:3365
@@ -6851,9 +6863,12 @@ fn try_execute_residual_call_via_executor(
     // `load_fields_from_virtualizable` analogue is needed because the FBW
     // abort discards the walk shadow instead of handing it to a blackhole
     // leg.  An intact token is cleared back to TOKEN_NONE.
-    if let Some(obj_ptr) = vable_obj_ptr {
+    if let Some(obj) = vable_obj_root.as_ref() {
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
-        let forced = unsafe { info.tracing_after_residual_call(obj_ptr) };
+        let forced = unsafe { info.tracing_after_residual_call(**obj as usize as *mut u8) };
+        if let Some(depth) = vable_root_depth {
+            majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
+        }
         if forced {
             return Err(DispatchError::VableEscapedDuringResidualCall { pc: op_pc });
         }
@@ -8207,6 +8222,24 @@ pub(crate) fn fbw_inline_multiframe_enabled() -> bool {
 pub(crate) fn fbw_rec_multiframe_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_REC_MULTIFRAME") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
+    })
+}
+
+/// Full-portal recursive-call cutover (`PYRE_FBW_REC_MUTUAL_CUTOVER`): at the
+/// inline-unroll cap, route a recursive callee (self OR mutual) through
+/// `get_assembler_token` → `compile_tmp_callback` (warmstate.py:714-723,
+/// compile.py:1101-1150) so a not-yet-compiled callee still enters via a real
+/// CALL_ASSEMBLER tmp-callback token instead of poisoning the trace with
+/// `LoopBearingCalleeInlineUnsupported`.  Mirrors the `build_jit_driver_pair`
+/// gate of the same name (eval.rs); default OFF while the migration lands.
+pub(crate) fn fbw_rec_mutual_cutover_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_REC_MUTUAL_CUTOVER") {
         Some(v) => {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
@@ -14470,8 +14503,26 @@ fn try_walker_call_assembler_self_recursive(
     let caller_code = unsafe {
         pyre_interpreter::live_code_wrapper((*sym.jitcode).raw_code() as *const ()) as *const ()
     };
+    // Self-fold requires callee code == portal code.  The full-portal cutover
+    // (`PYRE_FBW_REC_MUTUAL_CUTOVER`) additionally admits a *mutual*-recursive
+    // callee — one whose code is already on the inline framestack, i.e. a
+    // genuine recursion cycle (`is_even` → `is_odd` → `is_even` at the unroll
+    // cap).  It must NOT admit an arbitrary foreign call: folding a
+    // non-recursive callee (e.g. a CALL_KW-bearing leaf) to CALL_ASSEMBLER
+    // builds and enters a frame the callee's own loop was never traced against
+    // and faults.  The emit below keys on `w_code` (callee-agnostic); the token
+    // is resolved / synthesised per `callee_key` via `get_assembler_token`.
     if w_code as usize != caller_code as usize {
-        return Ok(None);
+        let admit_mutual = fbw_rec_mutual_cutover_enabled()
+            && ctx
+                .session
+                .borrow()
+                .framestack
+                .iter()
+                .any(|f| f.w_code == w_code as usize);
+        if !admit_mutual {
+            return Ok(None);
+        }
     }
     // A foreign (non self-recursive) non-pure residual already executed
     // concretely earlier in this walk (e.g. `events.append(n)` ahead of the
@@ -14509,16 +14560,61 @@ fn try_walker_call_assembler_self_recursive(
     // pending token `fib` hits before its loop finishes compiling
     // (`trace_opcode.rs:6035-6036`).  A key miss returns `None` here =
     // safe bail to residual.
+    //
+    // The self-recursion token is the callee's OWN reserved pending number,
+    // used directly — NOT re-synthesised through `compile_tmp_callback`.  Under
+    // pyre's number-keyed backend `_ll_function_addr` registry a
+    // `compile_tmp_callback` at the pending number and the later real-loop
+    // install collide on that same number, leaving a stale/garbage address the
+    // CALL_ASSEMBLER jumps to (SIGSEGV).  Converging the self path onto
+    // `get_assembler_token` (as `direct_assembler_call` already is) is blocked
+    // on the descr-identity cutover (Task #211) that re-roots address
+    // resolution on the descr-carried `Arc<JitCellToken>`; until it lands the
+    // reserved pending number resolved through `register_pending_target` +
+    // CA_FORCE_FN is the pyre-orthodox self-recursion path.
     let (driver, _) = crate::driver::driver_pair();
     let callee_key = crate::driver::make_green_key(w_code, 0);
-    let Some(token_number) = driver
+    // `get_loop_token_number` first (compiled loop), else the pending token the
+    // callee hits before its loop finishes compiling.  These take `&self`, so
+    // resolve to an owned `Option<u64>` before the `&mut` synth borrow below.
+    let existing = driver
         .get_loop_token_number(callee_key)
-        .or_else(|| driver.get_pending_token_number(callee_key))
-    else {
-        if std::env::var_os("PYRE_P2_DIAG").is_some() {
-            eprintln!("[p2-ca] decline pc={} reason=no-token", op.pc);
+        .or_else(|| driver.get_pending_token_number(callee_key));
+    let token_number = match existing {
+        Some(n) => n,
+        // Full-portal cutover: no token yet (typically the mutual callee, whose
+        // pending slot the current self-key trace never filled).  Synthesise a
+        // tmp-callback token via `get_assembler_token` → `compile_tmp_callback`
+        // (warmstate.py:714-723, compile.py:1101-1150).  greenboxes carry the
+        // portal greens in `build_portal_calldescr` order
+        // (`[next_instr, is_being_profiled, pycode]`); reds are `[frame, ec]`.
+        None if fbw_rec_mutual_cutover_enabled() => {
+            let greenboxes = [
+                majit_ir::Value::Int(0),
+                majit_ir::Value::Int(0),
+                majit_ir::Value::Ref(majit_ir::GcRef(w_code as usize)),
+            ];
+            let red_types = [Type::Ref, Type::Ref];
+            match driver
+                .meta_interp_mut()
+                .get_or_make_portal_assembler_token_number(callee_key, &greenboxes, &red_types)
+            {
+                Some(n) => n,
+                None => {
+                    if std::env::var_os("PYRE_P2_DIAG").is_some() {
+                        eprintln!("[p2-ca] decline pc={} reason=synth-failed", op.pc);
+                    }
+                    return Ok(None);
+                }
+            }
         }
-        return Ok(None);
+        // A key miss without cutover is a safe bail to the residual path.
+        None => {
+            if std::env::var_os("PYRE_P2_DIAG").is_some() {
+                eprintln!("[p2-ca] decline pc={} reason=no-token", op.pc);
+            }
+            return Ok(None);
+        }
     };
     if std::env::var_os("PYRE_P2_DIAG").is_some() {
         eprintln!("[p2-ca] EMIT pc={} token={token_number}", op.pc);
@@ -15171,6 +15267,13 @@ fn try_walker_inline_user_call(
         // cache; making an uninlineable method body blacklist the whole outer
         // loop turns a correct specialization into a compile regression.
         if method_form {
+            return Ok(None);
+        }
+        // Full-portal cutover: instead of poisoning the trace, fall through to
+        // the CALL_ASSEMBLER fold (`try_walker_call_assembler_self_recursive`,
+        // reached next in the residual-call dispatch) so a recursive callee at
+        // the inline cap enters via its own (possibly tmp-callback) loop token.
+        if fbw_rec_mutual_cutover_enabled() {
             return Ok(None);
         }
         return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });

@@ -906,11 +906,23 @@ impl Default for StandaloneFrameStack {
     }
 }
 
-#[derive(Clone)]
 struct ActiveStandardVirtualizable {
     vable_opref: OpRef,
     info: std::sync::Arc<crate::virtualizable::VirtualizableInfo>,
-    obj_ptr: *mut u8,
+    obj: Box<i64>,
+    root_depth: usize,
+}
+
+impl ActiveStandardVirtualizable {
+    fn obj_ptr(&self) -> *mut u8 {
+        *self.obj as usize as *mut u8
+    }
+}
+
+impl Drop for ActiveStandardVirtualizable {
+    fn drop(&mut self) {
+        majit_gc::shadow_stack::pop_resume_ref_roots_to(self.root_depth);
+    }
 }
 
 impl<'mi, S, R> JitCodeMachine<'mi, S, R>
@@ -921,22 +933,21 @@ where
     fn active_standard_virtualizable(&self, ctx: &TraceCtx) -> Option<ActiveStandardVirtualizable> {
         let vable_opref = ctx.standard_virtualizable_box()?;
         let info = ctx.virtualizable_info()?.clone();
-        let obj_ptr = self.frames.frames.iter().rev().find_map(|frame| {
+        let obj = self.frames.frames.iter().rev().find_map(|frame| {
             frame
                 .ref_regs
                 .iter()
                 .zip(frame.ref_values.iter())
                 .find_map(|(slot, concrete)| {
-                    (*slot == Some(vable_opref))
-                        .then_some(*concrete)
-                        .flatten()
-                        .map(|value| value as usize as *mut u8)
+                    (*slot == Some(vable_opref)).then_some(*concrete).flatten()
                 })
         })?;
+        let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
         Some(ActiveStandardVirtualizable {
             vable_opref,
             info,
-            obj_ptr,
+            obj: Box::new(obj),
+            root_depth,
         })
     }
 
@@ -944,9 +955,10 @@ where
         &mut self,
         ctx: &mut TraceCtx,
     ) -> Option<ActiveStandardVirtualizable> {
-        let active = self.active_standard_virtualizable(ctx)?;
+        let mut active = self.active_standard_virtualizable(ctx)?;
         unsafe {
-            active.info.tracing_before_residual_call(active.obj_ptr);
+            majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut *active.obj));
+            active.info.tracing_before_residual_call(active.obj_ptr());
         }
         let force_token = ctx.force_token();
         ctx.vable_setfield_descr(
@@ -963,7 +975,7 @@ where
         let Some(active) = active else {
             return false;
         };
-        unsafe { active.info.tracing_after_residual_call(active.obj_ptr) }
+        unsafe { active.info.tracing_after_residual_call(active.obj_ptr()) }
     }
 
     fn finalize_standard_virtualizable_may_force(

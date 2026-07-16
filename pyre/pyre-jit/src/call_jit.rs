@@ -76,8 +76,35 @@ thread_local! {
     /// re-running the resumed region over already-applied effects.
     static CA_WALK_FINISHED_FRAME: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static CA_WALK_RESUME_FRAME: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static CA_WALK_RESUME_DEADFRAME: std::cell::RefCell<Option<Vec<i64>>> =
+        const { std::cell::RefCell::new(None) };
     static SELF_RECURSIVE_DISPATCH_CACHE: UnsafeCell<Option<(u64, Option<u64>)>> =
         const { UnsafeCell::new(None) };
+}
+
+struct FrameRoot {
+    depth: usize,
+}
+
+impl FrameRoot {
+    fn new(frame: &mut PyFrame) -> Self {
+        Self {
+            depth: majit_gc::shadow_stack::push(majit_ir::GcRef(frame as *mut PyFrame as usize)),
+        }
+    }
+
+    fn frame(&mut self) -> &mut PyFrame {
+        let frame = majit_gc::shadow_stack::get(self.depth).0 as *mut PyFrame;
+        unsafe { &mut *frame }
+    }
+}
+
+impl Drop for FrameRoot {
+    fn drop(&mut self) {
+        majit_gc::shadow_stack::try_pop_to(self.depth);
+    }
 }
 
 /// Take stashed exception from blackhole/force FFI paths.
@@ -612,13 +639,20 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     if let Some(raw_local0) = pending {
         return jit_force_self_recursive_call_raw_1(frame_ptr, raw_local0);
     }
-    // Nursery-safe force: read code/namespace/exec_ctx via raw offsets
-    // (valid for both arena PyFrame AND nursery-allocated raw blocks).
-    // Then create a proper PyFrame for the interpreter.
-    //
-    // warmspot.py:1021 assembler_call_helper parity: the callee frame
-    // (deadframe) may be a nursery-allocated JitFrame-like block. We
-    // reconstruct a proper interpreter frame from its raw fields.
+    portal_runner_from_raw_frame_ptr(frame_ptr)
+}
+
+/// warmspot.py:941-959 `ll_portal_runner` core — reconstruct a proper
+/// interpreter frame from a raw JitFrame-like block pointer and run it
+/// through the portal.
+///
+/// Nursery-safe force: read code/namespace/exec_ctx via raw offsets (valid
+/// for both arena `PyFrame` AND nursery-allocated raw blocks), build a proper
+/// `PyFrame`, then hand it to `portal_runner` (`maybe_compile_and_run` +
+/// interpreter main loop; ContinueRunningNormally re-enters the JIT via the
+/// portal, warmspot.py:961-983). The callee frame may be a nursery-allocated
+/// JitFrame-like block, so the fields are recovered from raw offsets.
+fn portal_runner_from_raw_frame_ptr(frame_ptr: i64) -> i64 {
     let (code, w_globals, exec_ctx) = unsafe {
         use pyre_interpreter::pyframe::*;
         let p = frame_ptr as *const u8;
@@ -631,16 +665,41 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     let mut func_frame = PyFrame::new_for_call_with_globals_obj(code, &[], w_globals, exec_ctx);
     func_frame.fix_array_ptrs();
 
-    // warmspot.py:1021-1028 assembler_call_helper:
-    //   fail_descr.handle_fail(deadframe, metainterp_sd, jd)
-    //   except JitException as e: return handle_jitexception(e)
-    //
-    // handle_jitexception (warmspot.py:961) handles ContinueRunningNormally
-    // by calling portal_ptr(*args) — the JIT-aware portal. RPython does
-    // NOT prevent JIT re-entry here. The callee can enter compiled code
-    // through maybe_compile_and_run in the portal runner.
     let result = crate::eval::portal_runner(&mut func_frame);
 
+    // warmspot.py:449 result_type=REF: always boxed Ref
+    result as i64
+}
+
+/// warmspot.py:941-959 `ll_portal_runner` — the raw-address portal entry whose
+/// address is stored in `jd.portal_runner_adr` (warmspot.py:1010-1012) and
+/// called by the synthetic callback loop that `compile_tmp_callback`
+/// (compile.py:1125-1132) builds for a not-yet-compiled recursive callee.
+///
+/// The call uses the `jd.portal_calldescr` ABI —
+/// `JitDriverStaticData::build_portal_calldescr` lays the args out in `vars`
+/// declaration order: greens `[next_instr, is_being_profiled, pycode]` then
+/// reds `[frame, ec]`. The callee `frame` red already carries `pycode` /
+/// `next_instr` baked in by the caller that built it, so only the frame
+/// pointer is needed to resume; the greens are consumed implicitly through the
+/// reconstructed frame, matching the frame-only `assembler_call_helper` entry.
+#[majit_macros::jit_may_force]
+pub extern "C" fn ll_portal_runner_shim(
+    _next_instr: i64,
+    _is_being_profiled: i64,
+    _pycode: i64,
+    frame_ptr: i64,
+    _ec: i64,
+) -> i64 {
+    // The callback loop `compile_tmp_callback` builds (compile.py:1125-1132)
+    // passes the callee `frame` red that `emit_new_pyframe_inline_with_params`
+    // constructed — a proper `PyFrame` with `locals_cells_stack_w` already
+    // populated (NewWithVtable + SetfieldGc).  Run it directly; the greens
+    // (`next_instr` / `pycode`) are redundant because the frame carries them.
+    // (Contrast `jit_force_callee_frame`, whose CA_FORCE_FN deadframe is a raw
+    // JitFrame-like block that must be reconstructed with fresh fields.)
+    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    let result = crate::eval::portal_runner(frame);
     // warmspot.py:449 result_type=REF: always boxed Ref
     result as i64
 }
@@ -1383,6 +1442,8 @@ fn jit_blackhole_resume_from_guard(
 ) -> Option<i64> {
     let ca_adopted_frame = CA_WALK_ADOPTED_FRAME.with(|c| c.replace(0));
     let ca_finished_frame = CA_WALK_FINISHED_FRAME.with(|c| c.replace(0));
+    let ca_resume_frame = CA_WALK_RESUME_FRAME.with(|c| c.replace(0));
+    let ca_resume_deadframe = CA_WALK_RESUME_DEADFRAME.with(|c| c.borrow_mut().take());
 
     // rstack.stack_check_slowpath → _StackOverflow parity: drain the
     // pending JIT-prologue overflow exception when the backend probe
@@ -1404,7 +1465,17 @@ fn jit_blackhole_resume_from_guard(
         pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_reset();
         return None;
     }
-    let fail_values = unsafe { std::slice::from_raw_parts(fail_values_ptr, num_fail_values) };
+    let fail_values_raw = unsafe { std::slice::from_raw_parts(fail_values_ptr, num_fail_values) };
+    let mut fail_values_owned;
+    let fail_values = if let Some(values) = ca_resume_deadframe.as_deref() {
+        values
+    } else if ca_resume_frame != 0 {
+        fail_values_owned = fail_values_raw.to_vec();
+        fail_values_owned[0] = ca_resume_frame as i64;
+        fail_values_owned.as_slice()
+    } else {
+        fail_values_raw
+    };
 
     // The CA bridge walk ran the callee to its finishframe concretely and
     // kept the finish-concrete stash (`CA_WALK_FINISHED_FRAME` handshake set
@@ -1466,10 +1537,20 @@ fn jit_blackhole_resume_from_guard(
         };
     }
 
-    let raw_deadframe = if !raw_deadframe_ptr.is_null() && num_raw_deadframe > 0 {
+    let raw_deadframe_raw = if let Some(values) = ca_resume_deadframe.as_deref() {
+        values
+    } else if !raw_deadframe_ptr.is_null() && num_raw_deadframe > 0 {
         unsafe { std::slice::from_raw_parts(raw_deadframe_ptr, num_raw_deadframe) }
     } else {
         fail_values
+    };
+    let mut raw_deadframe_owned;
+    let raw_deadframe = if ca_resume_frame != 0 && !raw_deadframe_raw.is_empty() {
+        raw_deadframe_owned = raw_deadframe_raw.to_vec();
+        raw_deadframe_owned[0] = ca_resume_frame as i64;
+        raw_deadframe_owned.as_slice()
+    } else {
+        raw_deadframe_raw
     };
 
     // compile.py:710-716 `resume_in_blackhole(descr, deadframe)` parity:
@@ -1648,6 +1729,29 @@ struct ResumeDeadframeRoots {
 }
 
 impl ResumeDeadframeRoots {
+    fn register_pyframe_locals_slot(value: i64, slots: &mut Vec<*mut *mut u8>) {
+        let ptr = value as *mut u8;
+        if ptr.is_null()
+            || !pyre_object::gc_hook::try_gc_owns_object(ptr)
+            || majit_gc::gc_is_nursery_object(ptr as usize)
+        {
+            return;
+        }
+        let current = pyre_object::gc_hook::try_gc_current_object_address(ptr);
+        if current.is_null() || !pyre_object::gc_hook::try_gc_owns_object(current) {
+            return;
+        }
+        let type_id = unsafe { (*majit_gc::header::header_of(current as usize)).type_id() };
+        if type_id != pyre_interpreter::pyframe::PYFRAME_GC_TYPE_ID {
+            return;
+        }
+        let frame = current as *mut PyFrame;
+        let slot = unsafe { std::ptr::addr_of_mut!((*frame).locals_cells_stack_w) as *mut *mut u8 };
+        if unsafe { pyre_object::gc_hook::try_gc_add_root(slot) } {
+            slots.push(slot);
+        }
+    }
+
     fn register(deadframe: &mut [i64], deadframe_types: Option<&[majit_ir::Type]>) -> Self {
         let mut slots = Vec::new();
         if let Some(types) = deadframe_types {
@@ -1666,6 +1770,7 @@ impl ResumeDeadframeRoots {
                 if unsafe { pyre_object::gc_hook::try_gc_add_root(slot) } {
                     slots.push(slot);
                 }
+                Self::register_pyframe_locals_slot(*cell, &mut slots);
             }
         }
         Self { slots }
@@ -2619,6 +2724,13 @@ pub fn trace_and_compile_from_bridge(
         return BridgeResolution::ResumeBlackhole;
     }
 
+    // The live frame is a virtualizable GC object held by raw bridge-trace
+    // locals while retracing can collect. RPython keeps the virtualizable
+    // object GC-visible during retracing
+    // (`rpython/jit/metainterp/pyjitpl.py:2839-2841`); pyre roots the frame
+    // word so PyFrame's custom trace can forward `locals_cells_stack_w`.
+    let mut bridge_frame_root = FrameRoot::new(frame);
+
     // pyjitpl.py:2841 interpret(): after start_retrace_from_guard, RPython
     // runs a single interpret() over the resumed frame state until the
     // bridge closes or aborts. `trace_bytecode` is the pyre equivalent of
@@ -2682,10 +2794,12 @@ pub fn trace_and_compile_from_bridge(
                 // re-apply every side effect.  Uncommitted → fall through
                 // to the guard-state restore below (legacy replay).
                 if pyre_jit_trace::trace::take_walk_end_flush_committed() {
+                    let frame = bridge_frame_root.frame();
                     frame.restore_resume_state_from(&executed);
                     adopted_walk_end_state = true;
                     if !allow_finish_direct_return {
-                        CA_WALK_ADOPTED_FRAME.with(|c| c.set(live_frame_addr));
+                        let adopted_frame = frame as *mut PyFrame as usize;
+                        CA_WALK_ADOPTED_FRAME.with(|c| c.set(adopted_frame));
                     }
                 }
                 action
@@ -2725,7 +2839,8 @@ pub fn trace_and_compile_from_bridge(
                 "bridge Terminate no-replay stash kept for a multiframe resume \
                  (frames={num_resume_frames})"
             );
-            CA_WALK_FINISHED_FRAME.with(|c| c.set(live_frame_addr));
+            let finished_frame = bridge_frame_root.frame() as *mut PyFrame as usize;
+            CA_WALK_FINISHED_FRAME.with(|c| c.set(finished_frame));
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][bridge-trace] ca-finish-noreplay at resume_pc={} key={}",
@@ -2767,6 +2882,7 @@ pub fn trace_and_compile_from_bridge(
         None => {}
     }
     if !adopted_walk_end_state {
+        let frame = bridge_frame_root.frame();
         frame.restore_resume_state_from(&resume_state);
     }
     // A multi-frame (inlined-callee) guard restored on the non-flush path
@@ -2802,6 +2918,10 @@ pub fn trace_and_compile_from_bridge(
                 resume_pc, green_key, resume_via_blackhole
             );
         }
+        if !allow_finish_direct_return && resume_via_blackhole {
+            let resume_frame = bridge_frame_root.frame() as *mut PyFrame as usize;
+            CA_WALK_RESUME_FRAME.with(|c| c.set(resume_frame));
+        }
         return bridge_resolution_from_bool(!resume_via_blackhole);
     }
 
@@ -2826,6 +2946,10 @@ pub fn trace_and_compile_from_bridge(
                 "[jit][bridge-trace] compiled at resume_pc={} key={} (attached) blackhole_current={}",
                 resume_pc, green_key, resume_via_blackhole
             );
+        }
+        if !allow_finish_direct_return && resume_via_blackhole {
+            let resume_frame = bridge_frame_root.frame() as *mut PyFrame as usize;
+            CA_WALK_RESUME_FRAME.with(|c| c.set(resume_frame));
         }
         return bridge_resolution_from_bool(!resume_via_blackhole);
     }
@@ -2854,7 +2978,12 @@ pub fn trace_and_compile_from_bridge(
                 resume_pc, green_key, compiled, adopted_walk_end_state
             );
         }
-        return bridge_resolution_from_bool(compiled || adopted_walk_end_state);
+        let continue_compiled = compiled || adopted_walk_end_state;
+        if !allow_finish_direct_return && !continue_compiled {
+            let resume_frame = bridge_frame_root.frame() as *mut PyFrame as usize;
+            CA_WALK_RESUME_FRAME.with(|c| c.set(resume_frame));
+        }
+        return bridge_resolution_from_bool(continue_compiled);
     }
 
     // Trace did not converge into a bridge. Abort like RPython's
@@ -2871,6 +3000,10 @@ pub fn trace_and_compile_from_bridge(
     }
     // A committed walk has already executed the region into the live
     // frame; the blackhole replay must not run even on this abort path.
+    if !allow_finish_direct_return && !adopted_walk_end_state {
+        let resume_frame = bridge_frame_root.frame() as *mut PyFrame as usize;
+        CA_WALK_RESUME_FRAME.with(|c| c.set(resume_frame));
+    }
     bridge_resolution_from_bool(adopted_walk_end_state)
 }
 
@@ -2892,7 +3025,26 @@ fn jit_ca_handle_guard_failure(
     if raw_values_ptr.is_null() || num_values == 0 {
         return false;
     }
-    let raw_values = unsafe { std::slice::from_raw_parts(raw_values_ptr, num_values) };
+    // `enter_profiler_tracing` is not re-entrant (pyjitpl.py:2890 — RPython's
+    // `handle_guard_failure` unwinds to the top-level `execute_token` before any
+    // tracing decision, so a guard never fires while another trace is open).
+    // pyre's CALL_ASSEMBLER guard callback runs synchronously from the backend
+    // trampoline, so it CAN fire mid-trace: the self-recursion fold replays its
+    // CALL_ASSEMBLER concretely while the outer trace is still recording, and a
+    // deopt in that callee reaches here with the outer trace's profiler event
+    // still open.  Starting a nested bridge trace would panic in
+    // `start_retrace_from_guard`'s `enter_profiler_tracing`.  Bail to the
+    // blackhole resume (return false) so the callee completes in the interpreter
+    // and the outer trace keeps recording; the deferred bridge compiles later
+    // when this guard fails outside a trace.
+    {
+        let (driver, _) = crate::eval::driver_pair();
+        if driver.is_tracing() {
+            return false;
+        }
+    }
+    let raw_values_input = unsafe { std::slice::from_raw_parts(raw_values_ptr, num_values) };
+    let mut raw_values_vec = raw_values_input.to_vec();
 
     // compile.py:706-708 _trace_and_compile_from_bridge.  Native CA code
     // crosses the backend boundary with only the raw descr pointer; recover
@@ -2917,6 +3069,13 @@ fn jit_ca_handle_guard_failure(
     else {
         return false;
     };
+    let deadframe_types = {
+        let (driver, _) = crate::eval::driver_pair();
+        driver.get_recovery_slot_types(source_green_key, source_trace_id, source_fail_index)
+    };
+    let _raw_values_roots =
+        ResumeDeadframeRoots::register(&mut raw_values_vec, deadframe_types.as_deref());
+    let raw_values = raw_values_vec.as_slice();
 
     // This callback has no channel for the exception value carried by a
     // failing CALL_ASSEMBLER exception guard.  Compiling from its post-call
@@ -3006,6 +3165,13 @@ fn jit_ca_handle_guard_failure(
             "[jit][ca-bridge] compiled={} key={} trace={} fail={}",
             compiled, source_green_key, source_trace_id, source_fail_index,
         );
+    }
+
+    drop(_raw_values_roots);
+    if !compiled {
+        CA_WALK_RESUME_DEADFRAME.with(|c| {
+            *c.borrow_mut() = Some(raw_values_vec);
+        });
     }
 
     compiled
