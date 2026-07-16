@@ -10,21 +10,15 @@
 //! park gate remain authoritative; this word is only the JIT's deopt trigger.
 //!
 //! Immortal process-global, zero from process start, so the guard is harmless
-//! until a bit is armed. The published-address holder (`EVAL_BREAKER_WORD_ADDR`)
-//! reads `0` until published, and backends treat the back-edge poll as inert
-//! in that case.
+//! until a bit is armed. The trace records the address as the poll's constant
+//! operand; the published-address holder (`EVAL_BREAKER_WORD_ADDR`) reads `0`
+//! until published, and no poll is recorded in that case.
 //!
 //! The STW bit and authoritative request occupy two locations. A relaxed poll
 //! can briefly deopt before the request is visible, then resume and re-deopt
 //! until coherence propagates it; this is a bounded park-latency window.
 
-use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-thread_local! {
-    /// Test-only per-thread override for the baked back-edge poll address.
-    static ADDR_OVERRIDE: Cell<usize> = const { Cell::new(0) };
-}
 
 /// bit0 — async action / signal pending (mirrors a negative ticker).
 pub const EB_ASYNC: usize = 1;
@@ -34,10 +28,17 @@ pub const EB_STW: usize = 2;
 /// The shared eval-breaker word (see module docs).
 static EVAL_BREAKER_WORD: AtomicUsize = AtomicUsize::new(0);
 
+/// Width of the word, in bytes. The back-edge poll's load descriptor must use
+/// exactly this size: a wider load reads past the word into the adjacent
+/// static, so the poll's nonzero test would always be true and every back-edge
+/// guard would fail. Pointer-width rather than fixed-64 keeps `fetch_or`
+/// lock-free — `set_async` runs inside an OS signal handler.
+pub const EVAL_BREAKER_WORD_SIZE: usize = size_of::<AtomicUsize>();
+
 /// Published address of `EVAL_BREAKER_WORD`; `0` until published.
 static EVAL_BREAKER_WORD_ADDR: AtomicUsize = AtomicUsize::new(0);
 
-/// Publish the word's address for the backends to bake. Idempotent — the
+/// Publish the word's address for the tracer to record. Idempotent — the
 /// address is an immortal static, so re-publishing stores the same value.
 pub fn publish_addr() {
     EVAL_BREAKER_WORD_ADDR.store(
@@ -46,21 +47,10 @@ pub fn publish_addr() {
     );
 }
 
-/// Address the backend bakes into the back-edge poll, or `0` if not published.
+/// Address the trace records as the back-edge poll's constant, or `0` if not
+/// published — in which case no poll is recorded.
 pub fn eval_breaker_word_addr() -> usize {
-    let ov = ADDR_OVERRIDE.with(|c| c.get());
-    if ov != 0 {
-        return ov;
-    }
     EVAL_BREAKER_WORD_ADDR.load(Ordering::Relaxed)
-}
-
-/// Test-only: on the current thread, make the backend bake its back-edge poll
-/// against `addr` (a caller-owned word) instead of the process-global word, so
-/// unit tests never publish the global address (which would activate every
-/// other compiled trace in the test binary). Pass 0 to clear.
-pub fn set_addr_override_for_test(addr: usize) {
-    ADDR_OVERRIDE.with(|c| c.set(addr));
 }
 
 // --- async (bit0): armed by the OS signal handler / action dispatcher ---
@@ -79,3 +69,8 @@ pub fn set_stw() {
 pub fn clear_stw() {
     EVAL_BREAKER_WORD.fetch_and(!EB_STW, Ordering::Release);
 }
+
+/// Every flag must fit in the word the poll actually loads. Checked per target,
+/// so a flag too wide for a 32-bit `usize` fails the wasm32 build rather than
+/// silently reading as unarmed there.
+const _: () = assert!((EB_ASYNC | EB_STW) < (1 << (EVAL_BREAKER_WORD_SIZE * 8 - 1)));
