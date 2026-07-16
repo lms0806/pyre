@@ -1477,6 +1477,10 @@ impl MIFrame {
                     None
                 };
                 if marker_call_pc.is_some() {
+                    // This retired MIFrame trait-interpret leg has no production driver.
+                    // Production guard capture (`collect_outer_active_boxes`) captures rather than
+                    // aborts residual-call and inline guards as pyjitpl.py:2599/opencoder.py:819;
+                    // only trait-leg unit tests reach this abort before Phase-6 deletion.
                     crate::state::request_trace_abort();
                     return Vec::new();
                 }
@@ -3905,6 +3909,10 @@ impl MIFrame {
     fn marker_aware_resume_pc(&self, call_pc: usize, after_residual_call: bool) -> usize {
         let flag = majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize;
         if after_residual_call {
+            // This retired MIFrame trait-interpret leg has no production driver.
+            // Production guard capture (`walker_capture_snapshot_for_last_guard`)
+            // captures rather than aborts residual-call guards as pyjitpl.py:2599 does; only trait-leg
+            // unit tests reach this abort before Phase-6 deletion.
             return crate::state::abort_unencodable_resume_pc(call_pc);
         }
         if call_pc >= flag {
@@ -3918,6 +3926,10 @@ impl MIFrame {
     fn marker_aware_parent_resume_pc(call_pc: Option<usize>, return_point_pc: usize) -> usize {
         let flag = majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize;
         if call_pc.is_some() {
+            // This retired MIFrame trait-interpret leg has no production driver.
+            // Production guard capture (`collect_outer_active_boxes`) captures rather
+            // than aborts inline guards as opencoder.py:819 does; only trait-leg tests reach this
+            // abort before Phase-6 deletion.
             return crate::state::abort_unencodable_resume_pc(return_point_pc);
         }
         if return_point_pc >= flag {
@@ -4046,11 +4058,8 @@ impl MIFrame {
             let parent_pc_word =
                 crate::state::pyjitcode_for_jitcode_index(parent_jitcode_index as i32)
                     .and_then(|payload| {
-                        payload.resolve_resume_pc_with_jitcode_pc(
-                            parent_pc as i32,
-                            parent_word,
-                            crate::state::op_live(),
-                        )
+                        payload
+                            .resolve_resume_pc_with_jitcode_pc(parent_word, crate::state::op_live())
                     })
                     .map(|offset| offset as u32)
                     .unwrap_or_else(|| {
@@ -4107,7 +4116,7 @@ impl MIFrame {
         };
         let payload = unsafe { &(&*self.sym().jitcode).payload };
         let top_pc_word = payload
-            .resolve_resume_pc_with_jitcode_pc(top_pc as i32, top_word, crate::state::op_live())
+            .resolve_resume_pc_with_jitcode_pc(top_word, crate::state::op_live())
             .map(|offset| offset as u32)
             .unwrap_or_else(|| {
                 // A missing carried marker declines this trace before the
