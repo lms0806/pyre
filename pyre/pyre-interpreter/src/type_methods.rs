@@ -881,7 +881,7 @@ pub fn str_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     arity_at_least(args, "startswith", 1)?;
     arity_at_most(args, "startswith", 3)?;
     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
-    let Some(slice) = str_slice_args(s, args) else {
+    let Some(slice) = str_slice_args(s, args)? else {
         return validate_prefix_arg(args[1], "startswith").map(|()| w_bool_from(false));
     };
     str_prefix_match(slice, args[1], "startswith", true).map(w_bool_from)
@@ -891,54 +891,64 @@ pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     arity_at_least(args, "endswith", 1)?;
     arity_at_most(args, "endswith", 3)?;
     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
-    let Some(slice) = str_slice_args(s, args) else {
+    let Some(slice) = str_slice_args(s, args)? else {
         return validate_prefix_arg(args[1], "endswith").map(|()| w_bool_from(false));
     };
     str_prefix_match(slice, args[1], "endswith", false).map(w_bool_from)
 }
 
 /// Apply `startswith`/`endswith`'s optional `start`/`end` bounds to `s`,
-/// returning the code-point window as WTF-8. `None` signals an empty,
-/// out-of-range window (`start` past the end, or `start > end`), for which
-/// the tail match is always `False` — even for an empty needle. A positive
-/// `start` is not upper-clamped so `''.endswith('', 1, 0)` stays `start >
-/// end` rather than collapsing to a valid empty slice.
-fn str_slice_args<'a>(s: &'a Wtf8, args: &[pyre_object::PyObjectRef]) -> Option<&'a Wtf8> {
+/// returning the code-point window as WTF-8. `stringmethods.py:23
+/// _convert_idx_params` → `unwrap_start_stop`: each bound runs through
+/// `adapt_lower_bound(_eval_slice_index(...))`, so a non-index bound raises a
+/// TypeError and a bound is coerced via `__index__`.
+///
+/// `unicodeobject.py:1319 _unwrap_and_compute_idx_params` then converts the
+/// two code-point bounds to byte offsets: a `start` past the end becomes
+/// `end_index + 1` rather than being clamped, and `end` is only lowered when
+/// it is short of the end. `None` signals the resulting window is inverted,
+/// for which the match is always `False` — even for an empty needle, which is
+/// why `'abc'.startswith('', 5, 10)` and `''.endswith('', 1, 0)` are `False`.
+fn str_slice_args<'a>(
+    s: &'a Wtf8,
+    args: &[pyre_object::PyObjectRef],
+) -> Result<Option<&'a Wtf8>, crate::PyError> {
     let char_len = s.code_points().count() as i64;
     // `None` bounds mean "not provided" (start -> 0, end -> len).
     let start = if args.len() >= 3 && !unsafe { pyre_object::is_none(args[2]) } {
-        let v = unsafe { pyre_object::w_int_get_value(args[2]) };
-        if v < 0 {
-            (char_len + v).max(0) as usize
-        } else {
-            v as usize
-        }
+        crate::sliceobject::adapt_lower_bound(char_len, args[2])?
     } else {
         0
     };
     let end = if args.len() >= 4 && !unsafe { pyre_object::is_none(args[3]) } {
-        let v = unsafe { pyre_object::w_int_get_value(args[3]) };
-        if v < 0 {
-            (char_len + v).max(0) as usize
-        } else {
-            (v as usize).min(char_len as usize)
-        }
+        crate::sliceobject::adapt_lower_bound(char_len, args[3])?
     } else {
-        char_len as usize
+        char_len
     };
-    if start > end {
-        return None;
-    }
     let bytes = s.as_bytes();
-    let byte_start = s
-        .code_point_indices()
-        .nth(start)
-        .map_or(bytes.len(), |(i, _)| i);
-    let byte_end = s
-        .code_point_indices()
-        .nth(end)
-        .map_or(bytes.len(), |(i, _)| i);
-    Some(unsafe { Wtf8::from_bytes_unchecked(&bytes[byte_start..byte_end]) })
+    let index_to_byte = |cp: i64| {
+        s.code_point_indices()
+            .nth(cp as usize)
+            .map_or(bytes.len(), |(i, _)| i)
+    };
+    let mut end_index = bytes.len();
+    if end < char_len {
+        end_index = index_to_byte(end);
+    }
+    let mut start_index = 0usize;
+    if start > 0 {
+        start_index = if start > char_len {
+            end_index + 1
+        } else {
+            index_to_byte(start)
+        };
+    }
+    if start_index > end_index {
+        return Ok(None);
+    }
+    Ok(Some(unsafe {
+        Wtf8::from_bytes_unchecked(&bytes[start_index..end_index])
+    }))
 }
 
 fn str_prefix_match(
@@ -4737,6 +4747,55 @@ pub(crate) fn dict_store_checked(
     unsafe {
         pyre_object::dictmultiobject::w_dict_store_checked(dict, key, value)
             .map_err(|_| crate::baseobjspace::take_pending_hash_error())
+    }
+}
+
+/// Hash `item` with it rooted, then look it up with `probe`.
+///
+/// A user `__hash__` is a collection point and [`ObjectKey`] caches the element
+/// pointer, so hashing inside the key build (`object_key_for_checked`) captures
+/// the pre-move pointer — the reason `object_key_hashed` exists. The element is
+/// rooted across the hash and reloaded, matching the add path
+/// (`builtin_set_add_items`); the set needs no rooting, being an old-gen
+/// allocation that keeps its address across a collection.
+unsafe fn set_lookup_checked(
+    set: PyObjectRef,
+    item: PyObjectRef,
+    probe: unsafe fn(
+        PyObjectRef,
+        pyre_object::dictmultiobject::ObjectKey,
+    ) -> Result<bool, pyre_object::dictmultiobject::DictKeyError>,
+) -> Result<bool, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(item);
+    let hash = crate::builtins::try_hash_value(pyre_object::gc_roots::shadow_stack_get(sp))?;
+    let key = pyre_object::dictmultiobject::object_key_hashed(
+        pyre_object::gc_roots::shadow_stack_get(sp),
+        hash,
+    );
+    probe(set, key).map_err(|_| crate::baseobjspace::take_pending_hash_error())
+}
+
+/// Remove an element from a set, hashing it through the protocol.
+pub(crate) fn set_discard_checked(
+    set: PyObjectRef,
+    item: PyObjectRef,
+) -> Result<bool, crate::PyError> {
+    unsafe { set_lookup_checked(set, item, pyre_object::setobject::w_set_discard_key_checked) }
+}
+
+/// Test membership in a set, hashing the element through the protocol.
+pub(crate) fn set_contains_checked(
+    set: PyObjectRef,
+    item: PyObjectRef,
+) -> Result<bool, crate::PyError> {
+    unsafe {
+        set_lookup_checked(
+            set,
+            item,
+            pyre_object::setobject::w_set_contains_key_checked,
+        )
     }
 }
 

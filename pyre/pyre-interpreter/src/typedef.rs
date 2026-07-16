@@ -566,10 +566,17 @@ pub fn init_typeobjects() {
             new_typeobject_with_base("exception", |_| {}, object_type) as usize,
         );
 
-        // NoneType — bases=(object,)
+        // NoneType — PyPy noneobject.py, with the Python 3.14 rich-comparison
+        // slots exposed by CPython's singleton type.
+        let none_type = new_typeobject_with_base("NoneType", init_none_type, object_type);
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(none_type, false) };
+        reg.insert(&NONE_TYPE as *const PyType as usize, none_type as usize);
+
+        // setobject.py W_SetIterObject.typedef. Python 3.14 exposes the
+        // concrete name as `set_iterator` (PyPy 3.11 used `setiterator`).
         reg.insert(
-            &NONE_TYPE as *const PyType as usize,
-            new_typeobject_with_base("NoneType", |_| {}, object_type) as usize,
+            &pyre_object::setobject::SET_ITERATOR_TYPE as *const PyType as usize,
+            new_typeobject_with_base("set_iterator", init_set_iterator_type, object_type) as usize,
         );
 
         // typedef.py:941-946 Ellipsis.typedef.
@@ -673,23 +680,29 @@ pub fn init_typeobjects() {
         // Both carry their own layout typedef so check_user_subclass's layout
         // safety check (typeobject.py:520-523) can reject foreign-layout
         // subclasses (e.g. subclass adds __slots__).
+        let set_type = new_typeobject_with_base_and_layout(
+            "set",
+            init_set_type,
+            object_type,
+            &pyre_object::setobject::SET_TYPE as *const PyType,
+        );
+        // W_BaseSetObject.getweakref/setweakref/delweakref: both concrete
+        // set layouts carry a weakref lifeline.
+        unsafe { pyre_object::w_type_set_weakrefable(set_type, true) };
         reg.insert(
             &pyre_object::setobject::SET_TYPE as *const PyType as usize,
-            new_typeobject_with_base_and_layout(
-                "set",
-                init_set_type,
-                object_type,
-                &pyre_object::setobject::SET_TYPE as *const PyType,
-            ) as usize,
+            set_type as usize,
         );
+        let frozenset_type = new_typeobject_with_base_and_layout(
+            "frozenset",
+            init_frozenset_type,
+            object_type,
+            &pyre_object::setobject::FROZENSET_TYPE as *const PyType,
+        );
+        unsafe { pyre_object::w_type_set_weakrefable(frozenset_type, true) };
         reg.insert(
             &pyre_object::setobject::FROZENSET_TYPE as *const PyType as usize,
-            new_typeobject_with_base_and_layout(
-                "frozenset",
-                init_frozenset_type,
-                object_type,
-                &pyre_object::setobject::FROZENSET_TYPE as *const PyType,
-            ) as usize,
+            frozenset_type as usize,
         );
 
         // Foreign PyType statics that have no per-type init function but
@@ -708,36 +721,35 @@ pub fn init_typeobjects() {
         // the typedef itself stays empty.
         reg.insert(
             &pyre_object::descriptor::SUPER_TYPE as *const PyType as usize,
-            new_typeobject_with_base("super", |_| {}, object_type) as usize,
+            new_typeobject_with_base("super", init_super_type, object_type) as usize,
         );
-        let generator_type = new_typeobject_with_base("generator", |_| {}, object_type);
+        let generator_type =
+            new_typeobject_with_base("generator", init_generator_type, object_type);
         // `Py_TPFLAGS_DISALLOW_INSTANTIATION` — a generator is produced
         // only by calling a generator function, never by `generator()`,
         // so `tp_new` is NULL and pickling refuses it.
-        unsafe { pyre_object::w_type_set_disallow_instantiation(generator_type) };
+        unsafe {
+            pyre_object::w_type_set_disallow_instantiation(generator_type);
+            pyre_object::w_type_set_acceptable_as_base_class(generator_type, false);
+            pyre_object::w_type_set_weakrefable(generator_type, true);
+        }
         reg.insert(
             &pyre_object::generator::GENERATOR_TYPE as *const PyType as usize,
             generator_type as usize,
         );
+        let range_iterator_type =
+            new_typeobject_with_base("range_iterator", init_range_iterator_type, object_type);
+        unsafe {
+            pyre_object::w_type_set_disallow_instantiation(range_iterator_type);
+            pyre_object::w_type_set_acceptable_as_base_class(range_iterator_type, false);
+        }
         reg.insert(
             &pyre_object::functional::RANGE_ITER_TYPE as *const PyType as usize,
-            new_typeobject_with_base("range_iterator", |_| {}, object_type) as usize,
+            range_iterator_type as usize,
         );
         // rangeobject.c PyRange_Type carries no Py_TPFLAGS_BASETYPE, so
         // `range` is not an acceptable base class.
-        let range_type = new_typeobject_with_base(
-            "range",
-            |ns| {
-                unsafe {
-                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                        ns,
-                        "__new__",
-                        make_new_descr(range_descr_new),
-                    )
-                };
-            },
-            object_type,
-        );
+        let range_type = new_typeobject_with_base("range", init_range_type, object_type);
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(range_type, false) };
         reg.insert(
             &pyre_object::functional::RANGE_TYPE as *const PyType as usize,
@@ -749,141 +761,153 @@ pub fn init_typeobjects() {
             crate::builtins::init_memoryview_type,
             object_type,
         );
-        unsafe { pyre_object::w_type_set_acceptable_as_base_class(memoryview_type, false) };
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(memoryview_type, false);
+            pyre_object::w_type_set_weakrefable(memoryview_type, true);
+        }
         reg.insert(
             &pyre_object::memoryview::MEMORYVIEW_TYPE as *const PyType as usize,
             memoryview_type as usize,
         );
-        let seq_iterator_type = new_typeobject_with_base("iterator", |_| {}, object_type);
+        let seq_iterator_type =
+            new_typeobject_with_base("iterator", init_sequence_iterator_type, object_type);
         // `Py_TPFLAGS_DISALLOW_INSTANTIATION` — an iterator is produced only by
         // `iter(obj)`, never by `iterator()`, so `tp_new` is NULL.
-        unsafe { pyre_object::w_type_set_disallow_instantiation(seq_iterator_type) };
+        unsafe {
+            pyre_object::w_type_set_disallow_instantiation(seq_iterator_type);
+            pyre_object::w_type_set_acceptable_as_base_class(seq_iterator_type, false);
+        }
         reg.insert(
             &pyre_object::iterobject::SEQ_ITER_TYPE as *const PyType as usize,
             seq_iterator_type as usize,
         );
+        for (pytype, name, init) in [
+            (
+                &pyre_object::iterobject::LIST_ITER_TYPE as *const PyType,
+                "list_iterator",
+                init_list_iterator_type as fn(PyObjectRef),
+            ),
+            (
+                &pyre_object::iterobject::LIST_REVERSE_ITER_TYPE as *const PyType,
+                "list_reverseiterator",
+                init_list_reverse_iterator_type as fn(PyObjectRef),
+            ),
+            (
+                &pyre_object::iterobject::TUPLE_ITER_TYPE as *const PyType,
+                "tuple_iterator",
+                init_tuple_iterator_type as fn(PyObjectRef),
+            ),
+        ] {
+            let iterator_type = new_typeobject_with_base(name, init, object_type);
+            unsafe {
+                pyre_object::w_type_set_disallow_instantiation(iterator_type);
+                pyre_object::w_type_set_acceptable_as_base_class(iterator_type, false);
+            }
+            reg.insert(pytype as usize, iterator_type as usize);
+        }
+        let long_range_iterator_type =
+            new_typeobject_with_base("range_iterator", init_range_iterator_type, object_type);
+        unsafe {
+            pyre_object::w_type_set_disallow_instantiation(long_range_iterator_type);
+            pyre_object::w_type_set_acceptable_as_base_class(long_range_iterator_type, false);
+        }
         reg.insert(
             &pyre_object::functional::LONG_RANGE_ITER_TYPE as *const PyType as usize,
             // `W_AbstractRangeIterator.typedef` names every range-iterator
             // class `range_iterator` (`functional.py`); the word-fit and bignum
             // iterators share that public name though they are distinct types.
-            new_typeobject_with_base("range_iterator", |_| {}, object_type) as usize,
+            long_range_iterator_type as usize,
         );
         reg.insert(
             &pyre_object::functional::ENUMERATE_TYPE as *const PyType as usize,
-            new_typeobject_with_base(
-                "enumerate",
-                |ns| {
-                    unsafe {
-                        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                            ns,
-                            "__new__",
-                            make_new_descr(enumerate_descr_new),
-                        )
-                    };
-                },
-                object_type,
-            ) as usize,
+            new_typeobject_with_base("enumerate", init_enumerate_type, object_type) as usize,
         );
         reg.insert(
             &pyre_object::functional::REVERSED_TYPE as *const PyType as usize,
-            new_typeobject_with_base(
-                "reversed",
-                |ns| {
-                    unsafe {
-                        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                            ns,
-                            "__new__",
-                            make_new_descr(reversed_descr_new),
-                        )
-                    };
-                },
-                object_type,
-            ) as usize,
+            new_typeobject_with_base("reversed", init_reversed_type, object_type) as usize,
         );
         reg.insert(
             &pyre_object::functional::FILTER_TYPE as *const PyType as usize,
-            new_typeobject_with_base(
-                "filter",
-                |ns| {
-                    unsafe {
-                        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                            ns,
-                            "__new__",
-                            make_new_descr(filter_descr_new),
-                        )
-                    };
-                },
-                object_type,
-            ) as usize,
+            new_typeobject_with_base("filter", init_filter_type, object_type) as usize,
         );
         reg.insert(
             &pyre_object::functional::MAP_TYPE as *const PyType as usize,
-            new_typeobject_with_base(
-                "map",
-                |ns| {
-                    unsafe {
-                        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                            ns,
-                            "__new__",
-                            make_new_descr(map_descr_new),
-                        )
-                    };
-                },
-                object_type,
-            ) as usize,
+            new_typeobject_with_base("map", init_map_type, object_type) as usize,
         );
         reg.insert(
             &pyre_object::functional::ZIP_TYPE as *const PyType as usize,
-            new_typeobject_with_base(
-                "zip",
-                |ns| {
-                    unsafe {
-                        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                            ns,
-                            "__new__",
-                            make_new_descr(zip_descr_new),
-                        )
-                    };
-                },
-                object_type,
-            ) as usize,
+            new_typeobject_with_base("zip", init_zip_type, object_type) as usize,
         );
-        reg.insert(
-            &pyre_object::dictmultiobject::DICT_KEYITERATOR_TYPE as *const PyType as usize,
-            new_typeobject_with_base("dict_keyiterator", |_| {}, object_type) as usize,
-        );
-        reg.insert(
-            &pyre_object::dictmultiobject::DICT_VALUEITERATOR_TYPE as *const PyType as usize,
-            new_typeobject_with_base("dict_valueiterator", |_| {}, object_type) as usize,
-        );
-        reg.insert(
-            &pyre_object::dictmultiobject::DICT_ITEMITERATOR_TYPE as *const PyType as usize,
-            new_typeobject_with_base("dict_itemiterator", |_| {}, object_type) as usize,
-        );
+        for (pytype, name) in [
+            (
+                &pyre_object::dictmultiobject::DICT_KEYITERATOR_TYPE as *const PyType,
+                "dict_keyiterator",
+            ),
+            (
+                &pyre_object::dictmultiobject::DICT_VALUEITERATOR_TYPE as *const PyType,
+                "dict_valueiterator",
+            ),
+            (
+                &pyre_object::dictmultiobject::DICT_ITEMITERATOR_TYPE as *const PyType,
+                "dict_itemiterator",
+            ),
+        ] {
+            let iterator_type =
+                new_typeobject_with_base(name, init_dict_iterator_type, object_type);
+            unsafe {
+                pyre_object::w_type_set_disallow_instantiation(iterator_type);
+                pyre_object::w_type_set_acceptable_as_base_class(iterator_type, false);
+            }
+            reg.insert(pytype as usize, iterator_type as usize);
+        }
         reg.insert(
             &pyre_object::nestedscope::CELL_TYPE as *const PyType as usize,
             new_typeobject_with_base("cell", init_cell_type, object_type) as usize,
         );
         reg.insert(
             &pyre_object::interp_itertools::COUNT_TYPE as *const PyType as usize,
-            new_typeobject_with_base("itertools.count", |_| {}, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.count",
+                init_count_type,
+                object_type,
+                &pyre_object::interp_itertools::COUNT_TYPE as *const PyType,
+            ) as usize,
         );
         reg.insert(
             &pyre_object::interp_itertools::REPEAT_TYPE as *const PyType as usize,
-            new_typeobject_with_base("itertools.repeat", |_| {}, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.repeat",
+                init_repeat_type,
+                object_type,
+                &pyre_object::interp_itertools::REPEAT_TYPE as *const PyType,
+            ) as usize,
         );
         reg.insert(
             &pyre_object::interp_itertools::TAKEWHILE_TYPE as *const PyType as usize,
-            new_typeobject_with_base("itertools.takewhile", |_| {}, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.takewhile",
+                init_takewhile_type,
+                object_type,
+                &pyre_object::interp_itertools::TAKEWHILE_TYPE as *const PyType,
+            ) as usize,
         );
         reg.insert(
             &pyre_object::interp_itertools::DROPWHILE_TYPE as *const PyType as usize,
-            new_typeobject_with_base("itertools.dropwhile", |_| {}, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.dropwhile",
+                init_dropwhile_type,
+                object_type,
+                &pyre_object::interp_itertools::DROPWHILE_TYPE as *const PyType,
+            ) as usize,
         );
         reg.insert(
             &pyre_object::interp_itertools::FILTERFALSE_TYPE as *const PyType as usize,
-            new_typeobject_with_base("itertools.filterfalse", |_| {}, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.filterfalse",
+                init_filterfalse_type,
+                object_type,
+                &pyre_object::interp_itertools::FILTERFALSE_TYPE as *const PyType,
+            ) as usize,
         );
         reg.insert(
             &pyre_object::interp_itertools::PAIRWISE_TYPE as *const PyType as usize,
@@ -950,7 +974,7 @@ pub fn init_typeobjects() {
             }
         }
         // Set w_class on all built-in type objects to `type`.
-        // baseobjspace.py:76 getclass() — for type objects, the class
+        // baseobjspace.py getclass() — for type objects, the class
         // is the metatype (default: `type`).
         let w_type_type = W_TYPE_TYPEOBJECT
             .get()
@@ -968,10 +992,49 @@ pub fn init_typeobjects() {
         reg
     });
 
+    patch_object_class_descriptor();
     patch_builtin_function_descriptors();
     patch_frame_traceback_descriptors();
     patch_getset_descriptor_metadata();
     patch_typeobject_descriptor_names();
+}
+
+/// Install `object.__class__` after the root object type exists.
+///
+/// `GetSetProperty` itself inherits from object, so allocating this descriptor
+/// inside `init_object_type` would recursively request an object base before
+/// `W_OBJECT_TYPEOBJECT` has been published.  PyPy's module-level TypeDef
+/// construction has the root available already; pyre mirrors that ordering
+/// with this post-registration pass.
+fn patch_object_class_descriptor() {
+    let object_type = w_object();
+    if object_type.is_null()
+        || !crate::type_dict_has_storage(object_type)
+        || crate::type_dict_contains(object_type, "__class__")
+    {
+        return;
+    }
+    let class_getter = make_builtin_function_with_arity(
+        "__class__",
+        |args| Ok(crate::typedef::r#type(args[1]).unwrap_or(pyre_object::PY_NULL)),
+        2,
+    );
+    let class_setter = make_builtin_function_with_arity(
+        "__class__",
+        |args| crate::baseobjspace::descr_set___class__(args[1], args[2]),
+        3,
+    );
+    crate::type_dict_store(
+        object_type,
+        "__class__",
+        make_getset_property_full(
+            class_getter,
+            class_setter,
+            pyre_object::PY_NULL,
+            object_type,
+            Some("__class__"),
+        ),
+    );
 }
 
 /// `typedef.py:58 add_entries` parity — walk every registered
@@ -1551,6 +1614,13 @@ fn init_ellipsis_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
+            "__doc__",
+            w_str_new("The type of the Ellipsis singleton."),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__new__",
             make_new_descr(ellipsis_descr_new),
         )
@@ -1583,6 +1653,13 @@ fn notimplemented_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 /// typedef.py:948-954 NotImplemented.typedef
 fn init_notimplemented_type(ns: PyObjectRef) {
     unsafe {
+        pyre_object::w_dict_setitem_str(
+            ns,
+            "__doc__",
+            pyre_object::w_str_new("The type of the NotImplemented singleton."),
+        )
+    };
+    unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
@@ -1611,7 +1688,8 @@ fn init_notimplemented_type(ns: PyObjectRef) {
             ),
         )
     };
-    // special.py:28-33 descr_bool
+    // Python 3.14 changed the older PyPy/3.11 deprecation warning into a hard
+    // TypeError.  3.14 is pyre's language-version oracle.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -1619,15 +1697,104 @@ fn init_notimplemented_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__bool__",
                 |_args| {
-                    crate::warn::warn_deprecation(
+                    Err(crate::PyError::type_error(
                         "NotImplemented should not be used in a boolean context",
-                    );
-                    Ok(pyre_object::boolobject::w_bool_from(true))
+                    ))
                 },
                 1,
             ),
         )
     };
+}
+
+/// noneobject.py `W_NoneObject.typedef`, plus Python 3.14's singleton rich
+/// comparison/hash entries.  Equality is identity; ordering returns
+/// NotImplemented so the normal comparison dispatcher produces the final
+/// TypeError when neither operand handles it.
+fn none_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if positional.len() > 1 || crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error("NoneType takes no arguments"));
+    }
+    let cls = positional.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if let Some(w_none_type) = gettypefor(&pyre_object::NONE_TYPE) {
+        check_user_subclass(w_none_type, cls)?;
+    }
+    Ok(pyre_object::w_none())
+}
+
+fn init_none_type(ns: PyObjectRef) {
+    let entries = [
+        (
+            "__doc__",
+            pyre_object::w_str_new("The type of the None singleton."),
+        ),
+        ("__new__", make_new_descr(none_descr_new)),
+        (
+            "__bool__",
+            make_builtin_function_with_arity(
+                "__bool__",
+                |_args| Ok(pyre_object::w_bool_from(false)),
+                1,
+            ),
+        ),
+        (
+            "__repr__",
+            make_builtin_function_with_arity("__repr__", |_args| Ok(w_str_new("None")), 1),
+        ),
+        (
+            "__hash__",
+            make_builtin_function_with_arity(
+                "__hash__",
+                |args| Ok(pyre_object::w_int_new(crate::builtins::hash_value(args[0]))),
+                1,
+            ),
+        ),
+        (
+            "__eq__",
+            make_builtin_function_with_arity(
+                "__eq__",
+                |args| {
+                    if args.len() >= 2 && unsafe { pyre_object::is_none(args[1]) } {
+                        Ok(pyre_object::w_bool_from(true))
+                    } else {
+                        Ok(pyre_object::w_not_implemented())
+                    }
+                },
+                2,
+            ),
+        ),
+        (
+            "__ne__",
+            make_builtin_function_with_arity(
+                "__ne__",
+                |args| {
+                    if args.len() >= 2 && unsafe { pyre_object::is_none(args[1]) } {
+                        Ok(pyre_object::w_bool_from(false))
+                    } else {
+                        Ok(pyre_object::w_not_implemented())
+                    }
+                },
+                2,
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str(ns, name, value) };
+    }
+    for name in ["__lt__", "__le__", "__gt__", "__ge__"] {
+        unsafe {
+            pyre_object::w_dict_setitem_str(
+                ns,
+                name,
+                make_builtin_function_with_arity(
+                    name,
+                    |_args| Ok(pyre_object::w_not_implemented()),
+                    2,
+                ),
+            )
+        };
+    }
 }
 
 /// `str.__new__(cls, *args)` — PyPy: unicodeobject.py descr__new__
@@ -1667,8 +1834,18 @@ fn str_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(pyre_object::w_str_subclass_from_wtf8(contents, cls))
 }
 
-/// dict.__new__(cls, *args) — if cls is a dict subclass, create an instance
-/// with a backing dict for storage. PyPy: dictmultiobject.py descr__new__
+/// `dictmultiobject.py:115-117 descr_new` — allocate the instance and return
+/// it; `__args__` is ignored.
+///
+/// `__new__` must NOT populate from the constructor arguments:
+/// `object.__new__`/`dict.__new__` ignore them, and filling is the job of
+/// `__init__` (`:137-138 descr_init` → `:1430 init_or_update`, the inherited
+/// `dict.__init__` for a plain subclass, or the subclass override).
+/// Pre-filling here consumes the argument a second time: a re-iterable one is
+/// walked twice (`dict(mapping)` calling `keys`/`__getitem__` twice), a
+/// one-shot one raises on the second walk, and a subclass whose `__init__`
+/// accumulates (e.g. `Counter`, whose `update` adds rather than sets)
+/// double-applies it.
 fn dict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = if args.is_empty() {
         pyre_object::PY_NULL
@@ -1677,18 +1854,12 @@ fn dict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     };
     let dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
 
-    // If cls IS dict (not a subclass), use normal dict constructor
     if cls.is_null() || std::ptr::eq(cls, dict_type) {
-        return crate::builtins::builtin_dict_ctor(&args[1..]);
+        return Ok(pyre_object::w_dict_new());
     }
 
-    // cls is a dict subclass — create the instance with an empty backing
-    // dict. `__new__` must NOT populate from the constructor arguments:
-    // `object.__new__`/`dict.__new__` ignore them, and filling is the job of
-    // `__init__` (the inherited `dict.__init__` for a plain subclass, or the
-    // subclass override). Pre-filling here double-applies the argument for a
-    // subclass whose `__init__` accumulates (e.g. `Counter`, whose `update`
-    // adds rather than sets).
+    // A dict subclass keeps its items in an instance attribute, so the
+    // allocation carries an empty backing dict for `__init__` to fill.
     let instance = pyre_object::w_instance_new(cls);
     let backing = pyre_object::w_dict_new();
     let _ = crate::baseobjspace::setattr_str(instance, "__dict_data__", backing);
@@ -1972,6 +2143,497 @@ fn range_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     Ok(value)
 }
 
+/// `descriptor.py W_Super.__new__` — allocate an uninitialised field-resident
+/// proxy; `__init__` fills it from zero, one, or two user arguments.
+fn super_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = args.first().copied().unwrap_or(PY_NULL);
+    let value = pyre_object::descriptor::w_super_new(PY_NULL, PY_NULL);
+    if let Some(sub) = subclass_to_tag(cls, &pyre_object::descriptor::SUPER_TYPE)? {
+        unsafe { (*value).w_class = sub };
+    }
+    Ok(value)
+}
+
+fn super_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let fresh = crate::builtins::builtin_super(args.get(1..).unwrap_or(&[]))?;
+    unsafe {
+        pyre_object::descriptor::w_super_set_fields(
+            args[0],
+            pyre_object::descriptor::w_super_get_type(fresh),
+            pyre_object::descriptor::w_super_get_obj(fresh),
+        )
+    };
+    Ok(w_none())
+}
+
+fn super_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let start = unsafe { pyre_object::descriptor::w_super_get_type(args[0]) };
+    let bound = unsafe { pyre_object::descriptor::w_super_get_obj(args[0]) };
+    let start_name = if start.is_null() {
+        "NULL".to_string()
+    } else {
+        unsafe { pyre_object::w_type_get_name(start) }.to_string()
+    };
+    let bound_name = if bound.is_null() {
+        "NULL".to_string()
+    } else {
+        let bound_type = crate::builtins::super_check(start, bound)?;
+        format!("<{} object>", unsafe {
+            pyre_object::w_type_get_name(bound_type)
+        })
+    };
+    Ok(w_str_new(&format!(
+        "<super: <class '{}'>, {}>",
+        start_name, bound_name
+    )))
+}
+
+fn super_descr_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if !unsafe { pyre_object::is_str(args[1]) } {
+        return Err(crate::PyError::type_error("attribute name must be string"));
+    }
+    crate::baseobjspace::getattr_str(args[0], unsafe { pyre_object::w_str_get_value(args[1]) })
+}
+
+fn super_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let self_ = args[0];
+    let obj = args.get(1).copied().unwrap_or_else(w_none);
+    let bound = unsafe { pyre_object::descriptor::w_super_get_obj(self_) };
+    if !bound.is_null() || unsafe { pyre_object::is_none(obj) } {
+        return Ok(self_);
+    }
+    let start = unsafe { pyre_object::descriptor::w_super_get_type(self_) };
+    if start.is_null() {
+        return Err(crate::PyError::type_error(
+            "__get__(x) is invalid on an uninitialized instance of 'super'",
+        ));
+    }
+    let cls = r#type(self_).unwrap_or_else(|| gettypeobject(&pyre_object::descriptor::SUPER_TYPE));
+    crate::call::call_function_impl_result(cls, &[start, obj])
+}
+
+fn super_getter(args: &[PyObjectRef], field: usize) -> Result<PyObjectRef, crate::PyError> {
+    let self_ = args.get(1).copied().unwrap_or(PY_NULL);
+    if !unsafe { pyre_object::descriptor::is_super(self_) } {
+        return Err(crate::PyError::type_error("descriptor is for 'super'"));
+    }
+    let start = unsafe { pyre_object::descriptor::w_super_get_type(self_) };
+    let bound = unsafe { pyre_object::descriptor::w_super_get_obj(self_) };
+    Ok(match field {
+        0 => {
+            if start.is_null() {
+                w_none()
+            } else {
+                start
+            }
+        }
+        1 => {
+            if bound.is_null() {
+                w_none()
+            } else {
+                bound
+            }
+        }
+        _ => {
+            if bound.is_null() {
+                w_none()
+            } else {
+                crate::builtins::super_check(start, bound)?
+            }
+        }
+    })
+}
+
+fn super_get_thisclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    super_getter(args, 0)
+}
+
+fn super_get_self(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    super_getter(args, 1)
+}
+
+fn super_get_self_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    super_getter(args, 2)
+}
+
+/// PyPy `descriptor.py W_Super.typedef`, with Python 3.14's zero-argument
+/// documentation and concrete type surface.
+fn init_super_type(ns: PyObjectRef) {
+    unsafe {
+        pyre_object::w_dict_setitem_str(
+            ns,
+            "__doc__",
+            w_str_new(
+                "super() -> same as super(__class__, <first argument>)\n\
+                 super(type) -> unbound super object\n\
+                 super(type, obj) -> bound super object; requires isinstance(obj, type)\n\
+                 super(type, type2) -> bound super object; requires issubclass(type2, type)\n\
+                 Typical use to call a cooperative superclass method:\n\
+                 class C(B):\n\
+                     def meth(self, arg):\n\
+                         super().meth(arg)\n\
+                 This works for class methods too:\n\
+                 class C(B):\n\
+                     @classmethod\n\
+                     def cmeth(cls, arg):\n\
+                         super().cmeth(arg)",
+            ),
+        )
+    };
+    for (name, value) in [
+        ("__new__", make_new_descr(super_descr_new)),
+        (
+            "__init__",
+            make_builtin_function("__init__", super_descr_init),
+        ),
+        (
+            "__repr__",
+            make_builtin_function_with_arity("__repr__", super_descr_repr, 1),
+        ),
+        (
+            "__getattribute__",
+            make_builtin_function_with_arity("__getattribute__", super_descr_getattribute, 2),
+        ),
+        ("__get__", make_builtin_function("__get__", super_descr_get)),
+    ] {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+    for (name, getter) in [
+        ("__thisclass__", super_get_thisclass as DunderFn),
+        ("__self__", super_get_self as DunderFn),
+        ("__self_class__", super_get_self_class as DunderFn),
+    ] {
+        unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_getset_descriptor_named(
+                    make_builtin_function_with_arity(name, getter, 2),
+                    name,
+                ),
+            )
+        };
+    }
+}
+
+/// `functional.py W_Range.descr_repr`.
+fn range_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(w_str_new(&unsafe { crate::display::py_repr(args[0])? }))
+}
+
+/// `functional.py W_Range.descr_getitem`.
+fn range_descr_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::baseobjspace::getitem(args[0], args[1])
+}
+
+/// `functional.py W_Range.descr_len`, with Python 3.14's direct-descriptor
+/// ssize_t overflow behavior for a range whose length does not fit.
+fn range_descr_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::baseobjspace::len_slot(args[0])
+}
+
+/// `functional.py W_Range.descr_contains`.
+fn range_descr_contains(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(w_bool_from(crate::baseobjspace::contains(
+        args[0], args[1],
+    )?))
+}
+
+/// `functional.py W_Range.descr_eq`.
+fn range_descr_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if !unsafe { pyre_object::is_w_range(args[1]) } {
+        return Ok(w_not_implemented());
+    }
+    Ok(w_bool_from(unsafe {
+        pyre_object::w_range_eq(args[0], args[1])
+    }))
+}
+
+/// `functional.py W_Range.descr_bool`.
+fn range_descr_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(w_bool_from(unsafe { pyre_object::w_range_bool(args[0]) }))
+}
+
+fn range_getter(args: &[PyObjectRef], field: usize) -> Result<PyObjectRef, crate::PyError> {
+    let self_ = args.get(1).copied().unwrap_or(PY_NULL);
+    if !unsafe { pyre_object::is_w_range(self_) } {
+        return Err(crate::PyError::type_error("descriptor is for 'range'"));
+    }
+    let (start, stop, step) = unsafe { pyre_object::w_range_fields(self_) };
+    Ok(match field {
+        0 => start,
+        1 => stop,
+        _ => step,
+    })
+}
+
+fn range_get_start(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    range_getter(args, 0)
+}
+
+fn range_get_stop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    range_getter(args, 1)
+}
+
+fn range_get_step(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    range_getter(args, 2)
+}
+
+/// PyPy `functional.py W_Range.typedef`, kept in the same entry order.
+fn init_range_type(ns: PyObjectRef) {
+    unsafe {
+        pyre_object::w_dict_setitem_str(
+            ns,
+            "__doc__",
+            w_str_new(
+                "range(stop) -> range object\n\
+                 range(start, stop[, step]) -> range object\n\n\
+                 Return an object that produces a sequence of integers from start (inclusive)\n\
+                 to stop (exclusive) by step.  range(i, j) produces i, i+1, i+2, ..., j-1.\n\
+                 start defaults to 0, and stop is omitted!  range(4) produces 0, 1, 2, 3.\n\
+                 These are exactly the valid indices for a list of 4 elements.\n\
+                 When step is given, it specifies the increment (or decrement).",
+            ),
+        )
+    };
+    let entries = [
+        ("__new__", make_new_descr(range_descr_new)),
+        (
+            "__repr__",
+            make_builtin_function_with_arity("__repr__", range_descr_repr, 1),
+        ),
+        (
+            "__getitem__",
+            make_builtin_function_with_arity("__getitem__", range_descr_getitem, 2),
+        ),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::range_iter_method, 1),
+        ),
+        (
+            "__len__",
+            make_builtin_function_with_arity("__len__", range_descr_len, 1),
+        ),
+        (
+            "__reversed__",
+            make_builtin_function_with_arity(
+                "__reversed__",
+                crate::baseobjspace::range_reversed_method,
+                1,
+            ),
+        ),
+        (
+            "__reduce__",
+            make_builtin_function_with_arity(
+                "__reduce__",
+                crate::baseobjspace::range_reduce_method,
+                1,
+            ),
+        ),
+        (
+            "__contains__",
+            make_builtin_function_with_arity("__contains__", range_descr_contains, 2),
+        ),
+        (
+            "__eq__",
+            make_builtin_function_with_arity("__eq__", range_descr_eq, 2),
+        ),
+        (
+            "__hash__",
+            make_builtin_function_with_arity("__hash__", crate::baseobjspace::range_hash_method, 1),
+        ),
+        (
+            "__bool__",
+            make_builtin_function_with_arity("__bool__", range_descr_bool, 1),
+        ),
+        (
+            "count",
+            make_builtin_function_with_arity("count", crate::baseobjspace::range_count_method, 2),
+        ),
+        (
+            "index",
+            make_builtin_function_with_arity("index", crate::baseobjspace::range_index_method, 2),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+    for (name, getter_fn) in [
+        ("start", range_get_start as DunderFn),
+        ("stop", range_get_stop as DunderFn),
+        ("step", range_get_step as DunderFn),
+    ] {
+        let getter = make_builtin_function_with_arity(name, getter_fn, 2);
+        unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_getset_descriptor_named(getter, name),
+            )
+        };
+    }
+}
+
+fn install_functional_entry(ns: PyObjectRef, name: &'static str, value: PyObjectRef) {
+    unsafe { pyre_object::w_dict_setitem_str(ns, name, value) };
+}
+
+/// PyPy `functional.py W_Enumerate.typedef`.
+fn init_enumerate_type(ns: PyObjectRef) {
+    install_functional_entry(
+        ns,
+        "__doc__",
+        w_str_new(
+            "Return an enumerate object.\n\n  iterable\n    an object supporting iteration\n\nThe enumerate object yields pairs containing a count (from start, which\ndefaults to zero) and a value yielded by the iterable argument.\n\nenumerate is useful for obtaining an indexed list:\n    (0, seq[0]), (1, seq[1]), (2, seq[2]), ...",
+        ),
+    );
+    install_functional_entry(ns, "__new__", make_new_descr(enumerate_descr_new));
+    install_functional_entry(
+        ns,
+        "__iter__",
+        make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+    );
+    install_functional_entry(
+        ns,
+        "__next__",
+        make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+    );
+    install_functional_entry(
+        ns,
+        "__reduce__",
+        make_builtin_function_with_arity(
+            "__reduce__",
+            crate::baseobjspace::enumerate_reduce_method,
+            1,
+        ),
+    );
+    install_functional_entry(
+        ns,
+        "__class_getitem__",
+        pyre_object::function::w_classmethod_new(make_builtin_function(
+            "__class_getitem__",
+            crate::_pypy_generic_alias::generic_alias_class_getitem,
+        )),
+    );
+}
+
+/// PyPy `functional.py W_ReversedIterator.typedef`.
+fn init_reversed_type(ns: PyObjectRef) {
+    install_functional_entry(
+        ns,
+        "__doc__",
+        w_str_new("Return a reverse iterator over the values of the given sequence."),
+    );
+    install_functional_entry(ns, "__new__", make_new_descr(reversed_descr_new));
+    for (name, function, arity) in [
+        (
+            "__iter__",
+            crate::baseobjspace::iter_self_method as DunderFn,
+            1,
+        ),
+        ("__next__", crate::baseobjspace::iter_next_method, 1),
+        (
+            "__length_hint__",
+            crate::baseobjspace::reversed_length_hint_method,
+            1,
+        ),
+        ("__reduce__", crate::baseobjspace::reversed_reduce_method, 1),
+        (
+            "__setstate__",
+            crate::baseobjspace::reversed_setstate_method,
+            2,
+        ),
+    ] {
+        install_functional_entry(
+            ns,
+            name,
+            make_builtin_function_with_arity(name, function, arity),
+        );
+    }
+}
+
+/// PyPy `functional.py W_Map.typedef`, plus Python 3.14's exposed state slot.
+fn init_map_type(ns: PyObjectRef) {
+    install_functional_entry(
+        ns,
+        "__doc__",
+        w_str_new(
+            "map(func, *iterables) --> map object\n\nMake an iterator that computes the function using arguments from\neach of the iterables.  Stops when the shortest iterable is exhausted.",
+        ),
+    );
+    install_functional_entry(ns, "__new__", make_new_descr(map_descr_new));
+    for (name, function, arity) in [
+        (
+            "__iter__",
+            crate::baseobjspace::iter_self_method as DunderFn,
+            1,
+        ),
+        ("__next__", crate::baseobjspace::iter_next_method, 1),
+        ("__reduce__", crate::baseobjspace::map_reduce_method, 1),
+        ("__setstate__", crate::baseobjspace::map_setstate_method, 2),
+    ] {
+        install_functional_entry(
+            ns,
+            name,
+            make_builtin_function_with_arity(name, function, arity),
+        );
+    }
+}
+
+/// PyPy `functional.py W_Filter.typedef`.
+fn init_filter_type(ns: PyObjectRef) {
+    install_functional_entry(
+        ns,
+        "__doc__",
+        w_str_new(
+            "filter(function or None, iterable) --> filter object\n\nReturn an iterator yielding those items of iterable for which function(item)\nis true. If function is None, return the items that are true.",
+        ),
+    );
+    install_functional_entry(ns, "__new__", make_new_descr(filter_descr_new));
+    for (name, function) in [
+        (
+            "__iter__",
+            crate::baseobjspace::iter_self_method as DunderFn,
+        ),
+        ("__next__", crate::baseobjspace::iter_next_method),
+        ("__reduce__", crate::baseobjspace::filter_reduce_method),
+    ] {
+        install_functional_entry(
+            ns,
+            name,
+            make_builtin_function_with_arity(name, function, 1),
+        );
+    }
+}
+
+/// PyPy `functional.py W_Zip.typedef`.
+fn init_zip_type(ns: PyObjectRef) {
+    install_functional_entry(
+        ns,
+        "__doc__",
+        w_str_new(
+            "zip(*iterables) --> A zip object yielding tuples until an input is exhausted.\n\nThe zip object yields n-length tuples, where n is the number of iterables\npassed as positional arguments to zip().  The i-th element in every tuple\ncomes from the i-th iterable argument to zip().  This continues until the\nshortest argument is exhausted.",
+        ),
+    );
+    install_functional_entry(ns, "__new__", make_new_descr(zip_descr_new));
+    for (name, function, arity) in [
+        (
+            "__iter__",
+            crate::baseobjspace::iter_self_method as DunderFn,
+            1,
+        ),
+        ("__next__", crate::baseobjspace::iter_next_method, 1),
+        ("__reduce__", crate::baseobjspace::zip_reduce_method, 1),
+        ("__setstate__", crate::baseobjspace::zip_setstate_method, 2),
+    ] {
+        install_functional_entry(
+            ns,
+            name,
+            make_builtin_function_with_arity(name, function, arity),
+        );
+    }
+}
+
 // dict_new handled by dict_descr_new above (supports dict subclasses)
 
 /// typeobject.py:511-524 W_TypeObject.check_user_subclass.
@@ -2148,7 +2810,7 @@ fn frozenset_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     )?;
     let iterable = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
 
-    // setobject.py:616-618 — reuse the argument only when the target type is
+    // setobject.py — reuse the argument only when the target type is
     // exactly `frozenset` and the argument's implementation class is exactly
     // `W_FrozensetObject` (`type(w_iterable) is W_FrozensetObject`); a subclass
     // instance retags `w_class` and is rebuilt.
@@ -2162,33 +2824,27 @@ fn frozenset_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     }
 
     let obj = set_alloc_for_class(cls, frozenset_type, true)?;
-    let obj = if !iterable.is_null() {
-        let items = crate::builtins::collect_iterable(iterable)?;
-        // `try_hash_value` may run a user `__hash__` that allocates and
-        // triggers a moving minor collection; `obj` and every not-yet-added
-        // item are rooted for the whole loop and reloaded after each hash.
-        unsafe {
-            let _roots = pyre_object::gc_roots::push_roots();
-            let sp = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(obj);
-            let item_base = sp + 1;
-            for item in items {
-                pyre_object::gc_roots::pin_root(item);
-            }
-            let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
-            for i in 0..item_len {
-                let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                crate::builtins::try_hash_value(item)?;
-                let obj = pyre_object::gc_roots::shadow_stack_get(sp);
-                let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                pyre_object::w_set_add(obj, item);
-            }
-            pyre_object::gc_roots::shadow_stack_get(sp)
-        }
-    } else {
-        obj
-    };
+    if !iterable.is_null() {
+        set_init_from_iterable(obj, iterable)?;
+    }
     Ok(obj)
+}
+
+/// Fill a freshly allocated set/frozenset from `w_iterable`.
+///
+/// `setobject.py set_strategy_and_setdata` — the storage is set up from
+/// the iterable, and a set operand (`:1619-1621`) hands its own over rather
+/// than being walked: its elements hashed when they entered it.
+fn set_init_from_iterable(
+    w_set: PyObjectRef,
+    w_iterable: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    if unsafe { pyre_object::is_set_or_frozenset(w_iterable) } {
+        unsafe { pyre_object::w_set_copy_storage_from(w_set, w_iterable) };
+        return Ok(());
+    }
+    let items = crate::builtins::collect_iterable(w_iterable)?;
+    crate::builtins::builtin_set_add_items(w_set, &items)
 }
 
 /// `set.__init__(self, [iterable])` — PyPy: setobject.py W_SetObject.descr_init.
@@ -2212,7 +2868,7 @@ fn set_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             tp_name,
         )));
     }
-    // setobject.py:161 `descr_init(self, space, w_iterable=None, __posonly__=None)`
+    // setobject.py `descr_init(self, space, w_iterable=None, __posonly__=None)`
     // — `iterable` is a single positional-only optional argument.  Parse the
     // gateway args against that signature (gateway interp2app `parse_into_scope`)
     // so a keyword raises the matching TypeError instead of leaking the kwargs
@@ -2245,37 +2901,12 @@ fn set_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     )?;
     let w_iterable = scope_w[1];
 
-    let existing = unsafe { pyre_object::w_set_items(set_obj) };
-    for item in existing {
-        unsafe {
-            pyre_object::w_set_discard(set_obj, item);
-        }
-    }
-    // setobject.py:1722 `_initialize_set` populates from the iterable when it
-    // is not None (the parsed default).
+    // setobject.py `_initialize_set` — `w_obj.clear()` drops the
+    // storage in one go, then the iterable populates it when it is not None
+    // (the parsed default).
+    unsafe { pyre_object::w_set_clear(set_obj) };
     if !w_iterable.is_null() && !unsafe { pyre_object::is_none(w_iterable) } {
-        let items = crate::builtins::collect_iterable(w_iterable)?;
-        // `try_hash_value` may run a user `__hash__` that allocates and
-        // triggers a moving minor collection; `set_obj` and every
-        // not-yet-added item are rooted for the whole loop and reloaded
-        // after each hash.
-        unsafe {
-            let _roots = pyre_object::gc_roots::push_roots();
-            let sp = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(set_obj);
-            let item_base = sp + 1;
-            for item in items {
-                pyre_object::gc_roots::pin_root(item);
-            }
-            let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
-            for i in 0..item_len {
-                let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                crate::builtins::try_hash_value(item)?;
-                let set_obj = pyre_object::gc_roots::shadow_stack_get(sp);
-                let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                pyre_object::w_set_add(set_obj, item);
-            }
-        }
+        set_init_from_iterable(set_obj, w_iterable)?;
     }
     Ok(pyre_object::w_none())
 }
@@ -2294,6 +2925,16 @@ fn arg_type_name(obj: PyObjectRef) -> String {
 }
 
 fn init_list_type(ns: PyObjectRef) {
+    // listobject.py W_ListObject.typedef, kept in source order.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            w_str_new(
+                "Built-in mutable sequence.\n\nIf no argument is given, the constructor creates a new empty list.\nThe argument must be an iterable if specified.",
+            ),
+        )
+    };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -2306,6 +2947,38 @@ fn init_list_type(ns: PyObjectRef) {
             ns,
             "__init__",
             make_builtin_function("__init__", list_descr_init),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function_with_arity(
+                "__repr__",
+                |args| Ok(w_str_new(&unsafe { crate::display::list_repr(args[0])? })),
+                1,
+            ),
+        )
+    };
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__hash__", w_none()) };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__sizeof__",
+            make_builtin_function_with_arity(
+                "__sizeof__",
+                |args| {
+                    // CPython 3.14's PyListObject header is five machine
+                    // words; the item array contributes one pointer per
+                    // allocated slot. This is the version oracle where PyPy
+                    // does not expose a list-specific descriptor.
+                    let size = 5 * std::mem::size_of::<usize>()
+                        + unsafe { pyre_object::w_list_capacity(args[0]) }
+                            * std::mem::size_of::<PyObjectRef>();
+                    Ok(w_int_new(size as i64))
+                },
+                1,
+            ),
         )
     };
     // listobject.py:2486 __class_getitem__ = interp2app(
@@ -2493,9 +3166,7 @@ fn init_list_type(ns: PyObjectRef) {
                         return Ok(pyre_object::w_none());
                     }
                     crate::type_methods::arity_slot(args, 0)?;
-                    Ok(pyre_object::w_seq_iter_new(obj, unsafe {
-                        pyre_object::w_list_len(obj)
-                    }))
+                    Ok(pyre_object::w_list_iter_new(obj))
                 },
                 1,
             ),
@@ -2514,14 +3185,15 @@ fn init_list_type(ns: PyObjectRef) {
                     crate::type_methods::arity_no_args(args, "list.__reversed__")?;
                     let obj = args[0];
                     let n = unsafe { pyre_object::w_list_len(obj) } as i64;
-                    Ok(pyre_object::functional::w_reversed_new(obj, n - 1))
+                    Ok(pyre_object::w_list_reverse_iter_new(obj, n - 1))
                 },
                 1,
             ),
         )
     };
-    // Arithmetic slots.  `listobject.c:list_concat` rejects a non-list
-    // operand with TypeError (it does not return NotImplemented);
+    // Arithmetic slots.  `listobject.py:627 descr_add` returns NotImplemented
+    // for a non-list operand (so the `+` operator's reflected dispatch runs and
+    // a generic "unsupported operand type(s)" TypeError is raised);
     // `list_repeat` requires an integer count.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -2534,10 +3206,7 @@ fn init_list_type(ns: PyObjectRef) {
                     if unsafe { pyre_object::is_list(args[1]) } {
                         unsafe { crate::objspace::descroperation::list_concat(args[0], args[1]) }
                     } else {
-                        Err(crate::PyError::type_error(format!(
-                            "can only concatenate list (not \"{}\") to list",
-                            arg_type_name(args[1])
-                        )))
+                        Ok(pyre_object::w_not_implemented())
                     }
                 },
                 2,
@@ -2664,7 +3333,46 @@ fn list_descr_mul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 // ── Str TypeDef ──────────────────────────────────────────────────────
 // PyPy: pypy/objspace/std/unicodeobject.py TypeDef("str", ...)
 
+fn str_descr_mul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 1)?;
+    // unicodeobject.py descr_mul = getindex_w (no NotImplemented wrapper),
+    // so a non-__index__ operand raises and a custom __index__ is honoured.
+    let w_count = if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
+        args[1]
+    } else {
+        getindex_repeat(args[1])?
+    };
+    unsafe { crate::objspace::descroperation::str_repeat(args[0], w_count) }
+}
+
+fn str_descr_rmod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 1)?;
+    // unicodeobject.py:439-443 — only a unicode left operand reaches the
+    // formatter; every other direct invocation returns NotImplemented.
+    if !unsafe { pyre_object::is_str(args[1]) } {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    crate::baseobjspace::mod_(args[1], args[0])
+}
+
 fn init_str_type(ns: PyObjectRef) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            w_str_new(
+                "str(object='') -> str\n\
+                 str(bytes_or_buffer[, encoding[, errors]]) -> str\n\n\
+                 Create a new string object from the given object. If encoding or\n\
+                 errors is specified, then the object must expose a data buffer\n\
+                 that will be decoded using the given encoding and error handler.\n\
+                 Otherwise, returns the result of object.__str__() (if defined)\n\
+                 or repr(object).\n\
+                 encoding defaults to 'utf-8'.\n\
+                 errors defaults to 'strict'.",
+            ),
+        )
+    };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -2707,6 +3415,17 @@ fn init_str_type(ns: PyObjectRef) {
                         ))
                     }
                 },
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__hash__",
+            make_builtin_function_with_arity(
+                "__hash__",
+                |args| Ok(w_int_new(crate::builtins::hash_value(args[0]))),
                 1,
             ),
         )
@@ -3256,22 +3975,14 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__mul__",
-            make_builtin_function_with_arity(
-                "__mul__",
-                |args| {
-                    crate::type_methods::arity_slot(args, 1)?;
-                    // unicodeobject descr_mul = getindex_w (no NotImplemented
-                    // wrapper), so a non-__index__ operand raises and a custom
-                    // __index__ (incl. an out-of-range one) is honoured.
-                    let w_count = if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
-                        args[1]
-                    } else {
-                        getindex_repeat(args[1])?
-                    };
-                    unsafe { crate::objspace::descroperation::str_repeat(args[0], w_count) }
-                },
-                2,
-            ),
+            make_builtin_function_with_arity("__mul__", str_descr_mul, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__rmul__",
+            make_builtin_function_with_arity("__rmul__", str_descr_mul, 2),
         )
     };
     unsafe {
@@ -3286,6 +3997,13 @@ fn init_str_type(ns: PyObjectRef) {
                 },
                 2,
             ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__rmod__",
+            make_builtin_function_with_arity("__rmod__", str_descr_rmod, 2),
         )
     };
     // maketrans — PyPy: unicodeobject.py descr_maketrans
@@ -3431,6 +4149,25 @@ fn init_str_type(ns: PyObjectRef) {
 // PyPy: pypy/objspace/std/dictmultiobject.py TypeDef("dict", ...)
 
 fn init_dict_type(ns: PyObjectRef) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            w_str_new(
+                "dict() -> new empty dictionary\n\
+                 dict(mapping) -> new dictionary initialized from a mapping object's\n\
+                     (key, value) pairs\n\
+                 dict(iterable) -> new dictionary initialized as if via:\n\
+                     d = {}\n\
+                     for k, v in iterable:\n\
+                         d[k] = v\n\
+                 dict(**kwargs) -> new dictionary initialized with the name=value pairs\n\
+                     in the keyword argument list.  For example:  dict(one=1, two=2)",
+            ),
+        )
+    };
+    // dictmultiobject.py:421 `__hash__ = None`.
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__hash__", w_none()) };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -3758,6 +4495,68 @@ fn init_dict_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
+            "__ne__",
+            make_builtin_function_with_arity(
+                "__ne__",
+                |args| {
+                    crate::type_methods::arity_slot(args, 1)?;
+                    let a = crate::type_methods::resolve_dict_backing(args[0]);
+                    let b = crate::type_methods::resolve_dict_backing(args[1]);
+                    if a.is_null() || b.is_null() {
+                        return Ok(pyre_object::w_not_implemented());
+                    }
+                    let eq =
+                        crate::baseobjspace::compare(a, b, crate::baseobjspace::CompareOp::Eq)?;
+                    if unsafe { pyre_object::is_not_implemented(eq) } {
+                        return Ok(eq);
+                    }
+                    Ok(pyre_object::w_bool_from(!crate::baseobjspace::is_true(eq)?))
+                },
+                2,
+            ),
+        )
+    };
+    // CPython 3.14 keeps the inherited object ordering descriptors visible in
+    // dict.__dict__; like objectobject.py's generic rich comparison they
+    // return NotImplemented.
+    for name in ["__lt__", "__le__", "__gt__", "__ge__"] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(name, |_| Ok(w_not_implemented()), 2),
+            )
+        };
+    }
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__sizeof__",
+            make_builtin_function_with_arity(
+                "__sizeof__",
+                |args| {
+                    crate::type_methods::arity_slot(args, 0)?;
+                    let backing = crate::type_methods::resolve_dict_backing(args[0]);
+                    if backing.is_null() {
+                        return Err(crate::PyError::type_error(
+                            "descriptor '__sizeof__' for 'dict' objects doesn't apply",
+                        ));
+                    }
+                    let len = unsafe { pyre_object::w_dict_len(backing) };
+                    // W_DictObject plus its strategy/storage bookkeeping and
+                    // the stored hash/key/value lane for each live entry.
+                    let size = pyre_object::dictmultiobject::W_DICT_OBJECT_SIZE
+                        + std::mem::size_of::<usize>()
+                        + len * 3 * std::mem::size_of::<usize>();
+                    Ok(w_int_new(size as i64))
+                },
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__or__",
             make_builtin_function_with_arity(
                 "__or__",
@@ -3921,9 +4720,10 @@ fn init_dict_type(ns: PyObjectRef) {
                 };
                 let items = crate::builtins::collect_iterable(iterable)?;
                 // dictmultiobject.py:120-134 descr_fromkeys — for `dict` itself,
-                // fill a fresh dict directly; for a dict subclass, construct an
-                // instance via `cls()` and route through `space.setitem` so the
-                // result is an instance of the subclass.
+                // fill a fresh dict through the dict's own setitem, which hashes
+                // each key; for a dict subclass, construct an instance via `cls()`
+                // and route through `space.setitem` so the result is an instance
+                // of the subclass.
                 let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
                 if cls.is_null() || crate::baseobjspace::is_w(cls, w_dict_type) {
                     let d = pyre_object::w_dict_new();
@@ -3944,11 +4744,12 @@ fn init_dict_type(ns: PyObjectRef) {
                         let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
                         for i in 0..key_len {
                             let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
-                            crate::builtins::try_hash_value(key)?;
+                            let hash = crate::builtins::try_hash_value(key)?;
                             let d = pyre_object::gc_roots::shadow_stack_get(sp);
                             let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
                             let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-                            pyre_object::w_dict_store(d, key, value);
+                            pyre_object::w_dict_store_hashed_checked(d, key, value, hash)
+                                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
                         }
                         pyre_object::gc_roots::shadow_stack_get(sp)
                     };
@@ -4910,111 +5711,43 @@ fn dict_view_isdisjoint(
     Ok(pyre_object::w_bool_from(true))
 }
 
-/// `dictmultiobject.py:1692-1708 _as_set_op` — produce a fresh set
-/// holding the result of the named set operation between
-/// `self_view` and `other`.  PyPy delegates to set's `_update`
-/// methods for efficiency; pyre computes the result inline because
-/// pyre's set typedef does not expose the in-place mutators yet.
-/// Both shapes (forward and reflected) are reachable from the same
-/// helper because set ops on the supported subset (-, &, |, ^) are
-/// commutative under "build set(LHS) and combine with RHS"
-/// semantics — the reverse caller just swaps the operand order.
-#[derive(Clone, Copy)]
-enum DictViewSetOp {
-    Sub,
-    And,
-    Or,
-    Xor,
-}
-
-fn dict_view_set_op_compute(
-    self_view: pyre_object::PyObjectRef,
-    other: pyre_object::PyObjectRef,
-    op: DictViewSetOp,
+/// `dictmultiobject.py:1699-1710 _as_set_op` — build a set from the left
+/// operand and run the named in-place set method against the right one.
+///
+/// Materialising the left operand through the set constructor is what
+/// enforces the hash protocol: an unhashable element raises there rather
+/// than being dropped or stored unhashed.
+fn dict_view_as_set_op(
+    lhs: pyre_object::PyObjectRef,
+    rhs: pyre_object::PyObjectRef,
+    methname: &str,
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    let self_items = crate::type_methods::dict_view_snapshot(self_view);
-    let other_items = crate::builtins::collect_iterable(other)?;
-    // Materialise `other` as a set for O(1) `contains` lookups.  `set`
-    // requires hashable elements; PyPy raises TypeError naturally
-    // through the underlying set constructor, which is what `_as_set_op`
-    // surfaces too.
-    let other_set = pyre_object::w_set_from_items(&other_items);
-    let result_items: Vec<pyre_object::PyObjectRef> = match op {
-        // dictmultiobject.py:1705 sub → difference_update on set(self)
-        DictViewSetOp::Sub => self_items
-            .into_iter()
-            .filter(|&item| !unsafe { pyre_object::w_set_contains(other_set, item) })
-            .collect(),
-        // dictmultiobject.py:1706 and → intersection_update
-        DictViewSetOp::And => self_items
-            .into_iter()
-            .filter(|&item| unsafe { pyre_object::w_set_contains(other_set, item) })
-            .collect(),
-        // dictmultiobject.py:1707 or → update (set union, dedup via set ctor below)
-        DictViewSetOp::Or => {
-            let mut combined: Vec<pyre_object::PyObjectRef> = self_items;
-            combined.extend(other_items);
-            combined
-        }
-        // dictmultiobject.py:1708 xor → symmetric_difference_update
-        DictViewSetOp::Xor => {
-            let self_set = pyre_object::w_set_from_items(&self_items);
-            let mut out: Vec<pyre_object::PyObjectRef> = self_items
-                .into_iter()
-                .filter(|&item| !unsafe { pyre_object::w_set_contains(other_set, item) })
-                .collect();
-            for item in other_items {
-                if !unsafe { pyre_object::w_set_contains(self_set, item) } {
-                    out.push(item);
-                }
-            }
-            out
-        }
-    };
-    Ok(pyre_object::w_set_from_items(&result_items))
+    let w_set_type = crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);
+    let w_set = crate::call::call_function_impl_result(w_set_type, &[lhs])?;
+    let method = crate::baseobjspace::getattr_str(w_set, methname)?;
+    crate::call::call_function_impl_result(method, &[rhs])?;
+    Ok(w_set)
 }
 
+/// `dictmultiobject.py:1701-1704 _as_set_op.op` — `set(self)` combined with
+/// `w_other`.
 fn dict_view_set_op(
     self_view: pyre_object::PyObjectRef,
     other: pyre_object::PyObjectRef,
     op_name: &str,
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    let op = match op_name {
-        "difference_update" => DictViewSetOp::Sub,
-        "intersection_update" => DictViewSetOp::And,
-        "update" => DictViewSetOp::Or,
-        "symmetric_difference_update" => DictViewSetOp::Xor,
-        _ => return Err(crate::PyError::type_error("unknown set op")),
-    };
-    dict_view_set_op_compute(self_view, other, op)
+    dict_view_as_set_op(self_view, other, op_name)
 }
 
+/// `dictmultiobject.py:1705-1709 _as_set_op.rop` — the reflected shape builds
+/// the set from `w_other` instead, so the non-commutative `-` and `&` keep
+/// their operand order.
 fn dict_view_rset_op(
     self_view: pyre_object::PyObjectRef,
     other: pyre_object::PyObjectRef,
     op_name: &str,
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    let op = match op_name {
-        // PyPy's reverse ops swap operand order: `other - self_view`,
-        // `other & self_view`, etc.  Sub/And are not commutative, so
-        // the swap matters; Or/Xor are commutative.
-        "difference_update" => {
-            // other - self_view
-            let other_items = crate::builtins::collect_iterable(other)?;
-            let self_items = crate::type_methods::dict_view_snapshot(self_view);
-            let self_set = pyre_object::w_set_from_items(&self_items);
-            let result_items: Vec<pyre_object::PyObjectRef> = other_items
-                .into_iter()
-                .filter(|&item| !unsafe { pyre_object::w_set_contains(self_set, item) })
-                .collect();
-            return Ok(pyre_object::w_set_from_items(&result_items));
-        }
-        "intersection_update" => DictViewSetOp::And,
-        "update" => DictViewSetOp::Or,
-        "symmetric_difference_update" => DictViewSetOp::Xor,
-        _ => return Err(crate::PyError::type_error("unknown set op")),
-    };
-    dict_view_set_op_compute(self_view, other, op)
+    dict_view_as_set_op(other, self_view, op_name)
 }
 
 // Top-level fn-pointer dispatchers for each comparator and set op
@@ -5542,8 +6275,39 @@ fn init_tuple_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
+            "__doc__",
+            w_str_new(
+                "Built-in immutable sequence.\n\nIf no argument is given, the constructor returns an empty tuple.\nIf iterable is specified the tuple is initialized from iterable's items.\n\nIf the argument is a tuple, the return value is the same object.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__new__",
             make_new_descr(tuple_descr_new),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function_with_arity(
+                "__repr__",
+                |args| Ok(w_str_new(&unsafe { crate::display::tuple_repr(args[0])? })),
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__hash__",
+            make_builtin_function_with_arity(
+                "__hash__",
+                |args| Ok(w_int_new(crate::builtins::try_hash_value(args[0])?)),
+                1,
+            ),
         )
     };
     // tupleobject.py:354 __class_getitem__ = interp2app(
@@ -5621,9 +6385,7 @@ fn init_tuple_type(ns: PyObjectRef) {
                     if obj.is_null() {
                         return Ok(pyre_object::w_none());
                     }
-                    Ok(pyre_object::w_seq_iter_new(obj, unsafe {
-                        pyre_object::w_tuple_len(obj)
-                    }))
+                    Ok(pyre_object::w_tuple_iter_new(obj))
                 },
                 1,
             ),
@@ -5643,8 +6405,10 @@ fn init_tuple_type(ns: PyObjectRef) {
             ),
         )
     };
-    // `tupleobject.c:tuple_concat` rejects a non-tuple operand with
-    // TypeError; `*` requires an integer count.
+    // `tupleobject.py:181 descr_add` returns NotImplemented for a non-tuple
+    // operand (so the `+` operator's reflected dispatch runs and a generic
+    // "unsupported operand type(s)" TypeError is raised); `*` requires an
+    // integer count.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -5656,10 +6420,7 @@ fn init_tuple_type(ns: PyObjectRef) {
                     if unsafe { pyre_object::is_tuple(args[1]) } {
                         unsafe { crate::objspace::descroperation::tuple_concat(args[0], args[1]) }
                     } else {
-                        Err(crate::PyError::type_error(format!(
-                            "can only concatenate tuple (not \"{}\") to tuple",
-                            arg_type_name(args[1])
-                        )))
+                        Ok(pyre_object::w_not_implemented())
                     }
                 },
                 2,
@@ -5860,45 +6621,53 @@ fn slice_descr_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// sliceobject.py `descr_lt` — lexicographic on (start, stop, step).
 fn slice_descr_lt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (a, b) = (args[0], args[1]);
-    if a == b {
-        return Ok(pyre_object::w_bool_from(false));
-    }
-    if unsafe { pyre_object::sliceobject::is_slice(b) } {
-        slice_lt_components(a, b)
-    } else {
-        Ok(pyre_object::w_not_implemented())
-    }
+    slice_descr_richcompare(args, crate::baseobjspace::CompareOp::Lt)
 }
 
-fn slice_lt_components(a: PyObjectRef, b: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    let (sa, sb) = unsafe {
-        (
-            pyre_object::sliceobject::w_slice_get_start(a),
-            pyre_object::sliceobject::w_slice_get_start(b),
-        )
-    };
-    if crate::baseobjspace::eq_w(sa, sb)? {
-        let (ta, tb) = unsafe {
-            (
-                pyre_object::sliceobject::w_slice_get_stop(a),
-                pyre_object::sliceobject::w_slice_get_stop(b),
-            )
-        };
-        if crate::baseobjspace::eq_w(ta, tb)? {
-            let (pa, pb) = unsafe {
-                (
-                    pyre_object::sliceobject::w_slice_get_step(a),
-                    pyre_object::sliceobject::w_slice_get_step(b),
-                )
-            };
-            crate::baseobjspace::compare(pa, pb, crate::baseobjspace::CompareOp::Lt)
-        } else {
-            crate::baseobjspace::compare(ta, tb, crate::baseobjspace::CompareOp::Lt)
-        }
-    } else {
-        crate::baseobjspace::compare(sa, sb, crate::baseobjspace::CompareOp::Lt)
+fn slice_descr_le(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    slice_descr_richcompare(args, crate::baseobjspace::CompareOp::Le)
+}
+
+fn slice_descr_gt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    slice_descr_richcompare(args, crate::baseobjspace::CompareOp::Gt)
+}
+
+fn slice_descr_ge(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    slice_descr_richcompare(args, crate::baseobjspace::CompareOp::Ge)
+}
+
+/// CPython 3.14 `slice_richcompare`: compare the packed
+/// `(start, stop, step)` tuples with the original operation. PyPy 3.11 has
+/// the equivalent tuple walk only for `<`; the 3.14 version oracle exposes
+/// all four ordering slots.
+fn slice_descr_richcompare(
+    args: &[PyObjectRef],
+    op: crate::baseobjspace::CompareOp,
+) -> Result<PyObjectRef, crate::PyError> {
+    let (a, b) = (args[0], args[1]);
+    if !unsafe { pyre_object::sliceobject::is_slice(b) } {
+        return Ok(pyre_object::w_not_implemented());
     }
+    if a == b {
+        return Ok(pyre_object::w_bool_from(matches!(
+            op,
+            crate::baseobjspace::CompareOp::Le | crate::baseobjspace::CompareOp::Ge
+        )));
+    }
+    let components = |s| unsafe {
+        w_tuple_new(vec![
+            pyre_object::sliceobject::w_slice_get_start(s),
+            pyre_object::sliceobject::w_slice_get_stop(s),
+            pyre_object::sliceobject::w_slice_get_step(s),
+        ])
+    };
+    crate::baseobjspace::compare(components(a), components(b), op)
+}
+
+/// CPython 3.14 `slice_hash`, copied from the tuplehash-style three-lane
+/// mixer in `Objects/sliceobject.c`.
+fn slice_descr_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(w_int_new(crate::builtins::try_hash_value(args[0])?))
 }
 
 /// sliceobject.py `descr__reduce__` — `(type(self), (start, stop, step))`.
@@ -5916,6 +6685,15 @@ fn slice_descr_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 }
 
 fn init_slice_type(ns: PyObjectRef) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            w_str_new(
+                "slice(stop)\nslice(start, stop[, step])\n\nCreate a slice object. This is used for extended slicing (e.g. a[0:10:2]).",
+            ),
+        )
+    };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -5951,15 +6729,25 @@ fn init_slice_type(ns: PyObjectRef) {
             make_builtin_function("__lt__", slice_descr_lt),
         )
     };
-    // sliceobject.py:205 `__hash__ = None` — slice is unhashable, consistent
-    // with the value-based `__eq__`.  hash() raises via the unhashable
-    // ladder in `builtins::try_hash_value`; the dict entry surfaces
-    // `slice.__hash__ is None` to introspection.
+    for (name, func) in [
+        ("__le__", slice_descr_le as DunderFn),
+        ("__gt__", slice_descr_gt),
+        ("__ge__", slice_descr_ge),
+    ] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function(name, func),
+            )
+        };
+    }
+    // PyPy 3.11 has `__hash__ = None`; CPython 3.14 made slices hashable.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__hash__",
-            pyre_object::w_none(),
+            make_builtin_function("__hash__", slice_descr_hash),
         )
     };
     unsafe {
@@ -9112,6 +9900,9 @@ fn float_dunder_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     crate::type_methods::arity_pow(args)?;
     let b = args[1];
     if unsafe { pyre_object::pyobject::is_float(b) || pyre_object::pyobject::is_int_or_long(b) } {
+        // The operand is coerced to a double first, so an over-range int
+        // raises OverflowError before the ternary modulus is rejected.
+        unsafe { crate::objspace::descroperation::reject_pow_operand_overflow(b)? };
         float_pow_reject_modulus(args)?;
         crate::objspace::descroperation::pow_builtin(args[0], b)
     } else {
@@ -9122,6 +9913,7 @@ fn float_dunder_rpow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     crate::type_methods::arity_pow(args)?;
     let b = args[1];
     if unsafe { pyre_object::pyobject::is_float(b) || pyre_object::pyobject::is_int_or_long(b) } {
+        unsafe { crate::objspace::descroperation::reject_pow_operand_overflow(b)? };
         float_pow_reject_modulus(args)?;
         crate::objspace::descroperation::pow_builtin(b, args[0])
     } else {
@@ -9340,13 +10132,30 @@ fn init_int_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
+            "__doc__",
+            w_str_new(
+                "int([x]) -> integer\n\
+                 int(x, base=10) -> integer\n\n\
+                 Convert a number or string to an integer, or return 0 if no arguments\n\
+                 are given.  If x is a number, return x.__int__().  For floating-point\n\
+                 numbers, this truncates towards zero.\n\n\
+                 If x is not a number or if base is given, then x must be a string,\n\
+                 bytes, or bytearray instance representing an integer literal in the\n\
+                 given base.  The literal can be preceded by '+' or '-' and be surrounded\n\
+                 by whitespace.  The base defaults to 10.  Valid bases are 0 and 2-36.\n\
+                 Base 0 means to interpret the base from the string as an integer literal.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__new__",
             make_new_descr(int_descr_new),
         )
     };
-    // intobject.py descr_repr / descr_str.  IntEnum binds its __str__ to this
-    // descriptor, so it must exist in int's TypeDef rather than falling back
-    // to object.__str__.
+    // intobject.py descr_repr. CPython 3.14 inherits object.__str__, whose
+    // implementation delegates virtually to this repr slot.
     let int_to_text = |args: &[PyObjectRef]| {
         Ok(pyre_object::w_str_new(
             &unsafe { crate::builtins::obj_to_bigint(args[0]) }.to_string(),
@@ -9362,8 +10171,42 @@ fn init_int_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
-            "__str__",
-            make_builtin_function_with_arity("__str__", int_to_text, 1),
+            "__hash__",
+            make_builtin_function_with_arity(
+                "__hash__",
+                |args| Ok(w_int_new(crate::builtins::hash_value(args[0]))),
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__sizeof__",
+            make_builtin_function_with_arity(
+                "__sizeof__",
+                |args| {
+                    let bits = unsafe { crate::builtins::obj_to_bigint(args[0]).bits() } as usize;
+                    // CPython 3.14's compact PyLong layout: three pointer-sized
+                    // header words and at least one 30-bit, four-byte digit.
+                    let digits = std::cmp::max(1, (bits + 29) / 30);
+                    Ok(w_int_new(
+                        (3 * std::mem::size_of::<usize>() + digits * 4) as i64,
+                    ))
+                },
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "is_integer",
+            make_builtin_function_with_arity(
+                "is_integer",
+                |_| Ok(pyre_object::w_bool_from(true)),
+                1,
+            ),
         )
     };
     unsafe {
@@ -9824,6 +10667,19 @@ fn init_complex_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
+            "__doc__",
+            w_str_new(
+                "Create a complex number from a string or numbers.\n\n\
+                 If a string is given, parse it as a complex number.\n\
+                 If a single number is given, convert it to a complex number.\n\
+                 If the 'real' or 'imag' arguments are given, create a complex number\n\
+                 with the specified real and imaginary components.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__new__",
             make_new_descr(complex_descr_new),
         )
@@ -9847,8 +10703,25 @@ fn init_complex_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
-            "__str__",
-            make_builtin_function_with_arity("__str__", repr, 1),
+            "from_number",
+            pyre_object::function::w_classmethod_new(make_builtin_function_with_arity(
+                "from_number",
+                |args| {
+                    let value = args[1];
+                    if unsafe {
+                        pyre_object::is_str(value)
+                            || pyre_object::is_bytes(value)
+                            || pyre_object::is_bytearray(value)
+                    } {
+                        return Err(crate::PyError::type_error(format!(
+                            "must be real number, not {}",
+                            crate::type_methods::arg_type_name(value)
+                        )));
+                    }
+                    crate::builtins::builtin_complex(&[value])
+                },
+                2,
+            )),
         )
     };
     unsafe {
@@ -10084,8 +10957,52 @@ fn init_float_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
+            "__doc__",
+            w_str_new("Convert a string or number to a floating-point number, if possible."),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__new__",
             make_new_descr(float_descr_new),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function_with_arity(
+                "__repr__",
+                |args| {
+                    Ok(w_str_new(&crate::display::format_float_repr(unsafe {
+                        pyre_object::w_float_get_value(args[0])
+                    })))
+                },
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__hash__",
+            make_builtin_function_with_arity(
+                "__hash__",
+                |args| Ok(w_int_new(crate::builtins::hash_value(args[0]))),
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "from_number",
+            pyre_object::function::w_classmethod_new(make_builtin_function_with_arity(
+                "from_number",
+                |args| Ok(w_float_new(crate::baseobjspace::float_w(args[1])?)),
+                2,
+            )),
         )
     };
     // float.__getformat__(kind) → returns the format string for the
@@ -10664,6 +11581,17 @@ fn init_bool_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
+            "__doc__",
+            w_str_new(
+                "Returns True when the argument is true, False otherwise.\n\
+                 The builtins True and False are the only two instances of the class bool.\n\
+                 The class bool is a subclass of the class int, and cannot be subclassed.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__new__",
             make_new_descr(bool_descr_new),
         )
@@ -10675,11 +11603,25 @@ fn init_bool_type(ns: PyObjectRef) {
             make_builtin_function("__repr__", bool_repr),
         )
     };
+    // CPython 3.14 gives bool an explicit deprecated `__invert__` wrapper.
+    // It still returns the inversion of the underlying integer (`~True ==
+    // -2`, `~False == -1`); the removal is scheduled for Python 3.16.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
-            "__str__",
-            make_builtin_function("__str__", bool_repr),
+            "__invert__",
+            make_builtin_function_with_arity(
+                "__invert__",
+                |args| {
+                    let value = if crate::baseobjspace::is_true(args[0])? {
+                        1i64
+                    } else {
+                        0i64
+                    };
+                    Ok(w_int_new(!value))
+                },
+                1,
+            ),
         )
     };
     // boolobject.py:97-106 — bool defines its own bitwise dunders so that
@@ -10771,7 +11713,37 @@ fn object_descr_init(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     Ok(w_none())
 }
 
+/// `object.__sizeof__` — CPython 3.14's generic object size is the fixed
+/// object header plus one pointer-sized word for every declared slot.  The
+/// instance dict and weakref storage are accounted for separately by
+/// `sys.getsizeof`, so they are deliberately absent here.
+fn object_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 0)?;
+    let mut size = std::mem::size_of::<pyre_object::PyObject>();
+    if let Some(w_type) = crate::typedef::r#type(args[0]) {
+        if unsafe { pyre_object::is_type(w_type) } {
+            let layout = unsafe { pyre_object::w_type_get_layout_ptr(w_type) };
+            if !layout.is_null() {
+                size += unsafe { (*layout).nslots as usize }
+                    * std::mem::size_of::<pyre_object::PyObjectRef>();
+            }
+        }
+    }
+    Ok(w_int_new(size as i64))
+}
+
 fn init_object_type(ns: PyObjectRef) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            w_str_new(
+                "The base class of the class hierarchy.\n\n\
+                 When called, it accepts no arguments and returns a new featureless\n\
+                 instance that has no instance attributes and cannot be given any.\n",
+            ),
+        )
+    };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -10829,6 +11801,18 @@ fn init_object_type(ns: PyObjectRef) {
             ),
         )
     };
+    // objectobject.py:321 / typedef :451-458 — all four ordering methods
+    // return NotImplemented and leave reflected comparison / TypeError to the
+    // object space.
+    for name in ["__lt__", "__le__", "__gt__", "__ge__"] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(name, |_| Ok(pyre_object::w_not_implemented()), 2),
+            )
+        };
+    }
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -10960,6 +11944,24 @@ fn init_object_type(ns: PyObjectRef) {
                 |args| crate::reduce_protocol::object_getstate_default(args[0]),
                 1,
             ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__dir__",
+            make_builtin_function_with_arity(
+                "__dir__",
+                |args| crate::builtins::object_dir_default(args[0]),
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__sizeof__",
+            make_builtin_function_with_arity("__sizeof__", object_descr_sizeof, 1),
         )
     };
     // typeobject.py descr___init_subclass__ — the default accepts no
@@ -11244,6 +12246,49 @@ fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 
 /// PyPy: bytesobject.py W_BytesObject.typedef
 fn init_bytes_type(ns: PyObjectRef) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            w_str_new(
+                "bytes(iterable_of_ints) -> bytes\n\
+                 bytes(string, encoding[, errors]) -> bytes\n\
+                 bytes(bytes_or_buffer) -> immutable copy of bytes_or_buffer\n\
+                 bytes(int) -> bytes object of size given by the parameter initialized with null bytes\n\
+                 bytes() -> empty bytes object\n\n\
+                 Construct an immutable array of bytes from:\n\
+                   - an iterable yielding integers in range(256)\n\
+                   - a text string encoded using the specified encoding\n\
+                   - any object implementing the buffer API.\n\
+                   - an integer",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__hash__",
+            make_builtin_function_with_arity(
+                "__hash__",
+                |args| Ok(w_int_new(crate::builtins::hash_value(args[0]))),
+                1,
+            ),
+        )
+    };
+    // Python 3.14 exposes the PEP 688 buffer slot as `bytes.__buffer__`.
+    // The returned memoryview retains the immutable bytes backing and reports
+    // `readonly=True`; flags are advisory for this always-readable exporter.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__buffer__",
+            make_builtin_function_with_arity(
+                "__buffer__",
+                |args| crate::builtins::w_memoryview_new(args[0]),
+                2,
+            ),
+        )
+    };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -11577,7 +12622,16 @@ fn init_bytes_type(ns: PyObjectRef) {
                 "__add__",
                 |args| {
                     crate::type_methods::arity_slot(args, 1)?;
-                    unsafe { crate::objspace::descroperation::bytes_concat(args[0], args[1]) }
+                    // `descr_add` returns NotImplemented for a non-buffer operand
+                    // so the `+` operator raises the generic operator TypeError.
+                    unsafe {
+                        match buffer_as_bytes_like(args[1])? {
+                            Some(_) => {
+                                crate::objspace::descroperation::bytes_concat(args[0], args[1])
+                            }
+                            None => Ok(pyre_object::w_not_implemented()),
+                        }
+                    }
                 },
                 2,
             ),
@@ -14255,13 +15309,194 @@ fn bytearray_method_release_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, 
     Ok(pyre_object::w_none())
 }
 
+/// `bytearrayobject.py:247 descr_init` — materialize the replacement first,
+/// then replace the receiver's resizable storage in one step.
+fn bytearray_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::require_receiver(args, "__init__")?;
+    let fresh = bytearray_descr_new_impl(args)?;
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(fresh).to_vec() };
+    unsafe {
+        crate::builtins::bytearray_check_exports(args[0])?;
+        *pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]) = data;
+    }
+    Ok(w_none())
+}
+
+fn bytearray_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::require_receiver(args, "__repr__")?;
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let class_name = crate::typedef::r#type(args[0])
+        .map(|tp| unsafe { pyre_object::w_type_get_name(tp) })
+        .unwrap_or("bytearray");
+    Ok(w_str_new(&crate::display::bytearray_repr_string(
+        data, class_name,
+    )))
+}
+
+fn bytearray_reduce_impl(
+    obj: PyObjectRef,
+    protocol: Option<i64>,
+) -> Result<PyObjectRef, crate::PyError> {
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(obj) };
+    let args = if data.is_empty() {
+        w_tuple_new(vec![])
+    } else if protocol.is_some_and(|p| p >= 3) {
+        w_tuple_new(vec![pyre_object::bytesobject::w_bytes_from_bytes(data)])
+    } else {
+        // bytearrayobject.py:221-233 — legacy protocols carry a latin-1
+        // unicode string plus the explicit codec name.
+        let latin1: String = data.iter().map(|&b| char::from(b)).collect();
+        w_tuple_new(vec![w_str_new(&latin1), w_str_new("latin-1")])
+    };
+    let cls = crate::typedef::r#type(obj)
+        .unwrap_or_else(|| gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE));
+    let state = crate::reduce_protocol::object_getstate_default(obj)?;
+    Ok(w_tuple_new(vec![cls, args, state]))
+}
+
+fn bytearray_descr_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 0)?;
+    bytearray_reduce_impl(args[0], None)
+}
+
+fn bytearray_descr_reduce_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 1)?;
+    let protocol = crate::baseobjspace::int_w(args[1])?;
+    bytearray_reduce_impl(args[0], Some(protocol))
+}
+
+fn bytearray_descr_alloc(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 0)?;
+    let capacity = unsafe { pyre_object::bytearrayobject::w_bytearray_capacity(args[0]) };
+    // PyPy's resizable list includes its trailing NUL. CPython 3.14 exposes
+    // the same convention: empty has alloc 0, otherwise payload capacity + 1.
+    Ok(w_int_new(if capacity == 0 {
+        0
+    } else {
+        (capacity + 1) as i64
+    }))
+}
+
+fn bytearray_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 0)?;
+    let alloc = unsafe { pyre_object::bytearrayobject::w_bytearray_capacity(args[0]) };
+    let alloc = if alloc == 0 { 0 } else { alloc + 1 };
+    // Header + data/export fields + the separately allocated Vec descriptor,
+    // followed by its reserved byte payload.
+    let fixed =
+        pyre_object::bytearrayobject::W_BYTEARRAY_OBJECT_SIZE + std::mem::size_of::<Vec<u8>>();
+    Ok(w_int_new((fixed + alloc) as i64))
+}
+
+fn bytearray_descr_resize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 1)?;
+    let size = crate::builtins::space_index_w(args[1])?;
+    if size < 0 {
+        return Err(crate::PyError::value_error(format!(
+            "Can only resize to positive sizes, got {size}"
+        )));
+    }
+    unsafe {
+        crate::builtins::bytearray_check_exports(args[0])?;
+        pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).resize(size as usize, 0);
+    }
+    Ok(w_none())
+}
+
 /// PyPy: bytearrayobject.py W_BytearrayObject.typedef
 fn init_bytearray_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
+            "__doc__",
+            w_str_new(
+                "bytearray(iterable_of_ints) -> bytearray\n\
+                 bytearray(string, encoding[, errors]) -> bytearray\n\
+                 bytearray(bytes_or_buffer) -> mutable copy of bytes_or_buffer\n\
+                 bytearray(int) -> bytes array of size given by the parameter initialized with null bytes\n\
+                 bytearray() -> empty bytes array\n\n\
+                 Construct a mutable bytearray object from:\n\
+                   - an iterable yielding integers in range(256)\n\
+                   - a text string encoded using the specified encoding\n\
+                   - a bytes or a buffer object\n\
+                   - any object implementing the buffer API.\n\
+                   - an integer",
+            ),
+        )
+    };
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__hash__", w_none()) };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__new__",
             make_new_descr(bytearray_descr_new),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__init__",
+            make_builtin_function("__init__", bytearray_descr_init),
+        )
+    };
+    for (name, function, arity) in [
+        ("__repr__", bytearray_descr_repr as DunderFn, 1),
+        ("__str__", bytearray_descr_repr, 1),
+        ("__reduce__", bytearray_descr_reduce, 1),
+        ("__reduce_ex__", bytearray_descr_reduce_ex, 2),
+        ("__alloc__", bytearray_descr_alloc, 1),
+        ("__sizeof__", bytearray_descr_sizeof, 1),
+        ("resize", bytearray_descr_resize, 2),
+    ] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(name, function, arity),
+            )
+        };
+    }
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__buffer__",
+            make_builtin_function_with_arity(
+                "__buffer__",
+                |args| crate::builtins::w_memoryview_new(args[0]),
+                2,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__mod__",
+            make_builtin_function_with_arity(
+                "__mod__",
+                |args| unsafe {
+                    crate::objspace::std::formatting::bytes_format_percent(args[0], args[1])
+                },
+                2,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__rmod__",
+            make_builtin_function_with_arity(
+                "__rmod__",
+                |args| {
+                    if unsafe { pyre_object::is_bytearray(args[1]) } {
+                        unsafe {
+                            crate::objspace::std::formatting::bytes_format_percent(args[1], args[0])
+                        }
+                    } else {
+                        Ok(w_not_implemented())
+                    }
+                },
+                2,
+            ),
         )
     };
     unsafe {
@@ -14405,16 +15640,10 @@ fn init_bytearray_type(ns: PyObjectRef) {
                     let b = args[1];
                     unsafe {
                         let a_data = pyre_object::bytesobject::bytes_like_data(a);
-                        // descr_add: a non-buffer operand raises rather than
-                        // concatenating as empty.
+                        // `descr_add` returns NotImplemented for a non-buffer
+                        // operand so the `+` operator raises the generic TypeError.
                         let Some(src) = buffer_as_bytes_like(b)? else {
-                            return Err(crate::PyError::new(
-                                crate::PyErrorKind::TypeError,
-                                format!(
-                                    "can't concat {} to bytearray",
-                                    crate::type_methods::arg_type_name(b)
-                                ),
-                            ));
+                            return Ok(pyre_object::w_not_implemented());
                         };
                         let b_data = pyre_object::bytesobject::bytes_like_data(src).to_vec();
                         let mut result = a_data.to_vec();
@@ -14440,13 +15669,14 @@ fn init_bytearray_type(ns: PyObjectRef) {
                     let other = args[1];
                     unsafe {
                         crate::builtins::bytearray_check_exports(ba)?;
-                        // descr_inplace_add: a non-buffer operand raises rather
-                        // than silently leaving the bytearray unchanged.
+                        // `descr_inplace_add` requires a bytes-like operand; a
+                        // non-buffer one raises rather than silently leaving the
+                        // bytearray unchanged.
                         let Some(src) = buffer_as_bytes_like(other)? else {
                             return Err(crate::PyError::new(
                                 crate::PyErrorKind::TypeError,
                                 format!(
-                                    "can't concat {} to bytearray",
+                                    "a bytes-like object is required, not '{}'",
                                     crate::type_methods::arg_type_name(other)
                                 ),
                             ));
@@ -14864,7 +16094,93 @@ fn init_bytearray_type(ns: PyObjectRef) {
 // pyre splits the shared methods through `init_setlike_common` so the
 // frozenset typedef can omit the in-place mutators.
 
+/// `setobject.py _convert_set_to_frozenset` — a set is unhashable, but
+/// it stands in for the frozenset holding the same elements when it is used
+/// to look one up. Returns `None` for anything that is not a set, leaving the
+/// caller to re-raise. Upstream hands the strategy and storage to the new
+/// frozenset rather than copying; the elements hashed when they entered the
+/// set, so sharing them cannot raise.
+fn convert_set_to_frozenset(w_obj: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe {
+        if !pyre_object::is_set(w_obj) {
+            return None;
+        }
+        let w_frozenset = pyre_object::w_frozenset_new();
+        pyre_object::w_set_copy_storage_from(w_frozenset, w_obj);
+        Some(w_frozenset)
+    }
+}
+
+/// `setobject.py EmptySetStrategy.has_key` hashes the key ("make sure
+/// the key is hashable, issue 3824"), so membership hashes even against an
+/// empty set, unlike removal.
+///
+/// `setobject.py W_BaseSetObject.descr_contains`.
+pub(crate) fn set_descr_contains(
+    w_set: PyObjectRef,
+    w_other: PyObjectRef,
+) -> Result<bool, crate::PyError> {
+    match crate::type_methods::set_contains_checked(w_set, w_other) {
+        Ok(found) => Ok(found),
+        Err(e) => {
+            if e.kind == crate::PyErrorKind::TypeError {
+                if let Some(w_f) = convert_set_to_frozenset(w_other) {
+                    return crate::type_methods::set_contains_checked(w_set, w_f);
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
+/// `setobject.py EmptySetStrategy.remove` returns False without
+/// hashing, so an empty set removes nothing and never raises. Every other
+/// strategy hashes; pyre carries no strategies, so the length stands in for
+/// the strategy dispatch.
+fn set_remove(w_set: PyObjectRef, w_item: PyObjectRef) -> Result<bool, crate::PyError> {
+    if unsafe { pyre_object::w_set_len(w_set) } == 0 {
+        return Ok(false);
+    }
+    crate::type_methods::set_discard_checked(w_set, w_item)
+}
+
+/// Discard an element from a set, with automatic conversion to frozenset if
+/// the argument is a set. Returns true if successfully removed.
+///
+/// `setobject.py W_BaseSetObject._discard_from_set`. Upstream's trailing
+/// `switch_to_empty_strategy` has no counterpart here.
+fn set_discard_from_set(w_set: PyObjectRef, w_item: PyObjectRef) -> Result<bool, crate::PyError> {
+    match set_remove(w_set, w_item) {
+        Ok(deleted) => Ok(deleted),
+        Err(e) => {
+            if e.kind != crate::PyErrorKind::TypeError {
+                return Err(e);
+            }
+            match convert_set_to_frozenset(w_item) {
+                None => Err(e),
+                Some(w_f) => set_remove(w_set, w_f),
+            }
+        }
+    }
+}
+
 fn init_setlike_common(ns: PyObjectRef) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__sizeof__",
+            make_builtin_function_with_arity(
+                "__sizeof__",
+                |args| {
+                    let size = std::mem::size_of::<pyre_object::setobject::W_SetObject>()
+                        + unsafe { pyre_object::w_set_capacity(args[0]) }
+                            * std::mem::size_of::<pyre_object::dictmultiobject::ObjectKey>();
+                    Ok(pyre_object::w_int_new(size as i64))
+                },
+                1,
+            ),
+        )
+    };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -14877,9 +16193,9 @@ fn init_setlike_common(ns: PyObjectRef) {
                     }
                     unsafe {
                         if pyre_object::is_set_or_frozenset(args[0]) {
-                            return Ok(pyre_object::w_bool_from(pyre_object::w_set_contains(
+                            return Ok(pyre_object::w_bool_from(set_descr_contains(
                                 args[0], args[1],
-                            )));
+                            )?));
                         }
                     }
                     Ok(pyre_object::w_bool_from(false))
@@ -14930,22 +16246,10 @@ fn init_setlike_common(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
-            "__bool__",
+            "__repr__",
             make_builtin_function_with_arity(
-                "__bool__",
-                |args| {
-                    if args.is_empty() {
-                        return Ok(pyre_object::w_bool_from(false));
-                    }
-                    unsafe {
-                        if pyre_object::is_set_or_frozenset(args[0]) {
-                            return Ok(pyre_object::w_bool_from(
-                                pyre_object::w_set_len(args[0]) > 0,
-                            ));
-                        }
-                    }
-                    Ok(pyre_object::w_bool_from(true))
-                },
+                "__repr__",
+                |args| unsafe { Ok(pyre_object::w_str_new(&crate::display::py_repr(args[0])?)) },
                 1,
             ),
         )
@@ -14992,58 +16296,71 @@ fn init_setlike_common(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
+            "__rsub__",
+            make_builtin_function_with_arity("__rsub__", set_op_rsub, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__rand__",
+            make_builtin_function_with_arity("__rand__", set_op_and, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__ror__",
+            make_builtin_function_with_arity("__ror__", set_op_or, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__rxor__",
+            make_builtin_function_with_arity("__rxor__", set_op_xor, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__eq__",
-            make_builtin_function_with_arity("__eq__", set_method_eq, 2),
+            make_builtin_function_with_arity("__eq__", set_descr_eq, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__ne__",
+            make_builtin_function_with_arity("__ne__", set_descr_ne, 2),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__le__",
-            make_builtin_function_with_arity("__le__", set_method_le, 2),
+            make_builtin_function_with_arity("__le__", set_descr_le, 2),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__ge__",
-            make_builtin_function_with_arity("__ge__", set_method_ge, 2),
+            make_builtin_function_with_arity("__ge__", set_descr_ge, 2),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__lt__",
-            make_builtin_function_with_arity(
-                "__lt__",
-                |args| {
-                    if args.len() < 2 {
-                        return Ok(pyre_object::w_bool_from(false));
-                    }
-                    let le = unsafe { pyre_object::w_bool_get_value(set_method_le(args)?) };
-                    let eq = unsafe { pyre_object::w_bool_get_value(set_method_eq(args)?) };
-                    Ok(pyre_object::w_bool_from(le && !eq))
-                },
-                2,
-            ),
+            make_builtin_function_with_arity("__lt__", set_descr_lt, 2),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__gt__",
-            make_builtin_function_with_arity(
-                "__gt__",
-                |args| {
-                    if args.len() < 2 {
-                        return Ok(pyre_object::w_bool_from(false));
-                    }
-                    let ge = unsafe { pyre_object::w_bool_get_value(set_method_ge(args)?) };
-                    let eq = unsafe { pyre_object::w_bool_get_value(set_method_eq(args)?) };
-                    Ok(pyre_object::w_bool_from(ge && !eq))
-                },
-                2,
-            ),
+            make_builtin_function_with_arity("__gt__", set_descr_gt, 2),
         )
     };
     unsafe {
@@ -15102,12 +16419,18 @@ fn init_setlike_common(ns: PyObjectRef) {
                     if args.len() < 2 {
                         return Ok(pyre_object::w_bool_from(true));
                     }
-                    let other_items = crate::builtins::collect_iterable(args[1])?;
-                    unsafe {
-                        for item in &other_items {
-                            if pyre_object::w_set_contains(args[0], *item) {
-                                return Ok(pyre_object::w_bool_from(false));
-                            }
+                    // `setobject.py descr_isdisjoint` — a set operand is
+                    // compared through its storage.
+                    if unsafe { pyre_object::is_set_or_frozenset(args[1]) } {
+                        return Ok(pyre_object::w_bool_from(set_is_disjoint_from(
+                            args[0], args[1],
+                        )?));
+                    }
+                    // `:383-385` — any other iterable is walked and each key
+                    // hashed by the lookup, which raises on an unhashable one.
+                    for item in crate::builtins::collect_iterable(args[1])? {
+                        if crate::type_methods::set_contains_checked(args[0], item)? {
+                            return Ok(pyre_object::w_bool_from(false));
                         }
                     }
                     Ok(pyre_object::w_bool_from(true))
@@ -15120,19 +16443,23 @@ fn init_setlike_common(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "copy",
+            // `setobject.py descr_copy` — a shallow copy, taking the
+            // storage over rather than hashing the elements again.
             make_builtin_function_with_arity(
                 "copy",
                 |args| {
                     if args.is_empty() {
                         return Ok(pyre_object::w_set_new());
                     }
-                    let items = unsafe { pyre_object::w_set_items(args[0]) };
-                    unsafe {
-                        if pyre_object::is_frozenset(args[0]) {
-                            return Ok(pyre_object::w_frozenset_from_items(&items));
-                        }
+                    // setobject.py — only the exact built-in
+                    // frozenset is immutable enough for copy() to return
+                    // itself.  A subclass is copied into a base frozenset.
+                    if unsafe {
+                        pyre_object::is_exact_type(args[0], &pyre_object::setobject::FROZENSET_TYPE)
+                    } {
+                        return Ok(args[0]);
                     }
-                    Ok(pyre_object::w_set_from_items(&items))
+                    Ok(set_copy_real(args[0]))
                 },
                 1,
             ),
@@ -15171,6 +16498,14 @@ fn set_op_sub(
     }
     set_method_difference(args)
 }
+fn set_op_rsub(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if set_op_requires_set(args) {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    set_method_difference(&[args[1], args[0]])
+}
 fn set_op_xor(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
@@ -15180,69 +16515,194 @@ fn set_op_xor(
     set_method_symmetric_difference(args)
 }
 
-fn set_method_union(
+/// `setobject.py W_BaseSetObject.descr_union` — the result starts as a copy
+/// of self and every operand is merged in: a set operand through its storage
+/// (`:366`), any other iterable element by element (`:368-369`).
+pub(crate) fn set_method_union(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(pyre_object::w_set_new());
     }
-    let mut items = unsafe { pyre_object::w_set_items(args[0]) };
+    let result = set_copy_real(args[0]);
     for other in &args[1..] {
-        let other_items = crate::builtins::collect_iterable(*other)?;
-        for item in other_items {
-            items.push(item);
+        if unsafe { pyre_object::is_set_or_frozenset(*other) } {
+            unsafe { pyre_object::w_set_update_from_set(result, *other) }
+                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+        } else {
+            let other_items = crate::builtins::collect_iterable(*other)?;
+            crate::builtins::builtin_set_add_items(result, &other_items)?;
         }
     }
-    unsafe {
-        if pyre_object::is_frozenset(args[0]) {
-            return Ok(pyre_object::w_frozenset_from_items(&items));
-        }
-    }
-    Ok(pyre_object::w_set_from_items(&items))
+    Ok(result)
 }
 
-fn set_method_intersection(
+/// A clone of the set, keeping the digest each element was stored under.
+///
+/// `setobject.py W_BaseSetObject.copy_real` — "returns a clone of the
+/// set; frozensets storages are also copied". The clone keeps self's class, so
+/// `frozenset.union` stays a frozenset.
+fn set_copy_real(w_set: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
+    unsafe {
+        let result = if pyre_object::is_frozenset(w_set) {
+            pyre_object::w_frozenset_new()
+        } else {
+            pyre_object::w_set_new()
+        };
+        pyre_object::w_set_copy_storage_from(result, w_set);
+        result
+    }
+}
+
+/// Build a set holding `w_iterable`'s elements.
+///
+/// `setobject.py W_SetObject._newobj` / `setobject.py
+/// W_FrozensetObject._newobj` — both take ownership of the iterable's
+/// elements; only the resulting class differs, and the callers here read the
+/// elements back rather than the object, so one set-shaped result serves both.
+///
+/// Both build the set and hand the iterable to its `__init__`, so the set
+/// operand branch is the one `set_init_from_iterable` already carries.
+fn set_newobj(
+    w_iterable: pyre_object::PyObjectRef,
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    let w_set = pyre_object::w_set_new();
+    set_init_from_iterable(w_set, w_iterable)?;
+    Ok(w_set)
+}
+
+/// The operand as a set: itself when it already is one, otherwise a set built
+/// from it.
+///
+/// `setobject.py descr_difference_update`, `:499-503
+/// descr_symmetric_difference_update` and `:312-316 descr_intersection` all
+/// open with this branch — a set operand is handed to the storage-level
+/// operation as it stands, and only a non-set is walked and hashed into one.
+fn set_operand_as_set(
+    w_other: pyre_object::PyObjectRef,
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if unsafe { pyre_object::is_set_or_frozenset(w_other) } {
+        return Ok(w_other);
+    }
+    set_newobj(w_other)
+}
+
+/// Keep only the elements the two sides share.
+///
+/// `setobject.py AbstractUnwrappedSetStrategy.intersect_update` swaps the
+/// operands when self is the longer, and `setobject.py _intersect_base`
+/// swaps again on the way through, so either way the shorter side is walked
+/// and it is that side's objects the result holds. Equal elements can be
+/// distinct objects, so which side is walked is observable; a tie walks self.
+///
+/// `setobject.py _intersect_unwrapped` walks the storage as
+/// `(key, keyhash)` pairs and probes the other side with `contains_with_hash`,
+/// so the elements are neither re-hashed nor handed to a user `__hash__` again;
+/// only `eq_w` runs, from the bucket probes.
+fn set_intersect_update(
+    w_set: pyre_object::PyObjectRef,
+    w_other: pyre_object::PyObjectRef,
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    unsafe {
+        let (keep, probe) = if pyre_object::w_set_len(w_set) > pyre_object::w_set_len(w_other) {
+            (w_other, w_set)
+        } else {
+            (w_set, w_other)
+        };
+        let result = pyre_object::w_set_new();
+        // The three sets are old-gen allocations and keep their addresses across
+        // a collection, but their elements are young and move, so each key is
+        // re-read from the table the collector rewrites rather than carried
+        // across the `eq_w` a bucket probe can run.
+        let mut i = 0;
+        while let Some(key) = pyre_object::w_set_key_at(keep, i) {
+            if pyre_object::w_set_contains_key_checked(probe, key)
+                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?
+            {
+                let key = pyre_object::w_set_key_at(keep, i)
+                    .expect("probing a set cannot shorten the set being walked");
+                pyre_object::w_set_insert_key_checked(result, key)
+                    .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+            }
+            i += 1;
+        }
+        Ok(result)
+    }
+}
+
+/// `setobject.py W_BaseSetObject.descr_intersection` — the shortest
+/// operand seeds the result and the rest are intersected into it. Length is
+/// measured on the operands as given, before any is turned into a set, so an
+/// operand whose length cannot be taken (a generator) never seeds and a list
+/// with duplicates is measured longer than the set it becomes. That measure
+/// disagreeing with the set lengths is what leaves work for the swap in
+/// `set_intersect_update`.
+pub(crate) fn set_method_intersection(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(pyre_object::w_set_new());
     }
-    let self_items = unsafe { pyre_object::w_set_items(args[0]) };
-    let mut result: Vec<pyre_object::PyObjectRef> = self_items;
-    for other in &args[1..] {
-        let other_items = crate::builtins::collect_iterable(*other)?;
-        let probe = pyre_object::w_set_from_items(&other_items);
-        result.retain(|&item| unsafe { pyre_object::w_set_contains(probe, item) });
+    let mut others_w: Vec<pyre_object::PyObjectRef> = args.to_vec();
+
+    // find smallest set in others_w to reduce comparisons
+    let mut startindex = 0usize;
+    let mut startlength: i64 = -1;
+    for i in 0..others_w.len() {
+        let length = match crate::baseobjspace::len_w(others_w[i]) {
+            Ok(length) => length,
+            Err(e)
+                if e.kind == crate::PyErrorKind::TypeError
+                    || e.kind == crate::PyErrorKind::AttributeError =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        if startlength == -1 || length < startlength {
+            startindex = i;
+            startlength = length;
+        }
+    }
+    others_w.swap(0, startindex);
+
+    // `setobject.py` — the seed and every operand become sets, and a
+    // set operand is intersected as it stands rather than rebuilt.
+    let mut result = set_newobj(others_w[0])?;
+    for &w_other in &others_w[1..] {
+        let w_other_as_set = if unsafe { pyre_object::is_set_or_frozenset(w_other) } {
+            w_other
+        } else {
+            set_newobj(w_other)?
+        };
+        result = set_intersect_update(result, w_other_as_set)?;
     }
     unsafe {
         if pyre_object::is_frozenset(args[0]) {
-            return Ok(pyre_object::w_frozenset_from_items(&result));
+            let w_frozenset = pyre_object::w_frozenset_new();
+            pyre_object::w_set_copy_storage_from(w_frozenset, result);
+            return Ok(w_frozenset);
         }
     }
-    Ok(pyre_object::w_set_from_items(&result))
+    Ok(result)
 }
 
-fn set_method_difference(
+/// `setobject.py W_BaseSetObject.descr_difference` — a copy of self with
+/// `descr_difference_update` run over it.
+pub(crate) fn set_method_difference(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(pyre_object::w_set_new());
     }
-    let mut items = unsafe { pyre_object::w_set_items(args[0]) };
-    for other in &args[1..] {
-        let other_items = crate::builtins::collect_iterable(*other)?;
-        let probe = pyre_object::w_set_from_items(&other_items);
-        items.retain(|&item| !unsafe { pyre_object::w_set_contains(probe, item) });
-    }
-    unsafe {
-        if pyre_object::is_frozenset(args[0]) {
-            return Ok(pyre_object::w_frozenset_from_items(&items));
-        }
-    }
-    Ok(pyre_object::w_set_from_items(&items))
+    let result = set_copy_real(args[0]);
+    let mut update_args: Vec<pyre_object::PyObjectRef> = vec![result];
+    update_args.extend_from_slice(&args[1..]);
+    set_method_difference_update(&update_args)?;
+    Ok(result)
 }
 
-fn set_method_symmetric_difference(
+pub(crate) fn set_method_symmetric_difference(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     if args.len() < 2 {
@@ -15251,26 +16711,108 @@ fn set_method_symmetric_difference(
         }
         return Ok(args[0]);
     }
-    let self_items = unsafe { pyre_object::w_set_items(args[0]) };
-    let other_items = crate::builtins::collect_iterable(args[1])?;
-    let other_probe = pyre_object::w_set_from_items(&other_items);
-    let self_probe = pyre_object::w_set_from_items(&self_items);
-    let mut result: Vec<pyre_object::PyObjectRef> = self_items
-        .iter()
-        .copied()
-        .filter(|&item| !unsafe { pyre_object::w_set_contains(other_probe, item) })
-        .collect();
-    for item in other_items {
-        if !unsafe { pyre_object::w_set_contains(self_probe, item) } {
-            result.push(item);
-        }
-    }
+    // `setobject.py symmetric_difference` wraps the computed storage
+    // in a set of self's class.
+    let w_other_as_set = set_operand_as_set(args[1])?;
+    let w_new = set_symmetric_difference_storage(args[0], w_other_as_set)?;
     unsafe {
         if pyre_object::is_frozenset(args[0]) {
-            return Ok(pyre_object::w_frozenset_from_items(&result));
+            let w_frozenset = pyre_object::w_frozenset_new();
+            pyre_object::w_set_copy_storage_from(w_frozenset, w_new);
+            return Ok(w_frozenset);
         }
     }
-    Ok(pyre_object::w_set_from_items(&result))
+    Ok(w_new)
+}
+
+/// Set rich comparisons accept only another set/frozenset.  The named
+/// `issubset`/`issuperset` methods below deliberately have a different shape:
+/// they materialize any iterable.  PyPy keeps these as distinct descr_* entry
+/// points (`setobject.py`), so do not route the operator slots through
+/// `set_method_le`/`set_method_ge`.
+fn set_descr_eq(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 || !unsafe { pyre_object::is_set_or_frozenset(args[1]) } {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    set_method_eq(args)
+}
+
+fn set_descr_ne(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    let w_eq = set_descr_eq(args)?;
+    if unsafe { pyre_object::is_not_implemented(w_eq) } {
+        return Ok(w_eq);
+    }
+    Ok(pyre_object::w_bool_from(!unsafe {
+        pyre_object::w_bool_get_value(w_eq)
+    }))
+}
+
+fn set_descr_le(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 || !unsafe { pyre_object::is_set_or_frozenset(args[1]) } {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    unsafe {
+        if pyre_object::w_set_len(args[0]) > pyre_object::w_set_len(args[1]) {
+            return Ok(pyre_object::w_bool_from(false));
+        }
+    }
+    Ok(pyre_object::w_bool_from(set_is_subset_of(
+        args[0], args[1],
+    )?))
+}
+
+fn set_descr_lt(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 || !unsafe { pyre_object::is_set_or_frozenset(args[1]) } {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    unsafe {
+        if pyre_object::w_set_len(args[0]) >= pyre_object::w_set_len(args[1]) {
+            return Ok(pyre_object::w_bool_from(false));
+        }
+    }
+    Ok(pyre_object::w_bool_from(set_is_subset_of(
+        args[0], args[1],
+    )?))
+}
+
+fn set_descr_ge(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 || !unsafe { pyre_object::is_set_or_frozenset(args[1]) } {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    unsafe {
+        if pyre_object::w_set_len(args[0]) < pyre_object::w_set_len(args[1]) {
+            return Ok(pyre_object::w_bool_from(false));
+        }
+    }
+    Ok(pyre_object::w_bool_from(set_is_subset_of(
+        args[1], args[0],
+    )?))
+}
+
+fn set_descr_gt(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 || !unsafe { pyre_object::is_set_or_frozenset(args[1]) } {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    unsafe {
+        if pyre_object::w_set_len(args[0]) <= pyre_object::w_set_len(args[1]) {
+            return Ok(pyre_object::w_bool_from(false));
+        }
+    }
+    Ok(pyre_object::w_bool_from(set_is_subset_of(
+        args[1], args[0],
+    )?))
 }
 
 fn set_method_eq(
@@ -15286,13 +16828,61 @@ fn set_method_eq(
         if pyre_object::w_set_len(args[0]) != pyre_object::w_set_len(args[1]) {
             return Ok(pyre_object::w_bool_from(false));
         }
-        for item in pyre_object::w_set_items(args[0]) {
-            if !pyre_object::w_set_contains(args[1], item) {
-                return Ok(pyre_object::w_bool_from(false));
-            }
-        }
     }
-    Ok(pyre_object::w_bool_from(true))
+    Ok(pyre_object::w_bool_from(set_is_subset_of(
+        args[0], args[1],
+    )?))
+}
+
+/// Whether the two sets share no element. Both must be sets.
+///
+/// `setobject.py _isdisjoint_unwrapped` walks one storage as
+/// `(key, keyhash)` pairs and probes the other with `contains_with_hash`;
+/// `:1214-1215 isdisjoint` walks the shorter side.
+fn set_is_disjoint_from(
+    w_set: pyre_object::PyObjectRef,
+    w_other: pyre_object::PyObjectRef,
+) -> Result<bool, crate::PyError> {
+    unsafe {
+        let (walk, probe) = if pyre_object::w_set_len(w_set) > pyre_object::w_set_len(w_other) {
+            (w_other, w_set)
+        } else {
+            (w_set, w_other)
+        };
+        let mut i = 0;
+        while let Some(key) = pyre_object::w_set_key_at(walk, i) {
+            if pyre_object::w_set_contains_key_checked(probe, key)
+                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?
+            {
+                return Ok(false);
+            }
+            i += 1;
+        }
+        Ok(true)
+    }
+}
+
+/// Whether every element of `w_set` is in `w_other`. Both must be sets.
+///
+/// `setobject.py _issubset_unwrapped` walks self's storage as
+/// `(key, keyhash)` pairs and probes with `contains_with_hash`, so a comparison
+/// re-hashes nothing.
+pub(crate) fn set_is_subset_of(
+    w_set: pyre_object::PyObjectRef,
+    w_other: pyre_object::PyObjectRef,
+) -> Result<bool, crate::PyError> {
+    unsafe {
+        let mut i = 0;
+        while let Some(key) = pyre_object::w_set_key_at(w_set, i) {
+            if !pyre_object::w_set_contains_key_checked(w_other, key)
+                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?
+            {
+                return Ok(false);
+            }
+            i += 1;
+        }
+        Ok(true)
+    }
 }
 
 fn set_method_le(
@@ -15301,16 +16891,11 @@ fn set_method_le(
     if args.len() < 2 {
         return Ok(pyre_object::w_bool_from(true));
     }
-    let other_items = crate::builtins::collect_iterable(args[1])?;
-    let probe = pyre_object::w_set_from_items(&other_items);
-    unsafe {
-        for item in pyre_object::w_set_items(args[0]) {
-            if !pyre_object::w_set_contains(probe, item) {
-                return Ok(pyre_object::w_bool_from(false));
-            }
-        }
-    }
-    Ok(pyre_object::w_bool_from(true))
+    let w_other_as_set = set_operand_as_set(args[1])?;
+    Ok(pyre_object::w_bool_from(set_is_subset_of(
+        args[0],
+        w_other_as_set,
+    )?))
 }
 
 fn set_method_ge(
@@ -15319,18 +16904,177 @@ fn set_method_ge(
     if args.len() < 2 {
         return Ok(pyre_object::w_bool_from(true));
     }
-    let other_items = crate::builtins::collect_iterable(args[1])?;
-    unsafe {
-        for item in other_items {
-            if !pyre_object::w_set_contains(args[0], item) {
-                return Ok(pyre_object::w_bool_from(false));
-            }
+    // `setobject.py descr_issuperset` — the operand becomes a set and
+    // the subset test runs the other way round.
+    let w_other_as_set = set_operand_as_set(args[1])?;
+    Ok(pyre_object::w_bool_from(set_is_subset_of(
+        w_other_as_set,
+        args[0],
+    )?))
+}
+
+// `setobject.py` W_BaseSetObject mutating helpers — shared by the
+// `*_update` methods (which accept any iterable) and the in-place operator
+// slots (which pre-filter their operand to a set/frozenset).
+fn set_method_update(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Ok(pyre_object::w_none());
+    }
+    // `setobject.py _descr_update` — a set operand's storage merges in
+    // as it stands; only another iterable is walked and hashed element by
+    // element.
+    for other in &args[1..] {
+        if unsafe { pyre_object::is_set_or_frozenset(*other) } {
+            unsafe { pyre_object::w_set_update_from_set(args[0], *other) }
+                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+        } else {
+            let other_items = crate::builtins::collect_iterable(*other)?;
+            crate::builtins::builtin_set_add_items(args[0], &other_items)?;
         }
     }
-    Ok(pyre_object::w_bool_from(true))
+    Ok(pyre_object::w_none())
+}
+
+/// `setobject.py W_BaseSetObject.descr_difference_update` — a non-set
+/// operand is turned into a set first, so it is hashed and deduped before
+/// anything is removed and a later unhashable element leaves self untouched.
+/// A set operand is used as it stands (`:392-393`).
+fn set_method_difference_update(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Ok(pyre_object::w_none());
+    }
+    for other in &args[1..] {
+        let w_other_as_set = set_operand_as_set(*other)?;
+        unsafe { pyre_object::w_set_difference_update_from_set(args[0], w_other_as_set) }
+            .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+    }
+    Ok(pyre_object::w_none())
+}
+
+/// `setobject.py W_SetObject.descr_intersection_update` — the result of
+/// `descr_intersection` replaces self's storage wholesale, so self keeps the
+/// surviving objects of whichever operand seeded that result rather than its
+/// own.
+fn set_method_intersection_update(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Ok(pyre_object::w_none());
+    }
+    // Every other operand becomes a set, hashing its elements, so an
+    // unhashable one raises even when self is empty and there is nothing
+    // left to compare against.
+    let result = set_method_intersection(args)?;
+    // `setobject.py` — self takes the result's storage over as it is;
+    // the elements hashed on their way into it.
+    unsafe { pyre_object::w_set_copy_storage_from(args[0], result) };
+    Ok(pyre_object::w_none())
+}
+
+/// `setobject.py W_SetObject.descr_symmetric_difference_update` — a
+/// non-set operand is turned into a set first, so it is hashed and deduped
+/// before anything is toggled: a later unhashable element leaves self
+/// untouched, and a duplicate toggles once rather than twice.
+fn set_method_symmetric_difference_update(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.is_empty() || args.len() < 2 {
+        return Ok(pyre_object::w_none());
+    }
+    let w_other_as_set = set_operand_as_set(args[1])?;
+    let w_new = set_symmetric_difference_storage(args[0], w_other_as_set)?;
+    // `setobject.py` — the computed storage replaces self's.
+    unsafe { pyre_object::w_set_copy_storage_from(args[0], w_new) };
+    Ok(pyre_object::w_none())
+}
+
+/// The elements on exactly one of the two sides, as a set.
+///
+/// `setobject.py _symmetric_difference_unwrapped` — each side is
+/// walked as `(key, keyhash)` pairs and probed against the other with
+/// `contains_with_hash`, and what survives is placed under the digest it
+/// already carries. Membership is decided by the table, so an element only
+/// counts as present when it lands in the same bucket and compares equal; a
+/// bare `eq_w` scan over the elements would instead call two objects the same
+/// element on `__eq__` alone, and place them where their hashes never meet.
+fn set_symmetric_difference_storage(
+    w_set: pyre_object::PyObjectRef,
+    w_other: pyre_object::PyObjectRef,
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    unsafe {
+        let w_new = pyre_object::w_set_new();
+        for (walk, probe) in [(w_other, w_set), (w_set, w_other)] {
+            let mut i = 0;
+            while let Some(key) = pyre_object::w_set_key_at(walk, i) {
+                if !pyre_object::w_set_contains_key_checked(probe, key)
+                    .map_err(|_| crate::baseobjspace::take_pending_hash_error())?
+                {
+                    // The probe's `eq_w` can move the element, so the key is
+                    // re-read from the table the collector rewrites.
+                    let key = pyre_object::w_set_key_at(walk, i)
+                        .expect("probing a set cannot shorten the set being walked");
+                    pyre_object::w_set_insert_key_checked(w_new, key)
+                        .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+                }
+                i += 1;
+            }
+        }
+        Ok(w_new)
+    }
+}
+
+// `setobject.py` W_SetObject.descr_inplace_sub / _and / _or / _xor — a
+// non-set/-frozenset operand yields NotImplemented; otherwise mutate self
+// through the matching update helper and return self.
+fn set_op_inplace_sub(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if set_op_requires_set(args) {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    set_method_difference_update(args)?;
+    Ok(args[0])
+}
+fn set_op_inplace_and(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if set_op_requires_set(args) {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    set_method_intersection_update(args)?;
+    Ok(args[0])
+}
+fn set_op_inplace_or(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if set_op_requires_set(args) {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    set_method_update(args)?;
+    Ok(args[0])
+}
+fn set_op_inplace_xor(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if set_op_requires_set(args) {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    set_method_symmetric_difference_update(args)?;
+    Ok(args[0])
 }
 
 fn init_set_type(ns: PyObjectRef) {
+    unsafe {
+        pyre_object::w_dict_setitem_str(
+            ns,
+            "__doc__",
+            pyre_object::w_str_new("Build an unordered collection of unique elements."),
+        )
+    };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -15338,7 +17082,7 @@ fn init_set_type(ns: PyObjectRef) {
             make_new_descr(set_descr_new),
         )
     };
-    // setobject.py:528 __class_getitem__ = gateway.interp2app(
+    // setobject.py __class_getitem__ = gateway.interp2app(
     //     generic_alias_class_getitem, as_classmethod=True)
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -15358,6 +17102,15 @@ fn init_set_type(ns: PyObjectRef) {
         )
     };
     init_setlike_common(ns);
+    // setobject.py `__hash__ = None` — keep the slot visible to
+    // introspection as well as the unhashable fast path in builtin_hash.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__hash__",
+            pyre_object::w_none(),
+        )
+    };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -15369,15 +17122,18 @@ fn init_set_type(ns: PyObjectRef) {
                         // `try_hash_value` may run a user `__hash__` that
                         // allocates and triggers a moving minor collection;
                         // root `self` and the element across it, then reload.
+                        // Its digest keys the store, so the element is hashed
+                        // once.
                         unsafe {
                             let _roots = pyre_object::gc_roots::push_roots();
                             let sp = pyre_object::gc_roots::shadow_stack_len();
                             pyre_object::gc_roots::pin_root(args[0]);
                             pyre_object::gc_roots::pin_root(args[1]);
-                            crate::builtins::try_hash_value(args[1])?;
+                            let hash = crate::builtins::try_hash_value(args[1])?;
                             let set = pyre_object::gc_roots::shadow_stack_get(sp);
                             let item = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-                            pyre_object::w_set_add(set, item);
+                            pyre_object::w_set_add_hashed_checked(set, item, hash)
+                                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
                         }
                     }
                     Ok(pyre_object::w_none())
@@ -15394,7 +17150,7 @@ fn init_set_type(ns: PyObjectRef) {
                 "discard",
                 |args| {
                     if args.len() >= 2 {
-                        unsafe { pyre_object::w_set_discard(args[0], args[1]) };
+                        set_discard_from_set(args[0], args[1])?;
                     }
                     Ok(pyre_object::w_none())
                 },
@@ -15412,8 +17168,7 @@ fn init_set_type(ns: PyObjectRef) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("remove() requires an argument"));
                     }
-                    let removed = unsafe { pyre_object::w_set_discard(args[0], args[1]) };
-                    if !removed {
+                    if !set_discard_from_set(args[0], args[1])? {
                         return Err(crate::PyError::key_error_with_key(args[1]));
                     }
                     Ok(pyre_object::w_none())
@@ -15435,9 +17190,7 @@ fn init_set_type(ns: PyObjectRef) {
                             "pop from an empty set",
                         ));
                     }
-                    let items = unsafe { pyre_object::w_set_items(args[0]) };
-                    if let Some(&item) = items.first() {
-                        unsafe { pyre_object::w_set_discard(args[0], item) };
+                    if let Some(item) = unsafe { pyre_object::w_set_popitem(args[0]) } {
                         return Ok(item);
                     }
                     Err(crate::PyError::new(
@@ -15457,10 +17210,7 @@ fn init_set_type(ns: PyObjectRef) {
                 "clear",
                 |args| {
                     if !args.is_empty() {
-                        let items = unsafe { pyre_object::w_set_items(args[0]) };
-                        for item in items {
-                            unsafe { pyre_object::w_set_discard(args[0], item) };
-                        }
+                        unsafe { pyre_object::w_set_clear(args[0]) };
                     }
                     Ok(pyre_object::w_none())
                 },
@@ -15472,150 +17222,77 @@ fn init_set_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "update",
-            make_builtin_function("update", |args| {
-                if args.is_empty() {
-                    return Ok(pyre_object::w_none());
-                }
-                // `self` (`args[0]`) is rooted once for the whole method body:
-                // both `collect_iterable` (an arbitrary iterator) and
-                // `try_hash_value` (an arbitrary `__hash__`) are collection
-                // points that can move it, and every element of the current
-                // `other`'s collected items is rooted for its own loop for the
-                // same reason.
-                unsafe {
-                    let _roots = pyre_object::gc_roots::push_roots();
-                    let set_slot = pyre_object::gc_roots::shadow_stack_len();
-                    pyre_object::gc_roots::pin_root(args[0]);
-                    for other in &args[1..] {
-                        let other_items = crate::builtins::collect_iterable(*other)?;
-                        let _item_roots = pyre_object::gc_roots::push_roots();
-                        let item_base = pyre_object::gc_roots::shadow_stack_len();
-                        for item in other_items {
-                            pyre_object::gc_roots::pin_root(item);
-                        }
-                        let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
-                        for i in 0..item_len {
-                            let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                            crate::builtins::try_hash_value(item)?;
-                            let set = pyre_object::gc_roots::shadow_stack_get(set_slot);
-                            let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                            pyre_object::w_set_add(set, item);
-                        }
-                    }
-                }
-                Ok(pyre_object::w_none())
-            }),
+            make_builtin_function("update", set_method_update),
         )
     };
-    // `pypy/objspace/std/setobject.py:1188 W_BaseSetObject.descr_difference_update`
-    // / `:1217 descr_intersection_update` / `:1244 descr_symmetric_difference_update`
-    // — in-place set ops that mirror the non-update variants but
-    // mutate `self` instead of returning a fresh set.
+    // `setobject.py W_BaseSetObject.descr_difference_update` /
+    // `:1217 descr_intersection_update` / `:1244
+    // descr_symmetric_difference_update` — in-place set ops that mirror the
+    // non-update variants but mutate `self` instead of returning a fresh set.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "difference_update",
-            make_builtin_function("difference_update", |args| {
-                if args.is_empty() {
-                    return Ok(pyre_object::w_none());
-                }
-                for other in &args[1..] {
-                    let other_items = crate::builtins::collect_iterable(*other)?;
-                    for item in other_items {
-                        unsafe { pyre_object::w_set_discard(args[0], item) };
-                    }
-                }
-                Ok(pyre_object::w_none())
-            }),
+            make_builtin_function("difference_update", set_method_difference_update),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "intersection_update",
-            make_builtin_function("intersection_update", |args| {
-                if args.is_empty() {
-                    return Ok(pyre_object::w_none());
-                }
-                // Snapshot self's items, drop any not present in EVERY other.
-                let self_items = unsafe { pyre_object::w_set_items(args[0]) };
-                for item in self_items {
-                    let mut keep = true;
-                    for other in &args[1..] {
-                        let other_items = crate::builtins::collect_iterable(*other)?;
-                        let mut found = false;
-                        for &o in other_items.iter() {
-                            if crate::baseobjspace::eq_w(item, o)? {
-                                found = true;
-                                break;
-                            }
-                        }
-                        if !found {
-                            keep = false;
-                            break;
-                        }
-                    }
-                    if !keep {
-                        unsafe { pyre_object::w_set_discard(args[0], item) };
-                    }
-                }
-                Ok(pyre_object::w_none())
-            }),
+            make_builtin_function("intersection_update", set_method_intersection_update),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "symmetric_difference_update",
-            make_builtin_function("symmetric_difference_update", |args| {
-                if args.is_empty() || args.len() < 2 {
-                    return Ok(pyre_object::w_none());
-                }
-                let other_items = crate::builtins::collect_iterable(args[1])?;
-                // `self` (`args[0]`) is rooted once for the whole loop, and
-                // every collected `other` item is rooted for the loop's
-                // duration; `try_hash_value` (an arbitrary `__hash__`, on the
-                // add arm) is a collection point that can move either.
-                unsafe {
-                    let _roots = pyre_object::gc_roots::push_roots();
-                    let set_slot = pyre_object::gc_roots::shadow_stack_len();
-                    pyre_object::gc_roots::pin_root(args[0]);
-                    let item_base = set_slot + 1;
-                    for item in other_items {
-                        pyre_object::gc_roots::pin_root(item);
-                    }
-                    let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
-                    for i in 0..item_len {
-                        // toggle: remove if present, add otherwise
-                        let set = pyre_object::gc_roots::shadow_stack_get(set_slot);
-                        let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                        let self_items = pyre_object::w_set_items(set);
-                        let mut present = false;
-                        for &existing in self_items.iter() {
-                            if crate::baseobjspace::eq_w(item, existing)? {
-                                present = true;
-                                break;
-                            }
-                        }
-                        let set = pyre_object::gc_roots::shadow_stack_get(set_slot);
-                        let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                        if present {
-                            pyre_object::w_set_discard(set, item);
-                        } else {
-                            crate::builtins::try_hash_value(item)?;
-                            let set = pyre_object::gc_roots::shadow_stack_get(set_slot);
-                            let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                            pyre_object::w_set_add(set, item);
-                        }
-                    }
-                }
-                Ok(pyre_object::w_none())
-            }),
+            make_builtin_function(
+                "symmetric_difference_update",
+                set_method_symmetric_difference_update,
+            ),
+        )
+    };
+    // `setobject.py` __isub__/__iand__/__ior__/__ixor__ — mutable-set-only
+    // in-place operator slots.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__isub__",
+            make_builtin_function_with_arity("__isub__", set_op_inplace_sub, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__iand__",
+            make_builtin_function_with_arity("__iand__", set_op_inplace_and, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__ior__",
+            make_builtin_function_with_arity("__ior__", set_op_inplace_or, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__ixor__",
+            make_builtin_function_with_arity("__ixor__", set_op_inplace_xor, 2),
         )
     };
 }
 
 fn init_frozenset_type(ns: PyObjectRef) {
+    unsafe {
+        pyre_object::w_dict_setitem_str(
+            ns,
+            "__doc__",
+            pyre_object::w_str_new("Build an immutable unordered collection of unique elements."),
+        )
+    };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -15623,7 +17300,7 @@ fn init_frozenset_type(ns: PyObjectRef) {
             make_new_descr(frozenset_descr_new),
         )
     };
-    // setobject.py:661 __class_getitem__ = gateway.interp2app(
+    // setobject.py __class_getitem__ = gateway.interp2app(
     //     generic_alias_class_getitem, as_classmethod=True)
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -15636,6 +17313,930 @@ fn init_frozenset_type(ns: PyObjectRef) {
         )
     };
     init_setlike_common(ns);
+    // setobject.py descr_hash.  The Result-bearing hash helper walks the
+    // elements and propagates an element hash error; the storage itself is not
+    // rebuilt and no set element is re-inserted.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__hash__",
+            make_builtin_function_with_arity(
+                "__hash__",
+                |args| {
+                    Ok(pyre_object::w_int_new(crate::builtins::try_hash_value(
+                        args[0],
+                    )?))
+                },
+                1,
+            ),
+        )
+    };
+}
+
+fn set_iter_self(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(args[0])
+}
+
+fn set_iter_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::baseobjspace::next(args[0])
+}
+
+fn set_iter_length_hint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    unsafe {
+        let w_set = pyre_object::w_set_iter_get_set(args[0]);
+        let startlen = pyre_object::w_set_iter_get_startlen(args[0]);
+        if w_set.is_null() || startlen == usize::MAX || pyre_object::w_set_len(w_set) != startlen {
+            return Ok(pyre_object::w_int_new(0));
+        }
+        let index = pyre_object::w_set_iter_get_index(args[0]);
+        Ok(pyre_object::w_int_new(startlen.saturating_sub(index) as i64))
+    }
+}
+
+/// setobject.py `W_SetIterObject.descr_reduce`: materialize only
+/// the clone's remaining entries, then return `(iter, (list,))`.
+fn set_iter_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    unsafe {
+        let w_set = pyre_object::w_set_iter_get_set(args[0]);
+        let startlen = pyre_object::w_set_iter_get_startlen(args[0]);
+        if w_set.is_null() {
+            let state = pyre_object::w_tuple_new(vec![pyre_object::w_list_new(vec![])]);
+            return Ok(pyre_object::w_tuple_new(vec![
+                crate::baseobjspace::builtin_callable("iter"),
+                state,
+            ]));
+        }
+        if startlen == usize::MAX || pyre_object::w_set_len(w_set) != startlen {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::RuntimeError,
+                "Set changed size during iteration",
+            ));
+        }
+        let index = pyre_object::w_set_iter_get_index(args[0]);
+        let mut remaining = Vec::with_capacity(startlen.saturating_sub(index));
+        for i in index..startlen {
+            if let Some(key) = pyre_object::w_set_key_at(w_set, i) {
+                remaining.push(key.obj);
+            }
+        }
+        let state = pyre_object::w_tuple_new(vec![pyre_object::w_list_new(remaining)]);
+        Ok(pyre_object::w_tuple_new(vec![
+            crate::baseobjspace::builtin_callable("iter"),
+            state,
+        ]))
+    }
+}
+
+fn init_set_iterator_type(ns: PyObjectRef) {
+    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", pyre_object::w_none()) };
+    let entries = [
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", set_iter_self, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", set_iter_next, 1),
+        ),
+        (
+            "__length_hint__",
+            make_builtin_function_with_arity("__length_hint__", set_iter_length_hint, 1),
+        ),
+        (
+            "__reduce__",
+            make_builtin_function_with_arity("__reduce__", set_iter_reduce, 1),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+fn generator_frame(obj: PyObjectRef) -> *mut crate::pyframe::PyFrame {
+    unsafe { pyre_object::generator::w_generator_get_frame(obj) as *mut crate::pyframe::PyFrame }
+}
+
+fn generator_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
+    let name = generator_name_value(args[0], true)?;
+    Ok(w_str_new(&format!(
+        "<generator object {} at {:p}>",
+        unsafe { pyre_object::w_str_get_value(name) },
+        args[0]
+    )))
+}
+
+fn generator_name_value(obj: PyObjectRef, qualname: bool) -> crate::PyResult {
+    let override_value = unsafe {
+        if qualname {
+            pyre_object::generator::w_generator_get_qualname(obj)
+        } else {
+            pyre_object::generator::w_generator_get_name(obj)
+        }
+    };
+    if !override_value.is_null() {
+        return Ok(override_value);
+    }
+    let frame = generator_frame(obj);
+    if frame.is_null() {
+        return Ok(w_str_new("<generator>"));
+    }
+    let code = unsafe { (*frame).code() };
+    Ok(w_str_new(if qualname {
+        &code.qualname
+    } else {
+        &code.obj_name
+    }))
+}
+
+fn generator_getter(args: &[PyObjectRef], field: usize) -> crate::PyResult {
+    let obj = args.get(1).copied().unwrap_or(PY_NULL);
+    if !unsafe { pyre_object::generator::is_generator(obj) } {
+        return Err(crate::PyError::type_error("descriptor is for 'generator'"));
+    }
+    let frame = generator_frame(obj);
+    Ok(match field {
+        0 => w_bool_from(unsafe { pyre_object::generator::w_generator_is_running(obj) }),
+        1 => w_bool_from(unsafe {
+            pyre_object::generator::w_generator_is_started(obj)
+                && !pyre_object::generator::w_generator_is_running(obj)
+                && !pyre_object::generator::w_generator_is_exhausted(obj)
+        }),
+        2 => {
+            if frame.is_null() || unsafe { pyre_object::generator::w_generator_is_exhausted(obj) } {
+                w_none()
+            } else {
+                frame as PyObjectRef
+            }
+        }
+        3 => {
+            if frame.is_null() {
+                w_none()
+            } else {
+                unsafe { (*frame).pycode as PyObjectRef }
+            }
+        }
+        4 => {
+            if frame.is_null() {
+                w_none()
+            } else {
+                let delegated = unsafe { (*frame).w_yielding_from };
+                if delegated.is_null() {
+                    w_none()
+                } else {
+                    delegated
+                }
+            }
+        }
+        5 => return generator_name_value(obj, false),
+        _ => return generator_name_value(obj, true),
+    })
+}
+
+fn generator_get_running(args: &[PyObjectRef]) -> crate::PyResult {
+    generator_getter(args, 0)
+}
+fn generator_get_suspended(args: &[PyObjectRef]) -> crate::PyResult {
+    generator_getter(args, 1)
+}
+fn generator_get_frame(args: &[PyObjectRef]) -> crate::PyResult {
+    generator_getter(args, 2)
+}
+fn generator_get_code(args: &[PyObjectRef]) -> crate::PyResult {
+    generator_getter(args, 3)
+}
+fn generator_get_yieldfrom(args: &[PyObjectRef]) -> crate::PyResult {
+    generator_getter(args, 4)
+}
+fn generator_get_name(args: &[PyObjectRef]) -> crate::PyResult {
+    generator_getter(args, 5)
+}
+fn generator_get_qualname(args: &[PyObjectRef]) -> crate::PyResult {
+    generator_getter(args, 6)
+}
+
+fn generator_set_name_common(args: &[PyObjectRef], qualname: bool) -> crate::PyResult {
+    let obj = args[1];
+    let value = args[2];
+    if !unsafe { pyre_object::is_str(value) } {
+        return Err(crate::PyError::type_error(format!(
+            "__{}__ must be set to a string object",
+            if qualname { "qualname" } else { "name" }
+        )));
+    }
+    unsafe {
+        if qualname {
+            pyre_object::generator::w_generator_set_qualname(obj, value);
+        } else {
+            pyre_object::generator::w_generator_set_name(obj, value);
+        }
+    }
+    Ok(w_none())
+}
+
+fn generator_set_name(args: &[PyObjectRef]) -> crate::PyResult {
+    generator_set_name_common(args, false)
+}
+fn generator_set_qualname(args: &[PyObjectRef]) -> crate::PyResult {
+    generator_set_name_common(args, true)
+}
+
+fn generator_descr_sizeof(_args: &[PyObjectRef]) -> crate::PyResult {
+    Ok(w_int_new(
+        (pyre_object::generator::W_GENERATOR_OBJECT_SIZE
+            + std::mem::size_of::<crate::pyframe::PyFrame>()) as i64,
+    ))
+}
+
+/// PyPy `generator.py GeneratorIterator.typedef`, augmented only by the
+/// concrete slots Python 3.14 exposes on `types.GeneratorType`.
+fn init_generator_type(ns: PyObjectRef) {
+    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", w_none()) };
+    for (name, function, arity) in [
+        ("__repr__", generator_descr_repr as DunderFn, 1),
+        ("__next__", crate::baseobjspace::generator_next_method, 1),
+        ("send", crate::baseobjspace::generator_send_method, 2),
+        ("close", crate::baseobjspace::generator_close_method, 1),
+        ("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ("__del__", crate::baseobjspace::generator_close_method, 1),
+        ("__sizeof__", generator_descr_sizeof, 1),
+    ] {
+        unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(name, function, arity),
+            )
+        };
+    }
+    unsafe {
+        pyre_object::w_dict_setitem_str(
+            ns,
+            "throw",
+            make_builtin_function("throw", crate::baseobjspace::generator_throw_method),
+        );
+        pyre_object::w_dict_setitem_str(
+            ns,
+            "__class_getitem__",
+            pyre_object::function::w_classmethod_new(make_builtin_function(
+                "__class_getitem__",
+                crate::_pypy_generic_alias::generic_alias_class_getitem,
+            )),
+        );
+    }
+    for (name, getter) in [
+        ("gi_running", generator_get_running as DunderFn),
+        ("gi_suspended", generator_get_suspended as DunderFn),
+        ("gi_frame", generator_get_frame as DunderFn),
+        ("gi_code", generator_get_code as DunderFn),
+        ("gi_yieldfrom", generator_get_yieldfrom as DunderFn),
+    ] {
+        unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_getset_descriptor_named(
+                    make_builtin_function_with_arity(name, getter, 2),
+                    name,
+                ),
+            )
+        };
+    }
+    for (name, getter, setter) in [
+        (
+            "__name__",
+            generator_get_name as DunderFn,
+            generator_set_name as DunderFn,
+        ),
+        (
+            "__qualname__",
+            generator_get_qualname as DunderFn,
+            generator_set_qualname as DunderFn,
+        ),
+    ] {
+        let get = make_builtin_function_with_arity(name, getter, 2);
+        let set = make_builtin_function_with_arity(name, setter, 3);
+        unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_getset_property_full(get, set, PY_NULL, PY_NULL, Some(name)),
+            )
+        };
+    }
+}
+
+/// PyPy `iterobject.py W_AbstractSeqIterObject.typedef`.
+fn init_sequence_iterator_type(ns: PyObjectRef) {
+    // PyPy carries the `iter()` builtin documentation on the abstract typedef;
+    // Python 3.14's concrete `iterator` type exposes `__doc__ is None`.
+    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", pyre_object::w_none()) };
+    let entries = [
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__reduce__",
+            make_builtin_function_with_arity(
+                "__reduce__",
+                crate::baseobjspace::seq_iter_reduce_method,
+                1,
+            ),
+        ),
+        (
+            "__length_hint__",
+            make_builtin_function_with_arity(
+                "__length_hint__",
+                crate::baseobjspace::seq_iter_length_hint_method,
+                1,
+            ),
+        ),
+        (
+            "__setstate__",
+            make_builtin_function_with_arity(
+                "__setstate__",
+                crate::baseobjspace::seq_iter_setstate_method,
+                2,
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+/// PyPy `dictmultiobject.py W_DictMultiIter{Keys,Values,Items}Object.typedef`.
+fn init_dict_iterator_type(ns: PyObjectRef) {
+    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", pyre_object::w_none()) };
+    let entries = [
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__length_hint__",
+            make_builtin_function_with_arity(
+                "__length_hint__",
+                crate::baseobjspace::dict_view_iter_length_hint_method,
+                1,
+            ),
+        ),
+        (
+            "__reduce__",
+            make_builtin_function_with_arity(
+                "__reduce__",
+                crate::baseobjspace::dict_view_iter_reduce_method,
+                1,
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+fn range_iterator_length_hint(args: &[PyObjectRef]) -> crate::PyResult {
+    if unsafe { pyre_object::is_range_iter(args[0]) } {
+        crate::baseobjspace::range_iter_length_hint_method(args)
+    } else {
+        crate::baseobjspace::long_range_iter_length_hint_method(args)
+    }
+}
+
+fn range_iterator_reduce(args: &[PyObjectRef]) -> crate::PyResult {
+    if unsafe { pyre_object::is_range_iter(args[0]) } {
+        crate::baseobjspace::range_iter_reduce_method(args)
+    } else {
+        crate::baseobjspace::long_range_iter_reduce_method(args)
+    }
+}
+
+/// PyPy `functional.py W_AbstractRangeIterator.typedef`.
+fn init_range_iterator_type(ns: PyObjectRef) {
+    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", pyre_object::w_none()) };
+    let entries = [
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__length_hint__",
+            make_builtin_function_with_arity("__length_hint__", range_iterator_length_hint, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__reduce__",
+            make_builtin_function_with_arity("__reduce__", range_iterator_reduce, 1),
+        ),
+        (
+            "__setstate__",
+            make_builtin_function_with_arity(
+                "__setstate__",
+                crate::baseobjspace::range_iter_setstate_method,
+                2,
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+fn init_list_iterator_type(ns: PyObjectRef) {
+    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", pyre_object::w_none()) };
+    let entries = [
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__length_hint__",
+            make_builtin_function_with_arity(
+                "__length_hint__",
+                crate::baseobjspace::list_iter_length_hint_method,
+                1,
+            ),
+        ),
+        (
+            "__reduce__",
+            make_builtin_function_with_arity(
+                "__reduce__",
+                crate::baseobjspace::list_iter_reduce_method,
+                1,
+            ),
+        ),
+        (
+            "__setstate__",
+            make_builtin_function_with_arity(
+                "__setstate__",
+                crate::baseobjspace::list_iter_setstate_method,
+                2,
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+fn init_list_reverse_iterator_type(ns: PyObjectRef) {
+    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", pyre_object::w_none()) };
+    let entries = [
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__length_hint__",
+            make_builtin_function_with_arity(
+                "__length_hint__",
+                crate::baseobjspace::list_reverse_iter_length_hint_method,
+                1,
+            ),
+        ),
+        (
+            "__reduce__",
+            make_builtin_function_with_arity(
+                "__reduce__",
+                crate::baseobjspace::list_reverse_iter_reduce_method,
+                1,
+            ),
+        ),
+        (
+            "__setstate__",
+            make_builtin_function_with_arity(
+                "__setstate__",
+                crate::baseobjspace::list_reverse_iter_setstate_method,
+                2,
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+fn init_tuple_iterator_type(ns: PyObjectRef) {
+    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", pyre_object::w_none()) };
+    let entries = [
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__length_hint__",
+            make_builtin_function_with_arity(
+                "__length_hint__",
+                crate::baseobjspace::tuple_iter_length_hint_method,
+                1,
+            ),
+        ),
+        (
+            "__reduce__",
+            make_builtin_function_with_arity(
+                "__reduce__",
+                crate::baseobjspace::tuple_iter_reduce_method,
+                1,
+            ),
+        ),
+        (
+            "__setstate__",
+            make_builtin_function_with_arity(
+                "__setstate__",
+                crate::baseobjspace::tuple_iter_setstate_method,
+                2,
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+// ── itertools.count / itertools.repeat TypeDefs ─────────────────────
+// PyPy: pypy/module/itertools/interp_itertools.py W_Count.typedef and
+// W_Repeat.typedef.  Python 3.14 deliberately omits the old PyPy
+// `__reduce__` entries, so these two concrete types are not picklable.
+
+fn itertools_constructor_scope(
+    args: &[PyObjectRef],
+    fn_name: &str,
+    names: Vec<&'static str>,
+    defaults: &[PyObjectRef],
+) -> Result<(PyObjectRef, Vec<PyObjectRef>), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let cls = positional.first().copied().unwrap_or(PY_NULL);
+    let positional = positional.get(1..).unwrap_or(&[]);
+    let mut keyword_names_w = Vec::new();
+    let mut keywords_w = Vec::new();
+    if let Some(dict) = kwargs {
+        for (key, value) in unsafe { pyre_object::w_dict_str_entries_wtf8(dict) } {
+            if key.as_str() == Ok("__pyre_kw__") {
+                continue;
+            }
+            let w_name = pyre_object::w_str_from_wtf8(key);
+            pyre_object::gc_roots::pin_root(w_name);
+            keyword_names_w.push(w_name);
+            keywords_w.push(value);
+        }
+    }
+    let signature = crate::gateway::Signature::new(names, None, None, 0, 0);
+    let arguments = crate::argument::Arguments::with_kw(positional, &keyword_names_w, &keywords_w);
+    let mut scope_w = vec![PY_NULL; signature.scope_length()];
+    arguments.parse_into_scope(
+        PY_NULL,
+        &mut scope_w,
+        fn_name,
+        &signature,
+        Some(defaults),
+        PY_NULL,
+    )?;
+    Ok((cls, scope_w))
+}
+
+fn itertools_alloc_for_class(
+    cls: PyObjectRef,
+    exact_type: PyObjectRef,
+    obj: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    // typedef.py:511 `allocate_instance` first checks that the requested
+    // subtype shares the builtin's layout, then installs that class on the
+    // freshly allocated interpreter object.
+    check_user_subclass(exact_type, cls)?;
+    if !std::ptr::eq(cls, exact_type) {
+        unsafe { (*obj).w_class = cls };
+    }
+    Ok(obj)
+}
+
+fn count_check_number(obj: PyObjectRef) -> Result<(), crate::PyError> {
+    // interp_itertools.py `check_number`, with CPython 3.14's public error
+    // wording (`a number is required`) in place of PyPy 3.11's older text.
+    let has_int = unsafe { crate::baseobjspace::lookup(obj, "__int__") }.is_some();
+    let has_float = unsafe { crate::baseobjspace::lookup(obj, "__float__") }.is_some();
+    let complex_type = gettypefor(&pyre_object::COMPLEX_TYPE).unwrap_or(PY_NULL);
+    if !has_int
+        && !has_float
+        && (complex_type.is_null()
+            || !unsafe { crate::baseobjspace::isinstance_w(obj, complex_type) })
+    {
+        return Err(crate::PyError::type_error("a number is required"));
+    }
+    Ok(())
+}
+
+fn count_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // W_Count___new__(space, w_subtype, w_start=0, w_step=1).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_zero = w_int_new(0);
+    pyre_object::gc_roots::pin_root(w_zero);
+    let w_one = w_int_new(1);
+    pyre_object::gc_roots::pin_root(w_one);
+    let (cls, scope) =
+        itertools_constructor_scope(args, "count", vec!["start", "step"], &[w_zero, w_one])?;
+    let w_start = scope[0];
+    let w_step = scope[1];
+    count_check_number(w_start)?;
+    count_check_number(w_step)?;
+    let exact = gettypefor(&pyre_object::interp_itertools::COUNT_TYPE).unwrap_or(PY_NULL);
+    let obj = pyre_object::interp_itertools::w_count_new(w_start, w_step);
+    itertools_alloc_for_class(cls, exact, obj)
+}
+
+fn count_single_argument(w_step: PyObjectRef) -> Result<bool, crate::PyError> {
+    // W_Count.single_argument: isinstance(step, int) and step == 1.
+    let int_type = gettypefor(&pyre_object::INT_TYPE).unwrap_or(PY_NULL);
+    Ok(!int_type.is_null()
+        && unsafe { crate::baseobjspace::isinstance_w(w_step, int_type) }
+        && crate::baseobjspace::eq_w(w_step, w_int_new(1))?)
+}
+
+fn count_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args.first().copied().unwrap_or(PY_NULL);
+    let cls = r#type(obj).unwrap_or(PY_NULL);
+    let full_name = unsafe { pyre_object::w_type_get_name(cls) };
+    let cls_name = full_name.rsplit('.').next().unwrap_or(full_name);
+    let w_c = unsafe { pyre_object::interp_itertools::w_count_get_c(obj) };
+    let w_step = unsafe { pyre_object::interp_itertools::w_count_get_step(obj) };
+    let c = unsafe { crate::display::py_repr(w_c)? };
+    let text = if count_single_argument(w_step)? {
+        format!("{cls_name}({c})")
+    } else {
+        let step = unsafe { crate::display::py_repr(w_step)? };
+        format!("{cls_name}({c}, {step})")
+    };
+    Ok(w_str_new(&text))
+}
+
+fn init_count_type(ns: PyObjectRef) {
+    // Source order follows W_Count.typedef.  `__reduce__` is the one explicit
+    // Python-3.14 semantic delta (the concrete type no longer exposes it).
+    let entries = [
+        ("__new__", make_new_descr(count_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__repr__",
+            make_builtin_function_with_arity("__repr__", count_descr_repr, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new(
+                "Return a count object whose .__next__() method returns consecutive values.\n\nEquivalent to:\n    def count(firstval=0, step=1):\n        x = firstval\n        while 1:\n            yield x\n            x += step",
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+fn repeat_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // W_Repeat___new__(space, w_subtype, w_object, w_times=None).  A null
+    // default represents a missing `times`; an explicit Python None still
+    // passes through `space.index_w` and raises TypeError, as in 3.14.
+    let (cls, scope) =
+        itertools_constructor_scope(args, "repeat", vec!["object", "times"], &[PY_NULL])?;
+    let w_obj = scope[0];
+    let w_times = scope[1];
+    let times = if w_times.is_null() {
+        None
+    } else {
+        Some(crate::builtins::space_index_w(w_times)?)
+    };
+    let exact = gettypefor(&pyre_object::interp_itertools::REPEAT_TYPE).unwrap_or(PY_NULL);
+    let obj = pyre_object::interp_itertools::w_repeat_new(w_obj, times);
+    itertools_alloc_for_class(cls, exact, obj)
+}
+
+fn repeat_descr_length_hint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args.first().copied().unwrap_or(PY_NULL);
+    if unsafe { pyre_object::interp_itertools::w_repeat_get_counting(obj) } {
+        Ok(w_int_new(unsafe {
+            pyre_object::interp_itertools::w_repeat_get_count(obj)
+        }))
+    } else {
+        // PyPy 3.11 returned NotImplemented; Python 3.14 raises directly.
+        Err(crate::PyError::type_error("len() of unsized object"))
+    }
+}
+
+fn repeat_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args.first().copied().unwrap_or(PY_NULL);
+    let cls = r#type(obj).unwrap_or(PY_NULL);
+    let full_name = unsafe { pyre_object::w_type_get_name(cls) };
+    let cls_name = full_name.rsplit('.').next().unwrap_or(full_name);
+    let w_obj = unsafe { pyre_object::interp_itertools::w_repeat_get_obj(obj) };
+    let objrepr = unsafe { crate::display::py_repr(w_obj)? };
+    let text = if unsafe { pyre_object::interp_itertools::w_repeat_get_counting(obj) } {
+        let count = unsafe { pyre_object::interp_itertools::w_repeat_get_count(obj) };
+        format!("{cls_name}({objrepr}, {count})")
+    } else {
+        format!("{cls_name}({objrepr})")
+    };
+    Ok(w_str_new(&text))
+}
+
+fn init_repeat_type(ns: PyObjectRef) {
+    let entries = [
+        ("__new__", make_new_descr(repeat_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__length_hint__",
+            make_builtin_function_with_arity("__length_hint__", repeat_descr_length_hint, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__repr__",
+            make_builtin_function_with_arity("__repr__", repeat_descr_repr, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new(
+                "repeat(object [,times]) -> create an iterator which returns the object\nfor the specified number of times.  If not specified, returns the object\nendlessly.",
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+// ── itertools predicate iterator TypeDefs ────────────────────────────
+// PyPy W_TakeWhile / W_DropWhile / W_FilterFalse.  Python 3.14 keeps the
+// constructor/iterator shape but no longer exposes PyPy 3.11's pickle state
+// methods on these concrete types.
+
+fn itertools_twoarg_new(
+    args: &[PyObjectRef],
+    exact_type: PyObjectRef,
+    name: &str,
+) -> Result<(PyObjectRef, PyObjectRef, PyObjectRef), crate::PyError> {
+    // interp_itertools.py W_Twoarg__new__, kept in source order.
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let cls = positional.first().copied().unwrap_or(PY_NULL);
+    let args_w = positional.get(1..).unwrap_or(&[]);
+    let init_matches = std::ptr::eq(cls, exact_type)
+        || unsafe {
+            match (
+                crate::baseobjspace::lookup_in_type(cls, "__init__"),
+                crate::baseobjspace::lookup_in_type(exact_type, "__init__"),
+            ) {
+                (Some(sub), Some(base)) => std::ptr::eq(sub, base),
+                (None, None) => true,
+                _ => false,
+            }
+        };
+    if init_matches && crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(format!(
+            "{name}() takes no keyword arguments"
+        )));
+    }
+    if args_w.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "{name} expected 2 arguments, got {}",
+            args_w.len()
+        )));
+    }
+    Ok((cls, args_w[0], args_w[1]))
+}
+
+fn takewhile_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exact = gettypefor(&pyre_object::interp_itertools::TAKEWHILE_TYPE).unwrap_or(PY_NULL);
+    let (cls, predicate, iterable) = itertools_twoarg_new(args, exact, "takewhile")?;
+    let iterator = crate::baseobjspace::iter(iterable)?;
+    let obj = pyre_object::interp_itertools::w_takewhile_new(predicate, iterator);
+    itertools_alloc_for_class(cls, exact, obj)
+}
+
+fn dropwhile_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exact = gettypefor(&pyre_object::interp_itertools::DROPWHILE_TYPE).unwrap_or(PY_NULL);
+    let (cls, predicate, iterable) = itertools_twoarg_new(args, exact, "dropwhile")?;
+    let iterator = crate::baseobjspace::iter(iterable)?;
+    let obj = pyre_object::interp_itertools::w_dropwhile_new(predicate, iterator);
+    itertools_alloc_for_class(cls, exact, obj)
+}
+
+fn filterfalse_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exact = gettypefor(&pyre_object::interp_itertools::FILTERFALSE_TYPE).unwrap_or(PY_NULL);
+    let (cls, predicate, iterable) = itertools_twoarg_new(args, exact, "filterfalse")?;
+    let predicate = if unsafe { pyre_object::is_none(predicate) } {
+        PY_NULL
+    } else {
+        predicate
+    };
+    let iterator = crate::baseobjspace::iter(iterable)?;
+    let obj = pyre_object::interp_itertools::w_filterfalse_new(predicate, iterator);
+    itertools_alloc_for_class(cls, exact, obj)
+}
+
+fn init_takewhile_type(ns: PyObjectRef) {
+    // W_TakeWhile.typedef, in source order (minus the 3.14-removed pickle
+    // entries between __next__ and __doc__).
+    let entries = [
+        ("__new__", make_new_descr(takewhile_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new(
+                "Return successive entries from an iterable as long as the predicate evaluates to true for each entry.",
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+fn init_dropwhile_type(ns: PyObjectRef) {
+    // W_DropWhile.typedef, in source order.
+    let entries = [
+        ("__new__", make_new_descr(dropwhile_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new(
+                "Drop items from the iterable while predicate(item) is true.\n\nAfterwards, return every element until the iterable is exhausted.",
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+fn init_filterfalse_type(ns: PyObjectRef) {
+    // W_FilterFalse.typedef, in source order.
+    let entries = [
+        ("__new__", make_new_descr(filterfalse_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new(
+                "Return those items of iterable for which function(item) is false.\n\nIf function is None, return the items that are false.",
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
 }
 
 // ── __dict__ / __weakref__ descriptors ───────────────────────────────

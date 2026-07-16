@@ -50,46 +50,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             2,
         ),
     );
-    // count(start=0, step=1) — PyPy: W_Count___new__
-    //
-    //     def W_Count___new__(space, w_subtype, w_start=0, w_step=1):
-    //         return W_Count(space, w_start, w_step)
+    // PyPy exposes W_Count.typedef / W_Repeat.typedef themselves from the
+    // module, not function-shaped constructor shims.  Their `__new__` slots
+    // perform allocation and argument parsing.
     crate::module_ns_store(
         ns,
         "count",
-        crate::make_builtin_function("count", |args| {
-            let w_start = args.first().copied().unwrap_or(pyre_object::w_int_new(0));
-            let w_step = args.get(1).copied().unwrap_or(pyre_object::w_int_new(1));
-            Ok(pyre_object::interp_itertools::w_count_new(w_start, w_step))
-        }),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::COUNT_TYPE)
+            .expect("itertools.count TypeDef initialized"),
     );
-    // repeat(obj, times=None) — PyPy: W_Repeat___new__
-    //
-    //     def W_Repeat___new__(space, w_subtype, w_obj, w_times=None):
-    //         return W_Repeat(space, w_obj, w_times)
     crate::module_ns_store(
         ns,
         "repeat",
-        crate::make_builtin_function("repeat", |args| {
-            if args.is_empty() {
-                return Err(crate::PyError::type_error(
-                    "repeat() missing 'object' argument",
-                ));
-            }
-            let w_obj = args[0];
-            let w_times = if args.len() >= 2 {
-                unsafe {
-                    if pyre_object::is_int(args[1]) {
-                        Some(pyre_object::w_int_get_value(args[1]))
-                    } else {
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            Ok(pyre_object::interp_itertools::w_repeat_new(w_obj, w_times))
-        }),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::REPEAT_TYPE)
+            .expect("itertools.repeat TypeDef initialized"),
     );
     // islice(iterable, stop) | islice(iterable, start, stop[, step]) —
     // PyPy: W_ISlice.__init__.  Pulled lazily from the source iterator so
@@ -431,61 +405,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             2,
         ),
     );
-    // takewhile(predicate, iterable) — W_TakeWhile.__init__: store the
-    // predicate and `space.iter(w_iterable)`; elements are pulled lazily
-    // by W_TakeWhile.next_w (baseobjspace::next).
+    // PyPy exposes these W_Root subclasses through their TypeDefs.  Their
+    // `__new__` slots retain the two-argument/subclass-init gateway behavior.
     crate::module_ns_store(
         ns,
         "takewhile",
-        crate::make_builtin_function_with_arity(
-            "takewhile",
-            |args| {
-                let iterator = crate::baseobjspace::iter(args[1])?;
-                Ok(pyre_object::interp_itertools::w_takewhile_new(
-                    args[0], iterator,
-                ))
-            },
-            2,
-        ),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::TAKEWHILE_TYPE)
+            .expect("itertools.takewhile TypeDef initialized"),
     );
-    // dropwhile(predicate, iterable) — W_DropWhile.__init__: store the
-    // predicate and `space.iter(w_iterable)`; the drop phase runs lazily
-    // inside W_DropWhile.next_w (baseobjspace::next).
     crate::module_ns_store(
         ns,
         "dropwhile",
-        crate::make_builtin_function_with_arity(
-            "dropwhile",
-            |args| {
-                let iterator = crate::baseobjspace::iter(args[1])?;
-                Ok(pyre_object::interp_itertools::w_dropwhile_new(
-                    args[0], iterator,
-                ))
-            },
-            2,
-        ),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::DROPWHILE_TYPE)
+            .expect("itertools.dropwhile TypeDef initialized"),
     );
-    // filterfalse(predicate, iterable) — W_FilterFalse (W_Filter with
-    // reverse=True).  W_Filter.__init__ normalizes a None predicate to
-    // null; elements are filtered lazily in next_w (baseobjspace::next).
     crate::module_ns_store(
         ns,
         "filterfalse",
-        crate::make_builtin_function_with_arity(
-            "filterfalse",
-            |args| {
-                let predicate = if unsafe { pyre_object::is_none(args[0]) } {
-                    pyre_object::PY_NULL
-                } else {
-                    args[0]
-                };
-                let iterator = crate::baseobjspace::iter(args[1])?;
-                Ok(pyre_object::interp_itertools::w_filterfalse_new(
-                    predicate, iterator,
-                ))
-            },
-            2,
-        ),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::FILTERFALSE_TYPE)
+            .expect("itertools.filterfalse TypeDef initialized"),
     );
     // pairwise(iterable) — W_Pairwise__new__: store `space.iter(w_iterable)`;
     // pairs are produced lazily by W_Pairwise.next_w (baseobjspace::next).

@@ -82,6 +82,41 @@ fn bigint_lshift(a: BigInt, shift: usize) -> BigInt {
     a << shift
 }
 
+/// `longobject.py` left shift — the underlying big-int `<<` aborts the process
+/// when the shifted result cannot be allocated, so pre-flight a fallible
+/// reservation of the result's 64-bit limbs and raise a catchable MemoryError
+/// instead. The probe uses the same global allocator and a limb count that
+/// upper-bounds the shift's own allocation, so it fails exactly when the real
+/// shift would.
+fn checked_bigint_lshift(a: BigInt, shift: u64) -> Result<BigInt, PyError> {
+    // `rbigint.py:1323 lshift` returns self for a zero shift or a zero
+    // operand, so neither allocates however large the count is.
+    if shift == 0 || a.sign() == malachite_bigint::Sign::NoSign {
+        return Ok(a);
+    }
+    let result_bits = a.bits().saturating_add(shift);
+    let limbs = (result_bits / 64).saturating_add(2);
+    // The shift and the result's limb count must both fit a machine word
+    // (`usize` is 32-bit on wasm), so anything exceeding it is unallocatable.
+    let shift = match usize::try_from(shift) {
+        Ok(s) => s,
+        Err(_) => return Err(PyError::new(PyErrorKind::MemoryError, "")),
+    };
+    let reservable = match usize::try_from(limbs) {
+        Ok(n) => {
+            let mut probe: Vec<u64> = Vec::new();
+            let ok = probe.try_reserve_exact(n).is_ok();
+            drop(probe);
+            ok
+        }
+        Err(_) => false,
+    };
+    if !reservable {
+        return Err(PyError::new(PyErrorKind::MemoryError, ""));
+    }
+    Ok(bigint_lshift(a, shift))
+}
+
 #[majit_macros::elidable]
 fn bigint_rshift(a: BigInt, shift: usize) -> BigInt {
     a >> shift
@@ -722,6 +757,18 @@ unsafe fn reject_float_coercion_overflow(obj: PyObjectRef, v: f64) -> Result<(),
     Ok(())
 }
 
+/// A `float`/`complex` power coerces each `int` operand to a double before the
+/// power is computed, so an over-range `int` (base or exponent) raises
+/// OverflowError up front — even for `1.0 ** huge`, which never reaches the
+/// arithmetic. Only an over-range `int` raises; a genuine float infinity does
+/// not.
+pub(crate) unsafe fn reject_pow_operand_overflow(obj: PyObjectRef) -> Result<(), PyError> {
+    if is_long(obj) && !jit_bigint_to_f64_or_inf(w_long_get_value(obj)).is_finite() {
+        return Err(PyError::overflow_error("int too large to convert to float"));
+    }
+    Ok(())
+}
+
 /// True if both operands are numeric and at least one is float.
 
 unsafe fn is_float_pair(a: PyObjectRef, b: PyObjectRef) -> bool {
@@ -911,7 +958,7 @@ unsafe fn int_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // happily returns a wrapped result when the VALUE overflows (e.g.
     // `(10**18) << 4`). Detect real value overflow by computing the shift
     // in BigInt and demoting to i64 only when the result fits.
-    let big = bigint_lshift(BigInt::from(va), vb as usize);
+    let big = checked_bigint_lshift(BigInt::from(va), vb as u64)?;
     Ok(bigint_result(big))
 }
 
@@ -943,7 +990,7 @@ unsafe fn long_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // when the count exceeds i64::MAX → 0 if base is zero, OverflowError
     // otherwise.
     let shift = if jit_bigint_to_i64_fits(&vb) != 0 {
-        jit_bigint_to_i64_value(&vb) as usize
+        jit_bigint_to_i64_value(&vb) as u64
     } else {
         let va = as_bigint(a);
         if pyre_object::longobject::jit_bigint_sign_i64(&va) == 0 {
@@ -951,7 +998,7 @@ unsafe fn long_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         return Err(PyError::overflow_error("shift count too large"));
     };
-    Ok(bigint_result(bigint_lshift(as_bigint(a), shift)))
+    Ok(bigint_result(checked_bigint_lshift(as_bigint(a), shift)?))
 }
 
 unsafe fn long_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -1834,6 +1881,19 @@ unsafe fn needs_numeric_binop_dispatch(
     numeric_operand_overrides(a, fwd, rev) || numeric_operand_overrides(b, fwd, rev)
 }
 
+/// Set/frozenset analogue of the numeric override gate.  The storage fast
+/// paths below are valid for exact builtins, but a heap subclass must enter
+/// `_call_binop_impl` so its forward/reflected override and the reflected-
+/// subclass priority are observed before inherited set semantics.
+unsafe fn needs_set_binop_dispatch(a: PyObjectRef, b: PyObjectRef) -> bool {
+    let is_exact_setlike = |obj| {
+        pyre_object::is_exact_type(obj, &pyre_object::setobject::SET_TYPE)
+            || pyre_object::is_exact_type(obj, &pyre_object::setobject::FROZENSET_TYPE)
+    };
+    (pyre_object::is_set_or_frozenset(a) && !is_exact_setlike(a))
+        || (pyre_object::is_set_or_frozenset(b) && !is_exact_setlike(b))
+}
+
 /// Unary analog: true when numeric operand `a` overrides the unary
 /// special `dunder` relative to its builtin base.
 #[majit_macros::dont_look_inside]
@@ -1924,7 +1984,13 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             if let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")? {
                 return Ok(result);
             }
-            return bytes_concat(a, b);
+            // A non-buffer rhs is rejected with the generic operator TypeError
+            // (bytes `descr_add` returns NotImplemented), not "can't concat".
+            let a_name = crate::baseobjspace::object_functionstr_type_name(a);
+            let b_name = crate::baseobjspace::object_functionstr_type_name(b);
+            return Err(PyError::type_error(format!(
+                "unsupported operand type(s) for +: '{a_name}' and '{b_name}'"
+            )));
         }
         // Forward `__add__` + reflected `__radd__` per
         // `descroperation.py:_make_binop_impl` — try_dispatch_binary_special
@@ -1939,14 +2005,6 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
-        // Sequence concatenation slot (sq_concat) reports a distinct
-        // message when the left operand is a sequence — `unicode_concatenate`
-        // / `list_concat` / `tuple_concat`.
-        if is_str(a) || is_list(a) || is_tuple(a) {
-            return Err(PyError::type_error(format!(
-                "can only concatenate {a_name} (not \"{b_name}\") to {a_name}"
-            )));
-        }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for +: '{}' and '{}'",
             a_name, b_name,
@@ -1973,6 +2031,12 @@ pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
+        let set_override = needs_set_binop_dispatch(a, b);
+        if set_override {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__sub__", "__rsub__")? {
+                return Ok(result);
+            }
+        }
         if needs_numeric_binop_dispatch(a, b, "__sub__", "__rsub__") {
             if let Some(result) = try_dispatch_binary_special(a, b, "__sub__", "__rsub__")? {
                 return Ok(result);
@@ -1993,18 +2057,11 @@ pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // set / frozenset difference — PyPy: setobject.py W_BaseSetObject.descr_sub.
         // descr_sub returns NotImplemented for a non-set rhs, so `-` requires
         // both operands to be sets (the `difference` method takes iterables).
-        if pyre_object::is_set_or_frozenset(a) && pyre_object::is_set_or_frozenset(b) {
-            let other_items = crate::builtins::collect_iterable(b)?;
-            let probe = pyre_object::w_set_from_items(&other_items);
-            let result: Vec<PyObjectRef> = pyre_object::w_set_items(a)
-                .into_iter()
-                .filter(|&item| !pyre_object::w_set_contains(probe, item))
-                .collect();
-            return Ok(if pyre_object::is_frozenset(a) {
-                pyre_object::w_frozenset_from_items(&result)
-            } else {
-                pyre_object::w_set_from_items(&result)
-            });
+        if !set_override
+            && pyre_object::is_set_or_frozenset(a)
+            && pyre_object::is_set_or_frozenset(b)
+        {
+            return crate::typedef::set_method_difference(&[a, b]);
         }
         if let Some(result) = try_dispatch_binary_special(a, b, "__sub__", "__rsub__")? {
             return Ok(result);
@@ -2278,9 +2335,13 @@ pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             return long_pow(a, b);
         }
         if is_float_pair(a, b) {
+            reject_pow_operand_overflow(a)?;
+            reject_pow_operand_overflow(b)?;
             return float_pow_impl(as_float(a), as_float(b));
         }
         if is_complex_pair(a, b) {
+            reject_pow_operand_overflow(a)?;
+            reject_pow_operand_overflow(b)?;
             return complex_pow(a, b);
         }
         if let Some(result) = try_dispatch_binary_special(a, b, "__pow__", "__rpow__")? {
@@ -2442,9 +2503,13 @@ pub(crate) fn pow_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             return long_pow(a, b);
         }
         if is_float_pair(a, b) {
+            reject_pow_operand_overflow(a)?;
+            reject_pow_operand_overflow(b)?;
             return float_pow_impl(as_float(a), as_float(b));
         }
         if is_complex_pair(a, b) {
+            reject_pow_operand_overflow(a)?;
+            reject_pow_operand_overflow(b)?;
             return complex_pow(a, b);
         }
         Ok(w_not_implemented())
@@ -2814,10 +2879,12 @@ pub fn pow3(base: PyObjectRef, exp: PyObjectRef, modulus: PyObjectRef) -> PyResu
     if unsafe { is_none(modulus) } {
         return pow(base, exp);
     }
-    // descroperation.py:459 — three-arg power looks up only the forward
+    // descroperation.py:454-459 — three-arg power looks up only the forward
     // `__pow__` on the base (so a subclass override is honoured) and never
-    // the reflected `__rpow__`. The integer modular-power computation lives
-    // in `int.__pow__`, reached through this lookup.
+    // the reflected `__rpow__`. The `is_cpytype()` `pow3_bug_compat_cpyext`
+    // branch has no equivalent: with no cpyext type model every base takes
+    // the `else` branch. The integer modular-power computation lives in
+    // `int.__pow__`, reached through this lookup.
     if let Some(method) = unsafe { lookup_type_special(base, "__pow__") } {
         if let Some(result) = try_call_special(method, &[base, exp, modulus])? {
             return Ok(result);
@@ -2826,7 +2893,7 @@ pub fn pow3(base: PyObjectRef, exp: PyObjectRef, modulus: PyObjectRef) -> PyResu
     Err(ternary_builtin_type_error("pow()", base, exp, modulus))
 }
 
-/// `divmod(a, b)` dispatch — pypy/interpreter/baseobjspace.py:2159
+/// `divmod(a, b)` dispatch — pypy/interpreter/baseobjspace.py
 /// `('divmod', 'divmod', 2, ['__divmod__', '__rdivmod__'])`. Numeric
 /// fast path then forward + reverse special-method dispatch with the
 /// standard NotImplemented fallback.
@@ -3026,6 +3093,12 @@ pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
+        let set_override = needs_set_binop_dispatch(a, b);
+        if set_override {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__and__", "__rand__")? {
+                return Ok(result);
+            }
+        }
         if needs_numeric_binop_dispatch(a, b, "__and__", "__rand__") {
             if let Some(result) = try_dispatch_binary_special(a, b, "__and__", "__rand__")? {
                 return Ok(result);
@@ -3046,18 +3119,11 @@ pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // set / frozenset intersection — PyPy: setobject.py W_BaseSetObject.descr_and.
         // descr_and returns NotImplemented for a non-set rhs, so `&` requires
         // both operands to be sets (the `intersection` method takes iterables).
-        if pyre_object::is_set_or_frozenset(a) && pyre_object::is_set_or_frozenset(b) {
-            let other_items = crate::builtins::collect_iterable(b)?;
-            let probe = pyre_object::w_set_from_items(&other_items);
-            let result: Vec<PyObjectRef> = pyre_object::w_set_items(a)
-                .into_iter()
-                .filter(|&item| pyre_object::w_set_contains(probe, item))
-                .collect();
-            return Ok(if pyre_object::is_frozenset(a) {
-                pyre_object::w_frozenset_from_items(&result)
-            } else {
-                pyre_object::w_set_from_items(&result)
-            });
+        if !set_override
+            && pyre_object::is_set_or_frozenset(a)
+            && pyre_object::is_set_or_frozenset(b)
+        {
+            return crate::typedef::set_method_intersection(&[a, b]);
         }
         if let Some(result) = try_dispatch_binary_special(a, b, "__and__", "__rand__")? {
             return Ok(result);
@@ -3119,6 +3185,12 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
     };
     unsafe {
+        let set_override = needs_set_binop_dispatch(a, b);
+        if set_override {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__or__", "__ror__")? {
+                return Ok(result);
+            }
+        }
         if needs_numeric_binop_dispatch(a, b, "__or__", "__ror__") {
             if let Some(result) = try_dispatch_binary_special(a, b, "__or__", "__ror__")? {
                 return Ok(result);
@@ -3139,16 +3211,11 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // descr_or returns NotImplemented unless w_other is a set/frozenset,
         // so the binary `|` operator requires both operands to be sets
         // (the `union` method accepts arbitrary iterables, descr_or does not).
-        if pyre_object::is_set_or_frozenset(a) && pyre_object::is_set_or_frozenset(b) {
-            let mut items = pyre_object::w_set_items(a);
-            for item in crate::builtins::collect_iterable(b)? {
-                items.push(item);
-            }
-            return Ok(if pyre_object::is_frozenset(a) {
-                pyre_object::w_frozenset_from_items(&items)
-            } else {
-                pyre_object::w_set_from_items(&items)
-            });
+        if !set_override
+            && pyre_object::is_set_or_frozenset(a)
+            && pyre_object::is_set_or_frozenset(b)
+        {
+            return crate::typedef::set_method_union(&[a, b]);
         }
         // dict | dict — PEP 584 merge. PyPy: dictmultiobject.py descr_or.
         // Returns a new dict built from `a`'s items, then updated with `b`'s.
@@ -3193,6 +3260,12 @@ pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
+        let set_override = needs_set_binop_dispatch(a, b);
+        if set_override {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__xor__", "__rxor__")? {
+                return Ok(result);
+            }
+        }
         if needs_numeric_binop_dispatch(a, b, "__xor__", "__rxor__") {
             if let Some(result) = try_dispatch_binary_special(a, b, "__xor__", "__rxor__")? {
                 return Ok(result);
@@ -3212,21 +3285,11 @@ pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // intersection arm: walk both sides, keep elements present in
         // exactly one set.  Result type follows the left operand
         // (frozenset stays frozenset).
-        if pyre_object::is_set_or_frozenset(a) && pyre_object::is_set_or_frozenset(b) {
-            let mut out: Vec<PyObjectRef> = pyre_object::w_set_items(a)
-                .into_iter()
-                .filter(|&item| !pyre_object::w_set_contains(b, item))
-                .collect();
-            for item in pyre_object::w_set_items(b) {
-                if !pyre_object::w_set_contains(a, item) {
-                    out.push(item);
-                }
-            }
-            return Ok(if pyre_object::is_frozenset(a) {
-                pyre_object::w_frozenset_from_items(&out)
-            } else {
-                pyre_object::w_set_from_items(&out)
-            });
+        if !set_override
+            && pyre_object::is_set_or_frozenset(a)
+            && pyre_object::is_set_or_frozenset(b)
+        {
+            return crate::typedef::set_method_symmetric_difference(&[a, b]);
         }
         if let Some(result) = try_dispatch_binary_special(a, b, "__xor__", "__rxor__")? {
             return Ok(result);
@@ -3428,62 +3491,51 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 false
             };
             if view_set_like(a) && view_set_like(b) {
-                let a_items = if pyre_object::is_set_or_frozenset(a) {
-                    pyre_object::w_set_items(a)
-                } else {
-                    crate::type_methods::dict_view_snapshot(a)
+                // A set operand stands in for itself; only a view is walked and
+                // hashed into one. Rebuilding a set from its own elements would
+                // hand each of them back to a user `__hash__`.
+                let as_set = |obj: PyObjectRef| -> Result<PyObjectRef, PyError> {
+                    if pyre_object::is_set_or_frozenset(obj) {
+                        return Ok(obj);
+                    }
+                    crate::builtins::builtin_set_from_items(
+                        &crate::type_methods::dict_view_snapshot(obj),
+                    )
                 };
-                let b_items = if pyre_object::is_set_or_frozenset(b) {
-                    pyre_object::w_set_items(b)
-                } else {
-                    crate::type_methods::dict_view_snapshot(b)
-                };
-                let a_set = pyre_object::w_set_from_items(&a_items);
-                let b_set = pyre_object::w_set_from_items(&b_items);
+                let a_set = as_set(a)?;
+                let b_set = as_set(b)?;
                 let la = pyre_object::w_set_len(a_set);
                 let lb = pyre_object::w_set_len(b_set);
-                let a_subset_b = || {
-                    pyre_object::w_set_items(a_set)
-                        .into_iter()
-                        .all(|item| pyre_object::w_set_contains(b_set, item))
-                };
-                let b_subset_a = || {
-                    pyre_object::w_set_items(b_set)
-                        .into_iter()
-                        .all(|item| pyre_object::w_set_contains(a_set, item))
-                };
+                let a_subset_b = || crate::typedef::set_is_subset_of(a_set, b_set);
+                let b_subset_a = || crate::typedef::set_is_subset_of(b_set, a_set);
                 return Ok(w_bool_from(match op {
-                    CompareOp::Eq => la == lb && a_subset_b(),
-                    CompareOp::Ne => la != lb || !a_subset_b(),
-                    CompareOp::Le => la <= lb && a_subset_b(),
-                    CompareOp::Lt => la < lb && a_subset_b(),
-                    CompareOp::Ge => la >= lb && b_subset_a(),
-                    CompareOp::Gt => la > lb && b_subset_a(),
+                    CompareOp::Eq => la == lb && a_subset_b()?,
+                    CompareOp::Ne => la != lb || !a_subset_b()?,
+                    CompareOp::Le => la <= lb && a_subset_b()?,
+                    CompareOp::Lt => la < lb && a_subset_b()?,
+                    CompareOp::Ge => la >= lb && b_subset_a()?,
+                    CompareOp::Gt => la > lb && b_subset_a()?,
                 }));
             }
         }
         // set / frozenset comparison — subset / superset / equality.
         // PyPy: setobject.py W_BaseSetObject.descr_eq, descr_le, descr_lt
         if pyre_object::is_set_or_frozenset(a) && pyre_object::is_set_or_frozenset(b) {
+            // The subset walks probe with the digest each element was stored
+            // under (`setobject.py _issubset_unwrapped`), so a
+            // comparison hashes nothing and an `eq_w` raised from a bucket
+            // probe propagates instead of reading as "not a subset".
             let la = pyre_object::w_set_len(a);
             let lb = pyre_object::w_set_len(b);
-            let a_subset_b = || {
-                pyre_object::w_set_items(a)
-                    .into_iter()
-                    .all(|item| pyre_object::w_set_contains(b, item))
-            };
-            let b_subset_a = || {
-                pyre_object::w_set_items(b)
-                    .into_iter()
-                    .all(|item| pyre_object::w_set_contains(a, item))
-            };
+            let a_subset_b = || crate::typedef::set_is_subset_of(a, b);
+            let b_subset_a = || crate::typedef::set_is_subset_of(b, a);
             return Ok(w_bool_from(match op {
-                CompareOp::Eq => la == lb && a_subset_b(),
-                CompareOp::Ne => la != lb || !a_subset_b(),
-                CompareOp::Le => la <= lb && a_subset_b(),
-                CompareOp::Lt => la < lb && a_subset_b(),
-                CompareOp::Ge => la >= lb && b_subset_a(),
-                CompareOp::Gt => la > lb && b_subset_a(),
+                CompareOp::Eq => la == lb && a_subset_b()?,
+                CompareOp::Ne => la != lb || !a_subset_b()?,
+                CompareOp::Le => la <= lb && a_subset_b()?,
+                CompareOp::Lt => la < lb && a_subset_b()?,
+                CompareOp::Ge => la >= lb && b_subset_a()?,
+                CompareOp::Gt => la > lb && b_subset_a()?,
             }));
         }
         // List lexicographic comparison — same logic as tuple.
