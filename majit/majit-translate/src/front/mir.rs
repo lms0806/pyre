@@ -762,7 +762,12 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // production keeps going with a degraded SemanticProgram —
         // failing-loud on the single broken function rather than
         // erroring out at program-build time.
-        let graph = match lower_fun_decl_with_static_addrs(llbc, fd, static_addrs) {
+        let graph = match lower_fun_decl_with_static_addrs_and_attrs(
+            llbc,
+            fd,
+            static_addrs,
+            &struct_field_attrs,
+        ) {
             Ok(g) => g,
             Err(e) => {
                 skipped.push((name.clone(), e.to_string()));
@@ -1522,6 +1527,21 @@ pub fn lower_fun_decl_with_static_addrs(
     fd: &FunDecl,
     static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<FunctionGraph, LowerError> {
+    // Derive the struct field-layout map the boxing-alloc fusion reads
+    // (`fuse_boxing_alloc`).  The whole-program build lowers each function
+    // through the `_with_attrs` variant with a single precomputed map; this
+    // stand-alone entry (used by the reader / tests) derives it per call from
+    // the same source of truth so the fusion fires identically.
+    let (_, _, _, _, _, struct_field_attrs, _, _) = derive_program_metadata(llbc);
+    lower_fun_decl_with_static_addrs_and_attrs(llbc, fd, static_addrs, &struct_field_attrs)
+}
+
+fn lower_fun_decl_with_static_addrs_and_attrs(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    static_addrs: crate::HostStaticAddrs<'_>,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+) -> Result<FunctionGraph, LowerError> {
     let u = fd.unstructured().ok_or_else(|| {
         LowerError::Unsupported(format!(
             "{}: no Unstructured body (extracted with --ullbc?)",
@@ -1559,7 +1579,7 @@ pub fn lower_fun_decl_with_static_addrs(
             // matcher sees the switch, leaving the plain 0/1 pair.
             // Untouched graphs skip this and keep their single
             // end-of-lowering simplify, byte-identical.
-            simplify_lowered_graph(&mut lo.graph);
+            simplify_lowered_graph(&mut lo.graph, struct_field_attrs);
         }
         let mut tail_forwarded_returns = 0usize;
         if !lo.result_exc_call_results.is_empty() {
@@ -1739,6 +1759,32 @@ pub fn lower_fun_decl_with_static_addrs(
                 &lo.bigint_div_mod_floor_sites,
             );
         }
+        // The `(a..=b).contains(&x)` fold (`front::range_contains`) splices
+        // the residual `contains` method call in place with native
+        // `bitand(le(a, x), ge(b, x))` compares and removes the paired
+        // residual `RangeInclusive::new` call in its predecessor block.  It
+        // threads the `new` bounds into the `contains` block via
+        // `ensure_variable_at_block` (touching predecessor link args /
+        // inputargs only — no fresh blocks, no detached edges).  Removing the
+        // cross-block `new` producer leaves its threaded range value dangling
+        // on the predecessor link arg, so a rewrite MUST be followed by
+        // `prune_dead_phis` to reclaim the dead threaded range inputarg /
+        // link args (the compares never read them) — run it unconditionally
+        // on any rewrite rather than relying on the gated sweep in
+        // `simplify_lowered_graph`.  Fail-safe: a structural mismatch leaves
+        // BOTH residual calls (rtyper Skip) and touches nothing.
+        let range_contains_rewritten = if lo.range_contains_sites.is_empty() {
+            0
+        } else {
+            crate::front::range_contains::rewire_range_contains_call_sites(
+                &mut lo.graph,
+                &lo.range_inclusive_new_sites,
+                &lo.range_contains_sites,
+            )
+        };
+        if range_contains_rewritten > 0 {
+            crate::model::prune_dead_phis(&mut lo.graph);
+        }
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
             || next_rewritten > 0
@@ -1752,7 +1798,7 @@ pub fn lower_fun_decl_with_static_addrs(
         {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
-        simplify_lowered_graph(&mut lo.graph);
+        simplify_lowered_graph(&mut lo.graph, struct_field_attrs);
         // `format!`-chain expansion (#131): rewrite the recognized
         // `Argument::new_display`/`Arguments::new`/`alloc::fmt::format`
         // chain into native `str` + `ll_strconcat` ops so the graph-less
@@ -1788,7 +1834,7 @@ pub fn lower_fun_decl_with_static_addrs(
         // so untouched graphs keep their single end-of-lowering simplify.
         if collapse_panic_message_chains(&mut lo.graph) > 0 {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
-            simplify_lowered_graph(&mut lo.graph);
+            simplify_lowered_graph(&mut lo.graph, struct_field_attrs);
         }
         Ok(())
     };
@@ -1883,7 +1929,10 @@ pub fn lower_fun_decl_with_static_addrs(
 ///   the later backendopt sweep (`backendopt/all.py`); the model
 ///   layer has no later sweep, so it runs here, gated on an actual
 ///   removal to keep untouched graphs byte-identical.
-fn simplify_lowered_graph(graph: &mut FunctionGraph) {
+fn simplify_lowered_graph(
+    graph: &mut FunctionGraph,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+) {
     crate::model::eliminate_empty_blocks(graph);
     // `eliminate_empty_blocks` (simplify.py:33-78) rewires each incoming
     // link past an operation-less block and leaves the bypassed block
@@ -1906,7 +1955,19 @@ fn simplify_lowered_graph(graph: &mut FunctionGraph) {
     // to a native `NewWithVtable` + payload store before the dead-aggregate
     // sweep, which then reclaims the orphaned construct-on-stack ctor and
     // header field writes.
-    let mut dirty = crate::model::fuse_boxing_alloc(graph) > 0;
+    let mut dirty = crate::model::fuse_boxing_alloc(graph, struct_field_attrs) > 0;
+    // Reclaim boxing-cluster remnants (fused header ctors/casts, and a
+    // `vec![…]` box whose consumer became a `newlist`) using dependency-flow
+    // liveness (`transform_dead_op_vars`, simplify.py:425-479) with the
+    // malloc-removal exemption (`remove_simple_mallocs`, malloc.py).  Unlike
+    // `remove_dead_aggregates` below, it treats a `Link.arg` as a dependency
+    // of the target inputarg, not an unconditional read, so it reaches a box
+    // threaded across a block boundary.  Runs unconditionally: a `vec!`-only
+    // graph has `fused == 0`, and the pass is conservative (fresh-alloc
+    // producers + scoped store exemption) so it is a no-op on graphs with no
+    // such remnants.  A removal leaves dangling threaded inputargs / link args
+    // the `prune_dead_phis` below reclaims, so fold its count into `dirty`.
+    dirty |= crate::model::prune_dead_boxing_remnants(graph) > 0;
     // Drop dead aggregate constructions (malloc + field stores whose
     // result is never read) before the dead-op sweep — `prune_dead_phis`
     // keeps them because a `FieldWrite` is side-effecting, so its `base`
@@ -2115,6 +2176,15 @@ struct Lowering<'a> {
     /// `front::bigint_div_mod_floor` post-pass synthesizes (see
     /// [`crate::front::bigint_div_mod_floor::BigIntDivModFloorSite`]).
     bigint_div_mod_floor_sites: Vec<crate::front::bigint_div_mod_floor::BigIntDivModFloorSite>,
+    /// `RangeInclusive::new(lo, hi)` call sites recorded for the
+    /// `(a..=b).contains(&x)` → `bitand(le, ge)` fold the
+    /// `front::range_contains` post-pass synthesizes (see
+    /// [`crate::front::range_contains::RangeInclusiveNewSite`]).
+    range_inclusive_new_sites: Vec<crate::front::range_contains::RangeInclusiveNewSite>,
+    /// `RangeInclusive::contains(&self, &x)` call sites paired with the
+    /// `new` sites above by the `front::range_contains` post-pass (see
+    /// [`crate::front::range_contains::RangeContainsSite`]).
+    range_contains_sites: Vec<crate::front::range_contains::RangeContainsSite>,
     /// `Option::unwrap_or(opt, default)` call sites recorded for the
     /// discriminant value-select the `front::option_unwrap_or` post-pass
     /// synthesizes after the body lowering completes.  Each carries the
@@ -2298,6 +2368,8 @@ impl<'a> Lowering<'a> {
             bool_then_sites: Vec::new(),
             bigint_div_rem_sites: Vec::new(),
             bigint_div_mod_floor_sites: Vec::new(),
+            range_inclusive_new_sites: Vec::new(),
+            range_contains_sites: Vec::new(),
             unwrap_or_sites: Vec::new(),
             unwrap_sites: Vec::new(),
             map_or_sites: Vec::new(),
@@ -5504,7 +5576,9 @@ impl<'a> Lowering<'a> {
                 // the destination to the receiver instead of emitting an
                 // `as_ref` method call the rtyper cannot route on the
                 // classdef-less string receiver.
-                if args.len() == 1 && self.is_string_to_str_identity(&reg, &call.dest.ty) {
+                if args.len() == 1
+                    && self.is_string_to_str_identity(&reg, first_arg_ty.as_ref(), &call.dest.ty)
+                {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -5531,7 +5605,8 @@ impl<'a> Lowering<'a> {
                 // let a char read byte-compare) without lowering a real
                 // byte-slice view here first, or those indexed uses would
                 // silently gain character semantics.
-                if args.len() == 1 && self.is_string_as_bytes_identity(&reg) {
+                if args.len() == 1 && self.is_string_as_bytes_identity(&reg, first_arg_ty.as_ref())
+                {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -6026,15 +6101,35 @@ impl<'a> Lowering<'a> {
                 // `box_assume_init` primitive is unregistered, so the legacy
                 // CodeWriter residualizes it as a plain call (the same
                 // treatment `w_int_new` / `w_float_new` get).  An earlier
-                // recognizer rewrote this shape to `OpKind::NewList`, but those
-                // graphs fail the two-phase prepass on the dead cross-block
-                // `Box::new_uninit` and drop to the legacy CodeWriter, which
-                // cannot run `rtype_newlist` (the legacy annotator types the
-                // result `Ref`, not `ListRepr`).  The un-lowered `newlist`
-                // opname then reached the build-time `Assembler.insns` table
-                // with no blackhole handler.  Until the vec! graphs two-phase
-                // lift (`rtype_newlist` is implemented but dormant), the
-                // residual call is the correct lowering.
+                // recognizer rewrote this shape to `OpKind::NewList` (feeding
+                // the now-repr-generic `rtype_newlist`, which decomposes it to
+                // `ll_fixed_newlist` + `ll_fixed_setitem_fast` for a
+                // never-mutated vec! `FixedSizeListRepr`), but the front-end
+                // rewrite is UNCONDITIONAL: it plants `NewList` into a graph
+                // regardless of whether that graph two-phase lifts or drops to
+                // the legacy walker.  The legacy walker never runs
+                // `rtype_newlist`, so a dropped graph's raw `NewList` reaches
+                // the assembler's default arm and emits `newlist/r>r` — an
+                // opname with no blackhole handler — breaking the build via
+                // `default_bh_builder_unwired_set_matches_task_85_snapshot`.
+                //
+                // Slice-C measurement (7/18, base 0bdfdb85781, AFTER wall-1 +
+                // wall-2 both closed): re-adding the recognizer STILL trips the
+                // snapshot with `newlist/r>r`.  Wall-1 (cross-block Link box
+                // sweep, `prune_dead_boxing_remnants`) and wall-2 (set/frozenset
+                // constant-`ob_type` monomorphization → `fuse_boxing_alloc`)
+                // are landed and census-verified (head 274→267, `w_set_new`
+                // fully lifts, set `malloc_typed` fuses), but at least one
+                // vec!-bearing graph beyond `make_generic_alias` /
+                // `set_method_difference` still drops to the legacy walker
+                // carrying a raw `NewList`.  The census only surfaces a graph's
+                // FIRST wall, so the blocking graph is one whose earlier wall
+                // hides its vec!; it must be identified (census scan for every
+                // `box_assume_init_into_vec_unsafe` producer graph, then trace
+                // why it fails phaseA) and its wall closed before the recognizer
+                // is safe.  Until then the residual call is the correct
+                // lowering; `rtype_newlist`'s Fixed arm stays implemented and
+                // dormant.
                 // For a method/direct callee this equals the callee's
                 // `name_path()`; the scope predicate keys on the module
                 // path, which the built `CallTarget::Method` drops.
@@ -6067,6 +6162,17 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 if self.try_lower_num_from(
+                    mir_bb,
+                    &reg.kind,
+                    &segments,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                if self.try_lower_bigint_i64_try_from(
                     mir_bb,
                     &reg.kind,
                     &segments,
@@ -6645,6 +6751,65 @@ impl<'a> Lowering<'a> {
                     result_var: result_var.clone(),
                 },
             );
+        }
+        // Capture `RangeInclusive::new(lo, hi)` sites for the
+        // `(a..=b).contains(&x)` fold `front::range_contains` synthesizes.
+        // `new` is an inherent-impl associated function whose owner
+        // resolves to the opaque `RangeInclusive` ADT, so `lower_call`
+        // emits it as a 2-arg FunctionPath whose segments end
+        // `["range", "RangeInclusive", "new"]` (the owner-qualified
+        // spelling, like `bigint::BigInt::div_rem`).  The int element gate
+        // reads the destination `RangeInclusive`'s type argument
+        // (`call.dest.ty`), which is present even when the bounds are
+        // literal constants — the common `(0..=255)` shape passes
+        // `Operand::Const` bounds, so gating the operand types instead
+        // would miss them.  A float / narrower-width range never records a
+        // site and declines cleanly (both calls stay residual, census
+        // Skip).  The op is still emitted normally; the post-pass removes
+        // it once the paired `contains` folds.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && fmt_path_ends_with(segments, &["range", "RangeInclusive", "new"])
+            && tyref_is_int_range_inclusive(&call.dest.ty, self.llbc)
+        {
+            self.range_inclusive_new_sites.push(
+                crate::front::range_contains::RangeInclusiveNewSite {
+                    result_var: result_var.clone(),
+                    lo: args[0].clone(),
+                    hi: args[1].clone(),
+                },
+            );
+        }
+        // Capture `RangeInclusive::contains(&self, &x)` sites for the same
+        // fold.  Its `&RangeInclusive` receiver is an opaque foreign ADT
+        // whose impl-owner resolution routes it as a 2-arg FunctionPath
+        // (receiver `args[0]`, value `args[1]`) ending
+        // `["range", "RangeInclusive", "contains"]`, NOT a
+        // `CallTarget::Method`.  Gate on the receiver operand type
+        // (`first_arg_ty`) resolving to the opaque `RangeInclusive` ADT
+        // over an int element so a same-named `contains` on any other type
+        // — or a float range — is never recorded; the post-pass pairs each
+        // recorded site with its producing `new` and declines on any
+        // structural mismatch.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && fmt_path_ends_with(segments, &["range", "RangeInclusive", "contains"])
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|t| tyref_is_int_range_inclusive(t, self.llbc))
+        {
+            self.range_contains_sites
+                .push(crate::front::range_contains::RangeContainsSite {
+                    result_var: result_var.clone(),
+                });
         }
         // Capture `Option::unwrap_or(opt, default)` /
         // `Result::unwrap_or(res, default)` sites for the discriminant
@@ -7378,20 +7543,27 @@ impl<'a> Lowering<'a> {
     }
 
     /// `<String as AsRef<str>>::as_ref(&self) -> &str`,
-    /// `String::as_str(&self) -> &str`, and
+    /// `String::as_str(&self) -> &str`, `Wtf8::as_str(&self) -> &str`, and
     /// `<String as Borrow<str>>::borrow(&self) -> &str` — every one
     /// returns a `&str` view of the same string, an identity in the
-    /// lifted value model (Rust `String`/`&str`/`str` all lower to the
-    /// immutable rpy_string).  Without the intercept the call keeps a
-    /// `CallTarget::Method` `as_ref` getattr the rtyper cannot route on
-    /// the classdef-less string receiver (the `Cannot find attribute
-    /// "as_ref" on UnicodeString` wall).  Bind the destination to the
-    /// receiver instead, the same alias shape as the container deref
-    /// above.  Gated on the `str`-typed result so `String`'s sibling
-    /// `AsRef<[u8]>` / `AsRef<OsStr>` / `AsRef<Path>` impls — whose
-    /// `&[u8]`/etc. result is a *different* value-model family — keep
-    /// their ordinary lowering.
-    fn is_string_to_str_identity(&self, reg: &RegularCall, dest_ty: &TyRef) -> bool {
+    /// lifted value model (Rust `String`/`&str`/`str`/`Wtf8`/`Wtf8Buf`
+    /// all lower to the immutable rpy_string).  Without the intercept the
+    /// call keeps a `CallTarget::Method` `as_ref` getattr the rtyper
+    /// cannot route on the classdef-less string receiver (the `Cannot
+    /// find attribute "as_ref" on UnicodeString` wall).  Bind the
+    /// destination to the receiver instead, the same alias shape as the
+    /// container deref above.  Gated on the receiver being a string value
+    /// (`tyref_is_string_value`: `str`/`String`/`Wtf8`/`Wtf8Buf`), more
+    /// precise than the impl owner-leaf, plus the `str`-typed result so
+    /// `String`'s sibling `AsRef<[u8]>` / `AsRef<OsStr>` / `AsRef<Path>`
+    /// impls — whose `&[u8]`/etc. result is a *different* value-model
+    /// family — keep their ordinary lowering.
+    fn is_string_to_str_identity(
+        &self,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+    ) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
@@ -7405,7 +7577,7 @@ impl<'a> Lowering<'a> {
         if !matches!(leaf, "as_ref" | "as_str" | "borrow") {
             return false;
         }
-        if deref_impl_owner_leaf(self.llbc, fd).as_deref() != Some("String") {
+        if !first_arg_ty.is_some_and(|ty| tyref_is_string_value(ty, self.llbc)) {
             return false;
         }
         tyref_strips_to_str(dest_ty, self.llbc)
@@ -7418,9 +7590,19 @@ impl<'a> Lowering<'a> {
     /// identity on the receiver — unlike the `&[u8]` family the `as_str`
     /// gate above excludes via `tyref_strips_to_str`, the byte view of a
     /// *string* receiver re-meets that same string value.  Gated on the
-    /// impl owner being a string-family type so a non-string `as_bytes`
-    /// (a real byte-buffer producer) keeps its ordinary lowering.
-    fn is_string_as_bytes_identity(&self, reg: &RegularCall) -> bool {
+    /// receiver being a string value (`tyref_is_string_value`:
+    /// `str`/`String`/`Wtf8`/`Wtf8Buf`), more precise than the impl
+    /// owner-leaf, so a non-string `as_bytes` (a real byte-buffer
+    /// producer) fails the gate and keeps its ordinary lowering.
+    ///
+    /// Sound only for len / equality / iteration consumers.  A scalar
+    /// index (`as_bytes()[i]`) lowers to `getitem` on `StringRepr`, which
+    /// yields a `Char`, not the `u8` the Rust source expects; there is no
+    /// `(CharRepr, IntegerRepr)` eq/arithmetic pairtype, so such a use
+    /// fails rtype and residualizes rather than miscompiling.  Do NOT add
+    /// a `(CharRepr, IntegerRepr)` eq arm without lowering a real
+    /// byte-slice view first.
+    fn is_string_as_bytes_identity(&self, reg: &RegularCall, first_arg_ty: Option<&TyRef>) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
@@ -7430,10 +7612,7 @@ impl<'a> Lowering<'a> {
         if fd.item_meta.name_path().rsplit("::").next() != Some("as_bytes") {
             return false;
         }
-        matches!(
-            deref_impl_owner_leaf(self.llbc, fd).as_deref(),
-            Some("String" | "str" | "Wtf8" | "Wtf8Buf")
-        )
+        first_arg_ty.is_some_and(|ty| tyref_is_string_value(ty, self.llbc))
     }
 
     /// `<str as ToString>::to_string` / `<String as ToString>::to_string`
@@ -8700,6 +8879,159 @@ impl<'a> Lowering<'a> {
         // Success (`arg != MIN`) is the `Some` variant (discriminant 1).
         let payload_owner =
             Self::tagged_pair_payload_owner(td, &owner, 1).unwrap_or_else(|| owner.clone());
+        self.emit_tagged_pair_aggregate(
+            mir_bb,
+            &owner,
+            &payload_owner,
+            disc,
+            payload,
+            dest_local,
+            target,
+        )?;
+        Ok(true)
+    }
+
+    /// Lower the runtime-fallible `i64::try_from(&BigInt)`
+    /// (`malachite_bigint::bigint::<Impl>::try_from`, Opaque in the LLBC)
+    /// into its decomposed runtime-discriminant `Result` shape: a
+    /// `__discriminant` tag driven by `rbigint.fits_int()` and a
+    /// `__pos_0` payload holding the narrowed value.  Callers narrow a
+    /// list/str/bytes index or a byte value; overflow raises a Python
+    /// `IndexError`/`ValueError`, so the fallibility must survive the
+    /// lowering — a panic-residual swap would be a bit-exact regression.
+    ///
+    /// The arg type — not the module path — is the robust discriminator
+    /// (same philosophy as the BigInt binary-operator retarget), so this
+    /// guards on the opaque `BigInt` ADT rather than hard-matching
+    /// `malachite_bigint`.
+    ///
+    /// # Eager-payload panic hazard
+    /// [`Self::emit_tagged_pair_aggregate`] writes `__pos_0 = payload`
+    /// UNCONDITIONALLY in the call's block, before the consumer's
+    /// discriminant switch runs in a successor block.  A
+    /// [`jit_bigint_to_i64_value`] payload PANICS on overflow, so on a
+    /// non-fitting index (`lst[2**100]`) it would panic in the
+    /// walker/blackhole graph BEFORE the switch routes to the `Err` arm —
+    /// panic instead of `IndexError`.  `__pos_0` is read only on the
+    /// fits (`Ok`) path, so its value is dead on the `Err` path; the
+    /// payload op only needs to be TOTAL, not correct-on-overflow.  Hence
+    /// the non-trapping [`jit_bigint_to_i64_value_or_zero`] variant, which
+    /// returns 0 out of range.
+    ///
+    /// `Ok=0`/`Err=1`: `disc = (fits == 0)` is 0 when it fits (`Ok` tag)
+    /// and 1 otherwise (`Err` tag).
+    fn try_lower_bigint_i64_try_from(
+        &mut self,
+        mir_bb: usize,
+        kind: &CallKind,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let [.., impl_seg, leaf] = segments else {
+            return Ok(false);
+        };
+        if impl_seg.as_str() != "<Impl>" || leaf.as_str() != "try_from" {
+            return Ok(false);
+        }
+        let [arg] = args else {
+            return Ok(false);
+        };
+        // Guard on the ARG type (the opaque BigInt ADT), not the module
+        // path — the robust discriminator, so a same-named `try_from`
+        // impl on any other type is never redirected.  The narrowed
+        // operand is the receiver — `try_from(&BigInt)` — so read
+        // `inputs[0]`.
+        let CallKind::Fun(FunId::Regular { id }) = kind else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(false);
+        };
+        let Some(src) = fd.signature.inputs.first() else {
+            return Ok(false);
+        };
+        if !tyref_is_opaque_bigint(src, self.llbc) {
+            return Ok(false);
+        }
+        // Resolve the destination `Result` decl so the FieldWrite owner
+        // matches what `resolve_aggregate_adt` would record for a real
+        // `Ok(..)` construction site of the same type.
+        let Some(def_id) = self.tyref_adt_def_id(dest_ty) else {
+            return Ok(false);
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return Ok(false);
+        };
+        // Route the runtime-discriminant tagged-pair ctor to the SAME
+        // per-instantiation enum root a static `Ok(..)`/`Err(..)` mints,
+        // by suffixing the bare template name with the `<X>` the
+        // destination `Result<X, E>` local carries.
+        // Fail-closed: no splitting generic yields "" → bare owner.
+        let owner = format!(
+            "{}{}",
+            td.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+        );
+        let arg = arg.clone();
+        let bb_id = self.block_id[mir_bb];
+
+        let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
+            let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind,
+            });
+            res
+        };
+        // Non-trapping payload: read only on the fits (`Ok`) path, dead on
+        // the `Err` path, but eagerly evaluated in this block — must not
+        // panic on overflow (see the eager-payload hazard above).
+        let payload = push_op(
+            &mut self.graph,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![
+                        "pyre_object".to_string(),
+                        "longobject".to_string(),
+                        "jit_bigint_to_i64_value_or_zero".to_string(),
+                    ],
+                },
+                args: vec![arg.clone()],
+                result_ty: ValueType::Int,
+            },
+        );
+        let fits = push_op(
+            &mut self.graph,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![
+                        "pyre_object".to_string(),
+                        "longobject".to_string(),
+                        "jit_bigint_to_i64_fits".to_string(),
+                    ],
+                },
+                args: vec![arg],
+                result_ty: ValueType::Int,
+            },
+        );
+        let zero = push_op(&mut self.graph, OpKind::ConstInt(0));
+        // `disc = (fits == 0)`: 0 when it fits (`Ok` tag), 1 otherwise
+        // (`Err` tag) — matching the `Ok=0`/`Err=1` convention.
+        let disc = push_op(
+            &mut self.graph,
+            OpKind::BinOp {
+                op: "eq".to_string(),
+                lhs: fits,
+                rhs: zero,
+                result_ty: ValueType::Int,
+            },
+        );
+        // Success is the `Ok` variant (discriminant 0).
+        let payload_owner =
+            Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
         self.emit_tagged_pair_aggregate(
             mir_bb,
             &owner,
@@ -11232,6 +11564,53 @@ fn tyref_is_opaque_bigint(ty: &TyRef, llbc: &Llbc) -> bool {
             matches!(td.kind, TypeDeclKind::Opaque)
                 && td.item_meta.name_path().ends_with("bigint::BigInt")
         })
+}
+
+/// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to
+/// the foreign opaque `core::ops::range::RangeInclusive` ADT whose sole
+/// element type is a word-sized signed integer (`I64` / `Isize`).  Gates
+/// both the `new` and the `contains` recording of the
+/// `(a..=b).contains(&x)` fold so a same-named `contains` on any other
+/// type — and a float / narrower-width range — is never folded to
+/// integer compares.  The element type is read from the ADT reference's
+/// `generics.types[0]`, so it is available even when the `new` bounds are
+/// literal constants (whose operand types the front does not carry);
+/// float ranges decline cleanly (both calls stay residual, census Skip).
+fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return false;
+    };
+    let Some(adt) = node
+        .as_object()
+        .and_then(|m| m.get("Adt"))
+        .and_then(|v| v.as_object())
+    else {
+        return false;
+    };
+    let is_range = adt_node_def_id(node)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| {
+            matches!(td.kind, TypeDeclKind::Opaque)
+                && td.item_meta.name_path() == "core::ops::range::RangeInclusive"
+        });
+    if !is_range {
+        return false;
+    }
+    let elem = adt
+        .get("generics")
+        .and_then(|g| g.as_object())
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.as_array())
+        .and_then(|t| t.first())
+        .and_then(|n| strip_ty_wrappers(n, llbc));
+    matches!(
+        elem.and_then(|e| e.as_object())
+            .and_then(|m| m.get("Literal"))
+            .and_then(|l| l.as_object())
+            .and_then(|l| l.get("Int"))
+            .and_then(serde_json::Value::as_str),
+        Some("I64" | "Isize")
+    )
 }
 
 /// Classify a struct field [`TyRef`] into the RPython `lltype` register
@@ -16446,6 +16825,124 @@ mod tests {
         assert!(
             !residual,
             "FUNCTION_OBJECT_SIZE must not residualize as a FunctionPath call"
+        );
+    }
+
+    /// Anchor the `(a..=b).contains(&v)` fold to the real lowered IR of
+    /// its int census callers — `setitem_bytearray` / `byte_w`
+    /// (`(0..=255)`, constant bounds) and `c_int_w` (`(i32::MIN as
+    /// i64..=i32::MAX as i64)`, NON-constant bounds).  For each, both
+    /// residual range calls (`RangeInclusive::new` / `contains`) must be
+    /// gone and native `le` / `ge` / `bitand` compares present.  Ignored
+    /// by default (loads the real LLBC); run with `cargo test -p
+    /// majit-translate --lib range_contains_fold_real -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn range_contains_fold_real_int_census_sites() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+
+        for fname in ["setitem_bytearray", "byte_w", "c_int_w"] {
+            let graph = super::lower_function(&llbc, fname)
+                .unwrap_or_else(|e| panic!("lower {fname}: {e:?}"));
+
+            // Calls whose FunctionPath ends `["range", "RangeInclusive",
+            // "new"|"contains"]` (the owner-resolved spelling `lower_call`
+            // emits) and the native compare binops the fold produces.
+            let range_call = |leaf: &str| {
+                graph
+                    .blocks
+                    .iter()
+                    .flat_map(|b| b.operations.iter())
+                    .filter(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                                if super::fmt_path_ends_with(
+                                    segments,
+                                    &["range", "RangeInclusive", leaf],
+                                )
+                        )
+                    })
+                    .count()
+            };
+            let binops = |name: &str| {
+                graph
+                    .blocks
+                    .iter()
+                    .flat_map(|b| b.operations.iter())
+                    .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == name))
+                    .count()
+            };
+
+            assert_eq!(
+                range_call("new"),
+                0,
+                "{fname}: residual RangeInclusive::new removed"
+            );
+            assert_eq!(
+                range_call("contains"),
+                0,
+                "{fname}: residual contains removed"
+            );
+            assert!(
+                binops("le") >= 1,
+                "{fname}: at least one `le` compare emitted"
+            );
+            assert!(
+                binops("ge") >= 1,
+                "{fname}: at least one `ge` compare emitted"
+            );
+            assert!(
+                binops("bitand") >= 1,
+                "{fname}: at least one `bitand` emitted"
+            );
+        }
+    }
+
+    /// The float range in `complex_pow` (`descroperation.rs:1459`,
+    /// `(-100.0..=100.0)`) is out of the int-only fold's scope: the
+    /// element gate rejects the `F64` type, so BOTH residual range calls
+    /// survive (the graph census-Skips as before — no regression, no
+    /// float→int miscompile).  Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn range_contains_fold_real_declines_float_range() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "complex_pow").expect("lower complex_pow");
+
+        let range_call = |leaf: &str| {
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                            if super::fmt_path_ends_with(
+                                segments,
+                                &["range", "RangeInclusive", leaf],
+                            )
+                    )
+                })
+                .count()
+        };
+        assert!(
+            range_call("contains") >= 1,
+            "float range contains stays residual (fold out of scope)"
         );
     }
 
