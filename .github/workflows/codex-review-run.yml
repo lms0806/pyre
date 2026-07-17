@@ -245,6 +245,27 @@ jobs:
           printf '%s' "${CODEX_AUTH_JSON}" > "$HOME/.codex/auth.json"
           chmod 600 "$HOME/.codex/auth.json"
 
+      - name: Enable Linux user namespaces for Bubblewrap
+        if: steps.pr.outputs.skip == 'false' && steps.auth.outputs.present == 'true' && steps.diff.outputs.empty == 'false'
+        run: |
+          set -euo pipefail
+
+          # Codex uses Bubblewrap to sandbox model-generated commands. On
+          # GitHub-hosted Ubuntu runners, user namespaces may be disabled by a
+          # sysctl or by Ubuntu 24.04+'s AppArmor restriction. The latter
+          # produces `loopback: Failed RTM_NEWADDR: Operation not permitted`
+          # before the first command can run. This is the same runner setup
+          # performed by openai/codex-action before it invokes Codex.
+          current_userns="$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"
+          if [ -n "$current_userns" ] && [ "$current_userns" != "1" ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+
+          current_apparmor="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)"
+          if [ -n "$current_apparmor" ] && [ "$current_apparmor" != "0" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
       - name: Run Codex review
         if: steps.pr.outputs.skip == 'false' && steps.auth.outputs.present == 'true' && steps.diff.outputs.empty == 'false'
         run: |
