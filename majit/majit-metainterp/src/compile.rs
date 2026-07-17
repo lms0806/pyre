@@ -69,15 +69,14 @@ pub fn make_jitcell_token(number: u64, jd_index: Option<usize>) -> Arc<JitCellTo
 }
 
 /// `compile.py:180-181` `wref = weakref.ref(original_jitcell_token);
-/// clt.loop_token_wref = wref` parity. Must be called *after* every
-/// `Arc::get_mut(&mut token)` mutation has settled, because creating
-/// the `Weak` increments the weak count and `Arc::get_mut` requires
-/// `weak_count == 0`. Practically this means: configure the token
-/// fields first (`configure_loop_token_for_driver`, `inputarg_types`
-/// etc.), then call this helper before the token is published into
-/// `compiled_loops` / `attach_procedure_with_redirect`.
+/// clt.loop_token_wref = wref` parity.  The token's late-written fields
+/// (`green_key`, `inputarg_types`, `compiled`, `compiled_loop_token`) are
+/// interior-mutable, so `configure_loop_token_for_driver` and the backend's
+/// `compile_loop` operate through `&JitCellToken`; call this once those
+/// writes have settled, before the token is published into `compiled_loops`
+/// / `attach_procedure_with_redirect`.
 pub fn wire_clt_loop_token_wref(token: &Arc<JitCellToken>) {
-    if let Some(clt) = token.compiled_loop_token.as_ref() {
+    if let Some(clt) = token.compiled_loop_token() {
         clt.set_loop_token_wref(Arc::downgrade(token));
     }
 }
@@ -2358,15 +2357,12 @@ impl DescrContainer for dyn Backend + '_ {
 ///
 /// # Wiring status
 ///
-/// The recursive `CALL_ASSEMBLER` path (`pyjitpl.rs::direct_assembler_call`)
-/// routes pending callees through `warmstate::get_assembler_token`
-/// (`warmstate.py:714-723`), which installs the synthesised cell with
-/// `tmp=true` (`set_procedure_token(token, true)`). Step 3 — dropping
-/// `register_pending_target` plus the cranelift/dynasm number-keyed pending
-/// placeholder registries — remains pending (Task #211): both backends
-/// resolve the callee `_ll_function_addr` only via the `u64` token-number
-/// registry, so re-rooting address resolution on the descr-carried
-/// `Arc<JitCellToken>` is a separate multi-session descr-identity cutover.
+/// Recursive `CALL_ASSEMBLER` paths route unfinished callees through
+/// `warmstate::get_assembler_token` (`warmstate.py:714-723`), which installs
+/// this synthesised cell with `tmp=true` (`set_procedure_token(token, true)`).
+/// Backend address resolution reads the descr-carried `Arc<JitCellToken>` and
+/// its `_ll_function_addr`; backend registries that remain are metadata /
+/// helper registries, not bodyless pending targets.
 ///
 /// # Parameters
 ///
@@ -2421,13 +2417,13 @@ pub fn compile_tmp_callback(
     //
     // `compile.py:168` `jitcell_token.outermost_jitdriver_sd = jitdriver_sd`
     // is set inside `make_jitcell_token`.
-    let mut jitcell_token = make_jitcell_token(token_number, jitdriver_sd.index);
-    {
-        let token = Arc::get_mut(&mut jitcell_token)
-            .expect("fresh tmp callback JitCellToken must be uniquely owned");
-        token.green_key = green_key;
-        token.virtualizable_arg_index = jitdriver_sd.virtualizable_arg_index();
-    }
+    let jitcell_token = make_jitcell_token(token_number, jitdriver_sd.index);
+    // `green_key` / `virtualizable_arg_index` are interior-mutable (`Cell`),
+    // so they are written through the shared `Arc` directly.
+    jitcell_token.green_key.set(green_key);
+    jitcell_token
+        .virtualizable_arg_index
+        .set(jitdriver_sd.virtualizable_arg_index());
     //
     // `compile.py:1110` `jl.tmp_callback(jitcell_token)` — JIT logger
     // marker.  TODO: `rpython/rlib/jit.py`'s `jl`
@@ -2576,12 +2572,7 @@ pub fn compile_tmp_callback(
     // encoding survives past this point); identity ends here.
     let backend_inputargs: Vec<InputArg> =
         inputargs.iter().map(|ia| ia.fresh_value_copy()).collect();
-    backend.compile_loop(
-        &backend_inputargs,
-        &operations,
-        Arc::get_mut(&mut jitcell_token)
-            .expect("tmp callback JitCellToken must stay uniquely owned until backend compile"),
-    )?;
+    backend.compile_loop(&backend_inputargs, &operations, &jitcell_token)?;
     // `compile.py:180-181` wire wref now that all `Arc::get_mut` writes
     // have settled.  `compile_tmp_callback` doesn't go through
     // `record_loop_or_bridge` (the tmp callback is a synthetic

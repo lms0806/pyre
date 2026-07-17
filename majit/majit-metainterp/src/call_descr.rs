@@ -129,7 +129,7 @@ impl CallDescr for MetaCallAssemblerDescr {
         Some(self.target_token.number)
     }
     fn call_virtualizable_index(&self) -> Option<usize> {
-        self.target_token.virtualizable_arg_index
+        self.target_token.virtualizable_arg_index()
     }
     fn get_extra_info(&self) -> &EffectInfo {
         static INFO: EffectInfo = EffectInfo::const_new(ExtraEffect::CanRaise, OopSpecIndex::None);
@@ -146,7 +146,7 @@ impl majit_ir::descr::LoopTokenDescr for MetaCallAssemblerDescr {
     }
 
     fn call_virtualizable_index(&self) -> Option<usize> {
-        self.target_token.virtualizable_arg_index
+        self.target_token.virtualizable_arg_index()
     }
 
     fn token_handle_any(&self) -> Option<&dyn std::any::Any> {
@@ -742,25 +742,22 @@ pub fn make_call_assembler_descr(
     })
 }
 
-/// Number-only factory for callers that have not yet been threaded an
-/// `Arc<JitCellToken>` (jitcode dispatch in `dispatch.rs`, test fixtures).
+/// Test-only number factory for fixtures that do not have an
+/// `Arc<JitCellToken>`.
 ///
 /// Synthesises a fresh stand-alone `Arc<JitCellToken>` with the requested
 /// `target_number` so the descr keeps the same shape as the identity-preserving
-/// path. Identity is **not** preserved — the keepalive walker recovers the
-/// real Arc via `jitcell_token_by_number(target_number)` for these descrs
-/// (`pyjitpl.rs:record_loop_or_bridge` Arc-fallback inside the
-/// CALL_ASSEMBLER branch). Sites transitioning to
-/// `make_call_assembler_descr` once the Arc is available upstream remove
-/// the lookup.
+/// path. Identity is not preserved, so production callers must use
+/// `make_call_assembler_descr`.
+#[cfg(test)]
 pub fn make_call_assembler_descr_by_number(
     target_number: u64,
     arg_types: &[Type],
     result_type: Type,
     virtualizable_arg_index: Option<usize>,
 ) -> DescrRef {
-    let mut tok = JitCellToken::new(target_number);
-    tok.virtualizable_arg_index = virtualizable_arg_index;
+    let tok = JitCellToken::new(target_number);
+    tok.virtualizable_arg_index.set(virtualizable_arg_index);
     make_call_assembler_descr(Arc::new(tok), arg_types, result_type)
 }
 
@@ -781,8 +778,8 @@ pub fn make_call_assembler_descr_with_vable(
     })
 }
 
-/// Number-only sibling of `make_call_assembler_descr_with_vable` for transitional
-/// callers (jitcode dispatch). See `make_call_assembler_descr_by_number`.
+/// Test-only number sibling of `make_call_assembler_descr_with_vable`.
+#[cfg(test)]
 pub fn make_call_assembler_descr_with_vable_by_number(
     target_number: u64,
     arg_types: &[Type],

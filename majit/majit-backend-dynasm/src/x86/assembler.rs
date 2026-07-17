@@ -16,7 +16,9 @@ use std::sync::Arc;
 use dynasmrt::x64::Assembler;
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 
-use majit_backend::{BackendError, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout};
+use majit_backend::{
+    BackendError, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout, JitCellToken,
+};
 use majit_ir::{FailDescr, InputArg, Op, OpCode, OpRc, OpRef, OpTypeIndex, TargetArgLoc, Type};
 
 use crate::arch::*;
@@ -68,6 +70,17 @@ enum ResolvedArg {
     Slot(i32),
     /// Immediate constant value.
     Const(i64),
+}
+
+#[derive(Clone, Copy)]
+struct CallAssemblerTargetAddr {
+    immediate: Option<usize>,
+}
+
+impl CallAssemblerTargetAddr {
+    fn is_available(self) -> bool {
+        self.immediate.is_some()
+    }
 }
 
 #[cfg(test)]
@@ -807,10 +820,6 @@ pub struct Assembler386<'a> {
     /// Leaked pointer holding the resolved entry address for self-recursive
     /// CALL_ASSEMBLER via the execute trampoline. Written after finalization.
     self_entry_addr_ptr: *mut usize,
-    /// assembler.py:320 descr._ll_function_addr parity:
-    /// Maps call_target_token → compiled code address for CALL_ASSEMBLER.
-    /// Populated by the runner before compilation, from registered loop targets.
-    call_assembler_targets: IndexMap<u64, usize>,
     /// opassembler.py:1177 _finish_gcmap.
     finish_gcmap: Option<*mut usize>,
     /// opassembler.py:1215 gcmap_for_finish.
@@ -1021,7 +1030,6 @@ impl<'a> Assembler386<'a> {
             classptr_to_subclass_range,
             self_entry_label: None,
             self_entry_addr_ptr: Box::into_raw(Box::new(0usize)),
-            call_assembler_targets: IndexMap::new(),
             finish_gcmap: None,
             gcmap_for_finish: {
                 let gcmap = allocate_gcmap(1, JITFRAME_FIXED_SIZE);
@@ -2585,16 +2593,32 @@ impl<'a> Assembler386<'a> {
         })
     }
 
-    /// assembler.py:320 descr._ll_function_addr parity: store
-    /// call_target_token → code_addr mappings for CALL_ASSEMBLER.
-    pub fn set_call_assembler_targets(&mut self, targets: IndexMap<u64, usize>) {
-        self.call_assembler_targets = targets;
-    }
-
     /// Bake the owning token's `invalidated` flag address so
     /// `GUARD_NOT_INVALIDATED` reads it live at runtime.
     pub(crate) fn set_invalidated_flag_addr(&mut self, addr: usize) {
         self.invalidated_flag_addr = addr;
+    }
+
+    fn resolve_call_assembler_target_addr(
+        &self,
+        descr: Option<&majit_ir::DescrRef>,
+    ) -> CallAssemblerTargetAddr {
+        if let Some(token) = descr
+            .and_then(|d| d.as_loop_token_descr())
+            .and_then(|ltd| ltd.token_handle_any())
+            .and_then(|any| any.downcast_ref::<Arc<JitCellToken>>())
+        {
+            let descr_addr = token.ll_function_addr();
+            if descr_addr != 0 {
+                return CallAssemblerTargetAddr {
+                    immediate: Some(descr_addr),
+                };
+            }
+            return CallAssemblerTargetAddr { immediate: None };
+        }
+
+        let _ = descr;
+        CallAssemblerTargetAddr { immediate: None }
     }
 
     /// llsupport/assembler.py:201 rebuild_faillocs_from_descr — reconstruct
@@ -7351,13 +7375,9 @@ impl<'a> Assembler386<'a> {
                 .expect("call_assembler missing rewritten jitframe arg");
             let vable_loc = arglocs.get(1).copied();
 
-            let target_addr: Option<usize> = __descr_arc_call_descr
-                .as_ref()
-                .and_then(|d| d.as_call_descr())
-                .and_then(|cd| cd.call_target_token())
-                .and_then(|token| self.call_assembler_targets.get(&token).copied())
-                .filter(|&addr| addr != 0);
-            let is_resolved = target_addr.is_some() || self.self_entry_label.is_some();
+            let target_addr =
+                self.resolve_call_assembler_target_addr(__descr_arc_call_descr.as_ref());
+            let is_resolved = target_addr.is_available() || self.self_entry_label.is_some();
             let result_type = op.opcode.result_type();
             let done_descr_ptr = self.done_with_this_frame_descr_ptr_for_type(result_type);
             let helper_addr = crate::call_assembler_helper_addr() as i64;
@@ -7401,7 +7421,7 @@ impl<'a> Assembler386<'a> {
             let pushed_gcmap = self.push_pending_call_gcmap();
             self.emit_load_to_rax(frame_loc); // rax = callee jf_ptr
             self.emit_abi_int_arg_from_reg(0, 0); // arg0 = jf (Windows: rcx = rax)
-            if let Some(addr) = target_addr {
+            if let Some(addr) = target_addr.immediate {
                 dynasm!(self.mc ; .arch x64 ; mov rax, QWORD addr as i64);
                 self.emit_abi_call_rax_aligned();
             } else {
@@ -7601,15 +7621,8 @@ impl<'a> Assembler386<'a> {
         // assembler.py:320 _call_assembler_emit_call(descr._ll_function_addr, ...)
         // Resolve target address from descr.call_target_token() or self_entry_label.
         let descr_arc = op.getdescr();
-        let target_addr: Option<usize> = descr_arc
-            .as_ref()
-            .and_then(|d| d.as_call_descr())
-            .and_then(|cd| cd.call_target_token())
-            .and_then(|token| self.call_assembler_targets.get(&token).copied());
-
-        // Exclude address 0 (pending token placeholder) to avoid calling null.
-        let target_addr = target_addr.filter(|&a| a != 0);
-        let is_resolved = target_addr.is_some() || self.self_entry_label.is_some();
+        let target_addr = self.resolve_call_assembler_target_addr(descr_arc.as_ref());
+        let is_resolved = target_addr.is_available() || self.self_entry_label.is_some();
 
         // assembler.py:324-336 call_assembler: select done_descr by op.type.
         let result_type = op.opcode.result_type();
@@ -7618,13 +7631,11 @@ impl<'a> Assembler386<'a> {
         let green_key = self.header_pc as i64;
 
         if !is_resolved {
-            // Pending/unresolved target: code not yet compiled.
-            // RPython parity: call_assembler_fast_path (compiler.rs:2430)
-            // detects null code_ptr and calls force_fn(inputs[0]) where
-            // inputs[0] = the callee's frame pointer (a PyFrame).
-            //
-            // RPython uses the first argument slot of the callee jitframe.
-            // Read it, free the heap jf, then call force_fn(frame_ptr).
+            // Defensive unresolved-target fallback. Production
+            // CALL_ASSEMBLER descrs carry a token with a real body; direct
+            // backend callers can still hand us an unstamped token.
+            // Read the first argument slot of the callee jitframe, free the
+            // heap jf, then call force_fn(frame_ptr).
             let force_addr = crate::call_assembler_force_fn_addr() as i64;
             if force_addr != 0 {
                 dynasm!(self.mc ; .arch x64
@@ -7653,7 +7664,7 @@ impl<'a> Assembler386<'a> {
             // entry.  The previous trampoline indirection re-read
             // MAJIT_LOG on every recursive call (Win32 env lookup is
             // slow); a direct call matches cranelift's dispatch.
-            if let Some(addr) = target_addr {
+            if let Some(addr) = target_addr.immediate {
                 dynasm!(self.mc ; .arch x64 ; mov rax, QWORD addr as i64);
                 self.emit_abi_call_rax_aligned();
             } else if self.self_entry_label.is_some() {

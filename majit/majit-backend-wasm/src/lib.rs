@@ -1367,6 +1367,16 @@ impl majit_backend::Backend for WasmBackend {
         "wasm"
     }
 
+    fn supports_tmp_callback_call_assembler(&self) -> bool {
+        // `general_int_call_assembler_target` admits CALL_ASSEMBLER only
+        // against a published compiled target without trampoline calls; a
+        // tmp-callback body reaches the portal runner through a host
+        // trampoline, so its target is never admissible. Resolution keeps
+        // the pending token; the self-recursive bootstrap publishes it and
+        // redirects on the real compile.
+        false
+    }
+
     fn bridge_decline_is_terminal(&self) -> bool {
         // Every `compile_bridge` `Unsupported` return is a deterministic
         // structural decline — a function of the (ops, source-loop) shape that
@@ -1467,13 +1477,13 @@ impl majit_backend::Backend for WasmBackend {
         &mut self,
         inputargs: &[InputArg],
         ops: &[OpRc],
-        token: &mut JitCellToken,
+        token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
         // `x86/assembler.py:514` parity — bump
         // `cpu.tracker.total_compiled_loops` at the same point PyPy
         // creates the `CompiledLoopToken`.
-        if let Some(clt) = token.compiled_loop_token.as_ref() {
-            majit_backend::record_compiled_loop_token(&self.cpu_tracker, clt);
+        if let Some(clt) = token.compiled_loop_token() {
+            majit_backend::record_compiled_loop_token(&self.cpu_tracker, &clt);
         }
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let ops: &[Op] = &ops_owned;
@@ -1755,10 +1765,10 @@ impl majit_backend::Backend for WasmBackend {
             ca_callers: std::cell::RefCell::new(Vec::new()),
         };
 
-        token.compiled = Some(Box::new(compiled));
+        token.set_compiled(Box::new(compiled));
         let compiled = token
             .compiled
-            .as_ref()
+            .get()
             .and_then(|compiled| compiled.downcast_ref::<CompiledWasmLoop>())
             .expect("newly compiled wasm loop is missing");
         let loop_finish_fi = compiled
@@ -1901,7 +1911,7 @@ impl majit_backend::Backend for WasmBackend {
         ) = {
             let source_loop = original_token
                 .compiled
-                .as_ref()
+                .get()
                 .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
                 .ok_or_else(|| {
                     BackendError::Unsupported(
@@ -2317,7 +2327,7 @@ impl majit_backend::Backend for WasmBackend {
         {
             let source_loop = original_token
                 .compiled
-                .as_ref()
+                .get()
                 .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
                 .expect("source loop disappeared between borrows");
             // Append the bridge's exit descrs to the source loop's flat
@@ -2413,7 +2423,7 @@ impl majit_backend::Backend for WasmBackend {
     ) -> Option<Vec<majit_backend::FailDescrLayout>> {
         let compiled = token
             .compiled
-            .as_ref()
+            .get()
             .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())?;
         let trace_id = compiled.trace_id;
         let descrs = compiled.fail_descrs.borrow();
@@ -2453,7 +2463,7 @@ impl majit_backend::Backend for WasmBackend {
     fn store_guard_hashes(&self, token: &JitCellToken, hashes: &[u64]) {
         let Some(compiled) = token
             .compiled
-            .as_ref()
+            .get()
             .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
         else {
             return;
@@ -2488,7 +2498,7 @@ impl majit_backend::Backend for WasmBackend {
     ) -> Option<Vec<majit_backend::FailDescrLayout>> {
         let compiled = original_token
             .compiled
-            .as_ref()
+            .get()
             .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())?;
         // The most recently chained bridge at this source guard (last range).
         let (start, count) = compiled
@@ -2544,7 +2554,7 @@ impl majit_backend::Backend for WasmBackend {
     ) {
         let Some(compiled) = token
             .compiled
-            .as_ref()
+            .get()
             .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
         else {
             return;
@@ -2576,7 +2586,7 @@ impl majit_backend::Backend for WasmBackend {
     fn execute_token(&self, token: &JitCellToken, args: &[Value]) -> DeadFrame {
         let compiled = token
             .compiled
-            .as_ref()
+            .get()
             .expect("no compiled code")
             .downcast_ref::<CompiledWasmLoop>()
             .expect("not CompiledWasmLoop");

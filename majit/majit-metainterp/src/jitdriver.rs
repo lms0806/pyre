@@ -2927,7 +2927,7 @@ impl<S: JitState> JitDriver<S> {
                     .meta
                     .warm_state_ref()
                     .get_compiled(green_key)
-                    .map(|compiled| compiled.inputarg_types.len())
+                    .map(|compiled| compiled.inputarg_types().len())
                     .unwrap_or(0);
                 eprintln!(
                     "[callee-rca][entry] green_key={green_key} target_pc={target_pc} \
@@ -3740,7 +3740,7 @@ impl<S: JitState> JitDriver<S> {
             .meta
             .warm_state_ref()
             .get_compiled(green_key)?
-            .inputarg_types
+            .inputarg_types()
             .len();
         if compiled_inputs <= live_values.len() {
             return Some(live_values);
@@ -4471,12 +4471,42 @@ impl<S: JitState> JitDriver<S> {
         self.meta.get_loop_token(green_key).map(|t| t.number)
     }
 
+    /// Get the owning token object for a compiled loop.
+    pub fn get_loop_token_arc(
+        &self,
+        green_key: u64,
+    ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
+        self.meta.get_loop_token_arc(green_key).cloned()
+    }
+
     /// Get the pre-allocated token number for the trace being recorded.
     ///
     /// Returns `Some(number)` if `green_key` matches the current trace's
     /// target, enabling self-recursive call_assembler emission.
     pub fn get_pending_token_number(&self, green_key: u64) -> Option<u64> {
         self.meta.get_pending_token_number(green_key)
+    }
+
+    /// Get the pre-allocated token object for the trace being recorded.
+    pub fn get_pending_token_arc(
+        &self,
+        green_key: u64,
+    ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
+        self.meta.get_pending_token_arc(green_key).cloned()
+    }
+
+    /// Resolve a portal CALL_ASSEMBLER target through an installed loop token
+    /// or an RPython tmp callback (`warmstate.py:714-723`,
+    /// `compile.py:1101-1150`). The pending token remains only a
+    /// trace-in-progress marker for inline decisions.
+    pub fn get_or_make_portal_assembler_token_arc(
+        &mut self,
+        green_key: u64,
+        greenboxes: &[Value],
+        red_arg_types: &[Type],
+    ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
+        self.meta
+            .get_or_make_portal_assembler_token_arc(green_key, greenboxes, red_arg_types)
     }
 
     /// Decide how to handle a function call during tracing.
@@ -4770,7 +4800,7 @@ impl<S: JitState> JitDriver<S> {
             majit_metainterp::mc_diag_bump(14); // sbt early: no owning jct
             return false;
         };
-        let green_key = jct.green_key;
+        let green_key = jct.green_key();
         let trace_id = descr_fd.trace_id();
         let fail_index = descr_fd.fail_index_per_trace();
         let Some(_loop_meta) = self.meta.get_compiled_meta(green_key).cloned() else {
