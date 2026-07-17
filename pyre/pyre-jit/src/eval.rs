@@ -2618,17 +2618,26 @@ fn install_pyre_object_hooks() {
 /// `gc_sync::is_initialized()` + `gc_sync::store_singleton()` ensures
 /// exactly one GC is created even under cargo test's parallel threads.
 fn build_gc_global() {
-    if majit_gc::gc_sync::is_initialized() {
-        return;
-    }
-    let gc = build_gc();
-    // Publish the eval-breaker word address before store_singleton flips the
-    // GC-initialized flag (Release). A concurrent initializer that observes the
-    // flag set (Acquire) early-returns above; ordering the publish first makes
-    // that observer also sees a non-zero address when recording the
-    // back-edge eval-breaker poll.
-    majit_ir::eval_breaker_word::publish_addr();
-    majit_gc::gc_sync::store_singleton(gc);
+    // `is_initialized()` is a plain check-then-act, so on a fresh process
+    // every thread that reaches here before the first `store_singleton`
+    // observes the flag unset and would each run `build_gc()`.  `build_gc`
+    // calls `freeze_types()` and the subclass-range writeback, which mutate
+    // the shared global `PyType` GC-tid table and `subclassrange_{min,max}`
+    // atomics; concurrent writebacks race a sibling thread reading those
+    // ranges.  A `Once` collapses the build to a single initializer.
+    static BUILT: std::sync::Once = std::sync::Once::new();
+    BUILT.call_once(|| {
+        if majit_gc::gc_sync::is_initialized() {
+            return;
+        }
+        let gc = build_gc();
+        // Publish the eval-breaker word address before store_singleton flips
+        // the GC-initialized flag (Release), so an observer that sees the flag
+        // set also reads a non-zero address when recording the back-edge
+        // eval-breaker poll.
+        majit_ir::eval_breaker_word::publish_addr();
+        majit_gc::gc_sync::store_singleton(gc);
+    });
 }
 
 /// Test-support: give the calling `gc_stress` worker a pristine GC heap by
@@ -3148,9 +3157,9 @@ pub struct PyPyJitDriver {
 
 impl PyPyJitDriver {
     /// interp_jit.py:85-87 — jit_merge_point inside dispatch loop.
-    /// API-parity stub: the merge point is handled inside
-    /// `eval_loop_jit`'s `jit_merge_point_hook` until the S3 cutover
-    /// replaces this with the upstream marker call.
+    /// The untranslated body is intentionally a runtime no-op.  During source
+    /// translation, `ExtEnterLeaveMarker` lowers the call to `jit_marker` and
+    /// jtransform emits the JitCode `jit_merge_point` operation.
     pub fn jit_merge_point(
         &self,
         frame: &mut PyFrame,
@@ -3163,8 +3172,10 @@ impl PyPyJitDriver {
     }
 
     /// interp_jit.py:114-117 — can_enter_jit at back-edge.
-    /// API-parity stub: handled by `eval_loop_jit`'s
-    /// `maybe_compile_and_run` on `StepResult::CloseLoop`.
+    /// The untranslated body is intentionally a runtime no-op.  The translator
+    /// lowers it to `jit_marker('can_enter_jit', ...)`, which jtransform aliases
+    /// to the JitCode `loop_header` operation.  The live runtime warmstate call
+    /// remains alongside it until generic `warmspot.apply_jit` is wired.
     pub fn can_enter_jit(
         &self,
         frame: &mut PyFrame,
@@ -3801,9 +3812,6 @@ fn init_callbacks() {
     });
 }
 
-// JIT_TRACING_DEPTH removed — now MetaInterp.tracing_call_depth field.
-// RPython portal_call_depth parity: state colocated with tracing context.
-
 /// Read the call depth from pyre-interpreter's CALL_DEPTH TLS.
 /// Replaces the separate JIT_CALL_DEPTH — single source of truth.
 // dont_look_inside: reads CALL_DEPTH TLS; no registry-resolvable accessor.
@@ -4356,11 +4364,9 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     // Set CURRENT_FRAME so zero-arg super() can find __class__ in the caller.
     let _frame_guard = pyre_interpreter::eval::install_current_frame(frame_root.frame());
 
-    // RPython blackhole.py parity: during bridge tracing, concrete
-    // (force helper) calls must use the plain interpreter to avoid
-    // corrupting the bridge trace's symbolic state via eval_loop_jit's
-    // jit_merge_point_hook. RPython's blackhole interpreter has no
-    // JIT hooks; pyre's equivalent is eval_frame_plain.
+    // During bridge tracing, concrete force-helper calls use the plain
+    // interpreter so they cannot recursively enter warmstate or corrupt the
+    // bridge trace's symbolic state.
     {
         let (drv, _) = driver_pair();
         if drv.is_bridge_tracing() {
@@ -4566,9 +4572,8 @@ pub(crate) fn portal_runner_result(frame: &mut PyFrame) -> PyResult {
     // Mirror `eval_with_jit_inner`'s structural-region suppression so a
     // recursive portal entry whose code contains `WITH_EXCEPT_START`
     // keeps nested helper Python frames out of the JIT too. The current
-    // frame is already kept out of trace by `try_function_entry_jit` and
-    // `jit_merge_point_hook`'s `unsupported_jit_shape` check; the guard
-    // extends that to callees.
+    // frame is already kept out of trace by `try_function_entry_jit`; the
+    // guard extends that to callees.
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     let _suppression = match unsupported_jit_shape(code) {
         UnsupportedJitShape::StructuralRegion => Some(JitSuppressionGuard::new()),
@@ -4626,43 +4631,6 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     let env = PyreEnv;
     let (driver, info) = driver_pair();
-    // The codewriter-side portal check
-    // (`CallControl::jitdriver_sd_from_portal_graph`, codewriter.py:37)
-    // is the canonical "is this code a portal" answer once
-    // `setup_jitdriver` has registered it.
-    //
-    // Note: pyre routes every
-    // CodeObject through `jit_merge_point_hook` and `can_enter_jit`
-    // so that recursive calls into a previously-traced function reach
-    // `maybe_compile_and_run` even before the function's own loop
-    // runs. RPython does not need this because portals are an
-    // explicit registry (`jitdrivers_sd`), not an inferred property,
-    // and recursion goes through the portal_runner. Two narrowing
-    // alternatives both regress benchmarks:
-    //   - "is registered portal" alone (post-`setup_jitdriver`):
-    //     non-loop function frames never trigger registration, so
-    //     recursive entry never reaches `maybe_compile_and_run` —
-    //     surfaces as a TLS-drop panic in
-    //     `test_inline_residual_user_call_with_many_args_stays_correct`.
-    //   - "has back-edge AND name != <module>": same problem —
-    //     non-loop function frames are skipped.
-    //
-    // interp_jit.py:81-99 `PyFrame.dispatch` applies `pypyjitdriver`
-    // (`jit_merge_point` :87, `can_enter_jit` :117) to EVERY frame
-    // uniformly — there is no `co_name == "<module>"` gate and no env
-    // switch, so `<module>` frames trace exactly like function frames.
-    // The parity-correct value is unconditional `true`.
-    //
-    // This was briefly gated (a `<module>` exclusion, then a
-    // PYRE_MODULE_LOOP_TRACE env switch) while module-loop tracing was a
-    // deopt-storm regression: a dynamic driver-loop call to a loop-bearing
-    // callee is not inlinable by the full-body walker yet (#62).  That is
-    // resolved — the walk now declines such a key to the trait leg
-    // (`DispatchError::LoopBearingCalleeInlineUnsupported` ->
-    // `FBW_DECLINED_KEYS`), which inlines the callee via
-    // `recursive-call-assembler` — so module-loop tracing is a win
-    // (nbody_50k 0.22s interpreter -> 0.09s traced) and the gate is gone.
-    let is_portal: bool = true;
     // interp_jit.py:66 — next_instr, pycode are greens (managed by jit_merge_point).
     // No explicit promote needed; the JitDriver green-key mechanism handles this.
 
@@ -4685,40 +4653,26 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         }
 
         let pc = frame_root.frame().next_instr();
+
+        // interp_jit.py:85-87 — source-level marker declaration.  Its
+        // untranslated body is a no-op; source translation
+        // recognizes this method call and lowers it to JitCode
+        // `jit_merge_point` rather than leaving a residual call.
+        let marker_ec = frame_root.frame().execution_context as *const PyExecutionContext;
+        let marker_pycode = frame_root.frame().pycode as pyre_object::PyObjectRef;
+        let marker_profiled = frame_root.frame().get_is_being_profiled();
+        pypyjitdriver.jit_merge_point(
+            frame_root.frame(),
+            marker_ec,
+            pc,
+            marker_pycode,
+            marker_profiled,
+        );
+
         let (opcode_pc, instruction, op_arg) = match decode_instruction_for_dispatch(code, pc) {
             Ok(decoded) => decoded,
             Err(err) => return LoopResult::Done(Err(err.into())),
         };
-
-        // ── jit_merge_point (RPython interp_jit.py:85-87) ──
-        // Runtime no-op. Only handles trace feed when tracing is active.
-        if is_portal {
-            let tracing_depth: Option<u32> = driver.meta_interp().tracing_call_depth;
-            let mut merge_point_active = if let Some(depth) = tracing_depth {
-                call_depth() == depth
-            } else {
-                driver.is_tracing()
-            };
-            // A frame running under trace-continuation suspend is a
-            // residual-executed callee — the walk reached a self-recursive
-            // call and ran it concretely through `execute_residual_call`
-            // (jitdriver.rs `TraceContinuationSuspendGuard`).  It re-enters
-            // eval_loop_jit at the same call depth as the trace, so the depth
-            // check above mis-identifies it as a merge point.  It is opaque to
-            // the active trace's merge points (`do_residual_call` never
-            // re-enters the portal), so skip the merge-point feed and run it as
-            // plain interpretation.
-            if merge_point_active && majit_metainterp::trace_continuation_suspended() {
-                merge_point_active = false;
-            }
-            if merge_point_active {
-                if let Some(loop_result) =
-                    jit_merge_point_hook(frame_root.frame(), code, pc, driver, info, &env)
-                {
-                    return loop_result;
-                }
-            }
-        }
 
         // ── handle_bytecode (RPython interp_jit.py:90) ──
         trace_jit_bytecode(pc, "");
@@ -4847,9 +4801,19 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 // every traced step to prevent infinite trace recording.
                 driver.blackhole_if_trace_too_long();
             }
-            Ok(StepResult::CloseLoop { loop_header_pc, .. }) if is_portal => {
+            Ok(StepResult::CloseLoop { loop_header_pc, .. }) => {
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
                 // RPython interp_jit.py:114 → warmstate.py:446
+                let marker_ec = frame_root.frame().execution_context as *const PyExecutionContext;
+                let marker_pycode = frame_root.frame().pycode as pyre_object::PyObjectRef;
+                let marker_profiled = frame_root.frame().get_is_being_profiled();
+                pypyjitdriver.can_enter_jit(
+                    frame_root.frame(),
+                    marker_ec,
+                    loop_header_pc,
+                    marker_pycode,
+                    marker_profiled,
+                );
                 let green_key = make_green_key(frame_root.frame().pycode, loop_header_pc);
                 if let Some(loop_result) = maybe_compile_and_run(
                     frame_root.frame(),
@@ -4862,78 +4826,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     return loop_result;
                 }
             }
-            Ok(StepResult::CloseLoop { .. }) => {}
             Ok(StepResult::Return(result)) => return LoopResult::Done(Ok(result)),
             Ok(StepResult::Yield(result)) => return LoopResult::Done(Ok(result)),
             Err(mut err) => {
-                if pyre_interpreter::eval::handle_exception(
-                    frame_root.frame(),
-                    &mut err,
-                    &mut next_instr,
-                ) {
-                    frame_root
-                        .frame()
-                        .set_last_instr_from_next_instr(next_instr);
-                    continue;
-                }
-                return LoopResult::Done(Err(err));
-            }
-        }
-    }
-}
-
-/// pyjitpl.py:2837-2845 _interpret() parity for bridge tracing.
-///
-/// RPython's bridge tracing uses the same MetaInterp._interpret() loop
-/// as normal tracing. This function provides the same eval loop as
-/// eval_loop_jit, but always calls jit_merge_point_hook since tracing
-/// is already active from start_bridge_tracing.
-pub(crate) fn eval_loop_jit_bridge(frame: &mut PyFrame) -> LoopResult {
-    let mut frame_root = FrameRoot::new(frame);
-    // Same as eval_loop_jit: count the activation for the safepoint's
-    // depth gate (gh#393). See the comment in eval_loop_jit.
-    let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
-    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
-    let env = PyreEnv;
-    let (driver, info) = driver_pair();
-
-    loop {
-        if frame_root.frame().next_instr() >= code.instructions.len() {
-            return LoopResult::Done(Ok(w_none()));
-        }
-
-        let pc = frame_root.frame().next_instr();
-        let (opcode_pc, instruction, op_arg) = match decode_instruction_for_dispatch(code, pc) {
-            Ok(decoded) => decoded,
-            Err(err) => return LoopResult::Done(Err(err.into())),
-        };
-
-        // pyjitpl.py:1892-1914 run_one_step: trace + execute.
-        if driver.is_tracing() {
-            if let Some(loop_result) =
-                jit_merge_point_hook(frame_root.frame(), code, pc, driver, info, &env)
-            {
-                return loop_result;
-            }
-        } else {
-            // Tracing ended (bridge compiled or aborted).
-            return LoopResult::Done(Ok(w_none()));
-        }
-
-        // handle_bytecode: execute the bytecode on the concrete frame.
-        let next_instr = opcode_pc + 1;
-        frame_root
-            .frame()
-            .set_last_instr_from_next_instr(next_instr);
-        let step_result =
-            execute_opcode_step(frame_root.frame(), code, instruction, op_arg, next_instr);
-        match step_result {
-            Ok(StepResult::Continue) => {}
-            Ok(StepResult::CloseLoop { .. }) => {}
-            Ok(StepResult::Return(result)) => return LoopResult::Done(Ok(result)),
-            Ok(StepResult::Yield(result)) => return LoopResult::Done(Ok(result)),
-            Err(mut err) => {
-                let mut next_instr = frame_root.frame().next_instr();
                 if pyre_interpreter::eval::handle_exception(
                     frame_root.frame(),
                     &mut err,
@@ -5053,154 +4948,6 @@ fn deliver_inflight_foriter_item(frame: &mut PyFrame) -> bool {
     // (the FOR_ITER `orgpc + 1`).
     frame.set_last_instr_from_next_instr(body_pc);
     true
-}
-
-/// RPython jit_merge_point slow path — only called when tracing is active.
-// dont_look_inside: jit_merge_point slow path; the tracer must not enter the driver.
-#[cold]
-#[majit_macros::dont_look_inside]
-fn jit_merge_point_hook(
-    frame: &mut PyFrame,
-    code: &pyre_interpreter::CodeObject,
-    pc: usize,
-    driver: &mut JitDriver<PyreJitState>,
-    info: &majit_metainterp::virtualizable::VirtualizableInfo,
-    env: &PyreEnv,
-) -> Option<LoopResult> {
-    if jit_suppressed_by_unsupported_frame()
-        || unsupported_jit_shape(code) != UnsupportedJitShape::None
-    {
-        return None;
-    }
-    let concrete_frame = frame as *mut PyFrame as usize;
-    let green_key = make_green_key(frame.pycode, pc);
-
-    // The trace-START decision (counter / threshold / start-tracing) lives
-    // in the warmstate marker path — `maybe_compile_with_key` (back-edge)
-    // and `force_start_tracing_for_key` (function-entry/recursion) walk the
-    // cell chain by `comparekey_matches` and own the decision. This hook is
-    // only the trace FEED: it runs once tracing is already active and hands
-    // each merge-point opcode to `jit_merge_point_keyed`. `make_green_key`
-    // and the warmstate cell key are the same allocation-free
-    // `pypyjit_greenkey_uhash`, so the feed key and the decision key agree.
-
-    let mut jit_state = build_jit_state(frame, info);
-    let current_depth = call_depth();
-    let was_tracing = driver.is_tracing();
-    // warmstate.py:437-444: capture the starting cell's key before
-    // entering the trace body so we can unconditionally clear its
-    // TRACING flag in the post-trace finally block. May differ from
-    // `green_key` when we are mid-trace and the current merge point's
-    // key is not the tracing origin.
-    let starting_tracing_key = driver.starting_green_key();
-    let mut propagated_exception = None;
-    let driver_outcome = driver.jit_merge_point_keyed(
-        green_key,
-        pc,
-        &mut jit_state,
-        env,
-        || {},
-        |meta, sym| {
-            meta.tracing_call_depth = Some(current_depth);
-            // RPython parity: codewriter.make_jitcodes() runs before tracing
-            // starts, populating all_liveness. In pyre, JitCode compilation is
-            // lazy — ensure the code's JitCode (with liveness) exists before
-            // tracing so get_list_of_active_boxes can use it.
-            crate::jit::codewriter::register_portal_jitdriver(code);
-            let snapshot = frame.snapshot_for_tracing();
-            let _ = concrete_frame;
-            let live_frame_addr = &*frame as *const PyFrame as usize;
-            let (action, executed_frame) =
-                trace_bytecode(meta, sym, code, pc, snapshot, live_frame_addr, true);
-            // pyjitpl.py:3048-3091 raise_continue_running_normally: tracing
-            // IS execution — a walk that committed its end-of-walk state
-            // into the snapshot (CloseLoop / CompileTracePending flush)
-            // hands that state to the LIVE frame, so the
-            // ContinueRunningNormally re-entry continues from the walked
-            // iteration's end instead of replaying it (re-applying every
-            // concretely executed side effect).  An uncommitted flush
-            // leaves the snapshot at entry state — adopting it is a no-op.
-            let walk_end_flushed = pyre_jit_trace::trace::take_walk_end_flush_committed();
-            let walk_end_restart_pc = pyre_jit_trace::trace::take_walk_end_restart_pc();
-            if walk_end_flushed {
-                frame.restore_resume_state_from(&executed_frame);
-            } else if let Some(restart_pc) = walk_end_restart_pc {
-                // When `fbw_has_unjournaled_effect` / `PYRE_FBW_END_FLUSH=0`
-                // leaves the end flush uncommitted, the live frame stays at trace entry.
-                // At a super-instruction loop close it only corrects `last_instr` to the
-                // marker-consistent restart pc; walked locals/stack stay out for consistent replay.
-                frame.set_last_instr_from_next_instr(restart_pc);
-            }
-            propagated_exception = pyre_jit_trace::trace::take_walk_end_propagated_exception();
-            action
-        },
-    );
-    if let Some(err) = propagated_exception {
-        return Some(LoopResult::Done(Err(err)));
-    }
-    if let Some(outcome) = driver_outcome {
-        match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
-            JitAction::Return(result) => return Some(LoopResult::Done(result)),
-            JitAction::ContinueRunningNormally => return Some(LoopResult::ContinueRunningNormally),
-            JitAction::Continue => {}
-        }
-    }
-    // Trace completed or aborted — clear tracing depth.
-    if !driver.is_tracing() {
-        driver.meta_interp_mut().tracing_call_depth = None;
-        // compile.py:269: cross-loop cut stores under inner key.
-        // Use the actual compiled key for post-compilation steps.
-        let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
-        // warmstate.py:444 `finally: cell.flags &= ~JC_TRACING` parity.
-        // `starting_tracing_key` was captured before jit_merge_point_keyed;
-        // its TRACING must be cleared unconditionally — even if cross-loop
-        // cut compiled under a different key, or if the trace aborted.
-        if let Some(k) = starting_tracing_key {
-            driver
-                .meta_interp_mut()
-                .warm_state_mut()
-                .clear_tracing_flag(k);
-        }
-        register_quasi_immutable_deps(compiled_key);
-        // RPython pyjitpl.py:3048-3061 raise_continue_running_normally:
-        // after trace compilation, restart so maybe_compile_and_run
-        // (try_function_entry_jit) dispatches to compiled code.
-        if was_tracing {
-            // #57 Option C (deliver): a FOR_ITER trace that aborted advanced
-            // the real iterator once but discarded its recording.  Deliver
-            // the in-flight item to the live frame (push + reposition at the
-            // body) so the ContinueRunningNormally re-entry runs the body
-            // once for it, instead of bypassing past the now-orphaned
-            // FOR_ITER and dropping the iteration.
-            deliver_inflight_foriter_item(frame);
-            // No-replay portal exit for a loop-free function trace: when the
-            // walk captured its concrete return (the `run_perfn_walk`
-            // epilogue kept the stash only when the walk's eager side
-            // effects stand and no symbolic-only effect needs the replay),
-            // hand that result back directly.  Re-running the freshly
-            // compiled trace for THIS invocation would re-read the heap the
-            // walk already consumed (a side-effecting residual ran once) and
-            // deopt; the compiled trace serves only subsequent invocations.
-            // No capture → the legacy ContinueRunningNormally replay.
-            match pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
-                Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Return(cv)) => {
-                    let result = match cv {
-                        // A void return stashes `Null`, i.e. Python `None`
-                        // (`ConcreteValue::to_pyobj` would map it to PY_NULL).
-                        pyre_jit_trace::state::ConcreteValue::Null => w_none(),
-                        other => other.to_pyobj(),
-                    };
-                    return Some(LoopResult::Done(Ok(result)));
-                }
-                Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Raise(cv)) => {
-                    return Some(LoopResult::Done(Err(finish_concrete_raise_error(cv))));
-                }
-                None => {}
-            }
-            return Some(LoopResult::ContinueRunningNormally);
-        }
-    }
-    None
 }
 
 /// RPython warmstate.py:446-511 maybe_compile_and_run.
@@ -5885,6 +5632,139 @@ fn execute_assembler(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompileOnceStart {
+    BackEdge,
+    FunctionEntry,
+}
+
+/// RPython pyjitpl.py:2876-2888 `_compile_and_run_once`.
+///
+/// This is the single synchronous portal-trace walker for function-entry and
+/// back-edge tracing. It registers and resolves the portal's static JitCode
+/// entry and performs the whole walk immediately.
+#[cold]
+#[majit_macros::dont_look_inside]
+fn compile_and_run_once(
+    frame: &mut PyFrame,
+    green_key: u64,
+    target_pc: usize,
+    start: CompileOnceStart,
+    driver: &mut JitDriver<PyreJitState>,
+    info: &majit_metainterp::virtualizable::VirtualizableInfo,
+    env: &PyreEnv,
+) -> Option<LoopResult> {
+    let mut frame_root = FrameRoot::new(frame);
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
+
+    // warmspot/codewriter ordering: the portal and all drained JitCodes are
+    // installed before the marker-driven metainterpreter starts.  Resolve the
+    // per-green static entry here; `trace_bytecode` consumes the same sidecar
+    // when it constructs the root MIFrame.
+    crate::jit::codewriter::register_portal_jitdriver(code);
+    let pjc = pyre_jit_trace::state::pyjitcode_for_code(frame_root.frame().pycode)
+        .expect("registered portal must have a drained PyJitCode");
+    pjc.merge_entry_for(target_pc)
+        .expect("registered portal must have a static merge entry for the hot green");
+
+    let mut jit_state = build_jit_state(frame_root.frame(), info);
+    let had_compiled = driver.has_compiled_loop(green_key);
+    match start {
+        CompileOnceStart::BackEdge => {
+            driver.bound_reached(green_key, target_pc, &mut jit_state, env);
+        }
+        CompileOnceStart::FunctionEntry => {
+            let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
+            driver.force_start_tracing(green_key, target_pc, &mut jit_state, env);
+        }
+    }
+    if !driver.is_tracing() {
+        return None;
+    }
+
+    let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
+    let mut propagated_exception = None;
+    let outcome = driver.jit_merge_point_keyed(
+        green_key,
+        target_pc,
+        &mut jit_state,
+        env,
+        || {},
+        |meta, sym| {
+            let concrete_frame = frame_root.frame().snapshot_for_tracing();
+            let live_frame_addr = frame_root.frame() as *const PyFrame as usize;
+            let (action, executed_frame) = trace_bytecode(
+                meta,
+                sym,
+                code,
+                target_pc,
+                concrete_frame,
+                live_frame_addr,
+                true,
+            );
+            let walk_end_flushed = pyre_jit_trace::trace::take_walk_end_flush_committed();
+            let walk_end_restart_pc = pyre_jit_trace::trace::take_walk_end_restart_pc();
+            if walk_end_flushed {
+                frame_root
+                    .frame()
+                    .restore_resume_state_from(&executed_frame);
+            } else if let Some(restart_pc) = walk_end_restart_pc {
+                frame_root
+                    .frame()
+                    .set_last_instr_from_next_instr(restart_pc);
+            }
+            propagated_exception = pyre_jit_trace::trace::take_walk_end_propagated_exception();
+            action
+        },
+    );
+    let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
+    let tracing_finished = !driver.is_tracing();
+    if tracing_finished {
+        // warmstate.py:437-444 `finally`: the starting cell owns JC_TRACING
+        // even when a cross-loop cut attaches the token to another key.
+        driver
+            .meta_interp_mut()
+            .warm_state_mut()
+            .clear_tracing_flag(starting_tracing_key);
+        if !had_compiled && driver.has_compiled_loop(compiled_key) {
+            register_quasi_immutable_deps(compiled_key);
+        }
+    }
+
+    if let Some(err) = propagated_exception {
+        return Some(LoopResult::Done(Err(err)));
+    }
+
+    if tracing_finished {
+        deliver_inflight_foriter_item(frame_root.frame());
+        match pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
+            Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Return(cv)) => {
+                let result = match cv {
+                    pyre_jit_trace::state::ConcreteValue::Null => w_none(),
+                    other => other.to_pyobj(),
+                };
+                return Some(LoopResult::Done(Ok(result)));
+            }
+            Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Raise(cv)) => {
+                return Some(LoopResult::Done(Err(finish_concrete_raise_error(cv))));
+            }
+            None => {}
+        }
+        return Some(LoopResult::ContinueRunningNormally);
+    }
+
+    if let Some(outcome) = outcome {
+        match handle_jit_outcome(outcome, &jit_state, frame_root.frame(), info, green_key) {
+            JitAction::Return(result) => return Some(LoopResult::Done(result)),
+            JitAction::ContinueRunningNormally => {
+                return Some(LoopResult::ContinueRunningNormally);
+            }
+            JitAction::Continue => {}
+        }
+    }
+    None
+}
+
 /// RPython warmstate.py:425-444 bound_reached.
 ///
 /// Called when counter threshold fires and no compiled code exists.
@@ -5944,6 +5824,17 @@ fn bound_reached(
     {
         return None;
     }
+    if !driver.has_compiled_loop(green_key) && !driver.is_tracing() {
+        return compile_and_run_once(
+            frame_root.frame(),
+            green_key,
+            loop_header_pc,
+            CompileOnceStart::BackEdge,
+            driver,
+            info,
+            env,
+        );
+    }
     // warmstate.py:503-511: procedure_token → EnterJitAssembler.
     let outcome = if driver.has_compiled_loop(green_key) {
         let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
@@ -5954,145 +5845,6 @@ fn bound_reached(
             env,
             || {},
         ))
-    } else if !driver.is_tracing() {
-        // warmstate.py:425-444 bound_reached: enter tracing if the cell's
-        // counter / flags allow.  Pyre's `driver.bound_reached` does NOT
-        // compile synchronously — it returns `BackEdgeAction::StartedTracing`
-        // and the actual trace is driven by `jit_merge_point_keyed` below
-        // when `is_tracing()` becomes true after this call.
-        //
-        // PyPy parity: `maybe_compile_and_run` (warmstate.py:482-511)
-        // identifies "the compile we just made" through `cell.procedure_token`
-        // (per-greenkey cell), NOT by reading any global last-compiled
-        // value.  Pyre's equivalent is `has_compiled_loop(green_key)` —
-        // never `last_compiled_key()`, which is a single global slot that
-        // accumulates across iterations and cannot tell "stale prior
-        // compile" from "fresh same-key compile this round".  If a
-        // cross-loop cut compiles an INNER key, attachment goes to the
-        // INNER cell; the next iteration's `has_compiled_loop` query at
-        // the inner entry point dispatches to it (warmstate.py:482-483).
-        let had_compiled = driver.has_compiled_loop(green_key);
-        driver.bound_reached(green_key, loop_header_pc, &mut jit_state, env);
-        if driver.is_tracing() {
-            // RPython pyjitpl.py:2876-2888 _compile_and_run_once:
-            // interpret() traces the entire loop synchronously.
-            // Set tracing_call_depth so inner function calls (which
-            // run their own eval_loop_jit) don't trigger jit_merge_point_hook.
-            driver.meta_interp_mut().tracing_call_depth = Some(call_depth());
-            let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
-            let mut propagated_exception = None;
-            let outcome = driver.jit_merge_point_keyed(
-                green_key,
-                loop_header_pc,
-                &mut jit_state,
-                env,
-                || {},
-                |meta, sym| {
-                    use pyre_jit_trace::trace::trace_bytecode;
-                    crate::jit::codewriter::register_portal_jitdriver(code);
-                    let concrete_frame = frame_root.frame().snapshot_for_tracing();
-                    let live_frame_addr = frame_root.frame() as *const PyFrame as usize;
-                    let (action, executed_frame) = trace_bytecode(
-                        meta,
-                        sym,
-                        code,
-                        loop_header_pc,
-                        concrete_frame,
-                        live_frame_addr,
-                        true,
-                    );
-                    // raise_continue_running_normally seam — see the
-                    // jit_merge_point_hook tracing site for the contract.
-                    let walk_end_flushed = pyre_jit_trace::trace::take_walk_end_flush_committed();
-                    let walk_end_restart_pc = pyre_jit_trace::trace::take_walk_end_restart_pc();
-                    if walk_end_flushed {
-                        frame_root
-                            .frame()
-                            .restore_resume_state_from(&executed_frame);
-                    } else if let Some(restart_pc) = walk_end_restart_pc {
-                        frame_root
-                            .frame()
-                            .set_last_instr_from_next_instr(restart_pc);
-                    }
-                    propagated_exception =
-                        pyre_jit_trace::trace::take_walk_end_propagated_exception();
-                    action
-                },
-            );
-            driver.meta_interp_mut().tracing_call_depth = None;
-            if let Some(err) = propagated_exception {
-                return Some(LoopResult::Done(Err(err)));
-            }
-            let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
-            if !had_compiled && driver.has_compiled_loop(compiled_key) {
-                register_quasi_immutable_deps(compiled_key);
-            }
-            // pyjitpl.py:3048-3061 raise_continue_running_normally:
-            // after compilation, restart so execute_assembler runs.
-            if !driver.is_tracing() {
-                // warmstate.py:444 `finally: cell.flags &= ~JC_TRACING`
-                // — green_key is the starting cell. Cross-loop cut
-                // (compile.py:269) installs the token on an inner cell,
-                // so attach_procedure_to_interp does not clear TRACING
-                // on green_key. Restore the clear here. The full
-                // gate `!had_compiled && has_compiled_loop(compiled_key)
-                // && compiled_key != green_key` narrows to "this round
-                // cross-loop-compiled under a different inner key";
-                // without it stale `last_compiled_key` values from
-                // prior iterations trigger spurious clears that can
-                // destabilize active traces (cranelift fannkuch regresses
-                // without this gate).
-                if !had_compiled
-                    && driver.has_compiled_loop(compiled_key)
-                    && compiled_key != green_key
-                {
-                    driver
-                        .meta_interp_mut()
-                        .warm_state_mut()
-                        .clear_tracing_flag(green_key);
-                }
-                // No-replay portal exit for a walk that started at this
-                // loop header but fell through to `done_with_this_frame`
-                // (the back-edge counter tripped on the loop's terminal
-                // iteration, so the loop test exited immediately and the
-                // walk traced the post-loop tail to the frame return).
-                // The walk executed the tail's residual calls concretely
-                // and captured the concrete return value; re-running the
-                // freshly compiled trace for THIS invocation
-                // (ContinueRunningNormally re-enters the live frame still
-                // parked at the loop header) would re-apply those already
-                // executed side effects.  Hand the captured result back
-                // directly, mirroring the `jit_merge_point_hook` tracing
-                // site (which carries the same no-replay logic for the
-                // merge-point-driven trace path).
-                // #57 Option C (deliver): a FOR_ITER trace that aborted on
-                // the back-edge `can_enter_jit` path advanced the real
-                // iterator once but discarded its recording.  Deliver the
-                // in-flight item to the live frame so the
-                // ContinueRunningNormally re-entry runs the body once for it
-                // (the same continuation as the `jit_merge_point_hook`
-                // tracing site).
-                deliver_inflight_foriter_item(frame_root.frame());
-                match pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
-                    Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Return(cv)) => {
-                        let result = match cv {
-                            // A void return stashes `Null`, i.e. Python `None`.
-                            pyre_jit_trace::state::ConcreteValue::Null => w_none(),
-                            other => other.to_pyobj(),
-                        };
-                        return Some(LoopResult::Done(Ok(result)));
-                    }
-                    Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Raise(cv)) => {
-                        return Some(LoopResult::Done(Err(finish_concrete_raise_error(cv))));
-                    }
-                    None => {}
-                }
-                return Some(LoopResult::ContinueRunningNormally);
-            }
-            outcome
-        } else {
-            None
-        }
     } else {
         None
     };
@@ -6167,7 +5919,6 @@ fn bound_reached(
             }
         }
     }
-    driver.meta_interp_mut().tracing_call_depth = None;
     None
 }
 
@@ -6441,7 +6192,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         return None;
     }
     let env = PyreEnv;
-    let mut jit_state = build_jit_state(frame_root.frame(), info);
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][func-entry] start tracing key={} arg0={:?}",
@@ -6449,16 +6199,24 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             debug_first_arg_int(frame_root.frame()),
         );
     }
-    {
-        let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
-        driver.force_start_tracing(
-            green_key,
-            frame_root.frame().next_instr(),
-            &mut jit_state,
-            &env,
-        );
+    let next_instr = frame_root.frame().next_instr();
+    match compile_and_run_once(
+        frame_root.frame(),
+        green_key,
+        next_instr,
+        CompileOnceStart::FunctionEntry,
+        driver,
+        info,
+        &env,
+    ) {
+        Some(LoopResult::Done(result)) => Some(result),
+        Some(LoopResult::ContinueRunningNormally) => {
+            // warmspot.py:976-978 portal re-entry.  Marker mode completed the
+            // synchronous walk; continue from the adopted/restart state.
+            Some(handle_jitexception(frame_root.frame()))
+        }
+        None => None,
     }
-    None
 }
 
 // dont_look_inside: JIT-driver outcome dispatch the tracer must not enter.
