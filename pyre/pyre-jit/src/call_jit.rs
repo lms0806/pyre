@@ -2807,6 +2807,12 @@ pub fn trace_and_compile_from_bridge(
     // Disarm so the flag cannot leak into a later (non-bridge) walk on this
     // thread; the epilogue has already consumed it.
     pyre_jit_trace::jitcode_dispatch::fbw_bridge_noreplay_arm(false);
+    if pyre_jit_trace::trace::take_fbw_bridge_declined() {
+        let (driver, _) = crate::eval::driver_pair();
+        driver
+            .meta_interp_mut()
+            .record_declined_bridge_guard(descr_arc);
+    }
 
     // #177 bridge `Terminate` no-replay: consume any finish-concrete the walk
     // kept.  A stash survives the epilogue only when `bridge_noreplay_armed`
@@ -5052,6 +5058,48 @@ pub extern "C" fn bh_load_method_self_fn(
         return pyre_object::PY_NULL as i64;
     }
     let name = code.names[idx].as_ref();
+    pyre_interpreter::eval::compute_load_method_bound(
+        obj as pyre_object::PyObjectRef,
+        attr as pyre_object::PyObjectRef,
+        name,
+    ) as i64
+}
+
+#[inline]
+fn load_special_method_name(method_kind: i64) -> &'static str {
+    match method_kind {
+        0 => "__enter__",
+        1 => "__exit__",
+        2 => "__aenter__",
+        _ => "__aexit__",
+    }
+}
+
+/// Resolve `getattr(obj, special_method_name(method_kind))` for LOAD_SPECIAL.
+/// This is the fixed-name counterpart of [`bh_load_attr_fn`]: the codewriter
+/// passes the bytecode's special-method discriminant instead of a `co_names`
+/// index.
+pub extern "C" fn bh_load_special_fn(obj: i64, method_kind: i64) -> i64 {
+    let name = load_special_method_name(method_kind);
+    if let Some((_, _, w_descr)) =
+        unsafe { pyre_interpreter::baseobjspace::load_method_fast_path(obj as _, name) }
+    {
+        return w_descr as i64;
+    }
+    match pyre_interpreter::baseobjspace::getattr_str(obj as pyre_object::PyObjectRef, name) {
+        Ok(attr) => attr as i64,
+        Err(err) => {
+            publish_residual_call_exception(err.to_exc_object() as i64);
+            0
+        }
+    }
+}
+
+/// Compute the LOAD_SPECIAL `null_or_self` value for an already-resolved
+/// special method.  Mirrors [`bh_load_method_self_fn`] without a code-object
+/// name lookup.
+pub extern "C" fn bh_load_special_self_fn(obj: i64, attr: i64, method_kind: i64) -> i64 {
+    let name = load_special_method_name(method_kind);
     pyre_interpreter::eval::compute_load_method_bound(
         obj as pyre_object::PyObjectRef,
         attr as pyre_object::PyObjectRef,

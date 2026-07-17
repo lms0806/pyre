@@ -1451,15 +1451,12 @@ pub enum DispatchError {
     /// produced inside the arm, so the blackhole resumes it as NULL and
     /// feeds NULL into the consuming op — the boxed-int short-circuit /
     /// conditional-expression resume miscompile (a heap `ConstPtr`, an int
-    /// outside the small-int cache, parked in a register live-across the
-    /// guard).  Unlike [`BranchGuardKeptStackUnsupported`], this shape is
-    /// miscompiled the SAME way by BOTH the full-body walk and the trait
-    /// leg (both re-execute the identical not-taken arm on deopt), so a
-    /// recoverable [`TraceAction::Abort`] would retry the unsound shape.
-    /// The driver maps this to
-    /// `TraceAction::AbortPermanent` → `DONT_TRACE_HERE`: the loop runs in
-    /// the interpreter (correct, matching the pre-#416/#420 decline) and is
-    /// never retraced by either leg.
+    /// outside the 1-byte immediate range `[0, 256)`, parked in a register
+    /// live-across the guard).  The driver maps this to
+    /// `TraceAction::AbortPermanent` → `DONT_TRACE_HERE`.  Demoting it to a
+    /// plain [`TraceAction::Abort`] would still reach the same terminal state
+    /// through pyre's abort ceiling, so the permanent mapping records the
+    /// structural nature of this abort without changing runtime behavior.
     BranchGuardUnrestorableKeptStackPermanent { pc: usize },
     /// A callee compiled as its own Finish portal (reached via
     /// `call_user_function_with_eval`) accessed its frame through a
@@ -1964,6 +1961,20 @@ fn try_catch_exception_at(code: &[u8], position: usize) -> Option<usize> {
     }
 }
 
+fn reads_last_exc_before_next_catch(code: &[u8], position: usize) -> bool {
+    let mut pc = position;
+    while let Some(op) = decode_op_at(code, pc) {
+        if op.key == "catch_exception/L" {
+            return false;
+        }
+        if matches!(op.key, "last_exception/>i" | "last_exc_value/>r") {
+            return true;
+        }
+        pc = op.next_pc;
+    }
+    false
+}
+
 /// Read a 2-byte little-endian descr index operand and resolve to
 /// the descr from [`WalkContext::descr_refs`]. RPython equivalent:
 /// `BlackholeInterpreter.descrs[code[pc] | (code[pc+1] << 8)]`
@@ -2136,6 +2147,30 @@ fn write_ref_reg(
     // per-opcode hook.  Cheap unconditional write to a new side-field;
     // only consumed when the mirror is valid (never alters existing state).
     ctx.vstack_last_ref = value;
+    Ok(())
+}
+
+/// Write a pyre scalar virtualizable Ref field without stamping operand TOS.
+///
+/// Pyre's scalar virtualizable fields are `last_instr(0)`, `pycode(1)`,
+/// `valuestackdepth(2)`, `debugdata(3)`, `lastblock(4)`, and `w_globals(5)`
+/// (`virtualizable_gen.rs:33-60`, `NUM_VABLE_SCALARS = 6`).  They are frame
+/// bookkeeping; the Python operand stack lives in the separate
+/// `locals_cells_stack_w` array (`virtualizable_gen.rs:66-72`,
+/// `pyre-interpreter/src/pyframe.rs:735-739`).  PyPy's `interp_jit.py:24-30`
+/// grounds the same scalar-vs-array split, and `pyjitpl.py:177-234
+/// get_list_of_active_boxes` sources liveness-indexed register boxes, not
+/// scalar virtualizable fields.
+fn write_vable_field_ref_reg(
+    ctx: &mut WalkContext<'_, '_>,
+    pc: usize,
+    dst: usize,
+    value: OpRef,
+    concrete: ConcreteValue,
+) -> Result<(), DispatchError> {
+    let saved = ctx.vstack_last_ref;
+    write_ref_reg(ctx, pc, dst, value, concrete)?;
+    ctx.vstack_last_ref = saved;
     Ok(())
 }
 
@@ -2625,6 +2660,66 @@ fn dispatch_switch_id(
 /// **Production wiring**: the full-body-walk walker
 /// (`full_body_walk_trace`) is the caller, dispatching each JitCode
 /// opcode through this entry as it walks the body.
+fn seed_standing_exception_for_walk(
+    sym: &mut crate::state::PyreSym,
+    trace_ctx: &mut TraceCtx,
+    concrete_frame_addr: usize,
+) {
+    if !sym.last_exc_box.is_none() {
+        return;
+    }
+
+    let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+    if bh_exc != 0 {
+        let exc = bh_exc as pyre_object::PyObjectRef;
+        if !exc.is_null() && unsafe { pyre_object::is_exception(exc) } {
+            let exc_box = trace_ctx.const_ref(exc as i64);
+            sym.current_exc_value = exc;
+            sym.current_exc_box = exc_box;
+            sym.last_exc_value = exc;
+            sym.last_exc_box = exc_box;
+            sym.class_of_last_exc_is_const = true;
+            return;
+        }
+    }
+
+    let current = pyre_interpreter::eval::get_current_exception();
+    if !current.is_null() && unsafe { pyre_object::is_exception(current) } {
+        let exc_box = trace_ctx.const_ref(current as i64);
+        sym.current_exc_value = current;
+        sym.current_exc_box = exc_box;
+        sym.last_exc_value = current;
+        sym.last_exc_box = exc_box;
+        sym.class_of_last_exc_is_const = true;
+        return;
+    }
+
+    if concrete_frame_addr == 0 {
+        return;
+    }
+    let frame = unsafe { &*(concrete_frame_addr as *const pyre_interpreter::pyframe::PyFrame) };
+    if frame.locals_cells_stack_w.is_null() {
+        return;
+    }
+    let nlocals = crate::state::concrete_nlocals(concrete_frame_addr).unwrap_or(0);
+    let stack_top = frame.valuestackdepth.min(frame.locals_w().len());
+    let Some(exc) = frame.locals_w().as_slice()[nlocals.min(stack_top)..stack_top]
+        .iter()
+        .rev()
+        .copied()
+        .find(|obj| !obj.is_null() && unsafe { pyre_object::is_exception(*obj) })
+    else {
+        return;
+    };
+
+    let exc_box = trace_ctx.const_ref(exc as i64);
+    sym.current_exc_value = exc;
+    sym.current_exc_box = exc_box;
+    sym.last_exc_value = exc;
+    sym.last_exc_box = exc_box;
+    sym.class_of_last_exc_is_const = true;
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_via_miframe(
     miframe: &mut MIFrame,
@@ -2674,6 +2769,7 @@ pub fn dispatch_via_miframe(
     // means dereferencing both simultaneously is sound.
     let ctx_ptr = miframe.ctx;
     let sym_ptr = miframe.sym;
+    let concrete_frame_addr = miframe.concrete_frame_addr;
     let entry_py_pc = EntryPyPc::Py(miframe.orgpc as u32);
     // SAFETY: both pointers were initialized at MIFrame
     // construction time and outlive this call (TraceCtx and
@@ -2709,6 +2805,7 @@ pub fn dispatch_via_miframe(
     // references it (use-before-def).  Seed here — the trait's pre-guard
     // cache-once analog — so every guard snapshot reads a real EC OpRef.
     seed_execution_context_for_walk(sym, trace_ctx);
+    seed_standing_exception_for_walk(sym, trace_ctx, concrete_frame_addr);
 
     // RPython parity: `metainterp.last_exc_value` (pyjitpl.py:1695)
     // is the standing exception OpRef. Walker's `WalkContext::last_exc_value`
@@ -4304,7 +4401,7 @@ fn getfield_gc_via_heapcache(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
-/// `interp_jit.py:25-31` PyFrame static-field order
+/// `virtualizable_gen.rs:33-60` pyre PyFrame static-field order
 /// `[last_instr, pycode, valuestackdepth, debugdata, lastblock, w_globals]`.
 const VABLE_CODE_FIELD_IDX: usize = 1;
 const VABLE_NAMESPACE_FIELD_IDX: usize = 5;
@@ -4333,6 +4430,64 @@ fn top_level_live_code(ctx: &WalkContext<'_, '_>) -> Option<*const ()> {
         None
     } else {
         Some(pyre_interpreter::live_code_wrapper(raw as *const ()) as *const ())
+    }
+}
+
+fn guard_current_frame_globals_identity(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    expected_globals: pyre_object::PyObjectRef,
+) -> Result<bool, DispatchError> {
+    if expected_globals.is_null() || majit_gc::can_move(majit_ir::GcRef(expected_globals as usize))
+    {
+        return Ok(false);
+    }
+    let Some(w_globals_op) = ctx
+        .trace_ctx
+        .virtualizable_box_at(VABLE_NAMESPACE_FIELD_IDX)
+    else {
+        return Ok(false);
+    };
+    let expected = ctx.trace_ctx.const_ref(expected_globals as i64);
+    if w_globals_op.is_constant() {
+        return Ok(ctx.trace_ctx.const_value(w_globals_op) == Some(expected_globals as i64));
+    }
+    // pypy/objspace/std/celldict.py `elidable_promote('0,1,2')` promotes
+    // `w_dict`; mirror that by pinning the runtime frame's w_globals identity.
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[w_globals_op, expected], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    ctx.trace_ctx.replace_box(w_globals_op, expected);
+    for slot in ctx.registers_r.iter_mut() {
+        if *slot == w_globals_op {
+            *slot = expected;
+        }
+    }
+    Ok(true)
+}
+
+fn replace_movable_load_global_namespace_with_frame_globals(
+    ctx: &mut WalkContext<'_, '_>,
+    ei: &majit_ir::EffectInfo,
+    allboxes: &mut [OpRef],
+) {
+    if ei.pyre_helper != majit_ir::PyreHelperKind::LoadGlobal {
+        return;
+    }
+    let Some(ns_box) = allboxes.get_mut(1) else {
+        return;
+    };
+    let Some(Value::Ref(majit_ir::GcRef(ns_ptr))) = ctx.trace_ctx.box_value(*ns_box) else {
+        return;
+    };
+    if !majit_gc::can_move(majit_ir::GcRef(ns_ptr)) {
+        return;
+    }
+    if let Some(w_globals_op) = ctx
+        .trace_ctx
+        .virtualizable_box_at(VABLE_NAMESPACE_FIELD_IDX)
+    {
+        *ns_box = w_globals_op;
     }
 }
 
@@ -4378,7 +4533,7 @@ fn try_resolve_inline_callee_static_field(
     };
     let result = ctx.trace_ctx.const_ref(const_ptr as i64);
     let dst = code[op.pc + 4] as usize;
-    write_ref_reg(
+    write_vable_field_ref_reg(
         ctx,
         op.pc,
         dst,
@@ -4512,13 +4667,7 @@ fn getfield_vable_via_metainterp(
             write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
         }
         'r' => {
-            // Scalar vable fields are frame bookkeeping, never Python
-            // operand-stack values, so they must not become the mirror's TOS
-            // candidate. `get_list_of_active_boxes` (pyjitpl.py:177-234)
-            // never names scalar fields as per-PC stack slots.
-            let vstack_last_ref = ctx.vstack_last_ref;
-            write_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
-            ctx.vstack_last_ref = vstack_last_ref;
+            write_vable_field_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
         }
         'f' => {
             let len = ctx.registers_f.len();
@@ -6740,16 +6889,6 @@ fn try_execute_residual_call_via_executor(
     // the `for_iter_next` consume itself never counts).
     let user_frame_snapshot = (!provably_side_effect_free && fbw_foriter_inflight_active())
         .then(pyre_interpreter::call::frame_entry_count);
-    // #73/#267: the user-frame gate above excludes the `for_iter_next` consume
-    // itself, so sample the frame odometer separately for it — a user-defined
-    // iterator's `__next__`/`__getitem__` runs Python bytecode (the odometer
-    // advances) while a builtin iterator's next runs at the C level (it does
-    // not).  The operand-stack mirror cannot yet reconcile the inline sub-walk
-    // that the user iterator's bytecode drives, so the post-call decline uses
-    // this to keep the legacy resume for a user-iterator FOR_ITER while a
-    // builtin FOR_ITER stays modeled.
-    let foriter_frame_snapshot = (helper == majit_ir::PyreHelperKind::ForIterNext)
-        .then(pyre_interpreter::call::frame_entry_count);
     // #493: a NEW consume attempt for a FOR_ITER whose prior item is still in
     // flight means that item's body ran to completion — mark the entry BEFORE
     // the call so an attempt that aborts mid-way (a kept-stack guard on the
@@ -6869,19 +7008,6 @@ fn try_execute_residual_call_via_executor(
     {
         fbw_bump_executed_effect();
     }
-    // #73/#267: a user-defined iterator's FOR_ITER runs its item producer
-    // (`__next__`/`__getitem__`) as an inline sub-walk whose operand-stack
-    // boundaries the mirror does not yet reconcile — keeping the mirror valid
-    // across such a FOR_ITER grafts a corrupt box at a loop-body guard resume
-    // ("not an iterator").  Decline the mirror for the rest of this walk (the
-    // legacy resume, unchanged from the pre-`ResultToTos` behaviour) when the
-    // `for_iter_next` consume entered a user frame; a BUILTIN iterator's
-    // consume runs at the C level (no user frame) and stays modeled.
-    let foriter_entered_user_frame = foriter_frame_snapshot
-        .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before);
-    if foriter_entered_user_frame {
-        ctx.vstack_valid = false;
-    }
     match exec_result {
         Ok(result_i64) => {
             fbw_count_executed_residual(is_void, is_may_force);
@@ -6957,11 +7083,9 @@ fn try_execute_residual_call_via_executor(
                 // still holds whatever inner box the ForIterNext produced.  Seed
                 // it with the item OpRef so the FOR_ITER boundary
                 // (`ResultToTos`) places the item, not a stale box, on the new
-                // TOS.  Reached for a builtin iterator only: a user-defined
-                // iterator already latched `vstack_valid = false` above
-                // (`foriter_entered_user_frame`), so this seed is inert for it
-                // (`vstack_last_ref` is consumed only while the mirror is
-                // valid).
+                // TOS.  This runs for every `ForIterNext` residual once it
+                // returns, placing the item OpRef on the new TOS for the
+                // FOR_ITER `ResultToTos` boundary.
                 ctx.vstack_last_ref = recorded;
                 if fbw_debug_abort_enabled() {
                     pcmap_entrypc_audit_ctx_read(ctx, "foriter_debug");
@@ -8294,28 +8418,6 @@ pub(crate) fn m366_nonbranch_pc_enabled() -> bool {
 pub(crate) fn fbw_vable_scalar_ca_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_VABLE_SCALAR_CA") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => false,
-    })
-}
-
-/// `PYRE_FBW_DEEPKEPT_INT` (default OFF) — extend the deep-kept operand-stack
-/// recovery in [`walker_capture_snapshot_for_last_guard_impl`] to fill an
-/// UNBOXED-INT hole from the Int register bank. A Ref-typed stack slot
-/// semantically holding an Int (e.g. condexpr's `a+i` `IntAdd` result) is left
-/// a hole by the Ref-only fill; when on, the capture reads `registers_i[color]`
-/// (the color named by `semantic_slot_color_for_int_slot`) and boxes the raw
-/// int into a `W_IntObject` (`wrapint`) so the vable array carries a Ref.
-/// Ports the `if length_i:` i-bank section of `get_list_of_active_boxes`
-/// (`pyjitpl.py:206-210`). Default OFF: flag-off is byte-identical to the
-/// int-as-hole behavior (resume re-materializes the int from its defining IR),
-/// mirroring how the S1 mirror extension staged behind `PYRE_FBW_DEEPKEPT_MIRROR`.
-pub(crate) fn deepkept_int_recovery_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_DEEPKEPT_INT") {
         Some(v) => {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
@@ -10193,6 +10295,26 @@ fn classify_vstack_opcode(
         | Instruction::ConvertValue { .. }
         | Instruction::BinarySlice
         | Instruction::ImportName { .. }
+        // MAKE_FUNCTION pops the code object and pushes the built function
+        // (net 0, `stack_effects` `(d, d)`).  The `make_function_value`
+        // residual's Ref result reaches the new TOS through the operand-stack
+        // push chokepoint (`emit_pushvalue_ref!`, codewriter.rs:9260), so it is
+        // the same `ResultToTos` shape as the value producers above.  Left
+        // unmodeled it killed the mirror for the rest of the walk at the first
+        // nested `def`, declining any later depth > 1 kept-stack branch guard.
+        | Instruction::MakeFunction
+        // SET_FUNCTION_ATTRIBUTE follows MAKE_FUNCTION for defaults,
+        // annotations, and closures, and pushes the updated function back to
+        // TOS.  The remaining ops here also leave one result on the new TOS;
+        // their arg-dependent depths are already baked into
+        // `pyre/pyre-jit-trace/src/liveness.rs`'s depth table.
+        | Instruction::SetFunctionAttribute { .. }
+        | Instruction::CallKw { .. }
+        | Instruction::BuildSlice { .. }
+        | Instruction::CallFunctionEx
+        | Instruction::CallIntrinsic1 { .. }
+        | Instruction::LoadCommonConstant { .. }
+        | Instruction::LoadFromDictOrGlobals { .. }
         // #73: LOAD_FAST/STORE_FAST super-instructions.  Their net
         // result still lands on the new TOS as the LAST Ref written (the
         // second load, resp. the load following the store), so `ResultToTos`
@@ -10228,13 +10350,19 @@ fn classify_vstack_opcode(
         | Instruction::StoreSubscr
         | Instruction::DeleteSubscr
         | Instruction::StoreSlice
-        // LIST_APPEND / SET_ADD / MAP_ADD / LIST_EXTEND pop their value operand(s)
-        // and mutate the collection PEEK'd in place below them — a side-store,
-        // same shape as STORE_SUBSCR: the surviving TOS box stays put.
+        // LIST_APPEND / SET_ADD / MAP_ADD / LIST_EXTEND and the dict/set
+        // update opcodes pop their value operand(s) and mutate the collection
+        // PEEK'd in place below them — a side-store, same shape as
+        // STORE_SUBSCR: the surviving TOS box stays put. MAKE_CELL stores its
+        // result into the frame-local virtualizable slot, not operand TOS.
         | Instruction::ListAppend { .. }
         | Instruction::SetAdd { .. }
         | Instruction::MapAdd { .. }
         | Instruction::ListExtend { .. }
+        | Instruction::DictUpdate { .. }
+        | Instruction::DictMerge { .. }
+        | Instruction::SetUpdate { .. }
+        | Instruction::MakeCell { .. }
         | Instruction::DeleteFast { .. }
         | Instruction::DeleteName { .. }
         | Instruction::DeleteGlobal { .. }
@@ -10630,12 +10758,12 @@ fn step_vstack_mirror(ctx: &mut WalkContext<'_, '_>, jit_pc: usize) {
     if !ctx.vstack_valid {
         return;
     }
-    // Inside an inline sub-walk the `jit_pc` is a CALLEE coordinate that
-    // does not exist in the outer (`fbw_mode.snapshot_sym`) jitcode's
-    // py_pc→jitcode tables.  Without the `PYRE_FBW_CALLEE_VSTACK` gate the
-    // mirror declines (a callee `write_ref_reg` would clobber
-    // `vstack_last_ref`); with it, the coordinate is resolved through the
-    // active callee jitcode metadata instead.
+    // On genuine callee sub-walk paths, `jit_pc` is a callee coordinate with
+    // no meaning in the outer (`fbw_mode.snapshot_sym`) jitcode's py_pc→jitcode
+    // tables.  `inline_subwalk` is also set for the carrier walk of root code,
+    // where that premise does not hold and the mirror is simply never seeded.
+    // With `PYRE_FBW_CALLEE_VSTACK` off this branch documents intent only:
+    // `seed_callee_vstack_mirror` is gated by the same flag.
     let (new_pypc, code_ptr, new_depth) = if ctx.fbw_mode.inline_subwalk {
         if !fbw_callee_vstack_enabled() {
             ctx.vstack_valid = false;
@@ -11765,11 +11893,12 @@ fn branch_resume_target_stack_depth(frame: &ActiveResumeFrame, target: usize) ->
 }
 
 /// Flat-free (#267) boxed-int kept-slot hazard: a kept operand-stack slot
-/// holding a heap int outside `[0, 256)` is reconstructed with a WRONG / NULL
-/// value on a kept-stack branch-guard resume (the conditional-expression /
-/// short-circuit boxed-int crash), so its presence forces the conservative
-/// decline.  This replaces the dense `stack_slot_color_map` read the gate used
-/// to inspect: every kept-slot kind has a per-PC source — a live Variable
+/// holding a heap int outside the 1-byte immediate range `[0, 256)` is
+/// reconstructed with a WRONG / NULL value on a kept-stack branch-guard resume
+/// (the conditional-expression / short-circuit boxed-int crash), so its
+/// presence forces the conservative decline.  This replaces the dense
+/// `stack_slot_color_map` read the gate used to inspect: every kept-slot kind
+/// has a per-PC source — a live Variable
 /// through `pcdep_color_slots` (inspect its concrete register), a Ref constant
 /// (the hoisted boxed int `pcdep_color_slots` omits) through
 /// `const_ref_slots_at_pc` (inspect the raw value).  A kept slot in NEITHER map
@@ -11929,10 +12058,10 @@ fn branch_arm_resume_ref_liveness(
 ///
 /// That is the boxed-int short-circuit / conditional-expression resume
 /// miscompile: when the codewriter parks a heap constant (a co_consts
-/// `ConstPtr` — an int outside the small-int cache, `>= 257` or negative —
-/// or any value computed before the branch) in a regular register
+/// `ConstPtr` — an int outside the 1-byte immediate range `[0, 256)` — or any
+/// value computed before the branch) in a regular register
 /// live-ACROSS the guard rather than materializing it inside the arm, the
-/// resume cannot restore it.  Cached small ints materialize via an in-arm
+/// resume cannot restore it.  One-byte immediates materialize via an in-arm
 /// `residual_call` (a write the blackhole re-executes), so their arms stay
 /// restorable and keep compiling.
 ///
@@ -12756,65 +12885,29 @@ fn walker_capture_snapshot_for_last_guard_impl(
                             // `OpRef::ty()`.  An unboxed-int kept temp (a `Ref`-
                             // bank color holding an `IntAdd` result, e.g.
                             // condexpr's `a+i`) is Int-typed and would decode as
-                            // `Box type Int != expected Ref`; it needs a
-                            // `NEW_W_INT` box the capture cannot synthesize
-                            // (boxing here emits into a settled trace →
-                            // `store_final_boxes_in_guard` panic), so leave it a
-                            // hole (the mirror already sourced every restorable
-                            // slot). The int-bank recovery below handles the
-                            // bank-0 channel where a raw int lives in the Int
-                            // register file instead.
+                            // `Box type Int != expected Ref`. Boxing it after
+                            // the guard is appended would make the guard
+                            // snapshot reference a box defined after the guard,
+                            // so the box was never computed on guard failure.
+                            // RPython materializes failargs before appending the
+                            // guard (`optimizer.py:664-672,705,708-710`).
+                            //
+                            // The hole stands because pyre elides the int box at
+                            // the tracer layer, losing the descr/known_class/
+                            // field structure deopt needs. RPython elides at
+                            // the optimizer layer (`virtualize.py:197-209`),
+                            // keeps `InstancePtrInfo`, and serializes a
+                            // TAGVIRTUAL recipe (`resume.py:415-426,487-500`)
+                            // materialized lazily only on guard failure
+                            // (`resume.py:618-621`). The orthodox fix is
+                            // push-time boxing plus optimizer virtualization,
+                            // beyond this capture hook.
                             if box_op != OpRef::NONE
                                 && !opref_is_null_const_ptr(box_op)
                                 && box_op.ty() == Some(majit_ir::Type::Ref)
                             {
                                 augmented.push((vidx, box_op));
                                 covered.insert(vidx);
-                            }
-                        }
-                    }
-                    // Int-bank fill (`get_list_of_active_boxes` `if length_i:`
-                    // section, `pyjitpl.py:206-210` —
-                    // `add_box_to_storage(self.registers_i[index])`), gated
-                    // `PYRE_FBW_DEEPKEPT_INT` (default OFF). Ref precedence:
-                    // only fill a slot the Ref bank left a hole. A bank-0 (Int)
-                    // pcdep entry names the Int-bank color owning slot
-                    // `nlocals + s`, and `registers_i[color]` holds the raw
-                    // unboxed int; box it into a `W_IntObject` (`wrapint`, the
-                    // `NewWithVtable` + `SetfieldGc(intval)` pair
-                    // `materialize_loop_carried_value` emits for a Ref-typed
-                    // loop-carried slot) so the uniformly Ref-typed vable array
-                    // carries a Ref, not a raw Int the resume decode would
-                    // reject as `Box type Int != expected Ref`. Default OFF:
-                    // flag-off leaves the int a hole, byte-identical to today
-                    // (resume re-materializes it from its defining IR).
-                    //
-                    // Scaffolding on the current frontend: pyre's operand stack
-                    // is uniformly Ref-banked in the pcdep map
-                    // (`locals_cells_stack_w` is a `W_Root[]` array), so no
-                    // bank-0 stack entry exists yet and this fires nowhere. The
-                    // real int-hole source — a Ref-bank color whose
-                    // `registers_r[color]` OpRef is itself Int-typed — CANNOT be
-                    // boxed here: `wrapint` emits `NewWithVtable` + `SetfieldGc`
-                    // into an already-settled trace at capture time, which trips
-                    // `store_final_boxes_in_guard` (`resume.py:397`
-                    // `resume_position >= 0`). The box must be synthesized at
-                    // operand-stack PUSH time, not lazily at snapshot capture —
-                    // that is a frontend change beyond this capture hook (a
-                    // bank-0 channel, e.g. the tagged-int epic, or a push-time
-                    // NEW_W_INT), tracked as a follow-up. This literal i-bank
-                    // read stays as the RPython-parity channel for when bank-0
-                    // stack entries do exist.
-                    if deepkept_int_recovery_enabled() && !covered.contains(&vidx) {
-                        if let Some(color) =
-                            crate::state::semantic_slot_color_for_int_slot(&pcdep, nlocals + s)
-                        {
-                            if let Some(&raw) = ctx.registers_i.get(color) {
-                                if raw != OpRef::NONE && raw.ty() == Some(majit_ir::Type::Int) {
-                                    let boxed = crate::state::wrapint(ctx.trace_ctx, raw);
-                                    augmented.push((vidx, boxed));
-                                    covered.insert(vidx);
-                                }
                             }
                         }
                     }
@@ -17029,7 +17122,8 @@ fn dispatch_residual_call_iRd_kind(
 
     // `_r_*` shape: argboxes = R-list only; argbox_types = [Ref; n].
     let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
-    let allboxes = build_allboxes(funcptr, &r_args, &argbox_types, call_descr.arg_types());
+    let mut allboxes = build_allboxes(funcptr, &r_args, &argbox_types, call_descr.arg_types());
+    replace_movable_load_global_namespace_with_frame_globals(ctx, ei, &mut allboxes);
     if let Err(e) = ensure_residual_call_args_bound(&allboxes, op.pc) {
         if fbw_debug_abort_enabled() {
             let len_pc = op.pc + 1 + 1;
@@ -23404,6 +23498,9 @@ fn try_walker_load_global_cell_fold(
     // ignores the slot); use `usize::MAX` as a past-the-end sentinel so the
     // `quasi_immut_cache` key cannot collide with a real cell fold's slot for
     // a DIFFERENT present name on the same module dict.
+    if !guard_current_frame_globals_identity(ctx, op_pc, w_globals)? {
+        return Ok(false);
+    }
     let abs_ns_const = ctx.trace_ctx.const_ref(w_globals as i64);
     let abs_slot_const = ctx.trace_ctx.const_int(usize::MAX as i64);
     crate::state::record_namespace_quasiimmut_field(
@@ -23417,7 +23514,21 @@ fn try_walker_load_global_cell_fold(
     // `emit_namespace_cell_fold` below records a `QUASIIMMUT_FIELD` on the
     // builtins dict + the elidable cell lookup, so a rebind/del of the
     // builtin bumps the builtins-dict `version` and fails the loop.
-    emit_namespace_cell_fold(ctx, op_pc, dst, dst_bank, w_builtin_dict, b_slot, b_stored)?;
+    if majit_gc::can_move(majit_ir::GcRef(w_builtin_dict as usize)) {
+        return Ok(false);
+    }
+    if !emit_namespace_cell_fold(
+        ctx,
+        op_pc,
+        dst,
+        dst_bank,
+        w_builtin_dict,
+        b_slot,
+        b_stored,
+        false,
+    )? {
+        return Ok(false);
+    }
     Ok(true)
 }
 
@@ -23511,8 +23622,9 @@ fn emit_module_dict_cell_fold(
                 // (never nursery), so `can_move` is false and a hot int/object
                 // global folds; a raw movable value does not.
                 if !majit_gc::can_move(majit_ir::GcRef(stored as usize)) {
-                    emit_namespace_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, slot, stored)?;
-                    return Ok(true);
+                    return emit_namespace_cell_fold(
+                        ctx, op_pc, dst, dst_bank, w_globals, slot, stored, true,
+                    );
                 }
             }
         }
@@ -23542,11 +23654,15 @@ fn emit_namespace_cell_fold(
     ns: pyre_object::PyObjectRef,
     slot: usize,
     stored: pyre_object::PyObjectRef,
-) -> Result<(), DispatchError> {
+    guard_frame_globals: bool,
+) -> Result<bool, DispatchError> {
     let is_obj_cell = unsafe { pyre_object::celldict::is_object_mutable_cell(stored) };
     let is_int_cell = unsafe { pyre_object::celldict::is_int_mutable_cell(stored) };
     let result_obj = unsafe { pyre_object::celldict::unwrap_cell(stored) };
 
+    if guard_frame_globals && !guard_current_frame_globals_identity(ctx, op_pc, ns)? {
+        return Ok(false);
+    }
     let ns_const = ctx.trace_ctx.const_ref(ns as i64);
     let slot_const = ctx.trace_ctx.const_int(slot as i64);
     crate::state::record_namespace_quasiimmut_field(
@@ -23614,7 +23730,7 @@ fn emit_namespace_cell_fold(
     // `last_exc_value` set and the walk aborts `CatchExceptionWithActiveException`.
     ctx.last_exc_value = None;
     ctx.last_exc_value_concrete = ConcreteValue::Null;
-    Ok(())
+    Ok(true)
 }
 
 /// LoadName cell fold — module-scope LOAD_NAME mirror of
@@ -23831,8 +23947,13 @@ fn dispatch_residual_call_iIRd_kind(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     // execute_varargs (pyjitpl.py:1940-1941) clear_exception at every
     // residual-call entry; see dispatch_residual_call_iRd_kind.
-    ctx.last_exc_value = None;
-    ctx.last_exc_value_concrete = ConcreteValue::Null;
+    let saved_last_exc_value = ctx.last_exc_value;
+    let saved_last_exc_value_concrete = ctx.last_exc_value_concrete;
+    let preserve_last_exc_for_handler =
+        saved_last_exc_value.is_some() && reads_last_exc_before_next_catch(code, op.next_pc);
+    if !preserve_last_exc_for_handler {
+        clear_walk_exception(ctx);
+    }
     let funcptr = read_int_reg(code, op, 0, ctx)?;
     let (i_args, i_width) = read_int_var_list(code, op, 1, ctx)?;
     let (r_args, r_width) = read_ref_var_list(code, op, 1 + i_width, ctx)?;
@@ -23927,7 +24048,6 @@ fn dispatch_residual_call_iIRd_kind(
         })?;
 
     let ei = call_descr.get_extra_info();
-    clear_walk_exception(ctx);
     // pyjitpl.py:2003-2005 OS_NOT_IN_TRACE guard — see helper docstring
     // for the convergence rationale.
     if let Some(outcome) = do_not_in_trace_call_result(ei, op.pc)? {
@@ -24266,6 +24386,8 @@ fn dispatch_residual_call_iIRd_kind(
         }
     }
 
+    replace_movable_load_global_namespace_with_frame_globals(ctx, ei, &mut allboxes);
+
     // Defer the arg-bound check past the short-circuiting LoadConst /
     // LoadGlobal folds above: each resolves the call to a constant from
     // `i_args`/`r_args` without recording it, so an unbound *trailing* arg
@@ -24368,7 +24490,15 @@ fn dispatch_residual_call_iIRd_kind(
                     // decline for Ref operands → generic residual) when an
                     // operand has no concrete shadow or the match target is
                     // not a valid exception class.
-                    try_walker_fold_check_exc_match(ctx, op.pc, &r_args, dst, dst_bank)?
+                    let keep_last_exc_for_handler =
+                        reads_last_exc_before_next_catch(code, op.next_pc);
+                    let folded =
+                        try_walker_fold_check_exc_match(ctx, op.pc, &r_args, dst, dst_bank)?;
+                    if folded.is_some() && keep_last_exc_for_handler {
+                        ctx.last_exc_value = saved_last_exc_value;
+                        ctx.last_exc_value_concrete = saved_last_exc_value_concrete;
+                    }
+                    folded
                 } else {
                     // int compare first; then long (two-bigint operands keep
                     // bigint comparison); float (incl. mixed int/float) last.
@@ -26788,7 +26918,16 @@ fn handle(
             // so a downstream
             // `last_exc_value/>r` can propagate it into its dst slot.
             let exc = read_ref_reg(code, op, 0, ctx)?;
-            let concrete_exc = read_ref_reg_concrete(code, op, 0, ctx);
+            let mut concrete_exc = read_ref_reg_concrete(code, op, 0, ctx);
+            if matches!(concrete_exc, ConcreteValue::Ref(p) if p.is_null())
+                && let Some(Value::Ref(gc_ref)) = ctx.trace_ctx.box_value(exc)
+                && gc_ref != majit_ir::GcRef::NO_CONCRETE
+            {
+                let ptr = gc_ref.as_usize() as pyre_object::PyObjectRef;
+                if !ptr.is_null() && unsafe { pyre_object::is_exception(ptr) } {
+                    concrete_exc = ConcreteValue::Ref(ptr);
+                }
+            }
             // `pyjitpl.py:1688-1693 opimpl_raise` calls
             // `generate_guard(GUARD_CLASS, exc_value_box, clsbox,
             // resumepc=orgpc)`; the first line of `generate_guard`
@@ -26912,19 +27051,25 @@ fn handle(
             //
             // Operand layout `>i`: 1B dst register only; the dst byte sits
             // at `op.pc + 1`.
-            let _exc = ctx
+            let exc = ctx
                 .last_exc_value
                 .ok_or(DispatchError::LastExceptionWithoutActiveException { pc: op.pc })?;
-            let exc_ptr = match ctx.last_exc_value_concrete {
-                ConcreteValue::Ref(p) if !p.is_null() => p,
-                _ => {
-                    return Err(DispatchError::LastExceptionWithoutActiveException { pc: op.pc });
+            let typeptr = if let Some(cls) = ctx.trace_ctx.heap_cache().get_known_class(exc) {
+                cls
+            } else {
+                let exc_ptr = match ctx.last_exc_value_concrete {
+                    ConcreteValue::Ref(p) if !p.is_null() => p,
+                    _ => {
+                        return Err(DispatchError::LastExceptionWithoutActiveException {
+                            pc: op.pc,
+                        });
+                    }
+                };
+                unsafe {
+                    (*(exc_ptr as *const pyre_object::interp_exceptions::W_BaseException))
+                        .ob_header
+                        .ob_type as i64
                 }
-            };
-            let typeptr = unsafe {
-                (*(exc_ptr as *const pyre_object::interp_exceptions::W_BaseException))
-                    .ob_header
-                    .ob_type as i64
             };
             let dst = code[op.pc + 1] as usize;
             let cls_const = ctx.trace_ctx.const_int(typeptr);

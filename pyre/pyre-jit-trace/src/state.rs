@@ -1785,27 +1785,6 @@ pub(crate) fn semantic_slot_for_reg_color(
     stack_match.or(local_match)
 }
 
-/// Bank-generic inverse of [`semantic_slot_for_reg_color`]: given a semantic
-/// `locals_cells_stack_w` slot and a bank tag (`pyjitcode.rs:198-204`:
-/// 0=Int, 1=Ref, 2=Float), return the color of that bank owning the slot at
-/// this PC per the `(bank, color, slot)` map. Returns the smallest matching
-/// color; `None` when no live color of that bank owns the slot at this PC.
-fn semantic_slot_color_for_slot(
-    pcdep_entries: &[(u8, u16, u16)],
-    slot: usize,
-    bank: u8,
-) -> Option<usize> {
-    let mut best: Option<usize> = None;
-    for &(b, color, s) in pcdep_entries {
-        if b != bank || s as usize != slot {
-            continue;
-        }
-        let c = color as usize;
-        best = Some(best.map_or(c, |cur: usize| cur.min(c)));
-    }
-    best
-}
-
 /// Inverse of [`semantic_slot_for_reg_color`] for the Ref bank: given a
 /// semantic `locals_cells_stack_w` slot, return the Ref-bank color that owns
 /// it at this PC per the `(bank, color, slot)` map. Used by the deep-kept
@@ -1817,28 +1796,15 @@ pub(crate) fn semantic_slot_color_for_ref_slot(
     pcdep_entries: &[(u8, u16, u16)],
     slot: usize,
 ) -> Option<usize> {
-    semantic_slot_color_for_slot(pcdep_entries, slot, 1)
-}
-
-/// Int-bank inverse of [`semantic_slot_for_reg_color`]: given a semantic
-/// `locals_cells_stack_w` slot, return the Int-bank color (`registers_i`) that
-/// owns it at this PC per the `(bank, color, slot)` map. The Int-bank sibling
-/// of [`semantic_slot_color_for_ref_slot`], feeding the deep-kept UNBOXED-INT
-/// operand-stack recovery in `walker_capture_snapshot_for_last_guard_impl`: a
-/// bank-0 (Int) stack slot names the guard-PC `registers_i[color]` holding the
-/// raw int, which the capture then boxes into a `W_IntObject`.
-/// `get_list_of_active_boxes` (`pyjitpl.py:206-210`) captures the i-bank via a
-/// separate `if length_i:` section
-/// (`add_box_to_storage(self.registers_i[index])`). Returns the smallest
-/// matching color; `None` when no live Int color owns the slot — which is
-/// every current-frontend stack slot, since pyre banks `locals_cells_stack_w`
-/// uniformly as Ref (bank-1). See the caller for why the Ref-bank Int-typed
-/// hole is NOT recovered by boxing at capture time.
-pub(crate) fn semantic_slot_color_for_int_slot(
-    pcdep_entries: &[(u8, u16, u16)],
-    slot: usize,
-) -> Option<usize> {
-    semantic_slot_color_for_slot(pcdep_entries, slot, 0)
+    let mut best: Option<usize> = None;
+    for &(b, color, s) in pcdep_entries {
+        if b != 1 || s as usize != slot {
+            continue;
+        }
+        let c = color as usize;
+        best = Some(best.map_or(c, |cur: usize| cur.min(c)));
+    }
+    best
 }
 
 // Sentinel null JitCode for uninitialized PyreSym.
@@ -4618,7 +4584,17 @@ impl PyreSym {
                 self.is_function_entry_trace
             );
         }
-        let valuestackdepth = concrete_stack_depth(concrete_frame).unwrap_or(nlocals);
+        let valuestackdepth = if self.bridge_stack_oprefs.is_some() {
+            // Bridge resumes keep the resume-decoded root depth. Multi-frame
+            // deopt later rewrites the live frame's valuestackdepth to the
+            // innermost callee depth (eval.rs:7740-7766), while the resume
+            // payload still carries the root depth; heap state is rebuilt from
+            // resume boxes, never the reverse (rebuild_state_after_failure,
+            // pyjitpl.py:3424-3461).
+            self.valuestackdepth
+        } else {
+            concrete_stack_depth(concrete_frame).unwrap_or(nlocals)
+        };
         let stack_only_depth = valuestackdepth.saturating_sub(nlocals);
         self.nlocals = nlocals;
         self.locals_cells_stack_array_ref = if self.is_active_vable_owner {
@@ -7951,6 +7927,71 @@ fn materialize_bridge_virtual(
     }
 }
 
+/// ResumeGuardExcDescr analog for bridge walks that start inside an
+/// already-entered exception handler.
+///
+/// `setup_bridge_sym` runs after guard-failure resume has rebuilt the live
+/// frame and restored the execution-context exception slot. If the raise that
+/// reached the handler was delivered by blackhole replay, it was not recorded
+/// in the bridge trace, so `sym.last_exc_box` is still empty even though the
+/// handler's first jitcode ops (`last_exception`, `last_exc_value`, `reraise`)
+/// require RPython's standing `metainterp.last_exc_value`. Seed the standing
+/// slot from the restored current exception only when it is a real exception
+/// object and the walk has not already seeded an in-trace raise.
+fn seed_bridge_standing_exception_from_current(
+    sym: &mut PyreSym,
+    ctx: &mut majit_metainterp::TraceCtx,
+    semantic_mirror: &[OpRef],
+    live_slot_values: &[Value],
+    nlocals: usize,
+) {
+    if !sym.last_exc_box.is_none() {
+        return;
+    }
+
+    let mut exc = sym.current_exc_value;
+    let mut exc_box = sym.current_exc_box;
+    if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
+        let current = pyre_interpreter::eval::get_current_exception();
+        if !current.is_null() && unsafe { pyre_object::is_exception(current) } {
+            exc = current;
+        } else {
+            let stack_exc = semantic_mirror
+                .iter()
+                .enumerate()
+                .skip(nlocals)
+                .rev()
+                .find_map(|(slot, &opref)| {
+                    let value = live_slot_values.get(slot)?;
+                    let Value::Ref(majit_ir::GcRef(ptr)) = value else {
+                        return None;
+                    };
+                    let obj = *ptr as pyre_object::PyObjectRef;
+                    if obj.is_null() || !unsafe { pyre_object::is_exception(obj) } {
+                        return None;
+                    }
+                    Some((obj, opref))
+                });
+            let Some((stack_exc, stack_opref)) = stack_exc else {
+                return;
+            };
+            exc = stack_exc;
+            exc_box = stack_opref;
+        }
+    }
+
+    let exc_box = if exc_box.is_none() {
+        ctx.const_ref(exc as i64)
+    } else {
+        exc_box
+    };
+    sym.current_exc_value = exc;
+    sym.current_exc_box = exc_box;
+    sym.last_exc_value = exc;
+    sym.last_exc_box = exc_box;
+    sym.class_of_last_exc_is_const = true;
+}
+
 impl JitState for PyreJitState {
     type Meta = PyreMeta;
     type Sym = PyreSym;
@@ -8844,6 +8885,13 @@ impl JitState for PyreJitState {
                 }
             }
         }
+        seed_bridge_standing_exception_from_current(
+            sym,
+            ctx,
+            &semantic_mirror,
+            &live_local_values,
+            nlocals,
+        );
         sym.registers_r = semantic_mirror;
         sym.symbolic_local_types = {
             let mut types = bridge_local_types.clone();

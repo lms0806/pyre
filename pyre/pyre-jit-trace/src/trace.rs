@@ -111,6 +111,11 @@ thread_local! {
     /// executing thread's trace; no cross-thread mutable JIT state is needed.
     static RANGE_FORITER_DEMOTED: std::cell::RefCell<std::collections::HashSet<u64>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
+    /// The current bridge trace's full-body walk hit a deterministic
+    /// structural decline.  The walker only knows `(w_code, start_pc)`; the
+    /// bridge launcher still has the originating guard descr and consumes this
+    /// bit to populate `MetaInterp::declined_bridge_guards`.
+    static FBW_BRIDGE_DECLINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn fbw_declined(key: u64) -> bool {
@@ -121,6 +126,21 @@ pub(crate) fn fbw_decline(key: u64) {
     FBW_DECLINED_KEYS.with(|s| {
         s.borrow_mut().insert(key);
     });
+}
+
+fn fbw_bridge_decline(ctx: &TraceCtx) {
+    if ctx.is_bridge_trace {
+        FBW_BRIDGE_DECLINED.with(|c| c.set(true));
+    }
+}
+
+fn p2_drain_abort(ctx: &TraceCtx) -> TraceAction {
+    fbw_bridge_decline(ctx);
+    TraceAction::Abort
+}
+
+pub fn take_fbw_bridge_declined() -> bool {
+    FBW_BRIDGE_DECLINED.with(|c| c.replace(false))
 }
 
 pub(crate) fn range_foriter_demoted(key: u64) -> bool {
@@ -484,6 +504,7 @@ pub fn trace_bytecode(
     WALK_END_PROPAGATED_EXCEPTION.with(|c| *c.borrow_mut() = None);
     WALK_END_PROPAGATE_ALLOWED.with(|c| c.set(allow_propagate_out));
     WALK_END_RESTART_PC.with(|c| c.set(None));
+    FBW_BRIDGE_DECLINED.with(|c| c.set(false));
     // `TraceCtx.reads_module_global` needs no reset here: a fresh TraceCtx is
     // built per trace (zero-init `false`), unlike the walk-end TLS flags above.
     // Likewise clear any no-replay finish payload a prior trace left
@@ -565,9 +586,8 @@ pub fn trace_bytecode(
         // The framestack-walk cross-frame bridge is correctness-buggy for a
         // branchy inlined-callee continuation. Keep it behind
         // `PYRE_P2_DRAIN=0` pending the orthodox multi-frame reconstruction fix
-        // (#343). The drain sub-walk is the safe default: with the experimental
-        // `PYRE_P2_COMPILE` unset it discards the trace and aborts to the
-        // blackhole safety floor.
+        // (#343). The drain sub-walk is the safe default, with the compile leg
+        // enabled unconditionally.
         if crate::state::p2_drain_enabled() {
             let action = drive_bridge_carrier_walk(ctx, sym, w_code, start_pc, cf_addr, carrier);
             finish_trace_namespace_dependency(meta);
@@ -600,8 +620,10 @@ pub fn trace_bytecode(
     //
     // A green key in `FBW_DECLINED_KEYS` had a prior walk fail on a
     // structural walker limitation (the recurring error classes in
-    // `full_body_walk_trace`); retraces bypass the walker and interpret
-    // without JIT instead of permanently blacklisting the location.
+    // `full_body_walk_trace`).  `FBW_DECLINED_KEYS` is insert/contains only,
+    // so the decline is permanent for this process: retraces bypass the
+    // walker and the key re-interprets without JIT instead of being
+    // permanently blacklisted (`DONT_TRACE_HERE`).
     if carrier.is_none()
         && std::env::var_os("PYRE_FULL_BODY_WALK").as_deref() != Some(std::ffi::OsStr::new("0"))
         && !fbw_declined(crate::driver::make_green_key(w_code, start_pc))
@@ -868,6 +890,18 @@ fn select_recipe_entry(
         .flatten()
 }
 
+fn residual_ref_call_dst_before(code: &[u8], entry: usize) -> Option<usize> {
+    crate::jitcode_runtime::decoded_ops(code)
+        .find(|op| op.next_pc == entry && op.opname.starts_with("residual_call"))
+        .and_then(|op| {
+            op.argcodes
+                .ends_with(">r")
+                .then(|| code.get(entry - 1).copied())
+                .flatten()
+        })
+        .map(usize::from)
+}
+
 /// Issue #215 item 2 (P2 drain): drive a multiframe bridge-carrier resume via
 /// the full-body walker instead of aborting to a no-JIT re-interpret.
 ///
@@ -882,45 +916,55 @@ fn select_recipe_entry(
 /// (`recipes` is outermost-first, so the last entry is the guard-failing
 /// frame), log the outcome, discard the trace, and abort — validates the
 /// reconstructed-frame walk plumbing before result-threading + the root walk
-/// are wired. This abort-to-blackhole drain is the safe default; the experimental
-/// `PYRE_P2_COMPILE` path remains opt-in.
+/// are wired. The compile leg is unconditional.
 /// Thread a reconstructed callee's `SubReturn` value into the root portal's
-/// operand-stack result slot so the subsequent root walk (`run_perfn_walk`'s
-/// `bridge_stack_oprefs` seeding) reads it as the call result at `root_pc`.
+/// operand-stack result register so the subsequent root walk
+/// (`run_perfn_walk`'s bridge seeding) reads it as the call result at `root_pc`.
 ///
-/// The result lands at the codewriter-precomputed result color for the call's
-/// return pc (`result_color_at_pc_at`), mapped to its `bridge_stack_oprefs`
-/// stack slot (`color - nlocals`).  Returns `false` (caller declines the
-/// compile) when the color is unresolved or sits below the operand stack.
+/// `make_result_of_lastop` writes the result to the residual-call body's
+/// trailing `>r` destination byte, so use that register when the call ending at
+/// `root_pc` can be decoded.  Fall back to the precomputed result-color table
+/// for older shapes that lack the canonical residual-call encoding.  Returns
+/// `false` (caller declines the compile) when the register is unresolved.
 fn inject_root_call_result(sym: &mut PyreSym, root_pc: usize, result: majit_ir::OpRef) -> bool {
     if sym.jitcode.is_null() {
         return false;
     }
+    let payload = unsafe { &(*sym.jitcode).payload };
     let jitcode_index = unsafe { (*sym.jitcode).index as i32 };
-    let root_py_pc = crate::state::backxlat_py_pc(jitcode_index, root_pc as i32) as usize;
-    if crate::jitcode_dispatch::result_color_audit_enabled() {
-        let payload = unsafe { &(*sym.jitcode).payload };
-        let py_pc =
-            crate::jitcode_dispatch::python_pc_for_jitcode_pc(&payload.metadata, root_pc) as usize;
-        assert_eq!(
-            payload.result_color_for_jitcode_pc_pred(root_pc),
-            payload.metadata.result_color_at_pc.get(py_pc).copied(),
-            "result_color_by_jit_pc diverges from result_color_at_pc at jit_pc={root_pc}"
-        );
-    }
-    let Some(result_color) = crate::state::result_color_at_pc_at(jitcode_index, root_py_pc) else {
+    let result_reg = residual_ref_call_dst_before(payload.jitcode.code.as_slice(), root_pc)
+        .or_else(|| {
+            let root_py_pc = crate::state::backxlat_py_pc(jitcode_index, root_pc as i32) as usize;
+            if crate::jitcode_dispatch::result_color_audit_enabled() {
+                let py_pc =
+                    crate::jitcode_dispatch::python_pc_for_jitcode_pc(&payload.metadata, root_pc)
+                        as usize;
+                assert_eq!(
+                    payload.result_color_for_jitcode_pc_pred(root_pc),
+                    payload.metadata.result_color_at_pc.get(py_pc).copied(),
+                    "result_color_by_jit_pc diverges from result_color_at_pc at jit_pc={root_pc}"
+                );
+            }
+            crate::state::result_color_at_pc_at(jitcode_index, root_py_pc)
+        });
+    let Some(result_reg) = result_reg else {
         return false;
     };
     let nlocals = sym.nlocals;
-    if result_color < nlocals {
-        return false;
+    if let Some(ref mut bridge_regs) = sym.bridge_registers_r {
+        if bridge_regs.len() <= result_reg {
+            bridge_regs.resize(result_reg + 1, majit_ir::OpRef::NONE);
+        }
+        bridge_regs[result_reg] = result;
     }
-    let slot = result_color - nlocals;
-    let bridge = sym.bridge_stack_oprefs.get_or_insert_with(Vec::new);
-    if bridge.len() <= slot {
-        bridge.resize(slot + 1, majit_ir::OpRef::NONE);
+    if result_reg >= nlocals {
+        let slot = result_reg - nlocals;
+        let bridge = sym.bridge_stack_oprefs.get_or_insert_with(Vec::new);
+        if bridge.len() <= slot {
+            bridge.resize(slot + 1, majit_ir::OpRef::NONE);
+        }
+        bridge[slot] = result;
     }
-    bridge[slot] = result;
     true
 }
 
@@ -951,7 +995,7 @@ fn drive_bridge_carrier_walk(
     }
     let Some(recipe) = carrier.recipes.last() else {
         crate::jitcode_dispatch::census_record("P2Drain::NoRecipes");
-        return TraceAction::Abort;
+        return p2_drain_abort(ctx);
     };
 
     let pre_pos = ctx.get_trace_position();
@@ -965,12 +1009,12 @@ fn drive_bridge_carrier_walk(
     else {
         ctx.cut_trace(pre_pos);
         crate::jitcode_dispatch::census_record("P2Drain::SetupFailed");
-        return TraceAction::Abort;
+        return p2_drain_abort(ctx);
     };
     let Some(callee_pjc) = crate::state::pyjitcode_for_code(recipe.code_ptr) else {
         ctx.cut_trace(pre_pos);
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleePjc");
-        return TraceAction::Abort;
+        return p2_drain_abort(ctx);
     };
     let entry = select_recipe_entry(
         recipe.jitcode_index,
@@ -980,7 +1024,7 @@ fn drive_bridge_carrier_walk(
     let Some(entry) = entry else {
         ctx.cut_trace(pre_pos);
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleeEntry");
-        return TraceAction::Abort;
+        return p2_drain_abort(ctx);
     };
     let callee_w_globals = crate::state::recover_inline_callee_globals(recipe.code_ptr) as usize;
     // The reconstructed callee's local slot concretes (`recipe.concrete_r` is
@@ -1009,9 +1053,8 @@ fn drive_bridge_carrier_walk(
     // 2b-ii: on a clean single-recipe `SubReturn`, thread the callee result
     // into the root's operand-stack result slot and walk the ROOT top-level to
     // compile the bridge (the recorded callee continuation + the root
-    // continuation form one bridge body).  Gated on `PYRE_P2_COMPILE` (requires
-    // the authoritative sub-walk that produced the `SubReturn`); other shapes /
-    // outcomes log + abort (trace discarded).
+    // continuation form one bridge body).
+    // Other shapes / outcomes log + abort (trace discarded).
     let subwalk_result = match &walk {
         Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: Some(r) }, _))) => {
             Some(*r)
@@ -1019,7 +1062,7 @@ fn drive_bridge_carrier_walk(
         _ => None,
     };
     if let Some(result) = subwalk_result {
-        if carrier.recipes.len() == 1 && std::env::var_os("PYRE_P2_COMPILE").is_some() {
+        if carrier.recipes.len() == 1 {
             if inject_root_call_result(sym, root_pc, result) {
                 crate::jitcode_dispatch::census_record("P2Drain::CompileRoot");
                 let root_py_pc =
@@ -1074,7 +1117,7 @@ fn drive_bridge_carrier_walk(
     // pre-walk heap rather than dropping the journals (which would leave every
     // eager store standing to be applied a second time).
     crate::jitcode_dispatch::fbw_store_journal_rollback();
-    TraceAction::Abort
+    p2_drain_abort(ctx)
 }
 
 /// Shape A orthodox multi-frame bridge resume: the escape-hatch driver for a
@@ -1525,6 +1568,7 @@ fn run_perfn_walk(
                 pjc.metadata.n_py_instrs as usize
             );
         }
+        fbw_bridge_decline(ctx);
         fbw_decline(crate::driver::make_green_key(w_code, start_pc));
         return None;
     };
@@ -1557,6 +1601,7 @@ fn run_perfn_walk(
                      entry_depth={entry_depth} marker_py={marker_py}; declining marker-entry walk"
                 );
             }
+            fbw_bridge_decline(ctx);
             fbw_decline(crate::driver::make_green_key(w_code, start_pc));
             return None;
         }
@@ -1575,6 +1620,7 @@ fn run_perfn_walk(
                  (built_as_portal=false); declining walk"
             );
         }
+        fbw_bridge_decline(ctx);
         fbw_decline(crate::driver::make_green_key(w_code, start_pc));
         return None;
     }
@@ -2542,9 +2588,9 @@ fn probe_walk_perfn_jitcode(
 /// `abort_permanent` (e.g. the `DELETE_FAST` cleanup for `except X as e`)
 /// still declines it, because compiled-loop delivery of an uncaught raise to
 /// the handler is not yet supported.
-fn loop_body_has_abort_permanent(w_code: *const (), start_pc: usize) -> bool {
+fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<usize> {
     let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
-        return false;
+        return None;
     };
     let code = pjc.jitcode.code.as_slice();
     let Some(merge_point) = pjc
@@ -2561,7 +2607,7 @@ fn loop_body_has_abort_permanent(w_code: *const (), start_pc: usize) -> bool {
                 .map(|op| op.pc)
         })
     else {
-        return false;
+        return None;
     };
 
     let mut back_edge_end: Option<usize> = None;
@@ -2592,14 +2638,110 @@ fn loop_body_has_abort_permanent(w_code: *const (), start_pc: usize) -> bool {
     } else {
         back_edge_end.unwrap_or(code.len())
     };
-    first_abort_permanent.is_some_and(|pc| pc < scan_end)
+    first_abort_permanent.filter(|pc| *pc < scan_end)
+}
+
+struct CalleeAbortPermanentHit {
+    callee_name: String,
+    marker_jit_pc: usize,
+    marker_py_pc: usize,
+}
+
+fn collect_loop_body_referenced_roots(
+    code: &CodeObject,
+    start_pc: usize,
+) -> Option<(
+    std::collections::HashSet<String>,
+    std::collections::HashSet<usize>,
+)> {
+    use pyre_interpreter::Instruction as I;
+
+    let mut back_edge_pc: Option<usize> = None;
+    let mut arg_state = pyre_interpreter::OpArgState::default();
+    for (pc, unit) in code.instructions.iter().copied().enumerate() {
+        let (instr, op_arg) = arg_state.get(unit);
+        let delta = match instr {
+            I::JumpBackward { delta } | I::JumpBackwardNoInterrupt { delta } => delta,
+            _ => continue,
+        };
+        if pyre_interpreter::jump_target_backward_decoded(code, pc + 1, delta, op_arg) == start_pc {
+            back_edge_pc = Some(back_edge_pc.map_or(pc, |old| old.max(pc)));
+        }
+    }
+    let back_edge_pc = back_edge_pc?;
+
+    let mut global_names = std::collections::HashSet::new();
+    let mut local_slots = std::collections::HashSet::new();
+    let mut scan_pc = |pc: usize| {
+        let Some((instr, op_arg)) = pyre_interpreter::decode_instruction_at(code, pc) else {
+            return;
+        };
+        match instr {
+            I::LoadGlobal { namei } => {
+                let name_idx = (namei.get(op_arg) as usize) >> 1;
+                if let Some(name) = code.names.get(name_idx) {
+                    global_names.insert(name.to_string());
+                }
+            }
+            I::LoadFast { var_num }
+            | I::LoadFastBorrow { var_num }
+            | I::LoadFastCheck { var_num }
+            | I::LoadFastAndClear { var_num } => {
+                local_slots.insert(var_num.get(op_arg).as_usize());
+            }
+            I::LoadDeref { i } => {
+                local_slots.insert(i.get(op_arg).as_usize());
+            }
+            I::LoadFastBorrowLoadFastBorrow { var_nums } | I::LoadFastLoadFast { var_nums } => {
+                let pair = var_nums.get(op_arg);
+                local_slots.insert(u32::from(pair.idx_1()) as usize);
+                local_slots.insert(u32::from(pair.idx_2()) as usize);
+            }
+            I::StoreFastLoadFast { var_nums } => {
+                let pair = var_nums.get(op_arg);
+                local_slots.insert(u32::from(pair.idx_2()) as usize);
+            }
+            _ => {}
+        }
+    };
+
+    for pc in start_pc..=back_edge_pc {
+        scan_pc(pc);
+    }
+
+    let loop_start_byte = (start_pc as u32) * 2;
+    let loop_end_byte = ((back_edge_pc + 1) as u32) * 2;
+    for entry in pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable) {
+        if entry.start < loop_start_byte || entry.end > loop_end_byte {
+            continue;
+        }
+        let handler_start = (entry.target / 2) as usize;
+        for pc in handler_start..code.instructions.len() {
+            scan_pc(pc);
+            let Some((instr, _)) = pyre_interpreter::decode_instruction_at(code, pc) else {
+                continue;
+            };
+            if matches!(
+                instr,
+                I::Reraise { .. }
+                    | I::JumpForward { .. }
+                    | I::JumpBackward { .. }
+                    | I::JumpBackwardNoInterrupt { .. }
+                    | I::ReturnValue
+            ) {
+                break;
+            }
+        }
+    }
+
+    Some((global_names, local_slots))
 }
 
 /// True when the hot loop body in `w_code` inline-calls — transitively — a
 /// user function whose per-fn jitcode body carries an `abort_permanent`
 /// marker.
 ///
-/// [`loop_body_has_abort_permanent`] only scans the top-level per-CodeObject
+/// [`loop_body_abort_permanent_pc`] only scans the top-level per-CodeObject
 /// jitcode, so an `abort_permanent` reached through an inlined callee slips
 /// past it.  That gap causes a walk-time double-apply: a non-journaled
 /// concrete heap store (dict/attr/set item, list `extend`, …) in the loop
@@ -2613,15 +2755,15 @@ fn loop_body_has_abort_permanent(w_code: *const (), start_pc: usize) -> bool {
 /// without JIT (correct, at interpreter speed).
 ///
 /// This is an OVER-DECLINING stopgap, and static: it mirrors the inline path's
-/// static eligibility gates, but can still decline on a function merely
-/// referenced by the loop (present in `co_names`/locals), not just one the
-/// executed path actually calls.  Call-site-dependent gates such as the
-/// passed-argument count and recursion depth cannot be resolved by this scan,
-/// so a callee that would fail one of those gates can also over-decline.  A hot
-/// loop that calls an otherwise inline-eligible helper whose body contains an
-/// unported op (`match`, `async`, chained-compare `SWAP`, …) — even on a rarely
-/// taken path — now runs interpreted in full, not just the aborting call.  The
-/// orthodox mechanism has no up-front scan at all: an unsupported op raises
+/// static eligibility gates, but can still decline on a function referenced by
+/// a loop-body `LOAD_GLOBAL`/local-slot load even when the executed path does
+/// not actually call it.  Call-site-dependent gates such as the passed-argument
+/// count and recursion depth cannot be resolved by this scan, so a callee that
+/// would fail one of those gates can also over-decline.  A hot loop that calls
+/// an otherwise inline-eligible helper whose body contains an unported op
+/// (`match`, `async`, chained-compare `SWAP`, …) — even on a rarely taken path
+/// — now runs interpreted in full, not just the aborting call.  The orthodox
+/// mechanism has no up-front scan at all: an unsupported op raises
 /// `SwitchToBlackhole` mid-trace and
 /// `run_blackhole_interp_to_cancel_tracing` (pyjitpl.py:2949) converts the live
 /// framestack and continues FORWARD in the blackhole interpreter, so nothing
@@ -2630,11 +2772,11 @@ fn loop_body_has_abort_permanent(w_code: *const (), start_pc: usize) -> bool {
 /// the outer walk in place instead of rolling back to loop entry.
 ///
 /// The scan resolves candidate callees CONCRETELY from the live frame (the
-/// walk has not run yet, so no store has executed).  Two seed sources:
-/// - the frame's module globals — every referenced name in the CodeObject's
-///   `co_names` is looked up in `w_globals`;
-/// - the ROOT frame's fastlocals + closure cells — a helper passed as an
-///   argument/local (`h([i, i])`) or held in a closure cell resolves here.
+/// walk has not run yet, so no store has executed).  Two root seed sources,
+/// both scoped to identifiers the loop body or its in-loop handlers read:
+/// - module globals named by loop-body `LOAD_GLOBAL`;
+/// - ROOT-frame fastlocals + closure cells whose slots are read by loop-body
+///   local-load opcodes.
 ///
 /// Each plain-function value first passes the inline path's static closure,
 /// positional-parameter, jitcode-body, and Ref-register-capacity gates.  Its
@@ -2643,20 +2785,24 @@ fn loop_body_has_abort_permanent(w_code: *const (), start_pc: usize) -> bool {
 /// Non-aborting eligible callees are enqueued and their own referenced
 /// functions scanned transitively through THEIR globals, guarded by a
 /// scan-local visited set.  The root `w_code` is pre-marked visited — its own
-/// loop-body marker is already handled by [`loop_body_has_abort_permanent`].
+/// loop-body marker is already handled by [`loop_body_abort_permanent_pc`].
 ///
 /// Frame-local seeding is ROOT-frame only; a deeper (not-yet-pushed) callee's
 /// locals are not available up front.  Callees reached via attribute access,
 /// container elements, or another call's return value, and callees local to a
 /// deeper frame, stay unresolvable before the walk — those rely on the
 /// deferred #126/#215 forward-resume convergence rather than this stopgap.
-fn loop_inlines_abort_permanent_callee(w_code: *const (), cf_addr: usize) -> bool {
+fn loop_inlines_abort_permanent_callee(
+    w_code: *const (),
+    start_pc: usize,
+    cf_addr: usize,
+) -> Option<CalleeAbortPermanentHit> {
     // Gate: only scan when the top-level loop body (ops after the first
     // `jit_merge_point`) contains a `residual_call*` op.  Every inline-eligible
     // user call lowers to a residual_call, so a call-free loop cannot
     // inline-abort — skipping it avoids resolving globals for the common case.
     let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
-        return false;
+        return None;
     };
     let mut seen_merge_point = false;
     let mut has_residual_call = false;
@@ -2669,7 +2815,7 @@ fn loop_inlines_abort_permanent_callee(w_code: *const (), cf_addr: usize) -> boo
         }
     }
     if !has_residual_call || cf_addr == 0 {
-        return false;
+        return None;
     }
 
     // Process one concrete candidate value shared by both seed paths (globals
@@ -2685,22 +2831,22 @@ fn loop_inlines_abort_permanent_callee(w_code: *const (), cf_addr: usize) -> boo
         function_type_addr: usize,
         visited: &mut std::collections::HashSet<*const ()>,
         queue: &mut std::collections::VecDeque<(*const (), pyre_object::PyObjectRef)>,
-    ) -> bool {
+    ) -> Option<CalleeAbortPermanentHit> {
         // A tagged immediate int is never a FUNCTION_TYPE callee; skip it
         // before the `ob_type` deref below (which reads an even-aligned heap
         // pointer). Reaches here via the globals-dict scan and via a cell
         // whose contents are a tagged int.
         if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(cand) {
-            return false;
+            return None;
         }
         // Only plain user functions inline (mirrors the inline path's exact
         // FUNCTION_TYPE gate); builtins carry no CodeObject.
         if cand.is_null() || (*cand).ob_type as *const () as usize != function_type_addr {
-            return false;
+            return None;
         }
         let callee_w_code = pyre_interpreter::function_get_code(cand);
         if callee_w_code.is_null() {
-            return false;
+            return None;
         }
         // A FUNCTION_TYPE object can wrap a BuiltinCode, not a CodeObject:
         // `make_builtin_function*` (gateway.rs:701) puts such a function into
@@ -2709,25 +2855,43 @@ fn loop_inlines_abort_permanent_callee(w_code: *const (), cf_addr: usize) -> boo
         // as a PyCode and derefs garbage, so reject it before the scan — a
         // builtin carries no traceable body and never inlines.
         if pyre_interpreter::is_builtin_code(callee_w_code as pyre_object::PyObjectRef) {
-            return false;
+            return None;
         }
         let Some((callee_w_code, nparams, has_closure)) =
             crate::jitcode_dispatch::resolve_inlinable_callee(cand)
         else {
-            return false;
+            return None;
         };
         if has_closure || nparams == 0 {
-            return false;
+            return None;
         }
         let Some(body) = crate::state::sub_jitcode_body_for_code(callee_w_code) else {
-            return false;
+            return None;
         };
         if nparams > body.num_regs_r || !visited.insert(callee_w_code) {
-            return false;
+            return None;
         }
         for op in crate::jitcode_runtime::decoded_ops(body.code) {
             if op.opname == "abort_permanent" {
-                return true;
+                let raw_code =
+                    pyre_interpreter::w_code_get_ptr(callee_w_code as pyre_object::PyObjectRef)
+                        as *const CodeObject;
+                let callee_name = if raw_code.is_null() {
+                    "<unknown>".to_string()
+                } else {
+                    (*raw_code).obj_name.as_str().to_owned()
+                };
+                let marker_py_pc = crate::state::pyjitcode_for_code(callee_w_code)
+                    .map(|pjc| {
+                        crate::jitcode_dispatch::python_pc_for_jitcode_pc(&pjc.metadata, op.pc)
+                            as usize
+                    })
+                    .unwrap_or(op.pc);
+                return Some(CalleeAbortPermanentHit {
+                    callee_name,
+                    marker_jit_pc: op.pc,
+                    marker_py_pc,
+                });
             }
         }
         // Transitive: resolve this callee's own referenced functions in its own
@@ -2736,7 +2900,7 @@ fn loop_inlines_abort_permanent_callee(w_code: *const (), cf_addr: usize) -> boo
         if !callee_globals.is_null() {
             queue.push_back((callee_w_code, callee_globals));
         }
-        false
+        None
     }
 
     // SAFETY: `cf_addr` is the live `PyFrame` pointer the portal passed to the
@@ -2747,8 +2911,18 @@ fn loop_inlines_abort_permanent_callee(w_code: *const (), cf_addr: usize) -> boo
         let cf = &*(cf_addr as *const pyre_interpreter::pyframe::PyFrame);
         let root_globals = cf.w_globals;
         if root_globals.is_null() {
-            return false;
+            return None;
         }
+        let raw_code = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const CodeObject;
+        if raw_code.is_null() {
+            return None;
+        }
+        let Some((loop_body_global_names, loop_body_local_slots)) =
+            collect_loop_body_referenced_roots(&*raw_code, start_pc)
+        else {
+            return None;
+        };
         let function_type_addr = &pyre_interpreter::FUNCTION_TYPE as *const _ as usize;
         let mut visited: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
         // The root's own loop-body `abort_permanent` is handled upstream.
@@ -2756,16 +2930,31 @@ fn loop_inlines_abort_permanent_callee(w_code: *const (), cf_addr: usize) -> boo
         // BFS over (code wrapper ptr, globals in which its `co_names` resolve).
         let mut queue: std::collections::VecDeque<(*const (), pyre_object::PyObjectRef)> =
             std::collections::VecDeque::new();
-        queue.push_back((w_code, root_globals));
+
+        for name in &loop_body_global_names {
+            let Some(cand) =
+                pyre_object::dictmultiobject::w_dict_getitem_str(root_globals, name.as_str())
+            else {
+                continue;
+            };
+            if let Some(hit) =
+                consider_candidate(cand, function_type_addr, &mut visited, &mut queue)
+            {
+                return Some(hit);
+            }
+        }
 
         // Seed from the root frame's fastlocals + closure cells: a helper
-        // passed as an argument/local or held in a cell is not in `co_names`,
-        // so resolve it directly from the frame's initialised locals/cells
-        // region.  Stop at `stack_base()` — operand-stack slots beyond it are
-        // uninitialised.
+        // passed as an argument/local or held in a cell is not in `co_names`, so
+        // resolve it directly from the loop-body-referenced slots in the
+        // frame's initialised locals/cells region.  Stop at `stack_base()` —
+        // operand-stack slots beyond it are uninitialised.
         let slots = cf.locals_w().as_slice();
         let bound = cf.stack_base().min(slots.len());
-        for &slot in &slots[..bound] {
+        for (slot_idx, &slot) in slots[..bound].iter().enumerate() {
+            if !loop_body_local_slots.contains(&slot_idx) {
+                continue;
+            }
             if slot.is_null() {
                 continue;
             }
@@ -2782,8 +2971,10 @@ fn loop_inlines_abort_permanent_callee(w_code: *const (), cf_addr: usize) -> boo
             } else {
                 slot
             };
-            if consider_candidate(value, function_type_addr, &mut visited, &mut queue) {
-                return true;
+            if let Some(hit) =
+                consider_candidate(value, function_type_addr, &mut visited, &mut queue)
+            {
+                return Some(hit);
             }
         }
 
@@ -2799,13 +2990,15 @@ fn loop_inlines_abort_permanent_callee(w_code: *const (), cf_addr: usize) -> boo
                 else {
                     continue;
                 };
-                if consider_candidate(cand, function_type_addr, &mut visited, &mut queue) {
-                    return true;
+                if let Some(hit) =
+                    consider_candidate(cand, function_type_addr, &mut visited, &mut queue)
+                {
+                    return Some(hit);
                 }
             }
         }
     }
-    false
+    None
 }
 
 /// Whether [`full_body_walk_trace`] starts a fresh walk or continues one that
@@ -2851,12 +3044,15 @@ fn full_body_walk_trace(
     // guard, exit early, and concretely double-execute the post-loop tail;
     // declining before the walk reaches the unported op avoids frame
     // corruption and returns to interpretation.
-    if loop_body_has_abort_permanent(w_code, start_pc) {
+    if let Some(abort_pc) = loop_body_abort_permanent_pc(w_code, start_pc) {
         // Tag the decline so `PYRE_FBW_DEBUG_ABORT` census attributes it to the
         // up-front `abort_permanent` scan, not the trait retry fall-through
         // (`Trait::DeclinedAbort`).  Without this the real declining class is
         // invisible to the census.
         crate::jitcode_dispatch::census_record("FullBodyWalk::LoopBodyAbortPermanent");
+        if std::env::var_os("PYRE_FBW_DEBUG_ABORT").is_some() {
+            eprintln!("[fbw-abort] start_pc={start_pc} abort_permanent_pc={abort_pc}");
+        }
         fbw_decline(crate::driver::make_green_key(w_code, start_pc));
         return TraceAction::Abort;
     }
@@ -2866,8 +3062,15 @@ fn full_body_walk_trace(
     // abort the walk, roll back the store journal, and replay from loop entry
     // — re-executing the non-journaled store.  Decline up front, before the
     // walk runs anything.  (See `loop_inlines_abort_permanent_callee`.)
-    if loop_inlines_abort_permanent_callee(w_code, cf_addr) {
+    if let Some(hit) = loop_inlines_abort_permanent_callee(w_code, start_pc, cf_addr) {
         crate::jitcode_dispatch::census_record("FullBodyWalk::CalleeAbortPermanent");
+        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-abort] start_pc={start_pc} callee={} abort_permanent_jit_pc={} \
+                 marker_py={}; declining callee-abort walk",
+                hit.callee_name, hit.marker_jit_pc, hit.marker_py_pc
+            );
+        }
         fbw_decline(crate::driver::make_green_key(w_code, start_pc));
         return TraceAction::Abort;
     }
@@ -3014,21 +3217,17 @@ fn full_body_walk_trace(
         Some((_entry, _code_len, Err(e))) => {
             // Structural walker limitations recur identically on every
             // retrace of this location (the same jitcode walked from the same
-            // entry produces the same error), so route the key's retraces to
-            // interpretation instead of thrashing futile deep re-walks —
+            // entry produces the same error), so record the key in
+            // `FBW_DECLINED_KEYS` instead of thrashing futile deep re-walks —
             // each of which executes the body's residual calls concretely
             // before failing at the unsupported resume / exception / closure
-            // shape.  Permanently blacklisting (`AbortPermanent` →
-            // `DONT_TRACE_HERE`) is wrong here: it leaves the location
-            // interpreting forever (a try-protected raise in a hot loop
-            // deopt-storms past any timeout), and upstream never marks a
-            // location untraceable on an abort (pyjitpl.py:2392
-            // aborted_tracing).  These are the multi-session-blocked
-            // shapes (resume snapshot #124, exception-handler resume #51c,
-            // closure NULL-self #60, unported raise marker, a residual
-            // arg register the walk never binds); other errors retain the
-            // plain `Abort` without declining so a capability that lands
-            // mid-run can still pick the location up.
+            // shape.  `FBW_DECLINED_KEYS` is a permanent per-process decline:
+            // the key re-interprets without tracing.  These are the
+            // multi-session-blocked shapes (resume snapshot #124,
+            // exception-handler resume #51c, closure NULL-self #60, unported
+            // raise marker, a residual arg register the walk never binds);
+            // other errors retain the plain `Abort` without declining so a
+            // capability that lands mid-run can still pick the location up.
             use crate::jitcode_dispatch::DispatchError as DE;
             crate::jitcode_dispatch::census_record(e.variant_name());
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
@@ -3036,9 +3235,10 @@ fn full_body_walk_trace(
             }
             match e {
                 // A kept-stack branch guard whose not-taken arm reads an
-                // unrestorable boxed Ref register cannot safely be retraced.
-                // Mark the location `DONT_TRACE_HERE` so it interprets
-                // permanently — correct, matching the pre-#416/#420 decline.
+                // unrestorable boxed Ref register is a structural abort.
+                // Keeping the permanent mapping is behavior-neutral: a plain
+                // `Abort` reaches the same `DONT_TRACE_HERE` terminal state
+                // through pyre's abort ceiling.
                 DE::BranchGuardUnrestorableKeptStackPermanent { .. } => TraceAction::AbortPermanent,
                 // #57 (Finding #1): a non-journalable in-place container mutation
                 // in a FOR_ITER body cannot be rolled back on abort, so this
@@ -3083,6 +3283,7 @@ fn full_body_walk_trace(
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                 eprintln!("[fbw-abort] start_pc={start_pc} run_perfn_walk returned None");
             }
+            fbw_bridge_decline(ctx);
             TraceAction::Abort
         }
     }
