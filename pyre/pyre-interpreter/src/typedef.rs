@@ -406,9 +406,15 @@ pub fn init_typeobjects() {
         // `__flags__`, `isinstance(m, object)` and the inherited
         // `object.__reduce_ex__` all resolve.  `get_instantiate(&MODULE_TYPE)`
         // (read by `w_module_new`) is wired by the `set_instantiate` loop below.
+        let module_type = new_typeobject_with_base("module", init_module_type, object_type);
+        unsafe {
+            // module.py Module.getdict plus Module.typedef.__weakref__.
+            pyre_object::w_type_set_hasdict(module_type, true);
+            pyre_object::w_type_set_weakrefable(module_type, true);
+        }
         reg.insert(
             &pyre_object::MODULE_TYPE as *const PyType as usize,
-            new_typeobject_with_base("module", init_module_type, object_type) as usize,
+            module_type as usize,
         );
         // `pypy/objspace/std/dictmultiobject.py:449/459/469` —
         // dict_keys / dict_values / dict_items.  PyPy registers
@@ -489,13 +495,21 @@ pub fn init_typeobjects() {
             function_type as usize,
         );
 
-        // builtin_function — PyPy: typedef.py BuiltinFunction.typedef
-        // Mirrors Function.typedef except `__get__` is intentionally absent.
-        let builtin_function_type =
-            new_typeobject_with_base("builtin_function", init_builtin_function_type, object_type);
-        unsafe { pyre_object::w_type_set_acceptable_as_base_class(builtin_function_type, false) };
+        // builtin_function — PyPy: typedef.py BuiltinFunction.typedef. The
+        // externally visible name follows CPython 3.14.
+        let builtin_function_type = new_typeobject_with_base(
+            "builtin_function_or_method",
+            init_builtin_function_type,
+            object_type,
+        );
         unsafe {
-            pyre_object::w_type_set_hasdict(builtin_function_type, true);
+            pyre_object::w_type_set_acceptable_as_base_class(builtin_function_type, false);
+            pyre_object::w_type_set_disallow_instantiation(builtin_function_type);
+        }
+        unsafe {
+            // CPython 3.14 PyCFunction objects are weakrefable but have no
+            // instance dict. PyPy's copied Function rawdict differs here.
+            pyre_object::w_type_set_hasdict(builtin_function_type, false);
             pyre_object::w_type_set_weakrefable(builtin_function_type, true);
         }
         reg.insert(
@@ -860,9 +874,18 @@ pub fn init_typeobjects() {
             }
             reg.insert(pytype as usize, iterator_type as usize);
         }
+        let cell_type = new_typeobject_with_base_and_layout(
+            "cell",
+            init_cell_type,
+            object_type,
+            &pyre_object::nestedscope::CELL_TYPE as *const PyType,
+        );
+        // typedef.py:953 `Cell.typedef.acceptable_as_base_class = False`;
+        // CPython 3.14 likewise omits Py_TPFLAGS_BASETYPE.
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(cell_type, false) };
         reg.insert(
             &pyre_object::nestedscope::CELL_TYPE as *const PyType as usize,
-            new_typeobject_with_base("cell", init_cell_type, object_type) as usize,
+            cell_type as usize,
         );
         reg.insert(
             &pyre_object::interp_itertools::COUNT_TYPE as *const PyType as usize,
@@ -1005,7 +1028,10 @@ pub fn init_typeobjects() {
     PATCH_TYPEOBJECTS.call_once(|| {
         patch_object_class_descriptor();
         patch_builtin_function_descriptors();
+        patch_function_member_descriptors();
+        patch_module_descriptors();
         patch_frame_traceback_descriptors();
+        patch_cell_descriptor();
         patch_getset_descriptor_metadata();
         patch_typeobject_descriptor_names();
     });
@@ -1042,6 +1068,7 @@ fn patch_object_class_descriptor() {
         make_getset_property_full(
             class_getter,
             class_setter,
+            pyre_object::PY_NULL,
             pyre_object::PY_NULL,
             object_type,
             Some("__class__"),
@@ -1174,6 +1201,16 @@ unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef) {
         let Some(descr) = pyre_object::w_dict_getitem_str(ns, &key) else {
             continue;
         };
+        // CPython member descriptors carry their defining type in d_type;
+        // PyPy's Member receives w_cls while the TypeDef is materialised.
+        // Builtin TypeDef initializers necessarily create the descriptor
+        // before `type_obj` exists, so fill the equivalent typed field here.
+        if !descr.is_null() && pyre_object::is_member(descr) {
+            let owner = pyre_object::w_member_get_cls(descr);
+            if owner.is_null() {
+                pyre_object::w_member_set_cls(descr, type_obj);
+            }
+        }
         if !descr.is_null() && pyre_object::typedef::is_getset_property(descr) {
             let descr_slot = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(descr);
@@ -1569,19 +1606,64 @@ fn module_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 /// `__name__` / `__doc__` / `__package__` / `__loader__` / `__spec__`
 /// in the module dict.
 fn module_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, _kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if positional.len() < 2 {
-        return Err(crate::PyError::type_error(
-            "module.__init__() missing required argument 'name' (pos 1)".to_string(),
-        ));
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let given = positional.len().saturating_sub(1);
+    if given > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "module() takes at most 2 arguments ({given} given)"
+        )));
     }
+    let mut w_name = positional.get(1).copied();
+    let mut w_doc = positional.get(2).copied();
+    if let Some(kwargs) = kwargs {
+        for (key, value) in unsafe { pyre_object::w_dict_str_entries_wtf8(kwargs) } {
+            let Ok(key) = key.as_str() else {
+                continue;
+            };
+            if key == "__pyre_kw__" {
+                continue;
+            }
+            match key {
+                "name" if w_name.is_none() => w_name = Some(value),
+                "name" => {
+                    return Err(crate::PyError::type_error(
+                        "argument for module() given by name ('name') and position (1)",
+                    ));
+                }
+                "doc" if w_doc.is_none() => w_doc = Some(value),
+                "doc" => {
+                    return Err(crate::PyError::type_error(
+                        "argument for module() given by name ('doc') and position (2)",
+                    ));
+                }
+                other => {
+                    return Err(crate::PyError::type_error(format!(
+                        "module() got an unexpected keyword argument '{other}'"
+                    )));
+                }
+            }
+        }
+    }
+    let Some(w_name) = w_name else {
+        return Err(crate::PyError::type_error(
+            "module() missing required argument 'name' (pos 1)",
+        ));
+    };
     let self_ = positional[0];
-    let w_name = positional[1];
-    let w_doc = positional
-        .get(2)
-        .copied()
-        .unwrap_or_else(pyre_object::w_none);
-    let name = crate::baseobjspace::text_w(w_name)?;
+    if !unsafe { pyre_object::is_str(w_name) } {
+        let received = if unsafe { pyre_object::is_none(w_name) } {
+            "None".to_string()
+        } else {
+            crate::typedef::r#type(w_name)
+                .map(|tp| unsafe { pyre_object::w_type_get_name(tp) }.to_string())
+                .unwrap_or_else(|| unsafe { (*(*w_name).ob_type).name }.to_string())
+        };
+        return Err(crate::PyError::type_error(format!(
+            "module() argument 'name' must be str, not {received}"
+        )));
+    }
+    let w_doc = w_doc.unwrap_or_else(pyre_object::w_none);
+    let name = unsafe { pyre_object::w_str_get_value(w_name) };
     unsafe { pyre_object::w_module_set_name(self_, name) };
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(self_) };
     unsafe {
@@ -1592,6 +1674,244 @@ fn module_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         pyre_object::w_dict_setitem_str(w_dict, "__spec__", pyre_object::w_none());
     }
     Ok(pyre_object::w_none())
+}
+
+/// module.py:126-128 `Module.descr_module__repr__` — delegate to
+/// `_frozen_importlib._module_repr`, which implements the spec/file/name
+/// precedence shared by CPython 3.14.
+fn module_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(pyre_object::w_str_new(&module_repr_string(args[0])?))
+}
+
+pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<String, crate::PyError> {
+    let importlib = crate::importing::get_sys_module("_frozen_importlib")
+        .or_else(|| crate::importing::get_sys_module("importlib._bootstrap"));
+    if let Some(importlib) = importlib {
+        let repr_fn = crate::baseobjspace::getattr_str(importlib, "_module_repr")?;
+        let result = crate::call::call_function_impl_result(repr_fn, &[module])?;
+        return Ok(crate::baseobjspace::text_w(result)?.to_string());
+    }
+    let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+    let loader = crate::baseobjspace::finditem_str(w_dict, "__loader__")?;
+    if let Some(spec) = crate::baseobjspace::finditem_str(w_dict, "__spec__")? {
+        if !spec.is_null()
+            && !unsafe { pyre_object::is_none(spec) }
+            && crate::baseobjspace::is_true(spec)?
+        {
+            let mut name = crate::baseobjspace::getattr_str(spec, "name")?;
+            if unsafe { pyre_object::is_none(name) } {
+                name = pyre_object::w_str_new("?");
+            }
+            let origin = crate::baseobjspace::getattr_str(spec, "origin")?;
+            if unsafe { pyre_object::is_none(origin) } {
+                let spec_loader = crate::baseobjspace::getattr_str(spec, "loader")?;
+                if unsafe { pyre_object::is_none(spec_loader) } {
+                    return Ok(format!("<module {}>", unsafe {
+                        crate::display::py_repr(name)?
+                    }));
+                }
+                return Ok(format!(
+                    "<module {} ({})>",
+                    unsafe { crate::display::py_repr(name)? },
+                    unsafe { crate::display::py_repr(spec_loader)? }
+                ));
+            }
+            let has_location = crate::baseobjspace::getattr_str(spec, "has_location")?;
+            if crate::baseobjspace::is_true(has_location)? {
+                return Ok(format!(
+                    "<module {} from {}>",
+                    unsafe { crate::display::py_repr(name)? },
+                    unsafe { crate::display::py_repr(origin)? }
+                ));
+            }
+            return Ok(format!(
+                "<module {} ({})>",
+                unsafe { crate::display::py_repr(name)? },
+                unsafe { crate::display::py_str(origin)? }
+            ));
+        }
+    }
+    let name = crate::baseobjspace::finditem_str(w_dict, "__name__")?
+        .unwrap_or_else(|| pyre_object::w_str_new("?"));
+    let name_repr = unsafe { crate::display::py_repr(name)? };
+    if let Some(filename) = crate::baseobjspace::finditem_str(w_dict, "__file__")? {
+        return Ok(format!("<module {name_repr} from {}>", unsafe {
+            crate::display::py_repr(filename)?
+        }));
+    }
+    if let Some(loader) = loader {
+        if !loader.is_null() && !unsafe { pyre_object::is_none(loader) } {
+            return Ok(format!("<module {name_repr} ({})>", unsafe {
+                crate::display::py_repr(loader)?
+            }));
+        }
+    }
+    Ok(format!("<module {name_repr}>"))
+}
+
+/// module.py:130-160 `Module.descr_getattribute`. The object-space module
+/// path already performs the normal lookup, PEP 562 `__getattr__`, and the
+/// module-specific AttributeError wording, so the descriptor is the direct
+/// entry point into that same implementation.
+fn module_descr_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let module = args[0];
+    let name = crate::baseobjspace::text_w(args[1])?;
+    crate::baseobjspace::getattr_str(module, name)
+}
+
+/// module.py:164-173 `Module.descr_module__dir__`.
+fn module_descr_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let module = args[0];
+    let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+    if w_dict.is_null()
+        || (!unsafe { pyre_object::is_dict(w_dict) }
+            && !unsafe { pyre_object::dictmultiobject::is_module_dict(w_dict) }
+            && !gettypefor(&pyre_object::DICT_TYPE).is_some_and(|dict_type| unsafe {
+                crate::baseobjspace::isinstance_w(w_dict, dict_type)
+            }))
+    {
+        return Err(crate::PyError::type_error(format!(
+            "{}.__dict__ is not a dictionary",
+            unsafe { crate::display::py_repr(module)? }
+        )));
+    }
+    if let Some(w_dir) = crate::baseobjspace::finditem_str(w_dict, "__dir__")? {
+        return crate::call::call_function_impl_result(w_dir, &[]);
+    }
+    crate::builtins::builtin_list_ctor(&[w_dict])
+}
+
+fn module_annotations_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let module = args[1];
+    let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_dict);
+    if let Some(annotations) = crate::baseobjspace::finditem_str(w_dict, "__annotations__")? {
+        return Ok(annotations);
+    }
+    let annotations = match crate::baseobjspace::finditem_str(w_dict, "__annotate__")? {
+        Some(annotate) if !annotate.is_null() && !unsafe { pyre_object::is_none(annotate) } => {
+            let annotate_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(annotate);
+            let format = pyre_object::w_int_new(1);
+            let result = crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(annotate_slot),
+                &[format],
+            )?;
+            if !unsafe { pyre_object::is_dict(result) } {
+                let received = crate::typedef::r#type(result)
+                    .map(|tp| unsafe { pyre_object::w_type_get_name(tp) }.to_string())
+                    .unwrap_or_else(|| unsafe { (*(*result).ob_type).name }.to_string());
+                return Err(crate::PyError::type_error(format!(
+                    "__annotate__ returned non-dict of type '{received}'"
+                )));
+            }
+            result
+        }
+        _ => pyre_object::w_dict_new(),
+    };
+    let annotations_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(annotations);
+    let key = pyre_object::w_str_new("__annotations__");
+    crate::baseobjspace::setitem(
+        pyre_object::gc_roots::shadow_stack_get(dict_slot),
+        key,
+        pyre_object::gc_roots::shadow_stack_get(annotations_slot),
+    )?;
+    Ok(pyre_object::gc_roots::shadow_stack_get(annotations_slot))
+}
+
+fn module_annotations_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let module = args[1];
+    let value = args[2];
+    let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_dict);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(value);
+    let annotations_key = pyre_object::w_str_new("__annotations__");
+    crate::baseobjspace::setitem(
+        pyre_object::gc_roots::shadow_stack_get(dict_slot),
+        annotations_key,
+        pyre_object::gc_roots::shadow_stack_get(value_slot),
+    )?;
+    let annotate_key = pyre_object::w_str_new("__annotate__");
+    let _ = crate::baseobjspace::delitem(
+        pyre_object::gc_roots::shadow_stack_get(dict_slot),
+        annotate_key,
+    );
+    Ok(pyre_object::w_none())
+}
+
+fn module_annotations_del(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let module = args[1];
+    let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_dict);
+    if crate::baseobjspace::finditem_str(w_dict, "__annotations__")?.is_none() {
+        return Err(crate::PyError::attribute_error("__annotations__"));
+    }
+    let annotations_key = pyre_object::w_str_new("__annotations__");
+    crate::baseobjspace::delitem(
+        pyre_object::gc_roots::shadow_stack_get(dict_slot),
+        annotations_key,
+    )?;
+    let annotate_key = pyre_object::w_str_new("__annotate__");
+    let _ = crate::baseobjspace::delitem(
+        pyre_object::gc_roots::shadow_stack_get(dict_slot),
+        annotate_key,
+    );
+    Ok(pyre_object::w_none())
+}
+
+fn module_annotate_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let module = args[1];
+    let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+    if let Some(annotate) = crate::baseobjspace::finditem_str(w_dict, "__annotate__")? {
+        return Ok(annotate);
+    }
+    let none = pyre_object::w_none();
+    crate::baseobjspace::setitem(w_dict, pyre_object::w_str_new("__annotate__"), none)?;
+    Ok(none)
+}
+
+fn module_annotate_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let module = args[1];
+    let value = args[2];
+    if !unsafe { pyre_object::is_none(value) } && !crate::baseobjspace::callable_w(value) {
+        return Err(crate::PyError::type_error(
+            "__annotate__ must be callable or None",
+        ));
+    }
+    let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_dict);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(value);
+    let annotate_key = pyre_object::w_str_new("__annotate__");
+    crate::baseobjspace::setitem(
+        pyre_object::gc_roots::shadow_stack_get(dict_slot),
+        annotate_key,
+        pyre_object::gc_roots::shadow_stack_get(value_slot),
+    )?;
+    if !unsafe { pyre_object::is_none(value) } {
+        let annotations_key = pyre_object::w_str_new("__annotations__");
+        let _ = crate::baseobjspace::delitem(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            annotations_key,
+        );
+    }
+    Ok(pyre_object::w_none())
+}
+
+fn module_annotate_del(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Err(crate::PyError::type_error(
+        "cannot delete __annotate__ attribute",
+    ))
 }
 
 /// `module.py Module.typedef` — wire `__new__` / `__init__` so
@@ -1610,6 +1930,65 @@ fn init_module_type(ns: PyObjectRef) {
             ns,
             "__init__",
             make_builtin_function("__init__", module_descr_init),
+        )
+    };
+    for (name, function, arity) in [
+        (
+            "__repr__",
+            module_descr_repr as crate::gateway::BuiltinCodeFn,
+            1,
+        ),
+        ("__getattribute__", module_descr_getattribute, 2),
+        ("__dir__", module_descr_dir, 1),
+    ] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(name, function, arity),
+            )
+        };
+    }
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__dict__",
+            pyre_object::w_member_new_direct(
+                pyre_object::MEMBER_MODULE_DICT,
+                "__dict__".to_owned(),
+                pyre_object::PY_NULL,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__annotations__",
+            make_getset_property(
+                make_builtin_function_with_arity("__annotations__", module_annotations_get, 2),
+                make_builtin_function_with_arity("__annotations__", module_annotations_set, 3),
+                make_builtin_function_with_arity("__annotations__", module_annotations_del, 2),
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__annotate__",
+            make_getset_property(
+                make_builtin_function_with_arity("__annotate__", module_annotate_get, 2),
+                make_builtin_function_with_arity("__annotate__", module_annotate_set, 3),
+                make_builtin_function_with_arity("__annotate__", module_annotate_del, 2),
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            pyre_object::w_str_new(
+                "Create a module object.\n\nThe name must be a string; the optional doc argument can have any type.",
+            ),
         )
     };
 }
@@ -2351,14 +2730,53 @@ fn range_descr_contains(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     )?))
 }
 
-/// `functional.py W_Range.descr_eq`.
-fn range_descr_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+/// CPython 3.14 `range_richcompare`, layered on PyPy
+/// `functional.py W_Range.descr_eq`.  PyPy only publishes `descr_eq`; 3.14
+/// takes precedence and exposes the whole rich-comparison slot surface.
+fn range_descr_richcompare(
+    args: &[PyObjectRef],
+    op: crate::baseobjspace::CompareOp,
+) -> Result<PyObjectRef, crate::PyError> {
     if !unsafe { pyre_object::is_w_range(args[1]) } {
         return Ok(w_not_implemented());
     }
-    Ok(w_bool_from(unsafe {
-        pyre_object::w_range_eq(args[0], args[1])
-    }))
+    match op {
+        crate::baseobjspace::CompareOp::Eq | crate::baseobjspace::CompareOp::Ne => {
+            let mut result = unsafe { pyre_object::w_range_eq(args[0], args[1]) };
+            if matches!(op, crate::baseobjspace::CompareOp::Ne) {
+                result = !result;
+            }
+            Ok(w_bool_from(result))
+        }
+        crate::baseobjspace::CompareOp::Le
+        | crate::baseobjspace::CompareOp::Ge
+        | crate::baseobjspace::CompareOp::Lt
+        | crate::baseobjspace::CompareOp::Gt => Ok(w_not_implemented()),
+    }
+}
+
+fn range_descr_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    range_descr_richcompare(args, crate::baseobjspace::CompareOp::Eq)
+}
+
+fn range_descr_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    range_descr_richcompare(args, crate::baseobjspace::CompareOp::Ne)
+}
+
+fn range_descr_lt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    range_descr_richcompare(args, crate::baseobjspace::CompareOp::Lt)
+}
+
+fn range_descr_le(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    range_descr_richcompare(args, crate::baseobjspace::CompareOp::Le)
+}
+
+fn range_descr_gt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    range_descr_richcompare(args, crate::baseobjspace::CompareOp::Gt)
+}
+
+fn range_descr_ge(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    range_descr_richcompare(args, crate::baseobjspace::CompareOp::Ge)
 }
 
 /// `functional.py W_Range.descr_bool`.
@@ -2449,6 +2867,26 @@ fn init_range_type(ns: PyObjectRef) {
         (
             "__eq__",
             make_builtin_function_with_arity("__eq__", range_descr_eq, 2),
+        ),
+        (
+            "__ne__",
+            make_builtin_function_with_arity("__ne__", range_descr_ne, 2),
+        ),
+        (
+            "__lt__",
+            make_builtin_function_with_arity("__lt__", range_descr_lt, 2),
+        ),
+        (
+            "__le__",
+            make_builtin_function_with_arity("__le__", range_descr_le, 2),
+        ),
+        (
+            "__gt__",
+            make_builtin_function_with_arity("__gt__", range_descr_gt, 2),
+        ),
+        (
+            "__ge__",
+            make_builtin_function_with_arity("__ge__", range_descr_ge, 2),
         ),
         (
             "__hash__",
@@ -4861,21 +5299,28 @@ fn init_dict_view_common_slots(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "mapping",
-            make_getset_descriptor(make_builtin_function_with_arity(
+            make_getset_property_named_doc(
+                make_builtin_function_with_arity(
+                    "mapping",
+                    |args| {
+                        let view = args[1];
+                        if view.is_null() {
+                            return Ok(pyre_object::w_none());
+                        }
+                        let dict =
+                            unsafe { pyre_object::dictmultiobject::w_dict_view_get_dict(view) };
+                        if dict.is_null() {
+                            return Ok(pyre_object::w_dict_proxy_new(pyre_object::w_dict_new()));
+                        }
+                        Ok(pyre_object::w_dict_proxy_new(dict))
+                    },
+                    2,
+                ),
+                pyre_object::PY_NULL,
+                pyre_object::PY_NULL,
+                "dictionary that this view refers to",
                 "mapping",
-                |args| {
-                    let view = args[1];
-                    if view.is_null() {
-                        return Ok(pyre_object::w_none());
-                    }
-                    let dict = unsafe { pyre_object::dictmultiobject::w_dict_view_get_dict(view) };
-                    if dict.is_null() {
-                        return Ok(pyre_object::w_dict_proxy_new(pyre_object::w_dict_new()));
-                    }
-                    Ok(pyre_object::w_dict_proxy_new(dict))
-                },
-                2,
-            )),
+            ),
         )
     };
 }
@@ -5968,6 +6413,16 @@ fn mappingproxy_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 fn init_mappingproxy_type(ns: PyObjectRef) {
+    // Python 3.14 `PyDictProxy_Type`: "Read-only proxy of a mapping."
+    // PyPy's module doc spells out the same contract, while its TypeDef
+    // predates the explicit type-doc slot.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            pyre_object::w_str_new("Read-only proxy of a mapping."),
+        )
+    };
     // dictproxyobject.py:105 __new__=interp2app(descr_new)
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -6078,6 +6533,33 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                     "'|=' is not supported by mappingproxy; use '|' instead",
                 ))
             }),
+        )
+    };
+    // Python 3.14 `mappingproxy_hash`: delegate to the wrapped mapping.
+    // This is newer than PyPy's current `dictproxyobject.py` TypeDef. A
+    // proxy around dict therefore raises `unhashable type: 'dict'`, while a
+    // proxy around a custom hashable mapping returns that mapping's hash.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__hash__",
+            make_builtin_function_with_arity(
+                "__hash__",
+                |args| {
+                    let proxy = args[0];
+                    if !unsafe { pyre_object::is_dict_proxy(proxy) } {
+                        let received = unsafe { (*(*proxy).ob_type).name };
+                        return Err(crate::PyError::type_error(format!(
+                            "descriptor '__hash__' requires a 'mappingproxy' object but received a '{received}'"
+                        )));
+                    }
+                    let mapping = unsafe { pyre_object::w_dict_proxy_get_mapping(proxy) };
+                    Ok(pyre_object::w_int_new(crate::baseobjspace::hash_w_strict(
+                        mapping,
+                    )?))
+                },
+                1,
+            ),
         )
     };
     // dictproxyobject.py:51 descr_or →
@@ -7131,11 +7613,7 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
                 if !reqcls.is_null() {
                     if let Err(e) = crate::baseobjspace::descr_self_interp_w(reqcls, w_obj) {
                         if e.kind == crate::PyErrorKind::DescrMismatch {
-                            return Err(crate::baseobjspace::descr_call_mismatch(
-                                w_obj,
-                                "__getattribute__",
-                                reqcls,
-                            ));
+                            return Err(getset_descr_mismatch(w_self, w_obj, reqcls));
                         }
                         return Err(e);
                     }
@@ -7146,9 +7624,9 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
                 }
                 match crate::call::call_function_impl_result(fget, &[w_self, w_obj]) {
                     Ok(v) => Ok(v),
-                    Err(e) if e.kind == crate::PyErrorKind::DescrMismatch => Err(
-                        crate::baseobjspace::descr_call_mismatch(w_obj, "__getattribute__", reqcls),
-                    ),
+                    Err(e) if e.kind == crate::PyErrorKind::DescrMismatch => {
+                        Err(getset_descr_mismatch(w_self, w_obj, reqcls))
+                    }
                     Err(e) => Err(e),
                 }
             }),
@@ -7188,20 +7666,16 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
                     if !reqcls.is_null() {
                         if let Err(e) = crate::baseobjspace::descr_self_interp_w(reqcls, w_obj) {
                             if e.kind == crate::PyErrorKind::DescrMismatch {
-                                return Err(crate::baseobjspace::descr_call_mismatch(
-                                    w_obj,
-                                    "__setattr__",
-                                    reqcls,
-                                ));
+                                return Err(getset_descr_mismatch(w_self, w_obj, reqcls));
                             }
                             return Err(e);
                         }
                     }
                     match crate::call::call_function_impl_result(fset, &[w_self, w_obj, w_value]) {
                         Ok(_) => Ok(pyre_object::w_none()),
-                        Err(e) if e.kind == crate::PyErrorKind::DescrMismatch => Err(
-                            crate::baseobjspace::descr_call_mismatch(w_obj, "__setattr__", reqcls),
-                        ),
+                        Err(e) if e.kind == crate::PyErrorKind::DescrMismatch => {
+                            Err(getset_descr_mismatch(w_self, w_obj, reqcls))
+                        }
                         Err(e) => Err(e),
                     }
                 },
@@ -7260,24 +7734,53 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
                     if !reqcls.is_null() {
                         if let Err(e) = crate::baseobjspace::descr_self_interp_w(reqcls, w_obj) {
                             if e.kind == crate::PyErrorKind::DescrMismatch {
-                                return Err(crate::baseobjspace::descr_call_mismatch(
-                                    w_obj,
-                                    "__delattr__",
-                                    reqcls,
-                                ));
+                                return Err(getset_descr_mismatch(w_self, w_obj, reqcls));
                             }
                             return Err(e);
                         }
                     }
                     match crate::call::call_function_impl_result(fdel, &[w_self, w_obj]) {
                         Ok(_) => Ok(pyre_object::w_none()),
-                        Err(e) if e.kind == crate::PyErrorKind::DescrMismatch => Err(
-                            crate::baseobjspace::descr_call_mismatch(w_obj, "__delattr__", reqcls),
-                        ),
+                        Err(e) if e.kind == crate::PyErrorKind::DescrMismatch => {
+                            Err(getset_descr_mismatch(w_self, w_obj, reqcls))
+                        }
                         Err(e) => Err(e),
                     }
                 },
                 2,
+            ),
+        )
+    };
+    // CPython 3.14 `PyGetSetDescr_Type.tp_repr` renders
+    // `<attribute 'name' of 'Owner' objects>`. PyPy's GetSetProperty typedef
+    // has no explicit repr; this is the selected 3.14 surface.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function_with_arity(
+                "__repr__",
+                |args| {
+                    let descr = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    if descr.is_null()
+                        || !unsafe { pyre_object::typedef::is_getset_property(descr) }
+                    {
+                        let received = if descr.is_null() {
+                            "NoneType".to_string()
+                        } else {
+                            crate::typedef::r#type(descr)
+                                .map(|tp| unsafe { pyre_object::w_type_get_name(tp) }.to_string())
+                                .unwrap_or_else(|| "object".to_string())
+                        };
+                        return Err(crate::PyError::type_error(format!(
+                            "descriptor '__repr__' requires a 'getset_descriptor' object but received a '{received}'"
+                        )));
+                    }
+                    Ok(pyre_object::w_str_new(&unsafe {
+                        getset_descriptor_repr(descr)
+                    }))
+                },
+                1,
             ),
         )
     };
@@ -7319,21 +7822,27 @@ fn patch_getset_descriptor_metadata() {
     crate::type_dict_store(
         tp,
         "__name__",
-        make_getset_descriptor(make_builtin_function_with_arity(
-            "__name__",
-            |args| {
-                let descr = args[1];
-                if descr.is_null() {
-                    return Ok(pyre_object::w_none());
-                }
-                let name = unsafe { pyre_object::typedef::w_getset_get_name(descr) };
-                if name.is_null() {
-                    return Ok(pyre_object::w_none());
-                }
-                Ok(name)
-            },
-            2,
-        )),
+        copy_for_type(
+            make_getset_descriptor_named(
+                make_builtin_function_with_arity(
+                    "__name__",
+                    |args| {
+                        let descr = args[1];
+                        if descr.is_null() {
+                            return Ok(pyre_object::w_none());
+                        }
+                        let name = unsafe { pyre_object::typedef::w_getset_get_name(descr) };
+                        if name.is_null() {
+                            return Ok(pyre_object::w_none());
+                        }
+                        Ok(name)
+                    },
+                    2,
+                ),
+                "__name__",
+            ),
+            tp,
+        ),
     );
     // typedef.py:471 __qualname__ = GetSetProperty(descr_get_qualname)
     //
@@ -7356,61 +7865,64 @@ fn patch_getset_descriptor_metadata() {
     crate::type_dict_store(
         tp,
         "__qualname__",
-        make_getset_descriptor(make_builtin_function_with_arity(
-            "__qualname__",
-            |args| {
-                let descr = args[1];
-                if descr.is_null() {
-                    return Ok(pyre_object::w_none());
-                }
-                unsafe {
-                    let cached = pyre_object::typedef::w_getset_get_qualname(descr);
-                    if !cached.is_null() {
-                        return Ok(cached);
-                    }
-                    // typedef.py:425-432 _calculate_qualname:
-                    //   if self.reqcls is None: type_qualname = '?'
-                    //   else:
-                    //       w_type = space.gettypeobject(self.reqcls.typedef)
-                    //       type_qualname = space.text_w(
-                    //           space.getattr(w_type, space.newtext('__qualname__')))
-                    //
-                    // PyPy reads the bound class's `__qualname__`
-                    // (which respects nested-class scoping and any
-                    // explicit `__qualname__` assignment in the class
-                    // body), NOT the bare `__name__`.  Pyre's
-                    // `getattr(w_type, '__qualname__')` resolves
-                    // through the type-side __qualname__ getset that
-                    // already mirrors PyPy's lookup-then-fallback
-                    // chain (`baseobjspace.rs:4004-4009`).
-                    let reqcls = pyre_object::typedef::w_getset_get_reqcls(descr);
-                    let type_qualname = if reqcls.is_null() {
-                        "?".to_string()
-                    } else {
-                        match crate::baseobjspace::getattr_str(reqcls, "__qualname__") {
-                            Ok(qn) if pyre_object::is_str(qn) => {
-                                pyre_object::w_str_get_value(qn).to_string()
-                            }
-                            // PyPy raises through here on AttributeError;
-                            // pyre falls back to the bare type name to
-                            // avoid surfacing an unrelated AttributeError
-                            // when introspecting `descr.__qualname__`.
-                            _ => pyre_object::w_type_get_name(reqcls).to_string(),
+        copy_for_type(
+            make_getset_descriptor_named(
+                make_builtin_function_with_arity(
+                    "__qualname__",
+                    |args| {
+                        let descr = args[1];
+                        if descr.is_null() {
+                            return Ok(pyre_object::w_none());
                         }
-                    };
-                    let name_obj = pyre_object::typedef::w_getset_get_name(descr);
-                    let name = if !name_obj.is_null() && pyre_object::is_str(name_obj) {
-                        pyre_object::w_str_get_value(name_obj).to_string()
-                    } else {
-                        "<generic property>".to_string()
-                    };
-                    let combined = pyre_object::w_str_new(&format!("{type_qualname}.{name}"));
-                    pyre_object::typedef::w_getset_set_qualname(descr, combined);
-                    Ok(combined)
-                }
-            },
-            2,
-        )),
+                        unsafe {
+                            let cached = pyre_object::typedef::w_getset_get_qualname(descr);
+                            if !cached.is_null() {
+                                return Ok(cached);
+                            }
+                            // typedef.py:425-432 _calculate_qualname:
+                            //   if self.reqcls is None: type_qualname = '?'
+                            //   else:
+                            //       w_type = space.gettypeobject(self.reqcls.typedef)
+                            //       type_qualname = space.text_w(
+                            //           space.getattr(w_type, space.newtext('__qualname__')))
+                            //
+                            // PyPy reads the bound class's `__qualname__`
+                            // (which respects nested-class scoping and any
+                            // explicit `__qualname__` assignment in the class
+                            // body), NOT the bare `__name__`.  Pyre's
+                            // `getattr(w_type, '__qualname__')` resolves
+                            // through the type-side __qualname__ getset that
+                            // already mirrors PyPy's lookup-then-fallback
+                            // chain (`baseobjspace.rs:4004-4009`).
+                            // PyPy's original only consults `reqcls`. During type
+                            // materialisation `copy_for_type` deliberately leaves
+                            // reqcls null and records the concrete owner in
+                            // `w_objclass`; CPython 3.14 uses that owner for both
+                            // __objclass__ and __qualname__, so prefer it here.
+                            let owner = getset_descriptor_owner(descr);
+                            let type_qualname = if owner.is_null() {
+                                "?".to_string()
+                            } else {
+                                descriptor_owner_qualname(owner)
+                            };
+                            let name_obj = pyre_object::typedef::w_getset_get_name(descr);
+                            let name = if !name_obj.is_null() && pyre_object::is_str(name_obj) {
+                                pyre_object::w_str_get_value(name_obj).to_string()
+                            } else {
+                                "<generic property>".to_string()
+                            };
+                            let combined =
+                                pyre_object::w_str_new(&format!("{type_qualname}.{name}"));
+                            pyre_object::typedef::w_getset_set_qualname(descr, combined);
+                            Ok(combined)
+                        }
+                    },
+                    2,
+                ),
+                "__qualname__",
+            ),
+            tp,
+        ),
     );
     // typedef.py:472 __objclass__ = GetSetProperty(descr_get_objclass)
     //
@@ -7426,52 +7938,107 @@ fn patch_getset_descriptor_metadata() {
     crate::type_dict_store(
         tp,
         "__objclass__",
-        make_getset_descriptor(make_builtin_function_with_arity(
-            "__objclass__",
-            |args| {
-                let descr = args[1];
-                if descr.is_null() {
-                    return Err(crate::PyError::attribute_error(
-                        "generic self has no __objclass__",
-                    ));
-                }
-                unsafe {
-                    let w_objclass = pyre_object::typedef::w_getset_get_objclass(descr);
-                    if !w_objclass.is_null() {
-                        return Ok(w_objclass);
-                    }
-                    let reqcls = pyre_object::typedef::w_getset_get_reqcls(descr);
-                    if !reqcls.is_null() {
-                        return Ok(reqcls);
-                    }
-                    Err(crate::PyError::attribute_error(
-                        "generic self has no __objclass__",
-                    ))
-                }
-            },
-            2,
-        )),
+        copy_for_type(
+            make_getset_descriptor_named(
+                make_builtin_function_with_arity(
+                    "__objclass__",
+                    |args| {
+                        let descr = args[1];
+                        if descr.is_null() {
+                            return Err(crate::PyError::attribute_error(
+                                "generic self has no __objclass__",
+                            ));
+                        }
+                        unsafe {
+                            let w_objclass = pyre_object::typedef::w_getset_get_objclass(descr);
+                            if !w_objclass.is_null() {
+                                return Ok(w_objclass);
+                            }
+                            let reqcls = pyre_object::typedef::w_getset_get_reqcls(descr);
+                            if !reqcls.is_null() {
+                                return Ok(reqcls);
+                            }
+                            Err(crate::PyError::attribute_error(
+                                "generic self has no __objclass__",
+                            ))
+                        }
+                    },
+                    2,
+                ),
+                "__objclass__",
+            ),
+            tp,
+        ),
     );
     // typedef.py:473 __doc__ = interp_attrproperty('doc', ...)
     crate::type_dict_store(
         tp,
         "__doc__",
-        make_getset_descriptor(make_builtin_function_with_arity(
-            "__doc__",
-            |args| {
-                let descr = args[1];
-                if descr.is_null() {
-                    return Ok(pyre_object::w_none());
-                }
-                let doc = unsafe { pyre_object::typedef::w_getset_get_doc(descr) };
-                if doc.is_null() {
-                    return Ok(pyre_object::w_none());
-                }
-                Ok(doc)
-            },
-            2,
-        )),
+        copy_for_type(
+            make_getset_descriptor_named(
+                make_builtin_function_with_arity(
+                    "__doc__",
+                    |args| {
+                        let descr = args[1];
+                        if descr.is_null() {
+                            return Ok(pyre_object::w_none());
+                        }
+                        let doc = unsafe { pyre_object::typedef::w_getset_get_doc(descr) };
+                        if doc.is_null() {
+                            return Ok(pyre_object::w_none());
+                        }
+                        Ok(doc)
+                    },
+                    2,
+                ),
+                "__doc__",
+            ),
+            tp,
+        ),
     );
+}
+
+#[inline]
+unsafe fn getset_descriptor_owner(descr: PyObjectRef) -> PyObjectRef {
+    let objclass = unsafe { pyre_object::typedef::w_getset_get_objclass(descr) };
+    if !objclass.is_null() {
+        objclass
+    } else {
+        unsafe { pyre_object::typedef::w_getset_get_reqcls(descr) }
+    }
+}
+
+/// The owner component used by CPython 3.14 descriptor `__qualname__`.
+/// Heap classes carry their compiler-stamped qualified name in their own
+/// namespace; static types fall back to the bare final component of tp_name.
+unsafe fn descriptor_owner_qualname(owner: PyObjectRef) -> String {
+    match crate::type_dict_lookup(owner, "__qualname__") {
+        Some(value) if unsafe { pyre_object::is_str(value) } => {
+            unsafe { pyre_object::w_str_get_value(value) }.to_string()
+        }
+        _ => {
+            let full = unsafe { pyre_object::w_type_get_name(owner) };
+            full.rsplit('.').next().unwrap_or(full).to_string()
+        }
+    }
+}
+
+/// CPython 3.14 getset descriptor repr, shared with `display::py_repr` because
+/// native GetSetProperty instances do not carry a heap-instance `w_class`.
+pub(crate) unsafe fn getset_descriptor_repr(descr: PyObjectRef) -> String {
+    let name_obj = unsafe { pyre_object::typedef::w_getset_get_name(descr) };
+    let name = if !name_obj.is_null() && unsafe { pyre_object::is_str(name_obj) } {
+        unsafe { pyre_object::w_str_get_value(name_obj) }
+    } else {
+        "<generic property>"
+    };
+    let owner = unsafe { getset_descriptor_owner(descr) };
+    let owner_name = if owner.is_null() {
+        "?"
+    } else {
+        unsafe { pyre_object::w_type_get_name(owner) }
+    };
+    format!("<attribute '{name}' of '{owner_name}' objects>")
 }
 
 /// `GetSetProperty(fget)` — read-only getset descriptor with no required class.
@@ -7480,6 +8047,7 @@ fn patch_getset_descriptor_metadata() {
 fn make_getset_descriptor(getter: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
     make_getset_property_full(
         getter,
+        pyre_object::PY_NULL,
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
@@ -7501,6 +8069,7 @@ pub(crate) fn make_getset_descriptor_named(
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
         Some(name),
     )
 }
@@ -7513,7 +8082,14 @@ fn make_getset_property(
     fset: pyre_object::PyObjectRef,
     fdel: pyre_object::PyObjectRef,
 ) -> pyre_object::PyObjectRef {
-    make_getset_property_full(fget, fset, fdel, pyre_object::PY_NULL, None)
+    make_getset_property_full(
+        fget,
+        fset,
+        fdel,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        None,
+    )
 }
 
 /// `GetSetProperty(fget, fset, fdel)` with explicit `name` — see
@@ -7524,7 +8100,33 @@ pub(crate) fn make_getset_property_named(
     fdel: pyre_object::PyObjectRef,
     name: &str,
 ) -> pyre_object::PyObjectRef {
-    make_getset_property_full(fget, fset, fdel, pyre_object::PY_NULL, Some(name))
+    make_getset_property_full(
+        fget,
+        fset,
+        fdel,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        Some(name),
+    )
+}
+
+/// `GetSetProperty(..., doc=..., name=...)` — the full descriptor payload
+/// used by doc-bearing getsets such as `mapping`, `__dict__`, and `__weakref__`.
+fn make_getset_property_named_doc(
+    fget: pyre_object::PyObjectRef,
+    fset: pyre_object::PyObjectRef,
+    fdel: pyre_object::PyObjectRef,
+    doc: &str,
+    name: &str,
+) -> pyre_object::PyObjectRef {
+    make_getset_property_full(
+        fget,
+        fset,
+        fdel,
+        pyre_object::w_str_new(doc),
+        pyre_object::PY_NULL,
+        Some(name),
+    )
 }
 
 /// `GetSetProperty(fget, fset, fdel, cls=cls)` — full getset descriptor
@@ -7537,6 +8139,7 @@ fn make_getset_property_full(
     fget: pyre_object::PyObjectRef,
     fset: pyre_object::PyObjectRef,
     fdel: pyre_object::PyObjectRef,
+    doc: pyre_object::PyObjectRef,
     cls: pyre_object::PyObjectRef,
     name: Option<&str>,
 ) -> pyre_object::PyObjectRef {
@@ -7558,7 +8161,7 @@ fn make_getset_property_full(
         fget,
         fset,
         fdel,
-        pyre_object::PY_NULL, // doc
+        doc,
         cls,
         false, // use_closure
         resolved_name,
@@ -8299,25 +8902,17 @@ fn init_function_type_common(ns: PyObjectRef) {
             make_getset_descriptor(globals_getter),
         )
     };
-    // `func.__builtins__` — `_PyEval_BuiltinsFromGlobals(globals)`: look up
-    // `__builtins__` in the function's globals; a Module yields its dict,
-    // any other value is returned directly, and an absent key falls back to
-    // the default builtin Module.  `pick_builtin_obj` already performs that
-    // resolution (honoring a custom `__builtins__`); convert the Module it
-    // returns to its dict so callers see a mapping (annotationlib's
-    // `{**annotate.__builtins__, **annotate.__globals__}`).
+    // CPython 3.14 `func.__builtins__` is the construction-time
+    // `func_builtins` field, not a fresh lookup in `func_globals`.  The
+    // allocator resolves a Module to its dict and roots that exact object.
     let func_builtins_getter = make_builtin_function("__builtins__", |args| {
         let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
         if func.is_null() {
             return Ok(pyre_object::w_none());
         }
-        let w_globals = unsafe { crate::function::function_get_globals_obj(func) };
-        let exec_ctx = crate::call::take_last_exec_ctx();
-        let w_builtin = crate::baseobjspace::pick_builtin_obj(w_globals, exec_ctx);
+        let w_builtin = unsafe { crate::function::function_get_builtins(func) };
         if w_builtin.is_null() {
             Ok(pyre_object::w_none())
-        } else if unsafe { pyre_object::is_module(w_builtin) } {
-            Ok(unsafe { pyre_object::w_module_get_w_dict(w_builtin) })
         } else {
             Ok(w_builtin)
         }
@@ -8426,10 +9021,226 @@ fn init_function_type_common(ns: PyObjectRef) {
             )),
         )
     };
+    // typedef.py:793-794 `Function.typedef.__call__`; copied verbatim into
+    // `BuiltinFunction.typedef` by `**Function.typedef.rawdict`.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__call__",
+            make_builtin_function("__call__", function_descr_call),
+        )
+    };
+}
+
+/// PyPy `Function.descr_function_call(self, __args__)`: forward the complete
+/// Arguments object, including keyword names, to the wrapped function.
+fn function_descr_call(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let function = positional.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let call_args = positional.get(1..).unwrap_or(&[]);
+    if !crate::builtins::has_real_kwargs(kwargs) {
+        return crate::call::call_function_impl_result(function, call_args);
+    }
+    let keyword_args: Vec<(Wtf8Buf, PyObjectRef)> = unsafe {
+        pyre_object::w_dict_str_entries(kwargs.unwrap())
+            .into_iter()
+            .filter(|(name, _)| name != "__pyre_kw__")
+            .map(|(name, value)| (Wtf8Buf::from_string(name), value))
+            .collect()
+    };
+    crate::eval::CURRENT_FRAME.with(|current| {
+        let frame = current.get();
+        if frame.is_null() {
+            return Err(crate::PyError::runtime_error(
+                "function call has no current frame",
+            ));
+        }
+        crate::call::call_with_kwargs(unsafe { &mut *frame }, function, call_args, &keyword_args)
+    })
+}
+
+/// Python 3.14 direct `PyMemberDef` accessors. The tagged Member index keeps
+/// native object fields on the descriptor itself rather than in a side table.
+pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) -> crate::PyResult {
+    match unsafe { pyre_object::w_member_get_direct_kind(member) } {
+        pyre_object::MEMBER_FUNCTION_CLOSURE => {
+            Ok(unsafe { crate::function::fget_func_closure(obj) })
+        }
+        pyre_object::MEMBER_FUNCTION_DOC => Ok(unsafe { crate::function::fget_func_doc(obj) }),
+        pyre_object::MEMBER_FUNCTION_GLOBALS => {
+            let value = unsafe { crate::function::function_get_globals_obj(obj) };
+            Ok(if value.is_null() {
+                pyre_object::w_none()
+            } else {
+                value
+            })
+        }
+        pyre_object::MEMBER_FUNCTION_MODULE => Ok(unsafe { crate::function::fget___module__(obj) }),
+        pyre_object::MEMBER_FUNCTION_BUILTINS => {
+            let builtins = unsafe { crate::function::function_get_builtins(obj) };
+            Ok(if builtins.is_null() {
+                pyre_object::w_none()
+            } else {
+                builtins
+            })
+        }
+        pyre_object::MEMBER_MODULE_DICT => Ok(unsafe { pyre_object::w_module_get_w_dict(obj) }),
+        _ => Err(crate::PyError::attribute_error(unsafe {
+            pyre_object::w_member_get_name(member)
+        })),
+    }
+}
+
+pub(crate) unsafe fn direct_member_set(
+    member: PyObjectRef,
+    obj: PyObjectRef,
+    value: PyObjectRef,
+) -> crate::PyResult {
+    match unsafe { pyre_object::w_member_get_direct_kind(member) } {
+        pyre_object::MEMBER_FUNCTION_DOC => {
+            unsafe { crate::function::fset_func_doc(obj, value)? };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_FUNCTION_MODULE => {
+            if unsafe { pyre_object::py_type_check(obj, &crate::function::BUILTIN_FUNCTION_TYPE) } {
+                unsafe { crate::function::builtin_function_set_module_attr(obj, value) };
+            } else {
+                unsafe { crate::function::fset___module__(obj, value)? };
+            }
+            Ok(pyre_object::w_none())
+        }
+        _ => Err(crate::PyError::attribute_error("readonly attribute")),
+    }
+}
+
+pub(crate) unsafe fn direct_member_delete(
+    member: PyObjectRef,
+    obj: PyObjectRef,
+) -> crate::PyResult {
+    match unsafe { pyre_object::w_member_get_direct_kind(member) } {
+        pyre_object::MEMBER_FUNCTION_DOC => {
+            unsafe { crate::function::fdel_func_doc(obj)? };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_FUNCTION_MODULE => {
+            if unsafe { pyre_object::py_type_check(obj, &crate::function::BUILTIN_FUNCTION_TYPE) } {
+                unsafe {
+                    crate::function::builtin_function_set_module_attr(obj, pyre_object::w_none())
+                };
+            } else {
+                unsafe { crate::function::fdel___module__(obj)? };
+            }
+            Ok(pyre_object::w_none())
+        }
+        _ => Err(crate::PyError::attribute_error("readonly attribute")),
+    }
 }
 
 fn init_function_type(ns: PyObjectRef) {
     init_function_type_common(ns);
+    // CPython 3.14 `func_memberlist`: these five entries are direct
+    // member_descriptor objects. PyPy's equivalent values live in
+    // Function.typedef as GetSetProperty; the observable descriptor kind is
+    // the 3.14 difference selected by this project.
+    for (name, kind) in [
+        ("__closure__", pyre_object::MEMBER_FUNCTION_CLOSURE),
+        ("__doc__", pyre_object::MEMBER_FUNCTION_DOC),
+        ("__globals__", pyre_object::MEMBER_FUNCTION_GLOBALS),
+        ("__module__", pyre_object::MEMBER_FUNCTION_MODULE),
+        ("__builtins__", pyre_object::MEMBER_FUNCTION_BUILTINS),
+    ] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                pyre_object::w_member_new_direct(kind, name.to_owned(), pyre_object::PY_NULL),
+            );
+        }
+    }
+    // CPython 3.14 func_repr: `<function {qualname} at {address}>`.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function_with_arity(
+                "__repr__",
+                |args| {
+                    let function = args[0];
+                    let qualname = unsafe { crate::function::function_get_qualname(function) };
+                    Ok(pyre_object::w_str_new(&format!(
+                        "<function {qualname} at {function:p}>"
+                    )))
+                },
+                1,
+            ),
+        )
+    };
+    // PyPy typedef.py:796 `getset_func_dict = GetSetProperty(
+    // descr_get_dict, descr_set_dict, cls=Function)` — storage is the
+    // typed `Function.w_func_dict` field from function.py:68.
+    let dict_getter = make_builtin_function_with_arity("__dict__", descr_get_dict, 2);
+    let dict_setter = make_builtin_function_with_arity("__dict__", descr_set_dict, 3);
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__dict__",
+            make_getset_property(dict_getter, dict_setter, pyre_object::PY_NULL),
+        )
+    };
+    // CPython 3.14 `function.__annotate__`: callable-or-None, not deletable.
+    let annotate_getter = make_builtin_function("__annotate__", |args| {
+        let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        Ok(unsafe { crate::function::function_get_annotate(function) })
+    });
+    let annotate_setter = make_builtin_function("__annotate__", |args| {
+        let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        unsafe { crate::function::function_set_annotate(function, value)? };
+        Ok(pyre_object::w_none())
+    });
+    let annotate_deleter = make_builtin_function("__annotate__", |args| {
+        let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        unsafe { crate::function::function_set_annotate(function, pyre_object::PY_NULL)? };
+        Ok(pyre_object::w_none())
+    });
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__annotate__",
+            make_getset_property(annotate_getter, annotate_setter, annotate_deleter),
+        )
+    };
+    // CPython 3.14 `function.__type_params__`: tuple-only and not deletable.
+    let typeparams_getter = make_builtin_function("__type_params__", |args| {
+        let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        Ok(unsafe { crate::function::function_get_typeparams(function) })
+    });
+    let typeparams_setter = make_builtin_function("__type_params__", |args| {
+        let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        unsafe { crate::function::function_set_typeparams(function, value)? };
+        Ok(pyre_object::w_none())
+    });
+    let typeparams_deleter = make_builtin_function("__type_params__", |args| {
+        let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        unsafe { crate::function::function_set_typeparams(function, pyre_object::PY_NULL)? };
+        Ok(pyre_object::w_none())
+    });
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__type_params__",
+            make_getset_property(typeparams_getter, typeparams_setter, typeparams_deleter),
+        )
+    };
+    // The shared rawdict mirrors PyPy and is still used by
+    // BuiltinFunction.  Python 3.14's user `function` type omits these
+    // PyPy-only introspection extensions.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_delitem_str_no_proxy(ns, "__objclass__");
+        pyre_object::dictmultiobject::w_dict_delitem_str_no_proxy(ns, "__text_signature__");
+        pyre_object::dictmultiobject::w_dict_delitem_str_no_proxy(ns, "__defaults_count__");
+    }
     // `funcobject.c func_new` — `FunctionType(code, globals, name=None,
     // argdefs=None, closure=None, kwdefaults=None)`.
     unsafe {
@@ -8462,13 +9273,22 @@ fn init_function_type(ns: PyObjectRef) {
                 // as a plain function rather than a bound method.
                 let cls_is_none = unsafe { w_cls.is_null() || pyre_object::is_none(w_cls) };
                 let obj_is_none = unsafe { w_obj.is_null() || pyre_object::is_none(w_obj) };
-                let cls_is_none_type = std::ptr::eq(w_cls, gettypeobject(&pyre_object::NONE_TYPE));
-                let asking_for_function = cls_is_none || (obj_is_none && !cls_is_none_type);
-                if asking_for_function {
+                // Python 3.14 `func_descr_get`: omitting `type` is equivalent
+                // to passing None, but `__get__(None, None)` is invalid.
+                if obj_is_none && cls_is_none {
+                    return Err(crate::PyError::type_error("__get__(None, None) is invalid"));
+                }
+                if obj_is_none {
                     Ok(w_function)
                 } else {
-                    // function.py:470  Method(space, w_function, w_obj, w_cls)
-                    Ok(pyre_object::w_method_new(w_function, w_obj, w_cls))
+                    // function.py:470 Method(space, w_function, w_obj, w_cls),
+                    // with CPython's inferred owner when `type` is omitted.
+                    let owner = if cls_is_none {
+                        r#type(w_obj).unwrap_or(pyre_object::PY_NULL)
+                    } else {
+                        w_cls
+                    };
+                    Ok(pyre_object::w_method_new(w_function, w_obj, owner))
                 }
             }),
         )
@@ -8495,47 +9315,72 @@ fn init_function_type(ns: PyObjectRef) {
 /// pyre starts modeling them.
 fn init_builtin_function_type(ns: PyObjectRef) {
     init_function_type_common(ns);
+
+    // CPython 3.14 `PyCFunction_Type` does not expose the user-function
+    // storage copied by PyPy's `**Function.typedef.rawdict`. Keep the PyPy
+    // construction above, then apply the version-selected surface delta.
+    for name in [
+        "__annotations__",
+        "__builtins__",
+        "__closure__",
+        "__code__",
+        "__defaults__",
+        "__defaults_count__",
+        "__globals__",
+        "__kwdefaults__",
+        "__new__",
+        "__objclass__",
+    ] {
+        unsafe { pyre_object::dictmultiobject::w_dict_delitem_str_no_proxy(ns, name) };
+    }
+
+    // methodobject.c `meth_members`: `__module__` is the one direct member;
+    // it accepts arbitrary assignments and deletion stores None.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
-            "__new__",
-            make_new_descr(|_args| {
-                Err(crate::PyError::type_error(
-                    "cannot create 'builtin_function' instances",
-                ))
-            }),
+            "__module__",
+            pyre_object::w_member_new_direct(
+                pyre_object::MEMBER_FUNCTION_MODULE,
+                "__module__".to_owned(),
+                pyre_object::PY_NULL,
+            ),
         )
     };
 
-    // typedef.py:816 GetSetProperty(always_none, cls=BuiltinFunction). The
-    // `cls=` argument routes through descr_self_interp_w so wrong-class
-    // instances raise DescrMismatch instead of silently returning None.
-    // `init_builtin_function_type` runs while the BuiltinFunction
-    // W_TypeObject is still under construction, so `cls` cannot be
-    // resolved here; `patch_builtin_function_descriptors` runs after the
-    // type cache is populated and writes the missing reqcls.
-    // A builtin `__new__` carrier reports its defining type as `__self__`
-    // (`typeobject.c add_tp_new_wrapper`), stamped via
-    // `stamp_new_descr_self`; every other builtin function keeps the
-    // `always_none` behaviour.
-    let self_getter = make_builtin_function_with_arity(
-        "__self__",
-        |args| {
-            let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-            if func.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            Ok(unsafe { crate::function::function_get_self_or_none(func) })
-        },
-        2,
-    );
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__self__",
-            make_getset_descriptor(self_getter),
-        )
-    };
+    // methodobject.c `meth_getsets`. All five are read-only in 3.14. PyPy's
+    // `BuiltinFunction.w_moduleobj` supplies `__self__`; type `__new__`
+    // carriers fall back to their separately stamped defining type.
+    for (name, getter) in [
+        (
+            "__doc__",
+            (|args: &[PyObjectRef]| Ok(unsafe { crate::function::fget_func_doc(args[1]) }))
+                as fn(&[PyObjectRef]) -> crate::PyResult,
+        ),
+        ("__name__", |args: &[PyObjectRef]| {
+            Ok(unsafe { crate::function::fget_func_name(args[1]) })
+        }),
+        ("__qualname__", |args: &[PyObjectRef]| {
+            Ok(pyre_object::w_str_new(&unsafe {
+                crate::function::function_get_qualname(args[1])
+            }))
+        }),
+        ("__self__", |args: &[PyObjectRef]| {
+            Ok(unsafe { crate::function::function_get_self_or_none(args[1]) })
+        }),
+        ("__text_signature__", |args: &[PyObjectRef]| unsafe {
+            crate::function::fget_func_text_signature(args[1])
+        }),
+    ] {
+        let get = make_builtin_function_with_arity(name, getter, 2);
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_getset_descriptor(get),
+            )
+        };
+    }
 
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -8559,21 +9404,69 @@ fn init_builtin_function_type(ns: PyObjectRef) {
         )
     };
 
-    // `pypy/interpreter/typedef.py:899-906`
-    // `BuiltinFunction.typedef.rawdict.update({...})` re-asserts
-    // `__doc__` from the inherited `Function.typedef.rawdict` slot
-    // (also `getset_func_doc`).  Pyre installs `__doc__` once in
-    // `init_function_type_common` so both function types share the
-    // same getter/setter/deleter; the `_check_code_mutable` gate
-    // inside the setter/deleter raises `TypeError` for builtin
-    // instances because `can_change_code = False`.
+    // function.py:807-808 `BuiltinFunction.descr__reduce__`.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__reduce__",
+            make_builtin_function_with_arity(
+                "__reduce__",
+                |args| {
+                    Ok(pyre_object::w_str_new(&unsafe {
+                        crate::function::function_get_qualname(args[0])
+                    }))
+                },
+                1,
+            ),
+        )
+    };
+
+    // CPython 3.14's method-wrapper slots are materialised directly on
+    // `PyCFunction_Type`. Their semantics are the object identity defaults.
+    for (name, method) in [
+        (
+            "__eq__",
+            (|args: &[PyObjectRef]| Ok(pyre_object::w_bool_from(std::ptr::eq(args[0], args[1]))))
+                as fn(&[PyObjectRef]) -> crate::PyResult,
+        ),
+        ("__ne__", |args: &[PyObjectRef]| {
+            Ok(pyre_object::w_bool_from(!std::ptr::eq(args[0], args[1])))
+        }),
+    ] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(name, method, 2),
+            )
+        };
+    }
+    for name in ["__lt__", "__le__", "__gt__", "__ge__"] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(name, |_| Ok(pyre_object::w_not_implemented()), 2),
+            )
+        };
+    }
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__hash__",
+            make_builtin_function_with_arity(
+                "__hash__",
+                |args| Ok(pyre_object::w_int_new(args[0] as i64)),
+                1,
+            ),
+        )
+    };
 }
 
-/// typedef.py:816,818 wires `cls=BuiltinFunction` on the `__self__` and
-/// `__doc__` GetSetProperty entries; the inner `init_builtin_function_type`
-/// runs while the W_TypeObject is still under construction, so the reqcls
-/// patch happens here, after `init_typeobjects` has filled the cache and
-/// the BuiltinFunction typeobject is reachable.
+/// Stamp CPython 3.14's builtin-function getset/member descriptors after the
+/// W_TypeObject is reachable. PyPy supplies `cls=BuiltinFunction` for the
+/// inherited descriptors; CPython's `PyGetSetDef` / `PyMemberDef` entries all
+/// carry `PyCFunction_Type` as their owner.
 fn patch_builtin_function_descriptors() {
     let bf_type =
         gettypefor(&crate::BUILTIN_FUNCTION_TYPE as *const PyType).unwrap_or(pyre_object::PY_NULL);
@@ -8583,17 +9476,81 @@ fn patch_builtin_function_descriptors() {
     if !crate::type_dict_has_storage(bf_type) {
         return;
     }
-    for name in ["__self__", "__doc__"] {
+    for name in [
+        "__doc__",
+        "__name__",
+        "__qualname__",
+        "__self__",
+        "__text_signature__",
+    ] {
         if let Some(descr) = crate::type_dict_lookup(bf_type, name) {
             if unsafe { pyre_object::typedef::is_getset_property(descr) } {
-                // typedef.py:818 `cls=BuiltinFunction` — patch the
-                // `reqcls` slot in place now that the BuiltinFunction
-                // typeobject exists.  GetSetProperty's reqcls is a
-                // single PyObjectRef field, so this is a one-line
-                // store rather than the previous side-table read /
-                // mutate / write back dance.
                 unsafe { pyre_object::typedef::w_getset_set_reqcls(descr, bf_type) };
             }
+        }
+    }
+    if let Some(descr) = crate::type_dict_lookup(bf_type, "__module__") {
+        if unsafe { pyre_object::is_member(descr) && pyre_object::w_member_is_direct(descr) } {
+            unsafe { pyre_object::w_member_set_cls(descr, bf_type) };
+        }
+    }
+}
+
+/// Stamp the owner of Python 3.14's direct function member descriptors after
+/// the Function W_TypeObject is available. This is the Member counterpart of
+/// the GetSetProperty reqcls patch immediately above.
+fn patch_function_member_descriptors() {
+    let function_type =
+        gettypefor(&crate::FUNCTION_TYPE as *const PyType).unwrap_or(pyre_object::PY_NULL);
+    if function_type.is_null() || !crate::type_dict_has_storage(function_type) {
+        return;
+    }
+    for name in [
+        "__closure__",
+        "__doc__",
+        "__globals__",
+        "__module__",
+        "__builtins__",
+    ] {
+        if let Some(descr) = crate::type_dict_lookup(function_type, name) {
+            if unsafe { pyre_object::is_member(descr) && pyre_object::w_member_is_direct(descr) } {
+                unsafe { pyre_object::w_member_set_cls(descr, function_type) };
+            }
+        }
+    }
+}
+
+/// module.py Module.typedef binds the `__annotations__` methods to Module;
+/// stamp that inferred `cls=Module` after the W_TypeObject is registered so
+/// foreign receivers fail in GetSetProperty.typecheck before field access.
+fn patch_module_descriptors() {
+    let module_type =
+        gettypefor(&pyre_object::MODULE_TYPE as *const PyType).unwrap_or(pyre_object::PY_NULL);
+    if module_type.is_null() || !crate::type_dict_has_storage(module_type) {
+        return;
+    }
+    for name in ["__annotations__", "__annotate__"] {
+        if let Some(descr) = crate::type_dict_lookup(module_type, name) {
+            if unsafe { pyre_object::typedef::is_getset_property(descr) } {
+                unsafe { pyre_object::typedef::w_getset_set_reqcls(descr, module_type) };
+            }
+        }
+    }
+}
+
+/// typedef.py:947-951 stamps `cls=Cell` on `cell_contents`. The descriptor
+/// is constructed before the cell W_TypeObject exists, so fill its `reqcls`
+/// field in the same post-registration pass used for BuiltinFunction and
+/// frame descriptors.
+fn patch_cell_descriptor() {
+    let cell_type =
+        gettypefor(&pyre_object::nestedscope::CELL_TYPE).unwrap_or(pyre_object::PY_NULL);
+    if cell_type.is_null() || !crate::type_dict_has_storage(cell_type) {
+        return;
+    }
+    if let Some(descr) = crate::type_dict_lookup(cell_type, "cell_contents") {
+        if unsafe { pyre_object::typedef::is_getset_property(descr) } {
+            unsafe { pyre_object::typedef::w_getset_set_reqcls(descr, cell_type) };
         }
     }
 }
@@ -8769,6 +9726,59 @@ fn init_builtin_code_type(ns: PyObjectRef) {
 }
 
 fn init_method_type(ns: PyObjectRef) {
+    // typedef.py:833-848 Method.typedef, completed with CPython 3.14's
+    // ordering wrappers. Bound methods carry one wrapped callable and one
+    // bound instance; every operation below reads those two typed fields.
+    let doc_getter = make_builtin_function_with_arity(
+        "__doc__",
+        |args| {
+            let method = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+            let function = unsafe { pyre_object::w_method_get_func(method) };
+            crate::baseobjspace::getattr_str(function, "__doc__")
+        },
+        2,
+    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            make_getset_descriptor(doc_getter),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__new__",
+            make_new_descr(|args| {
+                if args.len() != 3 {
+                    return Err(crate::PyError::type_error(format!(
+                        "method expected 2 arguments, got {}",
+                        args.len().saturating_sub(1),
+                    )));
+                }
+                crate::function::descr_method__new__(args[0], args[1], args[2])
+            }),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__call__",
+            make_builtin_function("__call__", crate::function::descr_method_call),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__get__",
+            make_builtin_function("__get__", |args| unsafe {
+                let method = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                let cls = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+                crate::function::descr_method_get(method, obj, cls)
+            }),
+        )
+    };
     // typedef.py:839-840 ─
     //   __func__ = interp_attrproperty_w('w_function', cls=Method),
     //   __self__ = interp_attrproperty_w('w_instance', cls=Method),
@@ -8824,104 +9834,274 @@ fn init_method_type(ns: PyObjectRef) {
             make_getset_descriptor(self_getter),
         )
     };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__getattribute__",
+            make_builtin_function_with_arity(
+                "__getattribute__",
+                |args| unsafe { crate::function::descr_method_getattribute(args[0], args[1]) },
+                2,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__eq__",
+            make_builtin_function_with_arity(
+                "__eq__",
+                |args| unsafe { crate::function::descr_method_eq(args[0], args[1]) },
+                2,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__ne__",
+            make_builtin_function_with_arity(
+                "__ne__",
+                |args| unsafe { crate::function::descr_method_ne(args[0], args[1]) },
+                2,
+            ),
+        )
+    };
+    for name in ["__lt__", "__le__", "__gt__", "__ge__"] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(
+                    name,
+                    |_args| Ok(pyre_object::special::w_not_implemented()),
+                    2,
+                ),
+            )
+        };
+    }
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__hash__",
+            make_builtin_function_with_arity(
+                "__hash__",
+                |args| unsafe {
+                    Ok(pyre_object::w_int_new(crate::function::descr_method_hash(
+                        args[0],
+                    )?))
+                },
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function_with_arity(
+                "__repr__",
+                |args| unsafe { crate::function::descr_method_repr(args[0]) },
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__reduce__",
+            make_builtin_function_with_arity(
+                "__reduce__",
+                |args| unsafe { crate::function::descr_method__reduce__(args[0]) },
+                1,
+            ),
+        )
+    };
+}
+
+fn code_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
+    unsafe { crate::pycode::code_new(args) }
+}
+
+fn code_descr_eq(args: &[PyObjectRef]) -> crate::PyResult {
+    unsafe { crate::pycode::code_eq(args[0], args[1]) }
+}
+
+fn code_descr_ne(args: &[PyObjectRef]) -> crate::PyResult {
+    unsafe { crate::pycode::code_ne(args[0], args[1]) }
+}
+
+fn code_descr_positions(args: &[PyObjectRef]) -> crate::PyResult {
+    unsafe { crate::pycode::code_positions(args[0]) }
+}
+
+fn code_descr_lines(args: &[PyObjectRef]) -> crate::PyResult {
+    unsafe { crate::pycode::code_lines(args[0]) }
+}
+
+fn code_descr_branches(args: &[PyObjectRef]) -> crate::PyResult {
+    unsafe { crate::pycode::code_branches(args[0]) }
+}
+
+fn code_field_getter(args: &[PyObjectRef]) -> crate::PyResult {
+    let descriptor = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let name = unsafe { pyre_object::typedef::w_getset_get_name(descriptor) };
+    let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(name) }) else {
+        return Err(crate::PyError::runtime_error(
+            "code field descriptor has no name",
+        ));
+    };
+    unsafe {
+        crate::pycode::code_get_field(args.get(1).copied().unwrap_or(pyre_object::PY_NULL), name)
+    }
 }
 
 fn init_code_type(ns: PyObjectRef) {
-    // code.replace(**kwargs) — pycode.py:543-550 W_PyCode.descr_replace →
-    // reconstruct the code object with the given co_* fields overridden.
+    // PyPy typedef.py:695-725 `PyCode.typedef`, with the Python 3.14-only
+    // slots (`__replace__`, `co_branches`, adaptive bytes and ordering
+    // wrappers) added from `PyCode_Type`. Every field descriptor reads the
+    // single compiler CodeObject stored by `PyCode`.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
-            "replace",
-            make_builtin_function("replace", |args| unsafe {
-                crate::pycode::code_replace(args)
-            }),
-        )
-    };
-    // `pypy/interpreter/typedef.py:720`
-    // `co_exceptiontable = interp_attrproperty('co_exceptiontable', cls=PyCode,
-    //                                          wrapfn="newbytes")`.
-    //
-    // Read-only attribute exposing the raw varint-packed table.  The
-    // matching getset descriptor wraps the field as a `bytes` object
-    // (PyPy `wrapfn="newbytes"`).  `args[0]` is the descriptor itself,
-    // `args[1]` is the PyCode instance (typedef.py:467-470 calling
-    // convention via `descr_property_get`).
+            "__doc__",
+            pyre_object::w_str_new("Create a code object.  Not for the faint of heart."),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__new__",
+            make_new_descr(code_descr_new),
+        );
+    }
+    for (name, function) in [
+        ("__eq__", code_descr_eq as crate::gateway::BuiltinCodeFn),
+        ("__ne__", code_descr_ne as crate::gateway::BuiltinCodeFn),
+    ] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(name, function, 2),
+            );
+        }
+    }
+    for name in ["__lt__", "__le__", "__gt__", "__ge__"] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(
+                    name,
+                    |_args| Ok(pyre_object::special::w_not_implemented()),
+                    2,
+                ),
+            );
+        }
+    }
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
-            "co_exceptiontable",
-            make_getset_descriptor(make_builtin_function_with_arity(
-                "co_exceptiontable",
-                |args| {
-                    let w_self = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                    if w_self.is_null() {
-                        return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&[]));
-                    }
-                    if !unsafe { crate::pycode::is_code(w_self) } {
-                        return Err(crate::PyError::type_error(
-                            "descriptor 'co_exceptiontable' requires a 'code' object",
-                        ));
-                    }
-                    let bytes = unsafe { crate::pycode::w_code_exceptiontable(w_self) };
-                    Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
-                },
+            "__hash__",
+            make_builtin_function_with_arity(
+                "__hash__",
+                |args| unsafe { Ok(pyre_object::w_int_new(crate::pycode::code_hash(args[0])?)) },
+                1,
+            ),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function_with_arity(
+                "__repr__",
+                |args| unsafe { crate::pycode::code_repr(args[0]) },
+                1,
+            ),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__sizeof__",
+            make_builtin_function_with_arity(
+                "__sizeof__",
+                |args| unsafe { crate::pycode::code_sizeof(args[0]) },
+                1,
+            ),
+        );
+    }
+
+    for name in ["replace", "__replace__"] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function(name, |args| unsafe { crate::pycode::code_replace(args) }),
+            );
+        }
+    }
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "_varname_from_oparg",
+            make_builtin_function_with_arity(
+                "_varname_from_oparg",
+                |args| unsafe { crate::pycode::code_varname_from_oparg(args[0], args[1]) },
                 2,
-            )),
-        )
-    };
-    // code.co_positions() — PEP 657 per-instruction source positions
-    // (`pycode.py` exposes `co_positions` via `co_positions_iterator`).
-    // Yields one `(start_line, end_line, start_col, end_col)` tuple per
-    // instruction from the decoded `CodeObject.locations` table.
-    // `traceback._get_code_position` indexes the result at `tb_lasti // 2`,
-    // so the `tb_lasti` getter reports the byte-offset form
-    // (`2 * instruction_index`) to land on the same entry.
-    //
-    // The column fields are reported as `None`: pyre lacks the
-    // `compile(PyCF_ONLY_AST)` AST surface that `traceback`'s 3.14 caret
-    // anchoring (`_should_show_carets` / `_byte_offset_to_character_offset`)
-    // re-parses, and a `None` column makes `format_frame_summary`
-    // (`traceback.py:556-561`) take the column-free single-line branch —
-    // the same graceful degradation CPython uses when range info is absent
-    // (`-X no_debug_ranges`).  Line numbers stay exact.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+            ),
+        );
+    }
+    for (name, function) in [
+        (
             "co_positions",
-            make_builtin_function("co_positions", |args| {
-                let w_self = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                if w_self.is_null() || !unsafe { crate::pycode::is_code(w_self) } {
-                    return Err(crate::PyError::type_error(
-                        "descriptor 'co_positions' requires a 'code' object",
-                    ));
-                }
-                let code_ptr =
-                    unsafe { crate::pycode::w_code_get_ptr(w_self) } as *const crate::CodeObject;
-                let rows: Vec<pyre_object::PyObjectRef> = if code_ptr.is_null() {
-                    Vec::new()
-                } else {
-                    let code = unsafe { &*code_ptr };
-                    code.locations
-                        .iter()
-                        .map(|(start, end)| {
-                            pyre_object::w_tuple_new(vec![
-                                pyre_object::w_int_new(start.line.get() as i64),
-                                pyre_object::w_int_new(end.line.get() as i64),
-                                pyre_object::w_none(),
-                                pyre_object::w_none(),
-                            ])
-                        })
-                        .collect()
-                };
-                let n = rows.len();
-                Ok(pyre_object::w_seq_iter_new(
-                    pyre_object::w_list_new(rows),
-                    n,
-                ))
-            }),
-        )
-    };
+            code_descr_positions as crate::gateway::BuiltinCodeFn,
+        ),
+        (
+            "co_lines",
+            code_descr_lines as crate::gateway::BuiltinCodeFn,
+        ),
+        (
+            "co_branches",
+            code_descr_branches as crate::gateway::BuiltinCodeFn,
+        ),
+    ] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(name, function, 1),
+            );
+        }
+    }
+
+    for name in [
+        "_co_code_adaptive",
+        "co_argcount",
+        "co_posonlyargcount",
+        "co_kwonlyargcount",
+        "co_nlocals",
+        "co_stacksize",
+        "co_flags",
+        "co_code",
+        "co_consts",
+        "co_names",
+        "co_varnames",
+        "co_freevars",
+        "co_cellvars",
+        "co_filename",
+        "co_name",
+        "co_qualname",
+        "co_firstlineno",
+        "co_linetable",
+        "co_exceptiontable",
+        "co_lnotab",
+    ] {
+        let getter = make_builtin_function_with_arity(name, code_field_getter, 2);
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_getset_descriptor_named(getter, name),
+            );
+        }
+    }
 }
 
 /// typedef.py:533-540 Member.typedef
@@ -8956,6 +10136,9 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                             (*(*obj).ob_type).name,
                         )));
                     }
+                }
+                if unsafe { pyre_object::w_member_is_direct(descr) } {
+                    return unsafe { direct_member_get(descr, obj) };
                 }
                 // typedef.py:511-516: w_result = w_obj.getslotvalue(self.index);
                 // None → AttributeError("'%T' object has no attribute '%s'").
@@ -9008,6 +10191,9 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                         )));
                     }
                 }
+                if unsafe { pyre_object::w_member_is_direct(descr) } {
+                    return unsafe { direct_member_set(descr, obj, value) };
+                }
                 // typedef.py:522: w_obj.setslotvalue(self.index, w_value)
                 let index = unsafe { pyre_object::w_member_get_index(descr) };
                 if unsafe { pyre_object::is_instance(obj) } {
@@ -9055,6 +10241,9 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                             (*(*obj).ob_type).name,
                         )));
                     }
+                }
+                if unsafe { pyre_object::w_member_is_direct(descr) } {
+                    return unsafe { direct_member_delete(descr, obj) };
                 }
                 // typedef.py:527-531: success = w_obj.delslotvalue(self.index)
                 let slot_name = unsafe { pyre_object::w_member_get_name(descr) };
@@ -9126,29 +10315,275 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
             make_getset_descriptor(objclass_getter),
         )
     };
+    // CPython 3.14 `PyMemberDescr_Type` metadata.  PyPy's Member typedef
+    // stops at __name__/__objclass__; these four entries are the selected
+    // 3.14 surface.
+    let doc_getter =
+        make_builtin_function_with_arity("__doc__", |_args| Ok(pyre_object::w_none()), 2);
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            make_getset_descriptor_named(doc_getter, "__doc__"),
+        )
+    };
+
+    let qualname_getter = make_builtin_function_with_arity(
+        "__qualname__",
+        |args| {
+            let member = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+            if member.is_null() || !unsafe { pyre_object::typedef::is_member(member) } {
+                return Ok(pyre_object::w_none());
+            }
+            let name = unsafe { pyre_object::w_member_get_name(member) };
+            let owner = unsafe { pyre_object::w_member_get_cls(member) };
+            let owner_qualname = if owner.is_null() {
+                "?".to_string()
+            } else {
+                // `type.__getattribute__` also sees the metatype's
+                // `__qualname__` getset.  Read the class namespace itself,
+                // matching `type.getqualname`: heap classes carry the
+                // compiler-stamped string there; static types fall back to
+                // their bare `tp_name` component.
+                match crate::type_dict_lookup(owner, "__qualname__") {
+                    Some(value) if unsafe { pyre_object::is_str(value) } => {
+                        unsafe { pyre_object::w_str_get_value(value) }.to_string()
+                    }
+                    _ => {
+                        let full = unsafe { pyre_object::w_type_get_name(owner) };
+                        full.rsplit('.').next().unwrap_or(full).to_string()
+                    }
+                }
+            };
+            Ok(pyre_object::w_str_new(&format!("{owner_qualname}.{name}")))
+        },
+        2,
+    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__qualname__",
+            make_getset_descriptor_named(qualname_getter, "__qualname__"),
+        )
+    };
+
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function_with_arity(
+                "__repr__",
+                |args| {
+                    let member = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    Ok(pyre_object::w_str_new(&unsafe {
+                        member_descriptor_repr(member)
+                    }))
+                },
+                1,
+            ),
+        )
+    };
+
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__reduce__",
+            make_builtin_function_with_arity(
+                "__reduce__",
+                |args| {
+                    let member = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    let owner = unsafe { pyre_object::w_member_get_cls(member) };
+                    let name =
+                        pyre_object::w_str_new(unsafe { pyre_object::w_member_get_name(member) });
+                    Ok(pyre_object::w_tuple_new(vec![
+                        crate::baseobjspace::builtin_callable("getattr"),
+                        pyre_object::w_tuple_new(vec![owner, name]),
+                    ]))
+                },
+                1,
+            ),
+        )
+    };
 }
 
-/// `nestedscope.py:Cell` typedef.  PyPy `typedef.py:934-952 Cell.typedef`:
-///
-/// ```python
-/// Cell.typedef = TypeDef("cell",
-///     ...
-///     __repr__     = interp2app(Cell.descr__repr__),
-///     ...
-///     cell_contents= GetSetProperty(
-///         Cell.descr__cell_contents,
-///         Cell.descr_set_cell_contents,
-///         Cell.descr_del_cell_contents,
-///         cls=Cell),
-/// )
-/// ```
-///
-/// Only the user-visible read/write/delete of `cell_contents` is ported
-/// here.  `__eq__`/`__ne__`/`__lt__`/`__gt__`/`__le__`/`__ge__` cell-vs-cell
-/// comparisons (`nestedscope.py:9-19 make_cell_cmp`) and `__hash__ = None`
-/// remain unimplemented as a wider parity gap — they are not needed for
-/// the descriptor-on-tuple-of-cells path that motivates this work.
+/// CPython 3.14 `member_get_qualname` / `member_repr` surface shared by the
+/// registered `__repr__` method and `display::py_repr`'s native descriptor
+/// dispatch.
+pub(crate) unsafe fn member_descriptor_repr(member: PyObjectRef) -> String {
+    let name = unsafe { pyre_object::w_member_get_name(member) };
+    let owner = unsafe { pyre_object::w_member_get_cls(member) };
+    let owner_name = if owner.is_null() {
+        "?"
+    } else {
+        unsafe { pyre_object::w_type_get_name(owner) }
+    };
+    format!("<member '{name}' of '{owner_name}' objects>")
+}
+
+/// CPython 3.14 `cell_new`, matching PyPy `descr_new_cell` except that the
+/// 3.14 positional-only argument surface rejects keywords.
+fn cell_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "cell() takes no keyword arguments",
+        ));
+    }
+    let cls = positional.first().copied().unwrap_or(PY_NULL);
+    let cell_type = gettypefor(&pyre_object::nestedscope::CELL_TYPE).unwrap_or(PY_NULL);
+    check_user_subclass(cell_type, cls)?;
+    let contents = match positional.get(1..) {
+        Some([]) | None => PY_NULL,
+        Some([contents]) => *contents,
+        Some(rest) => {
+            return Err(crate::PyError::type_error(format!(
+                "cell expected at most 1 argument, got {}",
+                rest.len()
+            )));
+        }
+    };
+    Ok(pyre_object::w_cell_new(contents))
+}
+
+/// `nestedscope.py:9-19 make_cell_cmp` / CPython 3.14
+/// `cell_compare_impl`: compare contents, with an empty cell ordered before
+/// a populated cell. A foreign right operand returns NotImplemented.
+fn cell_descr_compare(
+    args: &[PyObjectRef],
+    op: crate::baseobjspace::CompareOp,
+) -> Result<PyObjectRef, crate::PyError> {
+    let a = args.first().copied().unwrap_or(PY_NULL);
+    let b = args.get(1).copied().unwrap_or(PY_NULL);
+    if a.is_null() || !unsafe { pyre_object::is_cell(a) } {
+        let dunder = match op {
+            crate::baseobjspace::CompareOp::Eq => "__eq__",
+            crate::baseobjspace::CompareOp::Ne => "__ne__",
+            crate::baseobjspace::CompareOp::Lt => "__lt__",
+            crate::baseobjspace::CompareOp::Le => "__le__",
+            crate::baseobjspace::CompareOp::Gt => "__gt__",
+            crate::baseobjspace::CompareOp::Ge => "__ge__",
+        };
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{}' requires a 'cell' object",
+            dunder
+        )));
+    }
+    if b.is_null() || !unsafe { pyre_object::is_cell(b) } {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    let a_value = unsafe { pyre_object::w_cell_get(a) };
+    let b_value = unsafe { pyre_object::w_cell_get(b) };
+    if !a_value.is_null() && !b_value.is_null() {
+        return crate::baseobjspace::compare(a_value, b_value, op);
+    }
+    // Cell._cmp_one_empty: empty/empty = 0, empty/value = -1,
+    // value/empty = 1; compare that result with zero using the requested op.
+    let ordering = match (a_value.is_null(), b_value.is_null()) {
+        (true, true) => 0,
+        (true, false) => -1,
+        (false, true) => 1,
+        (false, false) => unreachable!(),
+    };
+    Ok(pyre_object::w_bool_from(match op {
+        crate::baseobjspace::CompareOp::Eq => ordering == 0,
+        crate::baseobjspace::CompareOp::Ne => ordering != 0,
+        crate::baseobjspace::CompareOp::Lt => ordering < 0,
+        crate::baseobjspace::CompareOp::Le => ordering <= 0,
+        crate::baseobjspace::CompareOp::Gt => ordering > 0,
+        crate::baseobjspace::CompareOp::Ge => ordering >= 0,
+    }))
+}
+
+fn cell_descr_eq(args: &[PyObjectRef]) -> crate::PyResult {
+    cell_descr_compare(args, crate::baseobjspace::CompareOp::Eq)
+}
+fn cell_descr_ne(args: &[PyObjectRef]) -> crate::PyResult {
+    cell_descr_compare(args, crate::baseobjspace::CompareOp::Ne)
+}
+fn cell_descr_lt(args: &[PyObjectRef]) -> crate::PyResult {
+    cell_descr_compare(args, crate::baseobjspace::CompareOp::Lt)
+}
+fn cell_descr_gt(args: &[PyObjectRef]) -> crate::PyResult {
+    cell_descr_compare(args, crate::baseobjspace::CompareOp::Gt)
+}
+fn cell_descr_le(args: &[PyObjectRef]) -> crate::PyResult {
+    cell_descr_compare(args, crate::baseobjspace::CompareOp::Le)
+}
+fn cell_descr_ge(args: &[PyObjectRef]) -> crate::PyResult {
+    cell_descr_compare(args, crate::baseobjspace::CompareOp::Ge)
+}
+
+/// `nestedscope.py:101-110 Cell.descr__repr__`, with CPython 3.14's
+/// 80-character type-name cap from `Objects/cellobject.c:cell_repr`.
+fn cell_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
+    let cell = args.first().copied().unwrap_or(PY_NULL);
+    if cell.is_null() || !unsafe { pyre_object::is_cell(cell) } {
+        let received = crate::baseobjspace::object_functionstr_type_name(cell);
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '__repr__' requires a 'cell' object but received a '{received}'"
+        )));
+    }
+    let value = unsafe { pyre_object::w_cell_get(cell) };
+    let text = if value.is_null() {
+        format!("<cell at 0x{:x}: empty>", cell as usize)
+    } else {
+        let type_name = crate::typedef::r#type(value)
+            .map(|tp| unsafe { pyre_object::w_type_get_name(tp) })
+            .unwrap_or_else(|| unsafe { (*(*value).ob_type).name });
+        let type_name: String = type_name.chars().take(80).collect();
+        format!(
+            "<cell at 0x{:x}: {type_name} object at 0x{:x}>",
+            cell as usize, value as usize
+        )
+    };
+    Ok(w_str_new(&text))
+}
+
+/// `nestedscope.py:934-952 Cell.typedef`, in source order. CPython 3.14 is
+/// the version oracle where it differs: its public cell type deliberately
+/// omits PyPy 3.11's `__reduce__` and `__setstate__` pickle hooks.
 fn init_cell_type(ns: PyObjectRef) {
+    let entries = [
+        (
+            "__doc__",
+            w_str_new(
+                "Create a new cell object.\n\n  contents\n    the contents of the cell. If not specified, the cell will be empty,\n    and \n further attempts to access its cell_contents attribute will\n    raise a ValueError.",
+            ),
+        ),
+        ("__new__", make_new_descr(cell_descr_new)),
+        (
+            "__eq__",
+            make_builtin_function_with_arity("__eq__", cell_descr_eq, 2),
+        ),
+        (
+            "__ne__",
+            make_builtin_function_with_arity("__ne__", cell_descr_ne, 2),
+        ),
+        (
+            "__lt__",
+            make_builtin_function_with_arity("__lt__", cell_descr_lt, 2),
+        ),
+        (
+            "__gt__",
+            make_builtin_function_with_arity("__gt__", cell_descr_gt, 2),
+        ),
+        (
+            "__le__",
+            make_builtin_function_with_arity("__le__", cell_descr_le, 2),
+        ),
+        (
+            "__ge__",
+            make_builtin_function_with_arity("__ge__", cell_descr_ge, 2),
+        ),
+        ("__hash__", w_none()),
+        (
+            "__repr__",
+            make_builtin_function_with_arity("__repr__", cell_descr_repr, 1),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
     // `nestedscope.py:112-116 descr__cell_contents`:
     //
     //     def descr__cell_contents(self, space):
@@ -9236,404 +10671,931 @@ fn init_cell_type(ns: PyObjectRef) {
     };
 }
 
-/// `staticmethod.__new__(cls, func)` — PyPy: function.py StaticMethod.descr__new__
+fn staticmethod_require(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+    if obj.is_null() || !unsafe { pyre_object::function::is_staticmethod(obj) } {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' requires a 'staticmethod' object"
+        )));
+    }
+    Ok(obj)
+}
+
+/// function.py:695-698 `StaticMethod.descr_staticmethod__new__` / CPython
+/// 3.14 `sm_new`: allocate first with a None callable; `__init__` installs
+/// the user argument and copies presentation attributes.
+fn staticmethod_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
+    let cls = args.first().copied().unwrap_or(PY_NULL);
+    let staticmethod_type = gettypeobject(&pyre_object::function::STATICMETHOD_TYPE);
+    check_user_subclass(staticmethod_type, cls)?;
+    let sm = pyre_object::function::w_staticmethod_new(w_none());
+    if !std::ptr::eq(cls, staticmethod_type) {
+        unsafe { (*sm).w_class = cls };
+    }
+    Ok(sm)
+}
+
+/// function.py:700-703 `StaticMethod.descr_init`, adjusted to CPython 3.14:
+/// `functools_wraps` copies the four presentation attributes while
+/// `__annotations__` and `__annotate__` remain lazy proxy descriptors.
+fn staticmethod_descr_init(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "staticmethod() takes no keyword arguments",
+        ));
+    }
+    let sm = staticmethod_require(positional.first().copied().unwrap_or(PY_NULL), "__init__")?;
+    let supplied = positional.len().saturating_sub(1);
+    if supplied != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "staticmethod expected 1 argument, got {supplied}"
+        )));
+    }
+    let function = positional[1];
+    unsafe { pyre_object::function::w_staticmethod_set_func(sm, function) };
+    let w_dict = unsafe { pyre_object::function::w_staticmethod_getdict(sm) };
+    for name in ["__module__", "__name__", "__qualname__", "__doc__"] {
+        match crate::baseobjspace::getattr_str(function, name) {
+            Ok(value) => {
+                crate::baseobjspace::setitem(w_dict, w_str_new(name), value)?;
+            }
+            Err(err) if err.kind == crate::PyErrorKind::AttributeError => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(w_none())
+}
+
+/// function.py:691-693 `descr_staticmethod_get`.
+fn staticmethod_descr_get(args: &[PyObjectRef]) -> crate::PyResult {
+    let sm = staticmethod_require(args.first().copied().unwrap_or(PY_NULL), "__get__")?;
+    let function = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
+    Ok(if function.is_null() {
+        w_none()
+    } else {
+        function
+    })
+}
+
+/// function.py:712-713 `descr_call` / CPython 3.14 `sm_call`.
+fn staticmethod_descr_call(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let sm = staticmethod_require(positional.first().copied().unwrap_or(PY_NULL), "__call__")?;
+    let function = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
+    let call_args = positional.get(1..).unwrap_or(&[]);
+    if !crate::builtins::has_real_kwargs(kwargs) {
+        return crate::call::call_function_impl_result(function, call_args);
+    }
+    let keyword_args: Vec<(Wtf8Buf, PyObjectRef)> = unsafe {
+        pyre_object::w_dict_str_entries(kwargs.unwrap())
+            .into_iter()
+            .filter(|(name, _)| name != "__pyre_kw__")
+            .map(|(name, value)| (Wtf8Buf::from_string(name), value))
+            .collect()
+    };
+    crate::eval::CURRENT_FRAME.with(|current| {
+        let frame = current.get();
+        if frame.is_null() {
+            return Err(crate::PyError::runtime_error(
+                "staticmethod call has no current frame",
+            ));
+        }
+        crate::call::call_with_kwargs(unsafe { &mut *frame }, function, call_args, &keyword_args)
+    })
+}
+
+fn staticmethod_func_attr(args: &[PyObjectRef]) -> crate::PyResult {
+    let sm = staticmethod_require(args.get(1).copied().unwrap_or(PY_NULL), "__func__")?;
+    let value = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
+    Ok(if value.is_null() { w_none() } else { value })
+}
+
+fn staticmethod_isabstract(args: &[PyObjectRef]) -> crate::PyResult {
+    let sm = staticmethod_require(
+        args.get(1).copied().unwrap_or(PY_NULL),
+        "__isabstractmethod__",
+    )?;
+    let function = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
+    Ok(w_bool_from(crate::baseobjspace::isabstractmethod_w(
+        function,
+    )?))
+}
+
+fn staticmethod_wrapped_attr_get(obj: PyObjectRef, name: &str) -> crate::PyResult {
+    let sm = staticmethod_require(obj, name)?;
+    let w_dict = unsafe { pyre_object::function::w_staticmethod_getdict(sm) };
+    if let Some(value) = crate::baseobjspace::finditem_str(w_dict, name)? {
+        return Ok(value);
+    }
+    let function = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
+    let value = crate::baseobjspace::getattr_str(function, name)?;
+    crate::baseobjspace::setitem(w_dict, w_str_new(name), value)?;
+    Ok(value)
+}
+
+fn staticmethod_annotations_get(args: &[PyObjectRef]) -> crate::PyResult {
+    staticmethod_wrapped_attr_get(args.get(1).copied().unwrap_or(PY_NULL), "__annotations__")
+}
+
+fn staticmethod_annotate_get(args: &[PyObjectRef]) -> crate::PyResult {
+    staticmethod_wrapped_attr_get(args.get(1).copied().unwrap_or(PY_NULL), "__annotate__")
+}
+
+fn staticmethod_wrapped_attr_set(args: &[PyObjectRef], name: &str) -> crate::PyResult {
+    let sm = staticmethod_require(args.get(1).copied().unwrap_or(PY_NULL), name)?;
+    let value = args.get(2).copied().unwrap_or(PY_NULL);
+    let w_dict = unsafe { pyre_object::function::w_staticmethod_getdict(sm) };
+    crate::baseobjspace::setitem(w_dict, w_str_new(name), value)?;
+    Ok(w_none())
+}
+
+fn staticmethod_annotations_set(args: &[PyObjectRef]) -> crate::PyResult {
+    staticmethod_wrapped_attr_set(args, "__annotations__")
+}
+
+fn staticmethod_annotate_set(args: &[PyObjectRef]) -> crate::PyResult {
+    staticmethod_wrapped_attr_set(args, "__annotate__")
+}
+
+fn staticmethod_wrapped_attr_del(args: &[PyObjectRef], name: &str) -> crate::PyResult {
+    let sm = staticmethod_require(args.get(1).copied().unwrap_or(PY_NULL), name)?;
+    let w_dict = unsafe { pyre_object::function::w_staticmethod_getdict(sm) };
+    if let Err(err) = crate::baseobjspace::delitem(w_dict, w_str_new(name)) {
+        if err.kind == crate::PyErrorKind::KeyError {
+            return Err(crate::PyError::attribute_error(format!(
+                "'staticmethod' object has no attribute '{name}'"
+            )));
+        }
+        return Err(err);
+    }
+    Ok(w_none())
+}
+
+fn staticmethod_annotations_del(args: &[PyObjectRef]) -> crate::PyResult {
+    staticmethod_wrapped_attr_del(args, "__annotations__")
+}
+
+fn staticmethod_annotate_del(args: &[PyObjectRef]) -> crate::PyResult {
+    staticmethod_wrapped_attr_del(args, "__annotate__")
+}
+
+fn staticmethod_dict_del(_args: &[PyObjectRef]) -> crate::PyResult {
+    Err(crate::PyError::type_error("cannot delete __dict__"))
+}
+
+/// function.py:715-716 / CPython 3.14 `sm_repr`.
+fn staticmethod_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
+    let sm = staticmethod_require(args.first().copied().unwrap_or(PY_NULL), "__repr__")?;
+    let function = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
+    let repr = if function.is_null() {
+        "<NULL>".to_string()
+    } else {
+        unsafe { crate::display::py_repr(function)? }
+    };
+    Ok(w_str_new(&format!("<staticmethod({repr})>")))
+}
+
+/// PyPy `typedef.py:852-877 StaticMethod.typedef`, with the CPython 3.14
+/// surface taking precedence: PEP 649 proxy descriptors and generic alias
+/// support are present, while PyPy 3.11's `__reduce_ex__` is absent.
 fn init_staticmethod_type(ns: PyObjectRef) {
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            make_builtin_function("__new__", |args| {
-                // staticmethod(func) — args[0] is cls (staticmethod type), args[1] is func
-                let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let func = if args.len() > 1 {
-                    args[1]
-                } else {
-                    pyre_object::w_none()
-                };
-                let sm = pyre_object::function::w_staticmethod_new(func);
-                // function.py `allocate_instance(StaticMethod, w_subtype)` —
-                // honour the subtype so `abstractstaticmethod(func)` yields an
-                // `abstractstaticmethod` instance, not a bare `staticmethod`.
-                let staticmethod_type =
-                    crate::typedef::gettypeobject(&pyre_object::function::STATICMETHOD_TYPE);
-                if !cls.is_null() && !std::ptr::eq(cls, staticmethod_type) {
-                    check_user_subclass(staticmethod_type, cls)?;
-                    unsafe {
-                        (*sm).w_class = cls;
-                    }
-                }
-                Ok(sm)
-            }),
-        )
-    };
-    // `typedef.py:866 __get__ = interp2app(
-    //     StaticMethod.descr_staticmethod_get)`.  `function.py:691-693`:
-    //
-    //     def descr_staticmethod_get(self, w_obj, w_cls=None):
-    //         """staticmethod(x).__get__(obj[, type]) -> x"""
-    //         return self.w_function
-    //
-    // Arity 3 covers `__get__(self, obj, cls=None)`.  `args[0]` is the
-    // staticmethod instance; the remaining slots are ignored beyond the
-    // type guard.  Returning `w_function` without binding is the
-    // canonical staticmethod semantic (`function.py:864 …does not
-    // receive an implicit first argument`).
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__get__",
-            make_builtin_function_with_arity(
-                "__get__",
-                |args| {
-                    let sm = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                    if !unsafe { pyre_object::function::is_staticmethod(sm) } {
-                        return Err(crate::PyError::type_error(
-                            "descriptor '__get__' requires a 'staticmethod' object",
-                        ));
-                    }
-                    let w_func = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
-                    if w_func.is_null() {
-                        Ok(pyre_object::w_none())
-                    } else {
-                        Ok(w_func)
-                    }
-                },
-                3,
+    let dict_getter = make_builtin_function_with_arity("__dict__", descr_get_dict, 2);
+    let dict_setter = make_builtin_function_with_arity("__dict__", descr_set_dict, 3);
+    let dict_deleter = make_builtin_function_with_arity("__dict__", staticmethod_dict_del, 2);
+    let annotations_getter =
+        make_builtin_function_with_arity("__annotations__", staticmethod_annotations_get, 2);
+    let annotations_setter =
+        make_builtin_function_with_arity("__annotations__", staticmethod_annotations_set, 3);
+    let annotations_deleter =
+        make_builtin_function_with_arity("__annotations__", staticmethod_annotations_del, 2);
+    let annotate_getter =
+        make_builtin_function_with_arity("__annotate__", staticmethod_annotate_get, 2);
+    let annotate_setter =
+        make_builtin_function_with_arity("__annotate__", staticmethod_annotate_set, 3);
+    let annotate_deleter =
+        make_builtin_function_with_arity("__annotate__", staticmethod_annotate_del, 2);
+    let entries = [
+        (
+            "__doc__",
+            w_str_new(
+                "Convert a function to be a static method.\n\nA static method does not receive an implicit first argument.\nTo declare a static method, use this idiom:\n\n     class C:\n         @staticmethod\n         def f(arg1, arg2, argN):\n             ...\n\nIt can be called either on the class (e.g. C.f()) or on an instance\n(e.g. C().f()). Both the class and the instance are ignored, and\nneither is passed implicitly as the first argument to the method.\n\nStatic methods in Python are similar to those found in Java or C++.\nFor a more advanced concept, see the classmethod builtin.",
             ),
-        )
-    };
-    // typedef.py:870-871 ─
-    //   __func__ = interp_attrproperty_w('w_function', cls=StaticMethod),
-    //   __wrapped__ = interp_attrproperty_w('w_function', cls=StaticMethod),
-    // — same `w_function` slot, two aliases, both routed through
-    // the interp_attrproperty_w fget shape (typedef.py:465-474):
-    // substitute w_None when the fetched slot is None.
-    fn staticmethod_func_attr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if !unsafe { pyre_object::function::is_staticmethod(obj) } {
-            return Ok(pyre_object::w_none());
-        }
-        let w_value = unsafe { pyre_object::function::w_staticmethod_get_func(obj) };
-        if w_value.is_null() {
-            Ok(pyre_object::w_none())
-        } else {
-            Ok(w_value)
-        }
-    }
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        ),
+        (
+            "__get__",
+            make_builtin_function("__get__", staticmethod_descr_get),
+        ),
+        ("__new__", make_new_descr(staticmethod_descr_new)),
+        (
+            "__init__",
+            make_builtin_function("__init__", staticmethod_descr_init),
+        ),
+        (
+            "__call__",
+            make_builtin_function("__call__", staticmethod_descr_call),
+        ),
+        (
             "__func__",
             make_getset_descriptor(make_builtin_function_with_arity(
                 "__func__",
                 staticmethod_func_attr,
                 2,
             )),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        ),
+        (
             "__wrapped__",
             make_getset_descriptor(make_builtin_function_with_arity(
                 "__wrapped__",
                 staticmethod_func_attr,
                 2,
             )),
-        )
-    };
-    // typedef.py:872 `__isabstractmethod__ = GetSetProperty(
-    //     StaticMethod.descr_isabstract)`.  function.py:705-706:
-    //
-    //     def descr_isabstract(self, space):
-    //         return space.newbool(space.isabstractmethod_w(self.w_function))
-    //
-    // `baseobjspace.isabstractmethod_w` already factored above.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        ),
+        (
             "__isabstractmethod__",
             make_getset_descriptor(make_builtin_function_with_arity(
                 "__isabstractmethod__",
-                |args| {
-                    let sm = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                    if !unsafe { pyre_object::function::is_staticmethod(sm) } {
-                        return Ok(pyre_object::w_bool_from(false));
-                    }
-                    let func = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
-                    let result = crate::baseobjspace::isabstractmethod_w(func)?;
-                    Ok(pyre_object::w_bool_from(result))
-                },
+                staticmethod_isabstract,
                 2,
             )),
-        )
-    };
+        ),
+        (
+            "__dict__",
+            make_getset_property_named(dict_getter, dict_setter, dict_deleter, "__dict__"),
+        ),
+        (
+            "__annotations__",
+            make_getset_property_named(
+                annotations_getter,
+                annotations_setter,
+                annotations_deleter,
+                "__annotations__",
+            ),
+        ),
+        (
+            "__annotate__",
+            make_getset_property_named(
+                annotate_getter,
+                annotate_setter,
+                annotate_deleter,
+                "__annotate__",
+            ),
+        ),
+        (
+            "__class_getitem__",
+            pyre_object::function::w_classmethod_new(make_builtin_function(
+                "__class_getitem__",
+                crate::_pypy_generic_alias::generic_alias_class_getitem,
+            )),
+        ),
+        (
+            "__repr__",
+            make_builtin_function("__repr__", staticmethod_descr_repr),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
 }
 
-/// `classmethod.__new__(cls, func)` — PyPy: function.py ClassMethod.descr__new__
+fn classmethod_require(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+    if obj.is_null() || !unsafe { pyre_object::function::is_classmethod(obj) } {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' requires a 'classmethod' object"
+        )));
+    }
+    Ok(obj)
+}
+
+/// function.py:750-753 `ClassMethod.descr_classmethod__new__` / CPython
+/// 3.14 `cm_new`: allocate the requested subtype with a temporary None
+/// callable; `__init__` installs the actual callable.
+fn classmethod_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
+    let cls = args.first().copied().unwrap_or(PY_NULL);
+    let classmethod_type = gettypeobject(&pyre_object::function::CLASSMETHOD_TYPE);
+    check_user_subclass(classmethod_type, cls)?;
+    let cm = pyre_object::function::w_classmethod_new(w_none());
+    if !std::ptr::eq(cls, classmethod_type) {
+        unsafe { (*cm).w_class = cls };
+    }
+    Ok(cm)
+}
+
+/// function.py:755-758 `ClassMethod.descr_init`, adjusted to CPython 3.14's
+/// `functools_wraps`: copy the four eager presentation attributes while the
+/// two annotation attributes remain lazy proxy descriptors.
+fn classmethod_descr_init(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "classmethod() takes no keyword arguments",
+        ));
+    }
+    let cm = classmethod_require(positional.first().copied().unwrap_or(PY_NULL), "__init__")?;
+    let supplied = positional.len().saturating_sub(1);
+    if supplied != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "classmethod expected 1 argument, got {supplied}"
+        )));
+    }
+    let function = positional[1];
+    unsafe { pyre_object::function::w_classmethod_set_func(cm, function) };
+    let w_dict = unsafe { pyre_object::function::w_classmethod_getdict(cm) };
+    for name in ["__module__", "__name__", "__qualname__", "__doc__"] {
+        match crate::baseobjspace::getattr_str(function, name) {
+            Ok(value) => {
+                crate::baseobjspace::setitem(w_dict, w_str_new(name), value)?;
+            }
+            Err(err) if err.kind == crate::PyErrorKind::AttributeError => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(w_none())
+}
+
+/// function.py:738-748 `descr_classmethod_get`. Python 3.14's `cm_descr_get`
+/// binds the stored callable directly to the selected class; it no longer
+/// invokes a descriptor nested inside classmethod.
+fn classmethod_descr_get(args: &[PyObjectRef]) -> crate::PyResult {
+    let cm = classmethod_require(args.first().copied().unwrap_or(PY_NULL), "__get__")?;
+    let w_obj = args.get(1).copied().unwrap_or(PY_NULL);
+    let mut w_klass = args.get(2).copied().unwrap_or(PY_NULL);
+    if w_klass.is_null() || unsafe { pyre_object::is_none(w_klass) } {
+        w_klass = r#type(w_obj).unwrap_or(PY_NULL);
+    }
+    let function = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
+    Ok(pyre_object::w_method_new(function, w_klass, w_klass))
+}
+
+fn classmethod_func_attr(args: &[PyObjectRef]) -> crate::PyResult {
+    let cm = classmethod_require(args.get(1).copied().unwrap_or(PY_NULL), "__func__")?;
+    let value = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
+    Ok(if value.is_null() { w_none() } else { value })
+}
+
+fn classmethod_isabstract(args: &[PyObjectRef]) -> crate::PyResult {
+    let cm = classmethod_require(
+        args.get(1).copied().unwrap_or(PY_NULL),
+        "__isabstractmethod__",
+    )?;
+    let function = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
+    Ok(w_bool_from(crate::baseobjspace::isabstractmethod_w(
+        function,
+    )?))
+}
+
+fn classmethod_wrapped_attr_get(obj: PyObjectRef, name: &str) -> crate::PyResult {
+    let cm = classmethod_require(obj, name)?;
+    let w_dict = unsafe { pyre_object::function::w_classmethod_getdict(cm) };
+    if let Some(value) = crate::baseobjspace::finditem_str(w_dict, name)? {
+        return Ok(value);
+    }
+    let function = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
+    let value = crate::baseobjspace::getattr_str(function, name)?;
+    crate::baseobjspace::setitem(w_dict, w_str_new(name), value)?;
+    Ok(value)
+}
+
+fn classmethod_annotations_get(args: &[PyObjectRef]) -> crate::PyResult {
+    classmethod_wrapped_attr_get(args.get(1).copied().unwrap_or(PY_NULL), "__annotations__")
+}
+
+fn classmethod_annotate_get(args: &[PyObjectRef]) -> crate::PyResult {
+    classmethod_wrapped_attr_get(args.get(1).copied().unwrap_or(PY_NULL), "__annotate__")
+}
+
+fn classmethod_wrapped_attr_set(args: &[PyObjectRef], name: &str) -> crate::PyResult {
+    let cm = classmethod_require(args.get(1).copied().unwrap_or(PY_NULL), name)?;
+    let value = args.get(2).copied().unwrap_or(PY_NULL);
+    let w_dict = unsafe { pyre_object::function::w_classmethod_getdict(cm) };
+    crate::baseobjspace::setitem(w_dict, w_str_new(name), value)?;
+    Ok(w_none())
+}
+
+fn classmethod_annotations_set(args: &[PyObjectRef]) -> crate::PyResult {
+    classmethod_wrapped_attr_set(args, "__annotations__")
+}
+
+fn classmethod_annotate_set(args: &[PyObjectRef]) -> crate::PyResult {
+    classmethod_wrapped_attr_set(args, "__annotate__")
+}
+
+fn classmethod_wrapped_attr_del(args: &[PyObjectRef], name: &str) -> crate::PyResult {
+    let cm = classmethod_require(args.get(1).copied().unwrap_or(PY_NULL), name)?;
+    let w_dict = unsafe { pyre_object::function::w_classmethod_getdict(cm) };
+    if let Err(err) = crate::baseobjspace::delitem(w_dict, w_str_new(name)) {
+        if err.kind == crate::PyErrorKind::KeyError {
+            return Err(crate::PyError::attribute_error(format!(
+                "'classmethod' object has no attribute '{name}'"
+            )));
+        }
+        return Err(err);
+    }
+    Ok(w_none())
+}
+
+fn classmethod_annotations_del(args: &[PyObjectRef]) -> crate::PyResult {
+    classmethod_wrapped_attr_del(args, "__annotations__")
+}
+
+fn classmethod_annotate_del(args: &[PyObjectRef]) -> crate::PyResult {
+    classmethod_wrapped_attr_del(args, "__annotate__")
+}
+
+fn classmethod_dict_del(_args: &[PyObjectRef]) -> crate::PyResult {
+    Err(crate::PyError::type_error("cannot delete __dict__"))
+}
+
+/// function.py:767-768 `descr_repr` / CPython 3.14 `cm_repr`.
+fn classmethod_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
+    let cm = classmethod_require(args.first().copied().unwrap_or(PY_NULL), "__repr__")?;
+    let function = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
+    let repr = if function.is_null() {
+        "<NULL>".to_string()
+    } else {
+        unsafe { crate::display::py_repr(function)? }
+    };
+    Ok(w_str_new(&format!("<classmethod({repr})>")))
+}
+
+/// PyPy `typedef.py:878-908 ClassMethod.typedef`, with the Python 3.14
+/// surface taking precedence: PEP 649 proxy descriptors and generic alias
+/// support replace PyPy 3.11's eager annotations copy and `__reduce_ex__`.
 fn init_classmethod_type(ns: PyObjectRef) {
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            make_builtin_function("__new__", |args| {
-                let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let func = if args.len() > 1 {
-                    args[1]
-                } else {
-                    pyre_object::w_none()
-                };
-                let cm = pyre_object::function::w_classmethod_new(func);
-                // function.py `allocate_instance(ClassMethod, w_subtype)` —
-                // honour the subtype so `abstractclassmethod(func)` yields an
-                // `abstractclassmethod` instance, not a bare `classmethod`.
-                let classmethod_type =
-                    crate::typedef::gettypeobject(&pyre_object::function::CLASSMETHOD_TYPE);
-                if !cls.is_null() && !std::ptr::eq(cls, classmethod_type) {
-                    check_user_subclass(classmethod_type, cls)?;
-                    unsafe {
-                        (*cm).w_class = cls;
-                    }
-                }
-                Ok(cm)
-            }),
-        )
-    };
-    // `typedef.py:883 __get__ = interp2app(
-    //     ClassMethod.descr_classmethod_get)`.  `function.py:738-748`:
-    //
-    //     def descr_classmethod_get(self, space, w_obj, w_klass=None):
-    //         if space.is_none(w_klass):
-    //             w_klass = space.type(w_obj)
-    //         w_func = self.w_function
-    //         w_bound = space.get(w_func, w_klass, w_klass)
-    //         if w_bound is not w_func:
-    //             return w_bound
-    //         # the object doesn't have a get, but it might still be
-    //         # callable, so make a Method object
-    //         return Method(space, w_func, w_klass)
-    //
-    // The two branches collapse into a single `Method(func, klass)`
-    // construction because pyre's `w_method_new` is the same shape
-    // that `Function.descr_function_get` would return when
-    // `w_func.__get__(klass, klass)` fires.  This matches the
-    // pre-existing hardcoded classmethod arm in
-    // `baseobjspace::get` (`baseobjspace.rs:5420-5427`).
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__get__",
-            make_builtin_function_with_arity(
-                "__get__",
-                |args| {
-                    let cm = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                    if !unsafe { pyre_object::function::is_classmethod(cm) } {
-                        return Err(crate::PyError::type_error(
-                            "descriptor '__get__' requires a 'classmethod' object",
-                        ));
-                    }
-                    let w_obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                    let mut w_klass = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
-                    if w_klass.is_null() || unsafe { pyre_object::is_none(w_klass) } {
-                        w_klass = crate::typedef::r#type(w_obj).unwrap_or(pyre_object::PY_NULL);
-                    }
-                    let w_func = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
-                    Ok(pyre_object::w_method_new(w_func, w_klass, w_klass))
-                },
-                3,
+    let dict_getter = make_builtin_function_with_arity("__dict__", descr_get_dict, 2);
+    let dict_setter = make_builtin_function_with_arity("__dict__", descr_set_dict, 3);
+    let dict_deleter = make_builtin_function_with_arity("__dict__", classmethod_dict_del, 2);
+    let annotations_getter =
+        make_builtin_function_with_arity("__annotations__", classmethod_annotations_get, 2);
+    let annotations_setter =
+        make_builtin_function_with_arity("__annotations__", classmethod_annotations_set, 3);
+    let annotations_deleter =
+        make_builtin_function_with_arity("__annotations__", classmethod_annotations_del, 2);
+    let annotate_getter =
+        make_builtin_function_with_arity("__annotate__", classmethod_annotate_get, 2);
+    let annotate_setter =
+        make_builtin_function_with_arity("__annotate__", classmethod_annotate_set, 3);
+    let annotate_deleter =
+        make_builtin_function_with_arity("__annotate__", classmethod_annotate_del, 2);
+    let entries = [
+        (
+            "__doc__",
+            w_str_new(
+                "Convert a function to be a class method.\n\nA class method receives the class as implicit first argument,\njust like an instance method receives the instance.\nTo declare a class method, use this idiom:\n\n  class C:\n      @classmethod\n      def f(cls, arg1, arg2, argN):\n          ...\n\nIt can be called either on the class (e.g. C.f()) or on an instance\n(e.g. C().f()).  The instance is ignored except for its class.\nIf a class method is called for a derived class, the derived class\nobject is passed as the implied first argument.\n\nClass methods are different than C++ or Java static methods.\nIf you want those, see the staticmethod builtin.",
             ),
-        )
-    };
-    // typedef.py:884-885 ─
-    //   __func__ = interp_attrproperty_w('w_function', cls=ClassMethod),
-    //   __wrapped__ = interp_attrproperty_w('w_function', cls=ClassMethod),
-    fn classmethod_func_attr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if !unsafe { pyre_object::function::is_classmethod(obj) } {
-            return Ok(pyre_object::w_none());
-        }
-        let w_value = unsafe { pyre_object::function::w_classmethod_get_func(obj) };
-        if w_value.is_null() {
-            Ok(pyre_object::w_none())
-        } else {
-            Ok(w_value)
-        }
-    }
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        ),
+        (
+            "__get__",
+            make_builtin_function("__get__", classmethod_descr_get),
+        ),
+        ("__new__", make_new_descr(classmethod_descr_new)),
+        (
+            "__init__",
+            make_builtin_function("__init__", classmethod_descr_init),
+        ),
+        (
             "__func__",
             make_getset_descriptor(make_builtin_function_with_arity(
                 "__func__",
                 classmethod_func_attr,
                 2,
             )),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        ),
+        (
             "__wrapped__",
             make_getset_descriptor(make_builtin_function_with_arity(
                 "__wrapped__",
                 classmethod_func_attr,
                 2,
             )),
-        )
-    };
-    // typedef.py:886 `__isabstractmethod__ = GetSetProperty(
-    //     ClassMethod.descr_isabstract)`.  function.py:760-761:
-    //
-    //     def descr_isabstract(self, space):
-    //         return space.newbool(space.isabstractmethod_w(self.w_function))
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        ),
+        (
             "__isabstractmethod__",
             make_getset_descriptor(make_builtin_function_with_arity(
                 "__isabstractmethod__",
-                |args| {
-                    let cm = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                    if !unsafe { pyre_object::function::is_classmethod(cm) } {
-                        return Ok(pyre_object::w_bool_from(false));
-                    }
-                    let func = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
-                    let result = crate::baseobjspace::isabstractmethod_w(func)?;
-                    Ok(pyre_object::w_bool_from(result))
-                },
+                classmethod_isabstract,
                 2,
             )),
-        )
-    };
+        ),
+        (
+            "__dict__",
+            make_getset_property_named(dict_getter, dict_setter, dict_deleter, "__dict__"),
+        ),
+        (
+            "__annotations__",
+            make_getset_property_named(
+                annotations_getter,
+                annotations_setter,
+                annotations_deleter,
+                "__annotations__",
+            ),
+        ),
+        (
+            "__annotate__",
+            make_getset_property_named(
+                annotate_getter,
+                annotate_setter,
+                annotate_deleter,
+                "__annotate__",
+            ),
+        ),
+        (
+            "__class_getitem__",
+            pyre_object::function::w_classmethod_new(make_builtin_function(
+                "__class_getitem__",
+                crate::_pypy_generic_alias::generic_alias_class_getitem,
+            )),
+        ),
+        (
+            "__repr__",
+            make_builtin_function("__repr__", classmethod_descr_repr),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
 }
 
-/// `property.__new__(cls, fget=None, fset=None, fdel=None, doc=None)`
-/// — descriptor.py W_Property.descr_new
-fn init_property_type(ns: PyObjectRef) {
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            make_builtin_function("__new__", |args| {
-                // args[0] is cls; fget/fset/fdel/doc follow.
-                // descriptor.py:186-189 `@unwrap_spec(w_fget=..., w_fset=...,
-                // w_fdel=..., w_doc=...)` — keyword forms bind too.
-                let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-                crate::builtins::kwarg_reject_unknown(
-                    kwargs,
-                    &["fget", "fset", "fdel", "doc"],
-                    "property",
-                )?;
-                let arg = |idx: usize, name: &str| {
-                    pos.get(idx)
-                        .copied()
-                        .or_else(|| crate::builtins::kwarg_get(kwargs, name))
-                        .unwrap_or(pyre_object::PY_NULL)
-                };
-                let cls = pos.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let fget = arg(1, "fget");
-                let fset = arg(2, "fset");
-                let fdel = arg(3, "fdel");
-                let w_doc = arg(4, "doc");
-                let prop = pyre_object::w_property_new(fget, fset, fdel);
-                // typeobject.py:511 `allocate_instance(W_Property, w_subtype)`
-                // — `generic_new_descr(W_Property)` honours the subtype, so a
-                // `property` subclass instance keeps its own class.
-                let property_type =
-                    crate::typedef::gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE);
-                if !cls.is_null() && !std::ptr::eq(cls, property_type) {
-                    check_user_subclass(property_type, cls)?;
-                    unsafe {
-                        (*prop).w_class = cls;
-                    }
-                }
-                unsafe {
-                    // descriptor.py:193 `self.w_doc = w_doc`
-                    if !w_doc.is_null() && !pyre_object::is_none(w_doc) {
-                        pyre_object::descriptor::w_property_set_doc(prop, w_doc);
-                    } else if !fget.is_null() && !pyre_object::is_none(fget) {
-                        // descriptor.py:195-204 — without an explicit doc,
-                        // inherit `fget.__doc__` and mark `getter_doc`.
-                        // (The subclass `space.setattr` branch at :202-203
-                        // is folded into the field write: pyre property
-                        // subclass instances share the W_Property
-                        // layout, so the slot is the only storage.)
-                        if let Ok(getter_doc) = crate::baseobjspace::getattr_str(fget, "__doc__") {
-                            if !getter_doc.is_null() && !pyre_object::is_none(getter_doc) {
-                                pyre_object::descriptor::w_property_set_getter_doc(
-                                    prop, getter_doc,
-                                );
-                            }
-                        }
-                    }
-                }
-                Ok(prop)
-            }),
-        )
+/// CPython 3.14 `PyFunction_Type.tp_doc`. The instance `__doc__` getset
+/// occupies the function type dictionary's key, so exact type access is
+/// served separately by `baseobjspace`, as for property.
+pub(crate) const FUNCTION_DOC: &str = r#"Create a function object.
+
+  code
+    a code object
+  globals
+    the globals dictionary
+  name
+    a string that overrides the name from the code object
+  argdefs
+    a tuple that specifies the default argument values
+  closure
+    a tuple that supplies the bindings for free variables
+  kwdefaults
+    a dictionary that specifies the default keyword argument values"#;
+
+/// CPython 3.14 `PyMethod_Type.tp_doc`.
+pub(crate) const METHOD_DOC: &str = "Create a bound instance method object.";
+
+/// CPython 3.14 `PyProperty_Type.tp_doc`.  The instance-level `__doc__`
+/// descriptor occupies the same type-dict key; `baseobjspace` serves this
+/// separate type doc for the exact builtin, matching PyPy's TypeDef rawdict
+/// replacement and CPython's `tp_doc` + member-descriptor split.
+pub(crate) const PROPERTY_DOC: &str = r#"Property attribute.
+
+  fget
+    function to be used for getting an attribute value
+  fset
+    function to be used for setting an attribute value
+  fdel
+    function to be used for del'ing an attribute
+  doc
+    docstring
+
+Typical use is to define a managed attribute x:
+
+class C(object):
+    def getx(self): return self._x
+    def setx(self, value): self._x = value
+    def delx(self): del self._x
+    x = property(getx, setx, delx, "I'm the 'x' property.")
+
+Decorators make defining new properties or modifying existing ones easy:
+
+class C(object):
+    @property
+    def x(self):
+        "I am the 'x' property."
+        return self._x
+    @x.setter
+    def x(self, value):
+        self._x = value
+    @x.deleter
+    def x(self):
+        del self._x"#;
+
+fn property_require(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+    if obj.is_null() || !unsafe { pyre_object::descriptor::is_property(obj) } {
+        let received = if obj.is_null() {
+            "NULL".to_string()
+        } else {
+            crate::type_methods::arg_type_name(obj)
+        };
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' for 'property' objects doesn't apply to a '{received}' object"
+        )));
+    }
+    Ok(obj)
+}
+
+/// PyPy `generic_new_descr(W_Property)` / CPython 3.14 `PyType_GenericNew`:
+/// allocate the requested subtype and leave argument processing to `__init__`.
+fn property_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
+    let cls = args.first().copied().unwrap_or(PY_NULL);
+    if cls.is_null() {
+        return Err(crate::PyError::type_error(
+            "property.__new__(): not enough arguments",
+        ));
+    }
+    let property_type = gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE);
+    check_user_subclass(property_type, cls)?;
+    let prop = pyre_object::w_property_new(PY_NULL, PY_NULL, PY_NULL);
+    if !std::ptr::eq(cls, property_type) {
+        unsafe { (*prop).w_class = cls };
+    }
+    Ok(prop)
+}
+
+/// PyPy `W_Property.init`, with CPython 3.14's `prop_name` reset and
+/// subclass-doc placement taking precedence where the versions differ.
+fn property_descr_init(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if positional.is_empty() {
+        return Err(crate::PyError::type_error(
+            "descriptor '__init__' of 'property' object needs an argument",
+        ));
+    }
+    let prop = positional[0];
+    if !unsafe { pyre_object::descriptor::is_property(prop) } {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '__init__' requires a 'property' object but received a '{}'",
+            crate::type_methods::arg_type_name(prop),
+        )));
+    }
+    let supplied = positional.len() - 1;
+    if supplied > 4 {
+        return Err(crate::PyError::type_error(format!(
+            "property() takes at most 4 arguments ({supplied} given)"
+        )));
+    }
+    crate::builtins::kwarg_reject_unknown(kwargs, &["fget", "fset", "fdel", "doc"], "property")?;
+    let fget = crate::builtins::resolve_pos_or_kw(
+        positional.get(1).copied(),
+        kwargs,
+        "fget",
+        "property",
+        1,
+    )?
+    .unwrap_or_else(w_none);
+    let fset = crate::builtins::resolve_pos_or_kw(
+        positional.get(2).copied(),
+        kwargs,
+        "fset",
+        "property",
+        2,
+    )?
+    .unwrap_or_else(w_none);
+    let fdel = crate::builtins::resolve_pos_or_kw(
+        positional.get(3).copied(),
+        kwargs,
+        "fdel",
+        "property",
+        3,
+    )?
+    .unwrap_or_else(w_none);
+    let w_doc = crate::builtins::resolve_pos_or_kw(
+        positional.get(4).copied(),
+        kwargs,
+        "doc",
+        "property",
+        4,
+    )?
+    .unwrap_or_else(w_none);
+
+    unsafe { pyre_object::descriptor::w_property_reinit(prop, fget, fset, fdel) };
+
+    // CPython 3.14 property_init_impl: explicit non-None doc wins; otherwise
+    // inherit a non-None getter doc and remember that `_copy` must rederive it.
+    let mut getter_doc = false;
+    let prop_doc = if !unsafe { pyre_object::is_none(w_doc) } {
+        Some(w_doc)
+    } else if !unsafe { pyre_object::is_none(fget) } {
+        match crate::baseobjspace::getattr_str(fget, "__doc__") {
+            Ok(value) if !unsafe { pyre_object::is_none(value) } => {
+                getter_doc = true;
+                Some(value)
+            }
+            Ok(_) => None,
+            Err(err) if err.kind == crate::PyErrorKind::AttributeError => None,
+            Err(err) => return Err(err),
+        }
+    } else {
+        None
     };
-    // descriptor.py W_Property.typedef `__get__` / `__set__` / `__delete__`
-    // — the implicit descriptor path special-cases properties, but the
-    // type-dict entries make `prop.__get__`, `hasattr(prop, '__get__')`,
-    // and `_is_descriptor` see the property as a descriptor.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+
+    let property_type = gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE);
+    let exact = r#type(prop).is_some_and(|tp| std::ptr::eq(tp, property_type));
+    if exact {
+        if let Some(doc) = prop_doc {
+            unsafe {
+                if getter_doc {
+                    pyre_object::descriptor::w_property_set_getter_doc(prop, doc);
+                } else {
+                    pyre_object::descriptor::w_property_set_doc(prop, doc);
+                }
+            }
+        }
+    } else {
+        // CPython 3.14 puts a subclass property's doc in its instance dict or
+        // designated slot because the subclass class dict shadows the base
+        // descriptor with its own `__doc__` entry.
+        let visible_doc = prop_doc.unwrap_or_else(w_none);
+        match crate::baseobjspace::setattr_str(prop, "__doc__", visible_doc) {
+            Ok(_) => {}
+            Err(err) if !getter_doc && err.kind == crate::PyErrorKind::AttributeError => {}
+            Err(err) => return Err(err),
+        }
+        if getter_doc {
+            unsafe { pyre_object::descriptor::w_property_mark_getter_doc(prop) };
+        }
+    }
+    Ok(w_none())
+}
+
+fn property_fget(args: &[PyObjectRef]) -> crate::PyResult {
+    let prop = property_require(args.get(1).copied().unwrap_or(PY_NULL), "fget")?;
+    let value = unsafe { pyre_object::descriptor::w_property_get_fget(prop) };
+    Ok(if value.is_null() { w_none() } else { value })
+}
+
+fn property_fset(args: &[PyObjectRef]) -> crate::PyResult {
+    let prop = property_require(args.get(1).copied().unwrap_or(PY_NULL), "fset")?;
+    let value = unsafe { pyre_object::descriptor::w_property_get_fset(prop) };
+    Ok(if value.is_null() { w_none() } else { value })
+}
+
+fn property_fdel(args: &[PyObjectRef]) -> crate::PyResult {
+    let prop = property_require(args.get(1).copied().unwrap_or(PY_NULL), "fdel")?;
+    let value = unsafe { pyre_object::descriptor::w_property_get_fdel(prop) };
+    Ok(if value.is_null() { w_none() } else { value })
+}
+
+fn property_doc_get(args: &[PyObjectRef]) -> crate::PyResult {
+    let prop = property_require(args.get(1).copied().unwrap_or(PY_NULL), "__doc__")?;
+    let value = unsafe { pyre_object::descriptor::w_property_get_doc(prop) };
+    Ok(if value.is_null() { w_none() } else { value })
+}
+
+fn property_doc_set(args: &[PyObjectRef]) -> crate::PyResult {
+    let prop = property_require(args.get(1).copied().unwrap_or(PY_NULL), "__doc__")?;
+    let value = args.get(2).copied().unwrap_or(PY_NULL);
+    unsafe { pyre_object::descriptor::w_property_set_doc(prop, value) };
+    Ok(w_none())
+}
+
+fn property_doc_del(args: &[PyObjectRef]) -> crate::PyResult {
+    let prop = property_require(args.get(1).copied().unwrap_or(PY_NULL), "__doc__")?;
+    unsafe { pyre_object::descriptor::w_property_set_doc(prop, PY_NULL) };
+    Ok(w_none())
+}
+
+fn property_name_get(args: &[PyObjectRef]) -> crate::PyResult {
+    let prop = property_require(args.get(1).copied().unwrap_or(PY_NULL), "__name__")?;
+    let stored = unsafe { pyre_object::descriptor::w_property_get_name(prop) };
+    if !stored.is_null() {
+        return Ok(stored);
+    }
+    let fget = unsafe { pyre_object::descriptor::w_property_get_fget(prop) };
+    if !fget.is_null() && !unsafe { pyre_object::is_none(fget) } {
+        match crate::baseobjspace::getattr_str(fget, "__name__") {
+            Ok(name) => return Ok(name),
+            Err(err) if err.kind == crate::PyErrorKind::AttributeError => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Err(crate::PyError::attribute_error(
+        "'property' object has no attribute '__name__'",
+    ))
+}
+
+fn property_name_set(args: &[PyObjectRef]) -> crate::PyResult {
+    let prop = property_require(args.get(1).copied().unwrap_or(PY_NULL), "__name__")?;
+    let value = args.get(2).copied().unwrap_or(PY_NULL);
+    unsafe { pyre_object::descriptor::w_property_set_name(prop, value) };
+    Ok(w_none())
+}
+
+fn property_name_del(args: &[PyObjectRef]) -> crate::PyResult {
+    let prop = property_require(args.get(1).copied().unwrap_or(PY_NULL), "__name__")?;
+    unsafe { pyre_object::descriptor::w_property_set_name(prop, PY_NULL) };
+    Ok(w_none())
+}
+
+fn property_isabstract(args: &[PyObjectRef]) -> crate::PyResult {
+    let prop = property_require(
+        args.get(1).copied().unwrap_or(PY_NULL),
+        "__isabstractmethod__",
+    )?;
+    let is_abstract = |f: PyObjectRef| -> Result<bool, crate::PyError> {
+        if f.is_null() || unsafe { pyre_object::is_none(f) } {
+            Ok(false)
+        } else {
+            crate::baseobjspace::isabstractmethod_w(f)
+        }
+    };
+    let result = is_abstract(unsafe { pyre_object::descriptor::w_property_get_fget(prop) })?
+        || is_abstract(unsafe { pyre_object::descriptor::w_property_get_fset(prop) })?
+        || is_abstract(unsafe { pyre_object::descriptor::w_property_get_fdel(prop) })?;
+    Ok(pyre_object::w_bool_from(result))
+}
+
+/// PyPy `W_Property.typedef`, extended only where Python 3.14's public
+/// surface differs (`__name__`, `__set_name__`, no PyPy-3.11 `__reduce__`).
+fn init_property_type(ns: PyObjectRef) {
+    let entries = [
+        ("__new__", make_new_descr(property_descr_new)),
+        (
+            "__init__",
+            make_builtin_function("__init__", property_descr_init),
+        ),
+        (
             "__get__",
             make_builtin_function("__get__", crate::baseobjspace::property_descr_get_impl),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        ),
+        (
             "__set__",
             make_builtin_function("__set__", crate::baseobjspace::property_descr_set_impl),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        ),
+        (
             "__delete__",
             make_builtin_function(
                 "__delete__",
                 crate::baseobjspace::property_descr_delete_impl,
             ),
-        )
-    };
-    // descriptor.py `__isabstractmethod__` — `isabstract(fget) or
-    // isabstract(fset) or isabstract(fdel)`.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        ),
+        (
+            "fget",
+            make_getset_descriptor(make_builtin_function_with_arity("fget", property_fget, 2)),
+        ),
+        (
+            "fset",
+            make_getset_descriptor(make_builtin_function_with_arity("fset", property_fset, 2)),
+        ),
+        (
+            "fdel",
+            make_getset_descriptor(make_builtin_function_with_arity("fdel", property_fdel, 2)),
+        ),
+        (
+            "__doc__",
+            make_getset_property_named(
+                make_builtin_function_with_arity("__doc__", property_doc_get, 2),
+                make_builtin_function_with_arity("__doc__", property_doc_set, 3),
+                make_builtin_function_with_arity("__doc__", property_doc_del, 2),
+                "__doc__",
+            ),
+        ),
+        (
+            "__name__",
+            make_getset_property_named(
+                make_builtin_function_with_arity("__name__", property_name_get, 2),
+                make_builtin_function_with_arity("__name__", property_name_set, 3),
+                make_builtin_function_with_arity("__name__", property_name_del, 2),
+                "__name__",
+            ),
+        ),
+        (
             "__isabstractmethod__",
             make_getset_descriptor(make_builtin_function_with_arity(
                 "__isabstractmethod__",
-                |args| {
-                    let prop = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                    if !unsafe { pyre_object::descriptor::is_property(prop) } {
-                        return Ok(pyre_object::w_bool_from(false));
-                    }
-                    // A missing accessor is `PY_NULL`; treat it as not-abstract.
-                    let is_abstract = |f: PyObjectRef| -> Result<bool, crate::PyError> {
-                        if f.is_null() {
-                            Ok(false)
-                        } else {
-                            crate::baseobjspace::isabstractmethod_w(f)
-                        }
-                    };
-                    let result =
-                        is_abstract(unsafe { pyre_object::descriptor::w_property_get_fget(prop) })?
-                            || is_abstract(unsafe {
-                                pyre_object::descriptor::w_property_get_fset(prop)
-                            })?
-                            || is_abstract(unsafe {
-                                pyre_object::descriptor::w_property_get_fdel(prop)
-                            })?;
-                    Ok(pyre_object::w_bool_from(result))
-                },
+                property_isabstract,
                 2,
             )),
-        )
-    };
+        ),
+        (
+            "getter",
+            make_builtin_function_with_arity(
+                "getter",
+                crate::baseobjspace::property_getter_impl,
+                2,
+            ),
+        ),
+        (
+            "setter",
+            make_builtin_function_with_arity(
+                "setter",
+                crate::baseobjspace::property_setter_impl,
+                2,
+            ),
+        ),
+        (
+            "deleter",
+            make_builtin_function_with_arity(
+                "deleter",
+                crate::baseobjspace::property_deleter_impl,
+                2,
+            ),
+        ),
+        (
+            "__set_name__",
+            make_builtin_function_with_arity(
+                "__set_name__",
+                crate::baseobjspace::property_set_name_impl,
+                3,
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
 }
 
 /// `self` as a plain int — `int.real` / `numerator` / `conjugate` /
@@ -11572,8 +13534,8 @@ fn bool_bitwise_binop(
     if args.len() < 2 {
         return Err(crate::PyError::type_error("expected 1 argument, got 0"));
     }
-    let a = crate::baseobjspace::unwrap_cell(args[0]);
-    let b = crate::baseobjspace::unwrap_cell(args[1]);
+    let a = args[0];
+    let b = args[1];
     if !unsafe { pyre_object::is_bool(b) } {
         return int_op(a, b);
     }
@@ -11731,7 +13693,7 @@ fn object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             "object.__new__(): not enough arguments",
         ));
     }
-    let cls = crate::baseobjspace::unwrap_cell(args[0]);
+    let cls = args[0];
     // cls should be a W_TypeObject — create instance of it
     if unsafe { is_type(cls) } {
         // objectobject.py:131 descr__new__ — abstract classes refuse instantiation.
@@ -17659,7 +19621,7 @@ fn init_generator_type(ns: PyObjectRef) {
             pyre_object::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_getset_property_full(get, set, PY_NULL, PY_NULL, Some(name)),
+                make_getset_property_full(get, set, PY_NULL, PY_NULL, PY_NULL, Some(name)),
             )
         };
     }
@@ -18301,7 +20263,13 @@ pub fn dict_descr() -> pyre_object::PyObjectRef {
         // `"__dict__"` instead of the `"<generic property>"` sentinel.
         // The earlier setattr fix-up was masked by the new read-only
         // `__name__` getset and silently failed.
-        make_getset_property_named(fget, fset, fdel, "__dict__") as usize
+        make_getset_property_named_doc(
+            fget,
+            fset,
+            fdel,
+            "dictionary for instance variables",
+            "__dict__",
+        ) as usize
     });
     addr as pyre_object::PyObjectRef
 }
@@ -18320,7 +20288,13 @@ pub fn weakref_descr() -> pyre_object::PyObjectRef {
         let fget = make_builtin_function_with_arity("descr_get_weakref", descr_get_weakref, 2);
         // typedef.py:591 `weakref_descr.name = '__weakref__'` —
         // see `dict_descr` for the parity rationale.
-        make_getset_descriptor_named(fget, "__weakref__") as usize
+        make_getset_property_named_doc(
+            fget,
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+            "list of weak references to the object",
+            "__weakref__",
+        ) as usize
     });
     addr as pyre_object::PyObjectRef
 }
@@ -18411,6 +20385,31 @@ fn read_descr_name(descr: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef 
         return pyre_object::PY_NULL;
     }
     unsafe { pyre_object::typedef::w_getset_get_name(descr) }
+}
+
+/// CPython 3.14 `getset_get` / `getset_set` receiver mismatch wording.
+/// PyPy routes the same `DescrMismatch` through `descr_call_mismatch`; only
+/// the version-selected public TypeError text differs here.
+fn getset_descr_mismatch(
+    descr: pyre_object::PyObjectRef,
+    obj: pyre_object::PyObjectRef,
+    reqcls: pyre_object::PyObjectRef,
+) -> crate::PyError {
+    let name_obj = read_descr_name(descr);
+    let name = if !name_obj.is_null() && unsafe { pyre_object::is_str(name_obj) } {
+        unsafe { pyre_object::w_str_get_value(name_obj) }
+    } else {
+        "<generic property>"
+    };
+    let owner = if reqcls.is_null() {
+        "?"
+    } else {
+        unsafe { pyre_object::w_type_get_name(reqcls) }
+    };
+    crate::PyError::type_error(format!(
+        "descriptor '{name}' for '{owner}' objects doesn't apply to a '{}' object",
+        type_name_of(obj)
+    ))
 }
 
 /// typedef.py:337-345 GetSetProperty.copy_for_type.
@@ -18589,5 +20588,65 @@ mod tests {
             assert_eq!(pyre_object::w_type_get_name(w_type), "ellipsis");
             assert!(!pyre_object::w_type_get_acceptable_as_base_class(w_type));
         }
+        check_cell_typedef_python314_surface();
+        check_cell_comparison_repr_and_hash();
+    }
+
+    fn check_cell_typedef_python314_surface() {
+        crate::typedef::init_typeobjects();
+        let w_type = crate::typedef::gettypefor(&pyre_object::nestedscope::CELL_TYPE)
+            .expect("cell should resolve to a W_TypeObject");
+        let expected = [
+            "__doc__",
+            "__eq__",
+            "__ge__",
+            "__gt__",
+            "__hash__",
+            "__le__",
+            "__lt__",
+            "__ne__",
+            "__new__",
+            "__repr__",
+            "cell_contents",
+        ];
+        for name in expected {
+            assert!(crate::type_dict_lookup(w_type, name).is_some(), "{name}");
+        }
+        assert!(crate::type_dict_lookup(w_type, "__reduce__").is_none());
+        assert!(crate::type_dict_lookup(w_type, "__setstate__").is_none());
+        unsafe {
+            assert!(!pyre_object::w_type_get_acceptable_as_base_class(w_type));
+        }
+        let contents = crate::type_dict_lookup(w_type, "cell_contents").unwrap();
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::typedef::w_getset_get_reqcls(contents) },
+            w_type
+        ));
+    }
+
+    fn check_cell_comparison_repr_and_hash() {
+        crate::typedef::init_typeobjects();
+        let empty = pyre_object::w_cell_new(pyre_object::PY_NULL);
+        let one = pyre_object::w_cell_new(pyre_object::w_int_new(1));
+        let one_again = pyre_object::w_cell_new(pyre_object::w_int_new(1));
+        let two = pyre_object::w_cell_new(pyre_object::w_int_new(2));
+
+        assert!(
+            crate::baseobjspace::is_true(super::cell_descr_lt(&[empty, one]).unwrap()).unwrap()
+        );
+        assert!(
+            crate::baseobjspace::is_true(super::cell_descr_eq(&[one, one_again]).unwrap()).unwrap()
+        );
+        assert!(crate::baseobjspace::is_true(super::cell_descr_gt(&[two, one]).unwrap()).unwrap());
+        let foreign = super::cell_descr_eq(&[one, pyre_object::w_int_new(1)]).unwrap();
+        assert!(unsafe { pyre_object::is_not_implemented(foreign) });
+
+        let repr = super::cell_descr_repr(&[one]).unwrap();
+        let repr = unsafe { pyre_object::w_str_get_value(repr) };
+        assert!(repr.starts_with("<cell at 0x"));
+        assert!(repr.contains(": int object at 0x"));
+        let err = crate::builtins::try_hash_value(one).unwrap_err();
+        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(err.message, "unhashable type: 'cell'");
     }
 }

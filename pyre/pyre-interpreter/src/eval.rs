@@ -197,8 +197,11 @@ unsafe fn walk_raw_function_roots(
         visitor(&mut *(&mut func.w_kw_defs as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_module as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_func_globals_obj as *mut PyObjectRef as *mut majit_ir::GcRef));
+        visitor(&mut *(&mut func.w_builtins as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_ann as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_annotate as *mut PyObjectRef as *mut majit_ir::GcRef));
+        visitor(&mut *(&mut func.w_func_dict as *mut PyObjectRef as *mut majit_ir::GcRef));
+        visitor(&mut *(&mut func.w_typeparams as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_doc as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_qualname as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_objclass as *mut PyObjectRef as *mut majit_ir::GcRef));
@@ -5954,10 +5957,10 @@ result = c.f([1, 2, 3])";
         }
     }
 
-    /// `pypy/interpreter/typedef.py:817-831 Function.typedef.acceptable_as_base_class
-    /// = False` enforces that `type(len)()` raises `TypeError("cannot
-    /// create 'builtin_function' instances")` via the
-    /// `init_builtin_function_type` `__new__` staticmethod.  This was
+    /// `pypy/interpreter/typedef.py BuiltinFunction.typedef.acceptable_as_base_class
+    /// = False` plus CPython 3.14's null `tp_new` enforce that `type(len)()`
+    /// raises `TypeError("cannot create 'builtin_function_or_method'
+    /// instances")`. This was
     /// previously failing because `PyError::type_error(msg)` produced
     /// an exception whose `args_w` slot stayed `PY_NULL`, so
     /// `str(e)` (which reads `W_BaseException.args_w` per
@@ -5976,7 +5979,7 @@ result = c.f([1, 2, 3])";
         // functions").
         let source = "\
 doc_value = len.__doc__
-self_is_none = len.__self__ is None
+self_is_module = type(len.__self__).__name__ == 'module'
 repr_result = len.__repr__()
 new_err = ''
 try:
@@ -5997,16 +6000,16 @@ except AttributeError as e:
         res.expect("builtin_function typedef overrides failed");
         unsafe {
             let _doc_value = w_dict_getitem_str(frame.w_globals, "doc_value").unwrap();
-            let self_is_none = w_dict_getitem_str(frame.w_globals, "self_is_none").unwrap();
+            let self_is_module = w_dict_getitem_str(frame.w_globals, "self_is_module").unwrap();
             let repr_result = w_dict_getitem_str(frame.w_globals, "repr_result").unwrap();
             let new_err = w_dict_getitem_str(frame.w_globals, "new_err").unwrap();
             let set_err = w_dict_getitem_str(frame.w_globals, "set_err").unwrap();
             let del_err = w_dict_getitem_str(frame.w_globals, "del_err").unwrap();
-            assert!(w_bool_get_value(self_is_none));
+            assert!(w_bool_get_value(self_is_module));
             assert_eq!(w_str_get_value(repr_result), "<built-in function len>");
             assert_eq!(
                 w_str_get_value(new_err),
-                "cannot create 'builtin_function' instances"
+                "cannot create 'builtin_function_or_method' instances"
             );
             assert!(
                 w_str_get_value(set_err).contains("__doc__"),

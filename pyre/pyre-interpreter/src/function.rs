@@ -11,7 +11,8 @@ use pyre_object::pyobject::*;
 /// Type descriptor for user-defined functions.
 pub static FUNCTION_TYPE: PyType = pyre_object::pyobject::new_pytype("function");
 /// Type descriptor for module-level builtins.
-pub static BUILTIN_FUNCTION_TYPE: PyType = pyre_object::pyobject::new_pytype("builtin_function");
+pub static BUILTIN_FUNCTION_TYPE: PyType =
+    pyre_object::pyobject::new_pytype("builtin_function_or_method");
 
 /// User-defined function object.
 ///
@@ -53,6 +54,12 @@ pub struct Function {
     /// `__dict__` and frames built from this function share globals.
     /// `PY_NULL` for globals-less carriers (gateway builtins).
     pub w_func_globals_obj: PyObjectRef,
+    /// CPython 3.14 `PyFunctionObject.func_builtins` — resolved once from
+    /// globals at function construction and then exposed by the direct
+    /// read-only `__builtins__` member.  This is intentionally distinct from
+    /// frame builtin selection: replacing `globals['__builtins__']` later
+    /// does not change `function.__builtins__`.
+    pub w_builtins: PyObjectRef,
     /// `function.py:50 w_ann=None` constructor default plus
     /// `function.py:548-551 fget_func_annotations` lazy-init shape:
     /// PyPy stores the annotations dict directly on the function and
@@ -73,6 +80,13 @@ pub struct Function {
     /// PEP 649); the typed slot mirrors how `w_ann` sits on the
     /// function object rather than a side table.
     pub w_annotate: PyObjectRef,
+    /// `function.py:68 self.w_func_dict = None` — lazily allocated
+    /// per-function attribute dictionary.  This is a field on the function,
+    /// not mapdict side storage, matching PyPy's `Function.getdict`.
+    pub w_func_dict: PyObjectRef,
+    /// CPython 3.14 `PyFunctionObject.func_typeparams` — the declared type
+    /// parameters tuple.  `PY_NULL` represents the default empty tuple.
+    pub w_typeparams: PyObjectRef,
     /// `function.py:375 self.w_doc = w_doc` constructor slot plus
     /// `function.py:446-449 fget_func_doc` cache:
     ///
@@ -117,6 +131,11 @@ pub struct Function {
     /// has no `__self__`); only stamped on the per-type builtin
     /// `__new__` carriers at type-finalisation time.
     pub w_new_self: PyObjectRef,
+    /// function.py:797-815 `BuiltinFunction.w_moduleobj` — the module object
+    /// bound as `__self__` for an interp-level module function. PyPy stores
+    /// this on each BuiltinFunction; CPython 3.14 likewise exposes the
+    /// defining module object from `PyCFunction_GET_SELF`.
+    pub w_moduleobj: PyObjectRef,
 }
 
 /// function.py:706 — `class BuiltinFunction(Function): can_change_code = False`
@@ -176,12 +195,18 @@ pub const FUNCTION_W_MODULE_OFFSET: usize = std::mem::offset_of!(Function, w_mod
 /// lazy-cached canonical W_DictObject for `w_func_globals`.
 pub const FUNCTION_W_FUNC_GLOBALS_OBJ_OFFSET: usize =
     std::mem::offset_of!(Function, w_func_globals_obj);
+/// Field offset of CPython 3.14 `func_builtins`.
+pub const FUNCTION_W_BUILTINS_OFFSET: usize = std::mem::offset_of!(Function, w_builtins);
 /// Field offset of `w_ann` within `Function` — the
 /// `function.py:50 w_ann` annotations dict slot.
 pub const FUNCTION_W_ANN_OFFSET: usize = std::mem::offset_of!(Function, w_ann);
 /// Field offset of `w_annotate` within `Function` — the PEP 649
 /// `__annotate__` callable slot.
 pub const FUNCTION_W_ANNOTATE_OFFSET: usize = std::mem::offset_of!(Function, w_annotate);
+/// Field offset of PyPy `Function.w_func_dict`.
+pub const FUNCTION_W_FUNC_DICT_OFFSET: usize = std::mem::offset_of!(Function, w_func_dict);
+/// Field offset of CPython 3.14 `func_typeparams`.
+pub const FUNCTION_W_TYPEPARAMS_OFFSET: usize = std::mem::offset_of!(Function, w_typeparams);
 /// Field offset of `w_doc` within `Function` — the
 /// `function.py:375 w_doc` docstring cache slot.
 pub const FUNCTION_W_DOC_OFFSET: usize = std::mem::offset_of!(Function, w_doc);
@@ -198,6 +223,8 @@ pub const FUNCTION_W_TEXT_SIGNATURE_OFFSET: usize =
 /// Field offset of `w_new_self` within `Function` — the builtin
 /// `__new__` descriptor's `__self__` (defining type).
 pub const FUNCTION_W_NEW_SELF_OFFSET: usize = std::mem::offset_of!(Function, w_new_self);
+/// Field offset of PyPy `BuiltinFunction.w_moduleobj`.
+pub const FUNCTION_W_MODULEOBJ_OFFSET: usize = std::mem::offset_of!(Function, w_moduleobj);
 
 /// GC type id assigned to `Function` at JitDriver init time. Held as
 /// a constant alongside the struct (rather than runtime-queried) so
@@ -233,7 +260,7 @@ pub const FUNCTION_OBJECT_SIZE: usize = std::mem::size_of::<Function>();
 /// W_FloatObject leave the typeptr-shaped header field out of their
 /// `gc_ptr_offsets`. W_TypeObject instances are static-region and
 /// not subject to nursery relocation.
-pub const FUNCTION_GC_PTR_OFFSETS: [usize; 12] = [
+pub const FUNCTION_GC_PTR_OFFSETS: [usize; 16] = [
     FUNCTION_CODE_OFFSET,
     FUNCTION_CLOSURE_OFFSET,
     FUNCTION_DEFS_W_OFFSET,
@@ -243,6 +270,8 @@ pub const FUNCTION_GC_PTR_OFFSETS: [usize; 12] = [
     // the function's sole globals carrier; traced for the lifetime of the
     // function so its `__globals__` identity survives minor collection.
     FUNCTION_W_FUNC_GLOBALS_OBJ_OFFSET,
+    // CPython 3.14 `func_builtins` — frozen at Function construction.
+    FUNCTION_W_BUILTINS_OFFSET,
     // `function.py:50 w_ann` — annotations dict, allocated lazily on
     // first read by the getter or stamped at MAKE_FUNCTION time.
     FUNCTION_W_ANN_OFFSET,
@@ -250,6 +279,10 @@ pub const FUNCTION_GC_PTR_OFFSETS: [usize; 12] = [
     // Annotate flag; live until the first `__annotations__` read
     // materialises `w_ann`.
     FUNCTION_W_ANNOTATE_OFFSET,
+    // `function.py:68 w_func_dict` — lazily allocated instance dict.
+    FUNCTION_W_FUNC_DICT_OFFSET,
+    // CPython 3.14 `func_typeparams` — tuple or null for the empty default.
+    FUNCTION_W_TYPEPARAMS_OFFSET,
     // `function.py:375 w_doc` — docstring slot cached on first read.
     FUNCTION_W_DOC_OFFSET,
     // `function.py:54 qualname` — qualified name slot stamped at
@@ -264,6 +297,8 @@ pub const FUNCTION_GC_PTR_OFFSETS: [usize; 12] = [
     // `w_new_self` is intentionally absent: it holds the defining type
     // of a builtin `__new__` carrier, a static-region W_TypeObject that
     // is never nursery-relocated (same reasoning as `ob.w_class`).
+    // PyPy `BuiltinFunction.w_moduleobj` is an ordinary GC module reference.
+    FUNCTION_W_MODULEOBJ_OFFSET,
 ];
 
 impl pyre_object::lltype::GcType for Function {
@@ -353,6 +388,24 @@ pub(crate) fn function_new_impl(
     // object directly as the function's sole globals carrier.
     pyre_object::gc_roots::pin_root(w_func_globals_obj);
 
+    // CPython 3.14 `_PyEval_BuiltinsFromGlobals` at function construction:
+    // retain the selected mapping identity even if the globals entry changes
+    // later.  Builtin/gateway carriers have no globals and keep a null slot.
+    let w_builtins = if w_func_globals_obj.is_null() {
+        PY_NULL
+    } else {
+        let selected = crate::baseobjspace::pick_builtin_obj(
+            w_func_globals_obj,
+            crate::call::take_last_exec_ctx(),
+        );
+        if !selected.is_null() && unsafe { pyre_object::is_module(selected) } {
+            unsafe { pyre_object::w_module_get_w_dict(selected) }
+        } else {
+            selected
+        }
+    };
+    pyre_object::gc_roots::pin_root(w_builtins);
+
     let name_ptr = pyre_object::lltype::malloc_raw(name) as *const String;
     let function = Function {
         ob: PyObject {
@@ -367,13 +420,17 @@ pub(crate) fn function_new_impl(
         w_kw_defs: PY_NULL,
         w_module: PY_NULL,
         w_func_globals_obj,
+        w_builtins,
         w_ann: PY_NULL,
         w_annotate: PY_NULL,
+        w_func_dict: PY_NULL,
+        w_typeparams: PY_NULL,
         w_doc: PY_NULL,
         w_qualname: PY_NULL,
         w_objclass: PY_NULL,
         w_text_signature: PY_NULL,
         w_new_self: PY_NULL,
+        w_moduleobj: PY_NULL,
     };
 
     // A `BuiltinCode`-backed function is a permanent type / module slot (the
@@ -508,6 +565,16 @@ pub unsafe fn builtin_function_set_module(obj: PyObjectRef, w_module: PyObjectRe
     }
 }
 
+/// CPython 3.14 `PyCFunctionObject.m_module` member assignment. Unlike
+/// PyPy's shared Function getset, builtin `__module__` is a writable direct
+/// member and accepts any object; deletion stores `None`.
+pub unsafe fn builtin_function_set_module_attr(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        function_write_barrier(obj);
+        (*(obj as *mut Function)).w_module = value;
+    }
+}
+
 /// Stamp the `__self__` of a builtin `__new__` carrier — the defining
 /// type whose `tp_new` it wraps (`typeobject.c add_tp_new_wrapper`).
 /// Only touches functions whose `w_new_self` is still unset, so an
@@ -533,11 +600,33 @@ pub unsafe fn function_set_new_self(obj: PyObjectRef, w_type: PyObjectRef) {
 /// # Safety
 /// `obj` must be a valid, non-null pointer to a `Function`.
 pub unsafe fn function_get_self_or_none(obj: PyObjectRef) -> PyObjectRef {
-    let w_self = unsafe { (*(obj as *const Function)).w_new_self };
+    let func = unsafe { &*(obj as *const Function) };
+    let w_self = if !func.w_moduleobj.is_null() {
+        func.w_moduleobj
+    } else {
+        func.w_new_self
+    };
     if w_self.is_null() {
         pyre_object::w_none()
     } else {
         w_self
+    }
+}
+
+/// Stamp PyPy `BuiltinFunction.w_moduleobj` after the defining module object
+/// has been created. The module name is installed first through
+/// `builtin_function_set_module`; this second field preserves the distinct
+/// `__module__` (string) / `__self__` (module object) identities.
+///
+/// # Safety
+/// `obj` must be a valid PyObjectRef. Non-builtin functions are ignored.
+pub unsafe fn builtin_function_set_module_obj(obj: PyObjectRef, w_module: PyObjectRef) {
+    unsafe {
+        if py_type_check(obj, &BUILTIN_FUNCTION_TYPE) {
+            let func = obj as *mut Function;
+            function_write_barrier(obj);
+            (*func).w_moduleobj = w_module;
+        }
     }
 }
 
@@ -731,6 +820,13 @@ pub unsafe fn function_get_globals_obj(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const Function)).w_func_globals_obj }
 }
 
+/// CPython 3.14 `PyFunctionObject.func_builtins`, resolved once during
+/// construction. Returns `PY_NULL` for globals-less builtin carriers.
+#[inline]
+pub unsafe fn function_get_builtins(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const Function)).w_builtins }
+}
+
 /// Get the closure tuple from a function object.
 /// Returns PY_NULL if the function has no closure.
 ///
@@ -786,7 +882,14 @@ pub unsafe fn function_set_kwdefaults(obj: PyObjectRef, kwdefaults: PyObjectRef)
 /// PyPy-compatible `__dict__` storage field alias.
 #[inline]
 pub unsafe fn function_getdict(obj: PyObjectRef) -> PyObjectRef {
-    crate::baseobjspace::getattr_str(obj, "__dict__").unwrap_or(pyre_object::w_none())
+    unsafe {
+        let func = obj as *mut Function;
+        if (*func).w_func_dict.is_null() {
+            function_write_barrier(obj);
+            (*func).w_func_dict = pyre_object::w_dict_new();
+        }
+        (*func).w_func_dict
+    }
 }
 
 /// `function.py:238 Function.setdict` — replace the function's instance
@@ -795,7 +898,79 @@ pub unsafe fn function_getdict(obj: PyObjectRef) -> PyObjectRef {
 /// "__dict__", ..)` which would store a literal `"__dict__"` dict entry.
 #[inline]
 pub unsafe fn function_setdict(obj: PyObjectRef, value: PyObjectRef) -> Result<(), crate::PyError> {
-    crate::baseobjspace::setdict(obj, value)
+    let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+    if !unsafe { crate::baseobjspace::isinstance_w(value, w_dict_type) } {
+        return Err(crate::PyError::type_error(
+            "setting function's dictionary to a non-dict",
+        ));
+    }
+    unsafe {
+        function_write_barrier(obj);
+        (*(obj as *mut Function)).w_func_dict = value;
+    }
+    Ok(())
+}
+
+/// CPython 3.14 `function.__annotate__` getter.
+pub unsafe fn function_get_annotate(obj: PyObjectRef) -> PyObjectRef {
+    let value = unsafe { (*(obj as *const Function)).w_annotate };
+    if value.is_null() {
+        pyre_object::w_none()
+    } else {
+        value
+    }
+}
+
+/// CPython 3.14 `function.__annotate__` setter.
+pub unsafe fn function_set_annotate(
+    obj: PyObjectRef,
+    value: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    if value.is_null() {
+        return Err(crate::PyError::type_error("__annotate__ cannot be deleted"));
+    }
+    if !pyre_object::is_none(value) && !crate::baseobjspace::callable_w(value) {
+        return Err(crate::PyError::type_error(
+            "__annotate__ must be callable or None",
+        ));
+    }
+    unsafe {
+        function_write_barrier(obj);
+        let func = obj as *mut Function;
+        (*func).w_annotate = value;
+        if !pyre_object::is_none(value) {
+            (*func).w_ann = PY_NULL;
+        }
+    }
+    Ok(())
+}
+
+/// CPython 3.14 `function.__type_params__` getter.
+pub unsafe fn function_get_typeparams(obj: PyObjectRef) -> PyObjectRef {
+    let value = unsafe { (*(obj as *const Function)).w_typeparams };
+    if value.is_null() {
+        pyre_object::w_tuple_new(vec![])
+    } else {
+        value
+    }
+}
+
+/// CPython 3.14 `function.__type_params__` setter and
+/// `_Py_set_function_type_params` opcode helper.
+pub unsafe fn function_set_typeparams(
+    obj: PyObjectRef,
+    value: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    if value.is_null() || !pyre_object::is_tuple(value) {
+        return Err(crate::PyError::type_error(
+            "__type_params__ must be set to a tuple",
+        ));
+    }
+    unsafe {
+        function_write_barrier(obj);
+        (*(obj as *mut Function)).w_typeparams = value;
+    }
+    Ok(())
 }
 
 /// PyPy-compatible `getdict()` descriptor helper.
@@ -982,7 +1157,9 @@ pub unsafe fn function_set_annotations(obj: PyObjectRef, w_ann: PyObjectRef) {
             return;
         }
         function_write_barrier(obj);
-        (*(obj as *mut Function)).w_ann = w_ann;
+        let func = obj as *mut Function;
+        (*func).w_ann = w_ann;
+        (*func).w_annotate = PY_NULL;
     }
 }
 
@@ -1019,7 +1196,11 @@ pub unsafe fn fset_func_annotations(
             return Err(crate::PyError::type_error("__annotations__ must be a dict"));
         };
         function_write_barrier(obj);
-        (*(obj as *mut Function)).w_ann = stored;
+        let func = obj as *mut Function;
+        (*func).w_ann = stored;
+        // CPython 3.14 function___annotations___set_impl clears the lazy
+        // annotation callable whenever eager annotations are assigned.
+        (*func).w_annotate = PY_NULL;
         Ok(())
     }
 }
@@ -1041,7 +1222,9 @@ pub unsafe fn fdel_func_annotations(obj: PyObjectRef) -> Result<(), crate::PyErr
             return Ok(());
         }
         function_write_barrier(obj);
-        (*(obj as *mut Function)).w_ann = PY_NULL;
+        let func = obj as *mut Function;
+        (*func).w_ann = PY_NULL;
+        (*func).w_annotate = PY_NULL;
         Ok(())
     }
 }
@@ -1897,74 +2080,157 @@ pub unsafe fn descr_method__new__(
     _subtype: PyObjectRef,
     w_function: PyObjectRef,
     w_instance: PyObjectRef,
-    w_class: PyObjectRef,
-) -> PyObjectRef {
+) -> Result<PyObjectRef, crate::PyError> {
     let _ = _subtype;
-    if w_function.is_null() {
-        pyre_object::w_none()
-    } else {
-        pyre_object::w_method_new(w_function, w_instance, w_class)
+    if w_function.is_null() || !crate::baseobjspace::callable_w(w_function) {
+        return Err(crate::PyError::type_error(
+            "first argument must be callable",
+        ));
     }
+    if w_instance.is_null() || unsafe { pyre_object::is_none(w_instance) } {
+        return Err(crate::PyError::type_error("instance must not be None"));
+    }
+    let w_class = crate::typedef::r#type(w_instance).unwrap_or(pyre_object::PY_NULL);
+    Ok(pyre_object::w_method_new(w_function, w_instance, w_class))
 }
 
 #[inline]
 pub unsafe fn descr_method_get(
-    _func: PyObjectRef,
+    method: PyObjectRef,
     obj: PyObjectRef,
     cls: PyObjectRef,
-) -> PyObjectRef {
-    let _ = _func;
-    if obj.is_null() || unsafe { pyre_object::is_none(obj) } {
-        _func
+) -> Result<PyObjectRef, crate::PyError> {
+    let obj_is_none = obj.is_null() || unsafe { pyre_object::is_none(obj) };
+    let cls_is_none = cls.is_null() || unsafe { pyre_object::is_none(cls) };
+    if obj_is_none && cls_is_none {
+        return Err(crate::PyError::type_error("__get__(None, None) is invalid"));
+    }
+    Ok(method)
+}
+
+#[inline]
+pub fn descr_method_call(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let method = positional.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let call_args = positional.get(1..).unwrap_or(&[]);
+    if !crate::builtins::has_real_kwargs(kwargs) {
+        return crate::call::call_function_impl_result(method, call_args);
+    }
+    let keyword_args: Vec<(rustpython_wtf8::Wtf8Buf, PyObjectRef)> = unsafe {
+        pyre_object::w_dict_str_entries(kwargs.unwrap())
+            .into_iter()
+            .filter(|(name, _)| name != "__pyre_kw__")
+            .map(|(name, value)| (rustpython_wtf8::Wtf8Buf::from_string(name), value))
+            .collect()
+    };
+    crate::eval::CURRENT_FRAME.with(|current| {
+        let frame = current.get();
+        if frame.is_null() {
+            return Err(crate::PyError::runtime_error(
+                "method call has no current frame",
+            ));
+        }
+        crate::call::call_with_kwargs(unsafe { &mut *frame }, method, call_args, &keyword_args)
+    })
+}
+
+#[inline]
+pub unsafe fn descr_method_eq(
+    this: PyObjectRef,
+    other: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    if !unsafe { pyre_object::is_method(other) } {
+        return Ok(pyre_object::special::w_not_implemented());
+    }
+    let funcs_equal =
+        crate::baseobjspace::eq_w(unsafe { pyre_object::w_method_get_func(this) }, unsafe {
+            pyre_object::w_method_get_func(other)
+        })?;
+    let selves_identical =
+        unsafe { pyre_object::w_method_get_self(this) == pyre_object::w_method_get_self(other) };
+    Ok(pyre_object::w_bool_from(funcs_equal && selves_identical))
+}
+
+#[inline]
+pub unsafe fn descr_method_ne(
+    this: PyObjectRef,
+    other: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let equal = unsafe { descr_method_eq(this, other)? };
+    if unsafe { pyre_object::is_not_implemented(equal) } {
+        Ok(equal)
     } else {
-        let owner = if cls.is_null() {
-            pyre_object::w_none()
-        } else {
-            cls
-        };
-        pyre_object::w_method_new(_func, obj, owner)
+        Ok(pyre_object::w_bool_from(!unsafe {
+            pyre_object::w_bool_get_value(equal)
+        }))
     }
 }
 
 #[inline]
-pub unsafe fn descr_method_call(obj: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
-    if args.is_empty() {
-        call_obj_args(obj, pyre_object::w_none(), args)
-    } else {
-        call_obj_args(obj, args[0], &args[1..])
+pub unsafe fn descr_method_repr(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let function = unsafe { pyre_object::w_method_get_func(obj) };
+    let instance = unsafe { pyre_object::w_method_get_self(obj) };
+    let w_name = match crate::baseobjspace::getattr_str(function, "__qualname__") {
+        Ok(value) => Some(value),
+        Err(err) if err.kind == crate::PyErrorKind::AttributeError => {
+            match crate::baseobjspace::getattr_str(function, "__name__") {
+                Ok(value) => Some(value),
+                Err(err) if err.kind == crate::PyErrorKind::AttributeError => None,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(err) => return Err(err),
+    };
+    let name = w_name
+        .filter(|&value| unsafe { pyre_object::is_str(value) })
+        .and_then(|value| unsafe { pyre_object::w_str_get_value_opt(value) })
+        .unwrap_or("?");
+    let instance_repr = unsafe { crate::display::py_repr(instance)? };
+    Ok(pyre_object::w_str_new(&format!(
+        "<bound method {name} of {instance_repr}>"
+    )))
+}
+
+#[inline]
+pub unsafe fn descr_method_getattribute(
+    obj: PyObjectRef,
+    name: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(name) }) else {
+        return Err(crate::PyError::type_error("attribute name must be string"));
+    };
+    // function.py:604-614 — method attributes win, except `__doc__`;
+    // an AttributeError falls back to the wrapped function.
+    if name != "__doc__" {
+        match crate::baseobjspace::object_getattribute(obj, name) {
+            Ok(value) => return Ok(value),
+            Err(err) if err.kind == crate::PyErrorKind::AttributeError => {}
+            Err(err) => return Err(err),
+        }
     }
+    let function = unsafe { pyre_object::w_method_get_func(obj) };
+    crate::baseobjspace::getattr_str(function, name)
 }
 
 #[inline]
-pub unsafe fn descr_method_eq(_self: PyObjectRef, other: PyObjectRef) -> bool {
-    _self == other
+pub unsafe fn descr_method_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
+    let function = unsafe { pyre_object::w_method_get_func(obj) };
+    let instance = unsafe { pyre_object::w_method_get_self(obj) };
+    let x = pyre_object::gc_hook::gc_identity_hash(instance as usize) as i64;
+    let y = crate::baseobjspace::hash_w_strict(function)?;
+    let value = x ^ y;
+    Ok(if value == -1 { -2 } else { value })
 }
 
 #[inline]
-pub unsafe fn descr_method_ne(_self: PyObjectRef, other: PyObjectRef) -> bool {
-    _self != other
-}
-
-#[inline]
-pub unsafe fn descr_method_repr(obj: PyObjectRef) -> PyObjectRef {
-    pyre_object::w_str_new(&format!("method {obj:?}"))
-}
-
-#[inline]
-pub unsafe fn descr_method_getattribute(obj: PyObjectRef, _name: PyObjectRef) -> PyObjectRef {
-    let _ = _name;
-    obj
-}
-
-#[inline]
-pub unsafe fn descr_method_hash(_self: PyObjectRef) -> isize {
-    _self as isize
-}
-
-#[inline]
-pub unsafe fn descr_method__reduce__(_obj: PyObjectRef) -> PyObjectRef {
-    let _ = _obj;
-    pyre_object::w_tuple_new(vec![pyre_object::w_str_new("method")])
+pub unsafe fn descr_method__reduce__(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let function = unsafe { pyre_object::w_method_get_func(obj) };
+    let instance = unsafe { pyre_object::w_method_get_self(obj) };
+    let name = crate::baseobjspace::getattr_str(function, "__name__")?;
+    Ok(pyre_object::w_tuple_new(vec![
+        crate::baseobjspace::builtin_callable("getattr"),
+        pyre_object::w_tuple_new(vec![instance, name]),
+    ]))
 }
 
 #[inline]
@@ -2221,11 +2487,7 @@ pub fn funccall_valuestack(
         let natural_arity = fast_natural_arity & 0xff;
         if nargs < natural_arity {
             let raw_defs = unsafe { crate::function_get_defaults(func) };
-            let defs = if raw_defs.is_null() {
-                std::ptr::null_mut()
-            } else {
-                crate::baseobjspace::unwrap_cell(raw_defs)
-            };
+            let defs = raw_defs;
             let defs_len = if defs.is_null() || !unsafe { pyre_object::is_tuple(defs) } {
                 0
             } else {
@@ -2436,6 +2698,7 @@ mod tests {
 
     #[test]
     fn test_function_create() {
+        crate::test_hooks::install_hash_hook();
         // Function.code now stores a Code-level wrapper (PyCode).
         let raw_code = 0xDEAD_BEEF as *const ();
         let w_code = crate::w_code_new(raw_code);
@@ -2475,9 +2738,8 @@ mod tests {
         );
     }
 
-    /// `FUNCTION_GC_PTR_OFFSETS` must list the five inline
-    /// `PyObjectRef`-shaped fields the GC traces (the four
-    /// `PyObjectRef` payload fields plus `code`, which is `*const ()`
+    /// `FUNCTION_GC_PTR_OFFSETS` must list every inline
+    /// `PyObjectRef`-shaped field the GC traces (`code` is `*const ()`
     /// but points at a `[ob: PyObject, ...]`-prefixed Code object so
     /// the walker can interpret it as a typed reference). If a new GC
     /// field is added to `Function` (or one of these fields is removed)
@@ -2494,12 +2756,16 @@ mod tests {
                 std::mem::offset_of!(Function, w_kw_defs),
                 std::mem::offset_of!(Function, w_module),
                 std::mem::offset_of!(Function, w_func_globals_obj),
+                std::mem::offset_of!(Function, w_builtins),
                 std::mem::offset_of!(Function, w_ann),
                 std::mem::offset_of!(Function, w_annotate),
+                std::mem::offset_of!(Function, w_func_dict),
+                std::mem::offset_of!(Function, w_typeparams),
                 std::mem::offset_of!(Function, w_doc),
                 std::mem::offset_of!(Function, w_qualname),
                 std::mem::offset_of!(Function, w_objclass),
                 std::mem::offset_of!(Function, w_text_signature),
+                std::mem::offset_of!(Function, w_moduleobj),
             ]
         );
     }

@@ -326,7 +326,6 @@ fn fill_user_function_args(
     if nargs > nparams && !has_varargs {
         let fname = unsafe { crate::function_get_qualname(callable) };
         let ndefaults = if !defaults.is_null() {
-            let defaults = crate::baseobjspace::unwrap_cell(defaults);
             if unsafe { pyre_object::is_tuple(defaults) } {
                 unsafe { pyre_object::w_tuple_len(defaults) }
             } else {
@@ -371,7 +370,6 @@ fn fill_user_function_args(
 
     // Fill positional defaults for slots [n_pos_copied..nparams).
     if n_pos_copied < nparams && !defaults.is_null() {
-        let defaults = crate::baseobjspace::unwrap_cell(defaults);
         let ndefaults = if unsafe { pyre_object::is_tuple(defaults) } {
             unsafe { pyre_object::w_tuple_len(defaults) }
         } else {
@@ -746,7 +744,7 @@ pub fn call_kw(
     // Unwrap bound methods: load_method pushes (method, PY_NULL) for
     // bound methods. Extract the underlying function and prepend the
     // receiver so resolve_kwargs sees the correct function signature.
-    let callable_unwrapped = crate::baseobjspace::unwrap_cell(callable);
+    let callable_unwrapped = callable;
     let callable_unwrapped = if unsafe { pyre_object::is_method(callable_unwrapped) } {
         let func = unsafe { pyre_object::w_method_get_func(callable_unwrapped) };
         let receiver = unsafe { pyre_object::w_method_get_self(callable_unwrapped) };
@@ -757,6 +755,51 @@ pub fn call_kw(
     } else {
         callable_unwrapped
     };
+
+    // function.py:712-713 `StaticMethod.descr_call` receives the original
+    // Arguments object.  Preserve the positional/keyword split before the
+    // generic signature resolver (a staticmethod wrapper has no Python
+    // signature of its own) and forward both collections unchanged.
+    if unsafe { pyre_object::is_staticmethod(callable_unwrapped) } {
+        let nkw = if unsafe { pyre_object::is_tuple(kwarg_names) } {
+            unsafe { pyre_object::w_tuple_len(kwarg_names) }
+        } else {
+            0
+        };
+        let n_pos = args.len().saturating_sub(nkw);
+        let pos_args = args[..n_pos].to_vec();
+        let mut kw_entries = Vec::with_capacity(nkw);
+        for ki in 0..nkw {
+            if let Some(name_obj) = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) }
+            {
+                let key = unsafe { pyre_object::w_str_get_wtf8(name_obj) }.to_owned();
+                kw_entries.push((key, args[n_pos + ki]));
+            }
+        }
+        return call_with_kwargs(frame, callable_unwrapped, &pos_args, &kw_entries);
+    }
+
+    // A base classmethod has no tp_call, but a user subtype may define
+    // `__call__`. Split the keyword tail before generic signature handling;
+    // call_with_kwargs performs the special-method descriptor binding.
+    if unsafe { pyre_object::is_classmethod(callable_unwrapped) } {
+        let nkw = if unsafe { pyre_object::is_tuple(kwarg_names) } {
+            unsafe { pyre_object::w_tuple_len(kwarg_names) }
+        } else {
+            0
+        };
+        let n_pos = args.len().saturating_sub(nkw);
+        let pos_args = args[..n_pos].to_vec();
+        let mut kw_entries = Vec::with_capacity(nkw);
+        for ki in 0..nkw {
+            if let Some(name_obj) = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) }
+            {
+                let key = unsafe { pyre_object::w_str_get_wtf8(name_obj) }.to_owned();
+                kw_entries.push((key, args[n_pos + ki]));
+            }
+        }
+        return call_with_kwargs(frame, callable_unwrapped, &pos_args, &kw_entries);
+    }
 
     // For type objects with kwargs: use call_with_kwargs which handles
     // __new__/__init__ kwargs forwarding correctly.
@@ -914,13 +957,32 @@ fn metaclass_call_override(callable: PyObjectRef) -> Option<PyObjectRef> {
     Some(bound)
 }
 
+/// Resolve a `__call__` introduced by a classmethod *subtype*. The base
+/// classmethod has no such slot in PyPy or CPython 3.14. Descriptor binding
+/// is essential here: an ordinary function receives the wrapper, while a
+/// staticmethod override does not.
+fn classmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+    if !unsafe { pyre_object::is_classmethod(callable) } {
+        return Ok(None);
+    }
+    let Some(w_type) = crate::typedef::r#type(callable) else {
+        return Ok(None);
+    };
+    let Some(call_descr) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__call__") })
+    else {
+        return Ok(None);
+    };
+    let bound =
+        unsafe { crate::baseobjspace::get(call_descr, callable, w_type) }?.unwrap_or(call_descr);
+    Ok(Some(bound))
+}
+
 fn call_callable_with_mode(
     frame: &mut PyFrame,
     callable: PyObjectRef,
     args: &[PyObjectRef],
     mode: CallMode,
 ) -> PyResult {
-    let callable = crate::baseobjspace::unwrap_cell(callable);
     if unsafe { pyre_object::is_method(callable) } {
         let func = unsafe { pyre_object::w_method_get_func(callable) };
         let receiver = unsafe {
@@ -951,8 +1013,11 @@ fn call_callable_with_mode(
         let func = unsafe { pyre_object::w_staticmethod_get_func(callable) };
         return call_callable_with_mode(frame, func, args, mode);
     }
-    // ClassMethod defines no descr_call (function.py), so a raw classmethod
-    // object is not callable; it falls through to the not-callable error.
+    if let Some(bound) = classmethod_call_override(callable)? {
+        return call_callable_with_mode(frame, bound, args, mode);
+    }
+    // The base ClassMethod defines no descr_call (function.py), so a raw
+    // classmethod object falls through to the not-callable error.
 
     // Instance with __call__ — PyPy: descroperation.py descr_call
     if unsafe { pyre_object::is_instance(callable) } {
@@ -1299,7 +1364,6 @@ pub(crate) fn resolve_kwargs(
         let ndefaults = {
             let defaults = unsafe { crate::function_get_defaults(target_func) };
             if !defaults.is_null() {
-                let defaults = crate::baseobjspace::unwrap_cell(defaults);
                 if unsafe { pyre_object::is_tuple(defaults) } {
                     unsafe { pyre_object::w_tuple_len(defaults) }
                 } else {
@@ -1368,7 +1432,6 @@ pub(crate) fn resolve_kwargs(
     // Defaults cover the LAST N of the positional params (arg_count).
     let defaults = unsafe { crate::function_get_defaults(target_func) };
     if !defaults.is_null() {
-        let defaults = crate::baseobjspace::unwrap_cell(defaults);
         if unsafe { pyre_object::is_tuple(defaults) } {
             let ndefaults = unsafe { pyre_object::w_tuple_len(defaults) };
             let first_default = n_pos_params.saturating_sub(ndefaults);
@@ -1603,7 +1666,20 @@ pub fn call_with_kwargs(
     pos_args: &[PyObjectRef],
     kwargs: &[(Wtf8Buf, PyObjectRef)],
 ) -> PyResult {
-    let callable = crate::baseobjspace::unwrap_cell(callable);
+    // function.py:712-713 StaticMethod.descr_call — the wrapper contributes
+    // no implicit argument; forward the original positional and keyword
+    // collections unchanged to its w_function.
+    if unsafe { pyre_object::is_staticmethod(callable) } {
+        let func = unsafe { pyre_object::w_staticmethod_get_func(callable) };
+        return call_with_kwargs(frame, func, pos_args, kwargs);
+    }
+
+    if unsafe { pyre_object::is_classmethod(callable) } {
+        if let Some(bound) = classmethod_call_override(callable)? {
+            return call_with_kwargs(frame, bound, pos_args, kwargs);
+        }
+        return Err(PyError::type_error("'classmethod' object is not callable"));
+    }
 
     // Unwrap bound methods: prepend receiver to pos_args.
     if unsafe { pyre_object::is_method(callable) } {
@@ -1840,7 +1916,6 @@ pub fn call_with_kwargs(
                 let ndefaults = {
                     let defaults = unsafe { crate::function_get_defaults(callable) };
                     if !defaults.is_null() {
-                        let defaults = crate::baseobjspace::unwrap_cell(defaults);
                         if unsafe { pyre_object::is_tuple(defaults) } {
                             unsafe { pyre_object::w_tuple_len(defaults) }
                         } else {
@@ -1877,7 +1952,6 @@ pub fn call_with_kwargs(
             // Fill positional defaults from __defaults__ tuple.
             let defaults = unsafe { crate::function_get_defaults(callable) };
             if !defaults.is_null() {
-                let defaults = crate::baseobjspace::unwrap_cell(defaults);
                 if unsafe { pyre_object::is_tuple(defaults) } {
                     let ndefaults = unsafe { pyre_object::w_tuple_len(defaults) };
                     let first_default = n_pos_params.saturating_sub(ndefaults);
@@ -2240,12 +2314,12 @@ pub fn call_function_impl_result(
             let func = pyre_object::w_staticmethod_get_func(callable);
             return call_function_impl_result(func, args);
         }
-        // classmethod → unwrap and call the wrapped function
-        // PyPy: function.py ClassMethod.descr_classmethod__call__
-        if pyre_object::is_classmethod(callable) {
-            let func = pyre_object::w_classmethod_get_func(callable);
-            return call_function_impl_result(func, args);
+        if let Some(bound) = classmethod_call_override(callable)? {
+            return call_function_impl_result(bound, args);
         }
+        // ClassMethod has no descr_call (function.py:718-768; CPython 3.14
+        // `PyClassMethod_Type.tp_call = 0`), so a raw wrapper falls through
+        // to the ordinary not-callable error.
         // GenericAlias.__call__ (`_pypy_generic_alias.py:41`) —
         // `self.__origin__(*args, **kwargs)`, then best-effort
         // `result.__orig_class__ = self`.  Resolved here because the call
