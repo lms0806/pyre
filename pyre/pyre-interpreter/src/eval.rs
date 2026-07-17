@@ -723,7 +723,63 @@ pub fn register_pyframe_root_walker() {
     majit_gc::shadow_stack::register_extra_root_walker(walk_global_prebuilt_roots);
 }
 
+thread_local! {
+    /// The exception currently being raised / propagated up the Rust call
+    /// stack. Between the raising frame's `record_application_traceback` and
+    /// the frame that finally catches it, the exception is held only in the
+    /// Rust `PyError` value in flight — not on any frame's value stack or in
+    /// `ec.sys_exc_value` yet. `W_BaseException` is std::alloc-backed (outside
+    /// the managed nursery/old-gen), so the collector never reaches it as a
+    /// root and never traces its slots; a dispatch-loop safepoint running the
+    /// non-moving old-gen major would sweep its old-gen traceback chain from
+    /// under it. Mirrors `tstate->current_exception`: keep the in-flight
+    /// exception's traceback chain a GC root until the exception is caught.
+    static IN_FLIGHT_EXCEPTION: Cell<PyObjectRef> = const { Cell::new(pyre_object::PY_NULL) };
+}
+
+/// Publish the exception now being raised / propagated so the GC root walker
+/// keeps it (and its traceback chain) alive across a collection. Called from
+/// `record_application_traceback`, the single chokepoint every raising frame
+/// passes through.
+pub fn set_in_flight_exception(exc: PyObjectRef) {
+    IN_FLIGHT_EXCEPTION.with(|c| c.set(exc));
+}
+
+fn walk_in_flight_exception(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    IN_FLIGHT_EXCEPTION.with(|c| {
+        let exc = c.get();
+        if exc.is_null() {
+            return;
+        }
+        // Forward the exception OBJECT slot itself. A GC-managed exception
+        // (oldgen-stable `w_exception_new_empty`) is marked here and the
+        // collector then recurses into its `W_BASE_EXCEPTION_GC_PTR_OFFSETS`
+        // slots via offset tracing, keeping the whole graph alive. The
+        // exception is oldgen-stable (non-moving), so the slot is not rewritten,
+        // but marking is what matters. Mirrors the value-stack walker, which
+        // forwards the on-stack exception slot then walks its raw children.
+        let slot = c.as_ptr();
+        // SAFETY: `slot` points at the `Cell<PyObjectRef>`'s interior, which is
+        // valid for the duration of this closure. `PyObjectRef` and `GcRef`
+        // share layout (`*mut PyObject`).
+        unsafe { visitor(&mut *(slot as *mut majit_ir::GcRef)) };
+        // Off-GC fallback: when the GC is not installed the exception is
+        // `malloc_typed`-immortal, so the visitor above is a no-op and the
+        // collector never traces its slots. Forward ALL its GC-managed children
+        // in place — the whole `W_BASE_EXCEPTION_GC_PTR_OFFSETS` set (args_w,
+        // w_cause, w_context, the w_traceback chain, w_dict, and the per-subclass
+        // slots). Read the object AFTER the visitor so a (hypothetically) moved
+        // exception is the live one. The slots are forwarded by address (not the
+        // barriered setter), so a moving child is relocated with no re-entry.
+        let exc = unsafe { *(slot as *const PyObjectRef) };
+        unsafe { walk_raw_exception_roots(exc, visitor) };
+    });
+}
+
 fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    // The in-flight exception is a live stack root, not a prebuilt object;
+    // walk it on every collection, ahead of the prebuilt-dirty gate below.
+    walk_in_flight_exception(visitor);
     let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
         == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
     let scan_prebuilt = !is_minor
@@ -1069,6 +1125,12 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
     }
     if err.attach_tb {
         if !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
+            // The materialized exception is old-gen managed but lives only in the
+            // `PyError` local; publish it as the in-flight root before the trace hook
+            // runs arbitrary Python that can allocate and drive a major collection to
+            // sweep an unrooted (white) exception. `record_application_traceback`
+            // re-publishes the possibly-replaced operr below.
+            set_in_flight_exception(err.exc_object);
             let saved_trace = frame.get_w_f_trace();
             if !saved_trace.is_null() {
                 frame.getorcreatedebug(-1).w_f_trace = pyre_object::PY_NULL;
@@ -1083,12 +1145,22 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
                 *err = trace_err;
             }
         }
+        // pyopcode.py:144-149 — after `except OperationError as e: operr = e`,
+        // record/trace the (possibly tracer-replaced) operr, not the exception
+        // captured before the trace hook ran.  Re-derive from `err`: an
+        // unreplaced err returns the cached object; a replaced err
+        // materialises the replacement.  Cache it so record and trace share
+        // one object.
+        let operr_obj = err.to_exc_object();
+        if err.exc_object.is_null() {
+            err.exc_object = operr_obj;
+        }
         // `pyopcode.py:147-148 pytraceback.record_application_traceback`
         // — prepends a `PyTraceback` wrapping the current frame onto
         // the exception's `w_traceback` chain.
         unsafe {
             crate::pytraceback::record_application_traceback(
-                exc_obj,
+                operr_obj,
                 frame as *mut PyFrame,
                 frame.last_instr as i64,
             );
@@ -1102,9 +1174,10 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
         // derives the class.  Passing the instance as `w_value` with a
         // null `w_type` makes `normalize_exception` take `w_inst = w_type`
         // (null) and raise "exceptions must derive from BaseException".
-        let w_tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc_obj) };
+        let operr_obj = err.to_exc_object();
+        let w_tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(operr_obj) };
         if let Err(trace_err) = unsafe {
-            (*ec).exception_trace(frame as *mut PyFrame, exc_obj, pyre_object::PY_NULL, w_tb)
+            (*ec).exception_trace(frame as *mut PyFrame, operr_obj, pyre_object::PY_NULL, w_tb)
         } {
             // pyopcode.py:148 `ec.exception_trace(self, operr)` is
             // outside the except-block; a raise here propagates past

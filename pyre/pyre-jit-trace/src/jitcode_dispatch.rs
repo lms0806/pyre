@@ -1760,16 +1760,16 @@ pub fn walk(
                     continue;
                 }
                 if ctx.is_top_level {
-                    // RPython parity: framestack exhausted with no
-                    // handler match → `compile_exit_frame_with_exception(
-                    // last_exc_box)` records the outermost FINISH.
-                    ctx.trace_ctx
-                        .finish(&[exc], ctx.exit_frame_with_exception_descr_ref.clone());
-                    if let ConcreteValue::Ref(p) = exc_concrete {
-                        if !p.is_null() {
-                            fbw_finish_raise_set(exc_concrete);
-                        }
-                    }
+                    // RPython parity: framestack exhausted with no handler
+                    // match → `compile_exit_frame_with_exception(last_exc_box)`.
+                    // Stash the exception the same way the value-return arms
+                    // stash their result (payload + no inline FINISH); the
+                    // Terminate arm builds `TraceAction::Finish {
+                    // exit_with_exception: true }` so the compile consumer
+                    // records the FINISH once against
+                    // `exit_frame_with_exception_descr`.  Recording it here too
+                    // would double it.
+                    fbw_terminate_with_raise(exc, exc_concrete);
                     return Ok((DispatchOutcome::Terminate, pc));
                 } else {
                     return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, pc));
@@ -8098,17 +8098,22 @@ fn sync_intermediate_merge_point_last_instr(ctx: &mut TraceCtx, merge_pc: usize)
 /// alongside the already-explicit `after_residual_call`.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct GuardCaptureScope<'a> {
-    /// True for a FOR_ITER-next residual's `GUARD_NO_EXCEPTION`. Tells the
-    /// snapshot helper to fold the bit-14 after-residual-call marker onto the
-    /// FOR_ITER CALL pc so a deopt resumes at the call's OWN post-call
-    /// `catch_exception` (emitted by the codewriter when the FOR_ITER sits in a
-    /// try-block) — the blackhole's `handle_exception_in_frame` then routes the
-    /// raise to the enclosing handler instead of escaping the frame. A
-    /// FOR_ITER-next's fallthrough is the continue-arm body (reached only on a
-    /// non-null item), which carries no catch for the call's own raise, so the
-    /// generic fallthrough resume the other residual calls use cannot find one.
-    /// False for every other residual.
-    pub foriter_next_catch_resume: bool,
+    /// Request that a residual call's `GUARD_NO_EXCEPTION` route its resume
+    /// through the call's OWN post-call `catch_exception` instead of the
+    /// generic post-call fallthrough. The snapshot helper only acts on this
+    /// when the call's CALL pc is directly covered by an enclosing
+    /// exception-table handler: it then folds the bit-14 after-residual-call
+    /// marker onto the CALL pc so a deopt resumes at the call's own catch —
+    /// the blackhole's `handle_exception_in_frame` routes the raise to the
+    /// enclosing handler instead of escaping the frame. Without this, a
+    /// residual resumes at the NEXT opcode, whose own catch receives only a
+    /// raise from that opcode, not from the call itself; a residual whose CALL
+    /// pc sits directly under a try (its fallthrough may leave the covered
+    /// region — e.g. a FOR_ITER-next fallthrough is the continue-arm body,
+    /// reached only on a non-null item, which carries no catch for the call's
+    /// own raise) needs its own catch to receive the raise. Uncovered
+    /// residuals fall back to the fallthrough resume even when this is set.
+    pub residual_call_catch_resume: bool,
 
     /// The branch guard's own jitcode `op.pc` for a kept-stack branch guard
     /// (#124). The snapshot helper is invoked with the *resume* coordinate
@@ -8596,6 +8601,18 @@ thread_local! {
     static FBW_FINISH_PAYLOAD: std::cell::Cell<Option<(OpRef, Type)>> =
         const { std::cell::Cell::new(None) };
 
+    /// Discriminates the `FBW_FINISH_PAYLOAD` disposition: `true` when the
+    /// payload is a top-level uncaught raise (`fbw_terminate_with_raise`),
+    /// so [`crate::trace::full_body_walk_trace`] builds a
+    /// `TraceAction::Finish { exit_with_exception: true }`
+    /// (`compile_exit_frame_with_exception`) rather than a value-return
+    /// FINISH.  A dedicated flag rather than the `FBW_FINISH_CONCRETE::Raise`
+    /// marker because the latter is null-guarded for GC-rooting and so is
+    /// absent when the raised exception has no concrete Ref.  Reset with the
+    /// payload at the start of every walk.
+    static FBW_FINISH_IS_EXCEPTION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+
     /// The terminal disposition a top-level walk produced, set for a
     /// loop-free portal exit (`DispatchOutcome::Terminate`).  Unlike
     /// `FBW_FINISH_PAYLOAD` (the symbolic re-boxed `OpRef` the compile
@@ -8744,6 +8761,7 @@ pub fn fbw_debug_abort_enabled() -> bool {
 /// stale value from a prior aborted walk cannot leak into this one.
 pub(crate) fn fbw_finish_payload_reset() {
     FBW_FINISH_PAYLOAD.with(|c| c.set(None));
+    FBW_FINISH_IS_EXCEPTION.with(|c| c.set(false));
     FBW_FINISH_CONCRETE.with(|c| c.set(None));
 }
 
@@ -10161,6 +10179,32 @@ fn fbw_terminate_void_with_finish(
     fbw_store_token_in_vable(ctx, op_pc)?;
     FBW_FINISH_PAYLOAD.with(|c| c.set(Some((OpRef::NONE, Type::Void))));
     Ok(())
+}
+
+/// Exception variant of [`fbw_terminate_with_finish`] for the top-level
+/// uncaught raise (`compile_exit_frame_with_exception`, pyjitpl.py:3238-3242).
+/// Stashes the exception box (`exc`, already a `Type::Ref`) as an
+/// `is_exception` payload and, when the raised exception has a concrete Ref,
+/// the concrete disposition for the GC root walker / no-replay portal.  Like
+/// the value path it does NOT record the `FINISH` op — [`crate::trace::
+/// full_body_walk_trace`]'s Terminate arm builds
+/// `TraceAction::Finish { exit_with_exception: true }` and the compile
+/// consumer records it once against `exit_frame_with_exception_descr`.
+fn fbw_terminate_with_raise(exc: OpRef, exc_concrete: ConcreteValue) {
+    FBW_FINISH_PAYLOAD.with(|c| c.set(Some((exc, Type::Ref))));
+    FBW_FINISH_IS_EXCEPTION.with(|c| c.set(true));
+    if let ConcreteValue::Ref(p) = exc_concrete {
+        if !p.is_null() {
+            fbw_finish_raise_set(exc_concrete);
+        }
+    }
+}
+
+/// Whether the stashed `FBW_FINISH_PAYLOAD` is a top-level uncaught raise
+/// (see [`fbw_terminate_with_raise`]).  Read by the Terminate arm before
+/// taking the payload; reset with the payload at the start of every walk.
+pub(crate) fn fbw_finish_is_exception() -> bool {
+    FBW_FINISH_IS_EXCEPTION.with(|c| c.get())
 }
 
 /// #73: classification of a Python opcode's effect on the walk-level
@@ -12501,22 +12545,31 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     // fallthrough resume routes a raise through the next opcode's
                     // own `catch_exception` (still inside the same try-block) and
                     // the bridge-decline path, which handles every sequential
-                    // residual call.
+                    // residual call whose NEXT opcode shares the try.
                     //
-                    // FOR_ITER-next is the exception: its fallthrough is the
-                    // continue-arm body (reached only on a NON-null item), which
-                    // carries no catch for the call's OWN raise.  When the
-                    // FOR_ITER-next residual guard is being captured
-                    // (`GuardCaptureScope::foriter_next_catch_resume`) and the
-                    // call's CALL pc has a post-call catch, fold the bit-14
-                    // marker onto the CALL pc so the blackhole resumes at the
-                    // call's OWN catch and routes the raise to the
+                    // A residual whose CALL pc is itself directly covered by an
+                    // enclosing exception-table handler needs its OWN catch to
+                    // receive the raise: its fallthrough may leave the covered
+                    // region (e.g. FOR_ITER-next's fallthrough is the continue-arm
+                    // body, reached only on a NON-null item, which carries no
+                    // catch for the call's OWN raise).  When the guard capture
+                    // requested catch-resume
+                    // (`GuardCaptureScope::residual_call_catch_resume`) and the
+                    // call's CALL pc is covered by the code's exception table,
+                    // fold the bit-14 marker onto the CALL pc so the blackhole
+                    // resumes at the call's OWN catch and routes the raise to the
                     // enclosing handler instead of escaping the frame.
                     if after_residual_call {
                         let call_py_pc = py;
                         py = crate::pyjitpl::semantic_fallthrough_pc(code, py as usize) as u32;
                         let flag = majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as u32;
-                        if scope.foriter_next_catch_resume
+                        let call_pc_has_catch = pyre_interpreter::pycode::lookup_exceptiontable(
+                            &code.exceptiontable,
+                            call_py_pc * 2,
+                        )
+                        .is_some();
+                        if scope.residual_call_catch_resume
+                            && call_pc_has_catch
                             && call_py_pc < flag
                             && jc
                                 .payload
@@ -17311,7 +17364,18 @@ fn dispatch_residual_call_iRd_kind(
     {
         if try_walker_specialize_store_subscr(ctx, op.pc, &r_args)?.is_some() {
             return Ok((DispatchOutcome::Continue, op.next_pc));
-        } else if ctx.trace_ctx.is_bridge_trace && fbw_debug_abort_enabled() {
+        }
+        // #171 setslice inline: `target[const_slice] = source` for a
+        // same-length, step-1, Integer↔Integer slice — fold the assignment
+        // into per-element getarrayitem/setarrayitem on the int_items blocks so
+        // a virtualizable BUILD_LIST source temp is consumed without forcing.
+        // Gated on `PYRE_NEWLIST_VIRT`; declines to the opaque residual
+        // otherwise (SAFE — always byte-correct).
+        if newlist_virt_enabled() && try_walker_specialize_setslice(ctx, op.pc, &r_args)?.is_some()
+        {
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+        if ctx.trace_ctx.is_bridge_trace && fbw_debug_abort_enabled() {
             eprintln!(
                 "[fbw-store-fallthrough] bridge STORE_SUBSCR fell to GENERIC residual at pc={} \
                  (specialization declined — unjournaled concrete store)",
@@ -17734,18 +17798,19 @@ fn dispatch_residual_call_iRd_kind(
                 return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-                // FOR_ITER-next routes its no-exception-guard resume through
-                // the call's OWN post-call catch
-                // (`GuardCaptureScope::foriter_next_catch_resume`);
-                // every other residual keeps the fallthrough resume.  See the
-                // scope field's doc and the marker handling in
-                // `walker_capture_snapshot_for_last_guard_impl`.
-                let is_for_iter_next = ei.pyre_helper == majit_ir::PyreHelperKind::ForIterNext;
+                // Request that this residual call's no-exception-guard resume
+                // route through the call's OWN post-call catch
+                // (`GuardCaptureScope::residual_call_catch_resume`).  The
+                // snapshot helper folds the marker only when the call's CALL pc
+                // is actually covered by the code's exception table (checked in
+                // `walker_capture_snapshot_for_last_guard_impl`); an uncovered
+                // residual keeps the generic fallthrough resume.  See the scope
+                // field's doc.
                 walker_capture_snapshot_for_last_guard_scoped(
                     ctx,
                     op.pc,
                     GuardCaptureScope {
-                        foriter_next_catch_resume: is_for_iter_next,
+                        residual_call_catch_resume: true,
                         ..GuardCaptureScope::default()
                     },
                 )?;
@@ -23298,6 +23363,254 @@ fn walker_foriter_green_key(ctx: &WalkContext<'_, '_>, op_pc: usize) -> Option<u
     }
     let foriter_start_pc = python_pc_for_jitcode_pc(&jitcode.payload.metadata, op_pc) as usize;
     Some(crate::driver::make_green_key(w_code, foriter_start_pc))
+}
+
+/// Specialize `STORE_SUBSCR target[const_slice] = source` for a same-length,
+/// step-1 slice between two Integer-strategy exact lists, eliding the
+/// `CALL_MAY_FORCE` `store_subscr` residual that would force the virtualizable
+/// source list (the freshly built BUILD_LIST temp from
+/// [`try_walker_specialize_newlist`]) every iteration.  The same-length gate
+/// makes the assignment `slice_len` independent in-bounds setitems —
+/// `target[start + j] = source[j]` — with no resize and no strategy change, so
+/// it rides the existing `FBW_STORE_JOURNAL` per-element undo log.
+///
+/// Reads the source elements through `getfield_gc(int_items)` +
+/// `getarrayitem_gc` ops keyed on the source `OpRef`, so when the source is the
+/// freshly built virtual list the optimizer folds the reads against its
+/// recorded `SetarrayitemGc` stores and removes the whole temporary.
+///
+/// The slice key must be a trace constant (a `slice(...)` from `co_consts`);
+/// `start` / `stop` are read off the slice object and baked into the emitted
+/// index constants.  Falls through to the generic residual (returns `Ok(None)`)
+/// for anything outside the gate: a non-constant / `None` / negative bound, a
+/// non-unit step, a resizing (length-changing) slice, an empty slice, a
+/// non-Integer-storage target or source, or a list subclass (which may override
+/// `__setitem__` / `__iter__`).
+fn try_walker_specialize_setslice(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    r_args: &[OpRef],
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk || r_args.len() != 3 {
+        return Ok(None);
+    }
+    let list_op = r_args[0];
+    let key_op = r_args[1];
+    let value_op = r_args[2];
+    // The slice key must be a trace constant (a `slice(...)` from `co_consts`):
+    // its `start` / `stop` are baked into the emitted index constants, so a
+    // non-constant slice (whose bounds could differ at runtime) cannot be
+    // specialized this way.
+    if !key_op.is_constant() {
+        return Ok(None);
+    }
+    let (Some(list_obj), Some(key_obj), Some(value_obj)) = (
+        walker_concrete_ref_object(ctx, list_op),
+        walker_concrete_ref_object(ctx, key_op),
+        walker_concrete_ref_object(ctx, value_op),
+    ) else {
+        return Ok(None);
+    };
+
+    // Gate, all read from the concrete shadows: `target[start:stop:1] =
+    // source`, both exact-list Integer storage, `stop - start == len(source)`
+    // (no resize), `1 <= slice_len`, `0 <= start <= stop <= len(target)`.
+    let (start, slice_len) = unsafe {
+        // EXACT list for BOTH target and source: a list subclass shares
+        // `ob_type == &LIST_TYPE` but retags `w_class` and may override
+        // `__setitem__` (target) or `__iter__` (source); both must route
+        // through the generic residual.
+        if !pyre_object::pyobject::is_exact_list(list_obj)
+            || !pyre_object::is_slice(key_obj)
+            || !pyre_object::pyobject::is_exact_list(value_obj)
+        {
+            return Ok(None);
+        }
+        // step == 1 (None defaults to 1; an explicit non-1 step needs the
+        // strided path).
+        let step_o = pyre_object::w_slice_get_step(key_obj);
+        let step_is_one = pyre_object::is_none(step_o)
+            || (pyre_object::is_int(step_o)
+                && !pyre_object::is_bool(step_o)
+                && pyre_object::w_int_get_value(step_o) == 1);
+        if !step_is_one {
+            return Ok(None);
+        }
+        // start / stop must be explicit non-negative plain ints (None bounds and
+        // negative indices route through the generic residual, which normalises
+        // them).
+        let start_o = pyre_object::w_slice_get_start(key_obj);
+        let stop_o = pyre_object::w_slice_get_stop(key_obj);
+        if !(pyre_object::is_int(start_o)
+            && !pyre_object::is_bool(start_o)
+            && pyre_object::is_int(stop_o)
+            && !pyre_object::is_bool(stop_o))
+        {
+            return Ok(None);
+        }
+        let start = pyre_object::w_int_get_value(start_o);
+        let stop = pyre_object::w_int_get_value(stop_o);
+        let target_len = pyre_object::w_list_len(list_obj) as i64;
+        if start < 0 || stop < start || stop > target_len {
+            return Ok(None);
+        }
+        let slice_len = stop - start;
+        let src_len = pyre_object::w_list_len(value_obj) as i64;
+        // Same-length only — a resizing slice changes the target length and can
+        // switch strategy.
+        if slice_len != src_len || slice_len < 1 {
+            return Ok(None);
+        }
+        if !(pyre_object::w_list_uses_int_storage(list_obj)
+            && pyre_object::w_list_uses_int_storage(value_obj))
+        {
+            return Ok(None);
+        }
+        (start, slice_len)
+    };
+
+    // --- emit the specialized IR (walker-native) ---
+    // For BOTH target (`list_op`) and source (`value_op`): guard_class LIST +
+    // exact `w_class` (a list subclass sharing `ob_type == &LIST_TYPE` but with
+    // an overridden `__setitem__` / `__iter__` side-exits to the generic
+    // residual) + guard strategy == Integer.  Folds away when the operand is the
+    // just-built virtual list.
+    let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
+    let list_instantiate =
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE);
+    let sid_const_val = pyre_object::listobject::ListStrategy::Integer as i64;
+    for &lst_op in &[list_op, value_op] {
+        if !lst_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(lst_op) {
+            let type_const = ctx.trace_ctx.const_int(list_type_addr);
+            ctx.trace_ctx
+                .record_guard(OpCode::GuardClass, &[lst_op, type_const], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        }
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(lst_op, list_type_addr);
+        walker_guard_exact_w_class(ctx, op_pc, lst_op, list_instantiate)?;
+
+        let strategy = crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            lst_op,
+            crate::descr::list_strategy_descr(),
+        );
+        let sid_const = ctx.trace_ctx.const_int(sid_const_val);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[strategy, sid_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(strategy, sid_const);
+    }
+
+    // Bounds guard on the target: the highest written index `start + slice_len -
+    // 1` must be in range.  For an Integer-strategy list the `W_ListObject`
+    // `length` field is 0 — the authoritative length is `int_items.len`, so read
+    // it via `list_int_items_len_descr` (exactly as store_subscr's bounds
+    // guard).  IntLt(start+slice_len-1, target.int_items.len).
+    let tgt_len_box = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        list_op,
+        crate::descr::list_int_items_len_descr(),
+    );
+    let last_idx_const = ctx.trace_ctx.const_int(start + slice_len - 1);
+    let in_bounds = ctx
+        .trace_ctx
+        .record_op(OpCode::IntLt, &[last_idx_const, tgt_len_box]);
+    let concrete_target_len = unsafe { pyre_object::w_list_len(list_obj) as i64 };
+    ctx.trace_ctx.set_opref_concrete(
+        in_bounds,
+        majit_ir::Value::Int(((start + slice_len - 1) < concrete_target_len) as i64),
+    );
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[in_bounds])?;
+
+    // Length guard on the source: source.int_items.len == slice_len (folds for
+    // the virtual temp; protects a non-virtual source).
+    let src_len_box = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        value_op,
+        crate::descr::list_int_items_len_descr(),
+    );
+    let src_len_const = ctx.trace_ctx.const_int(slice_len);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[src_len_box, src_len_const], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(src_len_box, src_len_const);
+
+    // items[start + j] = source.items[j] for j in 0..slice_len, through the
+    // int_items blocks (`list_int_items_block_descr`, matching slice-1's
+    // `emit_typed_list_inline` `SetfieldGc`), so a virtual source temp's
+    // `SetarrayitemGc` stores fold against these reads.
+    let src_block = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        value_op,
+        crate::descr::list_int_items_block_descr(),
+    );
+    let tgt_block = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        list_op,
+        crate::descr::list_int_items_block_descr(),
+    );
+    for j in 0..slice_len {
+        let src_idx = ctx.trace_ctx.const_int(j);
+        let src_raw =
+            crate::state::trace_int_block_getitem_value(ctx.trace_ctx, src_block, src_idx);
+        let tgt_idx = ctx.trace_ctx.const_int(start + j);
+        crate::state::trace_int_block_setitem_value(ctx.trace_ctx, tgt_block, tgt_idx, src_raw);
+    }
+
+    // Tracing is execution (pyjitpl.py:2095 execute_and_record): apply the
+    // assignment to the concrete lists now as `slice_len` in-bounds setitems,
+    // journaling each displaced element first so a non-committing walk's legacy
+    // replay re-executes against the pre-walk heap (FBW_STORE_JOURNAL).  Each
+    // `w_list_getitem` / `w_int_new` boxes, and a minor collection there can
+    // move any live GC object.  Following the push_roots/pop_roots reload
+    // discipline, every live ref is reloaded after each boxing allocation,
+    // before its next use: walker operands (`list_obj`/`value_obj`) from the
+    // forwarded shadow via `walker_concrete_ref_object`, and the pinned fresh
+    // boxes (`src_item`/`displaced`) from their shadow-stack slot via
+    // `shadow_stack_get` (the slot index captured just before the pin).
+    {
+        let _roots = pyre_object::gc_roots::push_roots();
+        for j in 0..slice_len {
+            let tgt_index = start + j;
+            let Some(value_obj) = walker_concrete_ref_object(ctx, value_op) else {
+                unreachable!("setslice specialization: operand concrete vanished from the shadow");
+            };
+            let Some(src_item) = (unsafe { pyre_object::w_list_getitem(value_obj, j) }) else {
+                unreachable!("setslice specialization: source index {j} has no element");
+            };
+            let src_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(src_item);
+            let Some(list_obj) = walker_concrete_ref_object(ctx, list_op) else {
+                unreachable!("setslice specialization: operand concrete vanished from the shadow");
+            };
+            let Some(displaced) = (unsafe { pyre_object::w_list_getitem(list_obj, tgt_index) })
+            else {
+                unreachable!(
+                    "setslice specialization: target index {tgt_index} has no element \
+                     (bounds gate admitted it)"
+                );
+            };
+            let disp_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(displaced);
+            let key_box = pyre_object::w_int_new(tgt_index);
+            pyre_object::gc_roots::pin_root(key_box);
+            let Some(list_obj) = walker_concrete_ref_object(ctx, list_op) else {
+                unreachable!("setslice specialization: list concrete vanished mid-apply");
+            };
+            let src_item = pyre_object::gc_roots::shadow_stack_get(src_slot);
+            let displaced = pyre_object::gc_roots::shadow_stack_get(disp_slot);
+            fbw_store_journal_push(list_obj, key_box, displaced);
+            let stored = unsafe { pyre_object::w_list_setitem(list_obj, tgt_index, src_item) };
+            debug_assert!(stored, "setslice specialization: in-bounds store failed");
+        }
+    }
+    Ok(Some(()))
 }
 
 /// #57 SLICE 3c (compare): walker-native speculative float specialization
@@ -29428,36 +29741,36 @@ mod tests {
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
+        fbw_finish_payload_reset();
         let (outcome, _) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
         assert_eq!(
             outcome,
             DispatchOutcome::Terminate,
-            "top-level walk must convert uncaught SubRaise to Terminate \
-             after recording the outermost FINISH",
+            "top-level walk must convert uncaught SubRaise to Terminate",
         );
         drop(wc);
+        // The bubbled exception is stashed as an `is_exception` finish payload,
+        // NOT recorded inline: `full_body_walk_trace`'s Terminate arm builds
+        // `TraceAction::Finish { exit_with_exception: true }` and the compile
+        // consumer records the single FINISH against
+        // `exit_frame_with_exception_descr`.  So no op is recorded in `walk()`.
         assert_eq!(
             tc.num_ops(),
-            ops_before + 1,
-            "exactly one FINISH must be recorded",
+            ops_before,
+            "propagated SubRaise must NOT record an inline FINISH — the payload is deferred",
         );
-        let last = tc.ops().last().expect("FINISH must exist");
-        assert_eq!(last.opcode, majit_ir::OpCode::Finish);
-        assert_eq!(
-            last.getarglist()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            vec![arg_value],
-            "FINISH args must carry the bubbled exc OpRef",
-        );
-        let recorded_descr = last
-            .getdescr()
-            .expect("FINISH must carry exit_frame_with_exception_descr_ref");
         assert!(
-            std::sync::Arc::ptr_eq(&recorded_descr, &descr_exc),
-            "FINISH descr must be exit_frame_with_exception_descr_ref",
+            fbw_finish_is_exception(),
+            "a top-level propagated SubRaise must mark the finish payload as an exception exit",
         );
+        let (finish_value, finish_ty) =
+            fbw_finish_payload_take().expect("exception finish payload must be stashed");
+        assert_eq!(finish_ty, Type::Ref, "portal-exit FINISH carries Type::Ref");
+        assert_eq!(
+            finish_value, arg_value,
+            "the stashed payload must carry the bubbled exc OpRef",
+        );
+        let _ = &descr_exc;
     }
 
     #[test]
@@ -30494,33 +30807,32 @@ mod tests {
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
+        fbw_finish_payload_reset();
         let (outcome, next_pc) = walk(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
         assert_eq!(next_pc, 2);
         drop(wc);
+        // The exception is stashed as an `is_exception` finish payload, NOT
+        // recorded inline: `full_body_walk_trace`'s Terminate arm builds
+        // `TraceAction::Finish { exit_with_exception: true }` and the compile
+        // consumer records the single FINISH against
+        // `exit_frame_with_exception_descr` (mirror of the value-return
+        // `fbw_terminate_with_finish` path).  So no op is recorded in `walk()`.
         assert_eq!(
             tc.num_ops(),
-            ops_before + 1,
-            "raise/r must record exactly one FINISH op (outermost branch)",
+            ops_before,
+            "raise/r must NOT record an inline FINISH — the payload is deferred",
         );
-        let last = tc.ops().last().expect("recorded op must exist");
-        assert_eq!(last.opcode, majit_ir::OpCode::Finish);
-        assert_eq!(
-            last.getarglist()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            vec![expected_exc],
-            "FINISH args must carry the exception OpRef from registers_r[src]",
-        );
-        let recorded_descr = last
-            .getdescr()
-            .expect("FINISH must carry exit_frame_with_exception_descr_ref");
         assert!(
-            std::sync::Arc::ptr_eq(&recorded_descr, &descr_exc),
-            "FINISH descr must be the caller-supplied \
-             `exit_frame_with_exception_descr_ref`, not \
-             `done_with_this_frame_descr_ref`",
+            fbw_finish_is_exception(),
+            "top-level raise/r must mark the finish payload as an exception exit",
+        );
+        let (finish_value, finish_ty) =
+            fbw_finish_payload_take().expect("exception finish payload must be stashed");
+        assert_eq!(finish_ty, Type::Ref, "portal-exit FINISH carries Type::Ref");
+        assert_eq!(
+            finish_value, expected_exc,
+            "the stashed payload must carry the exception OpRef from registers_r[src]",
         );
     }
 
@@ -30600,20 +30912,34 @@ mod tests {
             live_after_jit_pc: usize::MAX,
         };
         // `raise/r` emits the GuardClass during dispatch, then surfaces
-        // `SubRaise`; `walk()`'s top-level SubRaise arm records the FINISH.
+        // `SubRaise`; the top-level SubRaise arm stashes the exception as a
+        // deferred `is_exception` finish payload.
         wc.outer_jitcode_index = test_outer_resume_jitcode_index();
         wc.outer_resume_marker_jit_pc = Some(0);
+        fbw_finish_payload_reset();
         let (outcome, _next_pc) = walk(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
         drop(wc);
 
-        // Expect two ops recorded: GuardClass(exc, cls_const) then
-        // Finish(exc) (the GUARD_CLASS precedes FINISH per
-        // `pyjitpl.py:1690-1696`).
+        // Only the GuardClass op lands inline: `raise/r` records it during
+        // dispatch (the GUARD_CLASS precedes the FINISH per
+        // `pyjitpl.py:1690-1696`), then the top-level SubRaise stashes the
+        // exception as an `is_exception` finish payload — the FINISH is
+        // recorded by the FBW Terminate arm's compile consumer, not inline.
         assert_eq!(
             tc.num_ops(),
-            ops_before + 2,
-            "raise/r with pinned concrete exc must record GuardClass + Finish",
+            ops_before + 1,
+            "raise/r with pinned concrete exc must record GuardClass (FINISH deferred)",
+        );
+        assert!(
+            fbw_finish_is_exception(),
+            "top-level raise/r must mark the finish payload as an exception exit",
+        );
+        let (finish_value, _finish_ty) =
+            fbw_finish_payload_take().expect("exception finish payload must be stashed");
+        assert_eq!(
+            finish_value, exc_box,
+            "the stashed payload must carry the exception OpRef",
         );
         let ops = tc.ops();
         let guard = &ops[ops_before];
@@ -30693,31 +31019,29 @@ mod tests {
         // With `PYRE_FBW_RAISE` on (default), `reraise/` surfaces
         // `SubRaise` and `walk()`'s top-level SubRaise arm records the
         // outermost FINISH + converts to Terminate.
+        fbw_finish_payload_reset();
         let (outcome, next_pc) = walk(&code, 0, &mut wc).expect("reraise/ must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
         assert_eq!(next_pc, 1, "reraise/ has no operand");
         drop(wc);
+        // As with `raise/r`, the standing exception is stashed as an
+        // `is_exception` payload and the outermost FINISH is recorded
+        // downstream by the compile consumer, not inline in `walk()`.
         assert_eq!(
             tc.num_ops(),
-            ops_before + 1,
-            "reraise/ at top-level must record exactly one outermost FINISH",
+            ops_before,
+            "reraise/ must NOT record an inline FINISH — the payload is deferred",
         );
-        let last = tc.ops().last().expect("recorded op must exist");
-        assert_eq!(last.opcode, majit_ir::OpCode::Finish);
-        assert_eq!(
-            last.getarglist()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            vec![active_exc],
-            "FINISH args must carry the standing last_exc_value OpRef",
-        );
-        let recorded_descr = last
-            .getdescr()
-            .expect("FINISH must carry exit_frame_with_exception_descr_ref");
         assert!(
-            std::sync::Arc::ptr_eq(&recorded_descr, &descr_exc),
-            "reraise/ at top-level must use exit_frame_with_exception_descr_ref",
+            fbw_finish_is_exception(),
+            "top-level reraise/ must mark the finish payload as an exception exit",
+        );
+        let (finish_value, finish_ty) =
+            fbw_finish_payload_take().expect("exception finish payload must be stashed");
+        assert_eq!(finish_ty, Type::Ref, "portal-exit FINISH carries Type::Ref");
+        assert_eq!(
+            finish_value, active_exc,
+            "the stashed payload must carry the standing last_exc_value OpRef",
         );
     }
 
