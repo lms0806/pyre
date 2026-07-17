@@ -32,10 +32,11 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 /// 10 = arity mismatch, 11 = loop-closing bridge advances no loop-carried value
 /// (guard side-trace that would livelock the chained loop), 14 = accepted
 /// CALL_ASSEMBLER trace, 15 = declined CA because a trace would use the host
-/// call trampoline on a movable CA frame.
-pub static BRIDGE_DIAG: [AtomicU64; 16] = {
+/// call trampoline on a movable CA frame.  Index 16 records the dormant
+/// forced-terminal-decline runtime regression hook.
+pub static BRIDGE_DIAG: [AtomicU64; 17] = {
     const Z: AtomicU64 = AtomicU64::new(0);
-    [Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z]
+    [Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z]
 };
 
 /// Read a `BRIDGE_DIAG` tally (saturating index). Surfaced to the host through
@@ -147,8 +148,10 @@ fn guard_fail_args_advanced(
 
 use failguard::{
     CallAssemblerTarget, ChainedTraceMeta, CompiledWasmLoop, LabelTarget, WasmFailDescr,
-    WasmFrameData, call_assembler_target, fail_descr_base, global_fail_descr, label_target,
+    WasmFrameData, ca_dispatch_exists, ca_dispatch_publish, ca_dispatch_redirect, ca_dispatch_slot,
+    call_assembler_target, fail_descr_base, global_fail_descr, label_target,
     publish_call_assembler_target, publish_label_target, register_fail_descrs,
+    register_pending_call_assembler_target,
 };
 use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
 use majit_gc::GcAllocator;
@@ -823,7 +826,11 @@ fn build_home_gcmap(frame: codegen::FrameGeometry) -> Box<[usize]> {
 /// makes `compile_bridge` decline the CA lift, since the arm would have no way
 /// to complete a deopt. Stored as `u64` to reuse the imported atomics.
 static CA_DEOPT_HELPER_SLOT: AtomicU64 = AtomicU64::new(0);
-static CA_BASELINE_HELPER_SLOT: AtomicU64 = AtomicU64::new(0);
+/// Dormant runtime-regression selector. The wasm runner writes this through a
+/// guest export before executing a test program; zero keeps production runs
+/// unchanged. `1` selects the first admitted target, otherwise the value is a
+/// `JitCellToken` number.
+static FORCE_CA_TERMINAL_DECLINE: AtomicU64 = AtomicU64::new(0);
 
 /// Host entry point publishing [`CA_DEOPT_HELPER_SLOT`] (called from pyre-jit's
 /// `init_jit_hooks` with `wasm_ca_resume_deopt as *const () as usize`, which on
@@ -837,12 +844,9 @@ pub fn ca_deopt_helper_slot() -> u32 {
     CA_DEOPT_HELPER_SLOT.load(Ordering::Relaxed) as u32
 }
 
-pub fn set_ca_baseline_helper_slot(slot: u32) {
-    CA_BASELINE_HELPER_SLOT.store(slot as u64, Ordering::Relaxed);
-}
-
-pub fn ca_baseline_helper_slot() -> u32 {
-    CA_BASELINE_HELPER_SLOT.load(Ordering::Relaxed) as u32
+/// Configure the dormant terminal-decline regression hook.
+pub fn set_force_ca_terminal_decline(selector: u64) {
+    FORCE_CA_TERMINAL_DECLINE.store(selector, Ordering::Relaxed);
 }
 
 /// A legacy pool-indexed const (`ConstInt(u32)` etc.) reached the wasm backend
@@ -1038,9 +1042,9 @@ unsafe impl Send for WasmBackend {}
 /// can. Declined traces fall back to the interpreter (correct, unaccelerated)
 /// instead of producing an invalid trace module. `is_loop` is true for
 /// `compile_loop`, false for `compile_bridge`. `allow_ca` (set by
-/// `compile_bridge` only when `PYRE_WASM_CA` is on and the bridge is a
-/// self-recursive single-int `CallAssemblerR` shape) lifts the CALL_ASSEMBLER
-/// decline so the CA arm (guest→guest `call_indirect`) lowers it instead.
+/// `compile_bridge` when every CALL_ASSEMBLER target is admitted) lifts the
+/// CALL_ASSEMBLER decline so the CA arm (guest→guest `call_indirect`) lowers
+/// it instead.
 fn wasm_unsupported_trace_reason(ops: &[Op], is_loop: bool, allow_ca: bool) -> Option<String> {
     for op in ops {
         if op.opcode.is_call_assembler() && !allow_ca {
@@ -1069,41 +1073,6 @@ fn wasm_unsupported_trace_reason(ops: &[Op], is_loop: bool, allow_ca: bool) -> O
                 "wasm backend: loop trace with cross-loop terminal JUMP (no local LABEL)".into(),
             );
         }
-        // The loop lowering assumes the closing back-edge JUMP targets the LAST
-        // label: `build_function` picks the loop-back label with
-        // `ops.rposition(Label)`, `find_label_args` returns that label's args,
-        // and the JUMP arm maps the jump args onto it positionally then `br`s to
-        // it. A loop re-traced after a quasi-immutable invalidation can instead
-        // close with a JUMP back to its wider preamble entry label while a
-        // narrower peeled header sits last; mapping the wide jump's args onto the
-        // narrow last label's params leaks preamble constants into loop-carried
-        // slots. The JUMP and the label it targets share the loop-target descr
-        // Arc, so a differing descr identity marks a non-last target — decline it
-        // (`compile_bridge` declines the analogous loop-closing JUMP). The
-        // interpreter runs the invalidated loop correctly.
-        let last_label_descr = ops
-            .iter()
-            .rev()
-            .find(|op| op.opcode == majit_ir::OpCode::Label)
-            .and_then(|op| {
-                op.getdescr()
-                    .map(|d| std::sync::Arc::as_ptr(&d) as *const () as usize)
-            });
-        let closing_jump_descr = ops
-            .iter()
-            .rev()
-            .find(|op| op.opcode == majit_ir::OpCode::Jump)
-            .and_then(|op| {
-                op.getdescr()
-                    .map(|d| std::sync::Arc::as_ptr(&d) as *const () as usize)
-            });
-        if matches!((last_label_descr, closing_jump_descr), (Some(label), Some(jump)) if label != jump)
-        {
-            return Some(
-                "wasm backend: loop back-edge JUMP targets a non-last label (re-traced/unpeeled loop shape)"
-                    .into(),
-            );
-        }
     }
     // A JUMP with no local LABEL inside a bridge (a loop-closing bridge) is
     // lowered to a `return_call_indirect` into the source loop's table slot — a
@@ -1111,43 +1080,30 @@ fn wasm_unsupported_trace_reason(ops: &[Op], is_loop: bool, allow_ca: bool) -> O
     None
 }
 
-/// True when `ops` is a bridge whose every `CallAssemblerR` op is a
-/// self-recursive single-int call into the source loop (`source_loop_number`):
-/// `[Ref, Ref] -> Ref` (the inline-built callee PyFrame + the EC), targeting the
-/// SAME token the bridge attaches to. This is the fib recursion shape — the only
-/// CA shape the wasm CA arm (codegen) lowers. `.all()` (not `.any()`) keeps a
-/// mixed self+foreign or wrong-arity bridge declined.
-fn bridge_is_self_recursive_int_ca(ops: &[Op], source_loop_number: u64) -> bool {
-    let cas: Vec<&Op> = ops
-        .iter()
-        .filter(|o| o.opcode.is_call_assembler())
-        .collect();
-    if cas.is_empty() {
-        return false;
-    }
-    cas.iter().all(|op| {
-        op.opcode == majit_ir::OpCode::CallAssemblerR
-            && op
-                .getdescr()
-                .and_then(|d| {
-                    d.as_call_descr().map(|cd| {
-                        let at = cd.arg_types();
-                        cd.call_target_token() == Some(source_loop_number)
-                            && at.len() == 2
-                            && at[0] == majit_ir::Type::Ref
-                            && at[1] == majit_ir::Type::Ref
-                            && cd.result_type() == majit_ir::Type::Ref
-                    })
-                })
-                .unwrap_or(false)
-    })
+/// Resolve every distinct compiled target used by CALL_ASSEMBLER ops in this
+/// trace.  Codegen resolves the matching frozen geometry at each op by token,
+/// so sibling specializations may safely have different frame sizes and gcmap
+/// pointers.
+/// Geometry/census of the loop being compiled.  This is only used to turn its
+/// own registered pending target into a CA target: no `CompiledWasmLoop` exists
+/// yet for that token, so the normal live-target census cannot be read.
+struct PendingSelfCa<'a> {
+    token_number: u64,
+    input_types: &'a [majit_ir::Type],
+    frame: codegen::FrameGeometry,
+    has_trampoline_calls: bool,
 }
 
-/// Resolve the one compiled target used by every CALL_ASSEMBLER in this trace.
-/// Slice A deliberately accepts one target only: a trace containing distinct
-/// callees needs per-op metadata rather than the single `CaParams` payload.
-fn general_int_call_assembler_target(ops: &[Op]) -> Option<CallAssemblerTarget> {
-    let mut resolved: Option<CallAssemblerTarget> = None;
+/// Resolve every distinct compiled target used by CALL_ASSEMBLER ops in this
+/// trace.  `pending_self` is present only from `compile_loop`, after its frame
+/// has been frozen.  It admits the currently-compiling token through the
+/// stable pending dispatch entry; all other tokens still require a live,
+/// installed `CompiledWasmLoop`.
+fn general_int_call_assembler_target(
+    ops: &[Op],
+    pending_self: Option<PendingSelfCa<'_>>,
+) -> Option<Vec<(u64, CallAssemblerTarget)>> {
+    let mut resolved = Vec::new();
     let mut saw_ca = false;
     for op in ops.iter().filter(|op| op.opcode.is_call_assembler()) {
         saw_ca = true;
@@ -1170,63 +1126,180 @@ fn general_int_call_assembler_target(ops: &[Op]) -> Option<CallAssemblerTarget> 
         {
             return None;
         }
-        let target = call_assembler_target(descr.call_target_token()?)?;
-        if target.input_types.as_slice() != arg_types
-            || target.callee_frame_bytes == 0
-            || target.callee_gcmap_ptr == 0
-            || target.compiled_ptr == 0
-            || target.has_trampoline_calls
-        {
-            return None;
-        }
-        if let Some(previous) = &resolved {
-            if previous.compiled_ptr != target.compiled_ptr {
+        let target_token = descr.call_target_token()?;
+        let registered = call_assembler_target(target_token)?;
+        let target = if let Some(self_) = pending_self.as_ref().filter(|self_| {
+            target_token == self_.token_number
+                // A self target must be precisely the placeholder installed
+                // by `register_pending_target`, never an old compiled loop.
+                && registered.func_handle == 0
+                && registered.compiled_ptr == 0
+                && ca_dispatch_exists(target_token)
+        }) {
+            // Keep the ordinary input validation, then use the current loop's
+            // frozen geometry.  Its direct-lowering census is the pending
+            // equivalent of the normal live-loop census below: a movable self
+            // frame must not run a host trampoline.
+            if registered.input_types.as_slice() != arg_types
+                || self_.frame.ca_frame_bytes == 0
+                || self_.has_trampoline_calls
+            {
                 return None;
             }
+            let callee_gcmap_ptr =
+                Box::leak(build_callee_gcmap(self_.input_types, self_.frame)).as_ptr() as i64;
+            if callee_gcmap_ptr == 0 {
+                return None;
+            }
+            CallAssemblerTarget {
+                token_number: target_token,
+                func_handle: 0,
+                input_types: self_.input_types.to_vec(),
+                callee_frame_bytes: self_.frame.ca_frame_bytes,
+                callee_gcmap_ptr,
+                loop_finish_fi: failguard::WASM_CA_FINISH_FI_UNKNOWN,
+                compiled_ptr: 0,
+                has_trampoline_calls: false,
+            }
         } else {
-            resolved = Some(target);
+            if registered.input_types.as_slice() != arg_types
+                || registered.callee_frame_bytes == 0
+                || registered.callee_gcmap_ptr == 0
+                || registered.compiled_ptr == 0
+                || registered.has_trampoline_calls
+            {
+                return None;
+            }
+            // A successfully compiled loop is retained by its token while it
+            // is registered. Its chained bridges can subsequently add
+            // trampoline calls or become terminally declined, so read the
+            // live census before baking every CA entry.
+            let live = unsafe {
+                (registered.compiled_ptr as *const CompiledWasmLoop)
+                    .as_ref()
+                    .is_some_and(|loop_| {
+                        !loop_.has_trampoline_calls.get() && !loop_.ca_terminal_declined.get()
+                    })
+            };
+            if !live {
+                return None;
+            }
+            registered
+        };
+        // The same target may occur in several operations; each operation was
+        // validated above, while the codegen map needs one geometry per token.
+        if !resolved
+            .iter()
+            .any(|(known_token, _)| *known_token == target_token)
+        {
+            resolved.push((target_token, target));
         }
     }
-    saw_ca.then_some(resolved?).filter(|target| {
-        // A successfully compiled loop is retained by its token while it is
-        // registered. Its chained bridges can subsequently add trampoline
-        // calls, so read the live census before baking a CA entry.
-        unsafe {
-            (target.compiled_ptr as *const CompiledWasmLoop)
-                .as_ref()
-                .is_some_and(|loop_| {
-                    !loop_.has_trampoline_calls.get() && !loop_.ca_terminal_declined.get()
-                })
-        }
-    })
+    (saw_ca && !resolved.is_empty()).then_some(resolved)
 }
 
-fn bridge_int_call_assembler_target(
-    ops: &[Op],
-    source_loop_number: u64,
-) -> Option<CallAssemblerTarget> {
-    if bridge_is_self_recursive_int_ca(ops, source_loop_number) {
-        // Keep the established self-recursive shape on its explicit admission
-        // path while using the registered target's frozen geometry.
-        return general_int_call_assembler_target(ops);
-    }
-    general_int_call_assembler_target(ops)
+fn bridge_int_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTarget)>> {
+    general_int_call_assembler_target(ops, None)
+}
+
+fn ca_codegen_targets(
+    targets: &[(u64, CallAssemblerTarget)],
+) -> std::collections::HashMap<u64, codegen::CaTarget> {
+    targets
+        .iter()
+        .map(|(token, target)| {
+            (
+                *token,
+                codegen::CaTarget {
+                    dispatch_entry: ca_dispatch_slot(*token),
+                    callee_frame_bytes: target.callee_frame_bytes,
+                    callee_gcmap_ptr: target.callee_gcmap_ptr,
+                },
+            )
+        })
+        .collect()
+}
+
+fn ca_max_frame_bytes(targets: &[(u64, CallAssemblerTarget)]) -> u32 {
+    targets
+        .iter()
+        .map(|(_, target)| target.callee_frame_bytes)
+        .max()
+        .expect("admitted CALL_ASSEMBLER targets must be non-empty")
 }
 
 fn mark_call_assembler_target_active(target: &CallAssemblerTarget, caller: &JitCellToken) {
     // The target metadata is removed by `CompiledWasmLoop::drop`; compilation
     // is single-threaded, and callers only retain the pointer while the token
     // remains compiled. This is the same lifetime used by the deopt helper.
-    unsafe {
+    let force_terminal_decline = unsafe {
         if let Some(loop_) = (target.compiled_ptr as *const CompiledWasmLoop).as_ref() {
             loop_.ca_active.set(true);
             let caller_flag = caller.invalidation_flag();
-            let mut callers = loop_.ca_callers.borrow_mut();
-            if !callers
-                .iter()
-                .any(|known| std::sync::Arc::ptr_eq(known, &caller_flag))
             {
-                callers.push(caller_flag);
+                let mut callers = loop_.ca_callers.borrow_mut();
+                if !callers
+                    .iter()
+                    .any(|known| std::sync::Arc::ptr_eq(known, &caller_flag))
+                {
+                    callers.push(caller_flag);
+                }
+            }
+
+            // Runtime-regression hook for the terminal-decline CA path.  It
+            // is dormant unless explicitly selected, and runs only after this
+            // caller has already admitted and compiled a CA edge.  `1` selects
+            // the first such target; a decimal JitCellToken number selects a
+            // particular target.  The caller's invalidation bit still makes
+            // this a bounded window, exactly like a real terminal bridge
+            // decline.
+            let selector = FORCE_CA_TERMINAL_DECLINE.load(Ordering::Relaxed);
+            if selector != 0 && (selector == 1 || selector == target.token_number) {
+                // One forced target per guest run. A real terminal decline
+                // also transitions its target just once.
+                FORCE_CA_TERMINAL_DECLINE.store(0, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    };
+    if force_terminal_decline {
+        // `mark_call_assembler_terminal_decline` reads `ca_callers`; release
+        // the registration borrow above before invalidating those callers.
+        mark_call_assembler_terminal_decline(target.compiled_ptr as usize);
+        diag_bump(16);
+    }
+}
+
+/// Move the movable-CA caller census from a redirected target to its
+/// replacement. Existing callers retain the old dispatch entry, but terminal
+/// decline of the replacement must still invalidate those callers.
+fn transfer_call_assembler_target_activity(
+    old_target: &CallAssemblerTarget,
+    new_target: &CallAssemblerTarget,
+) {
+    unsafe {
+        let Some(old_loop) = (old_target.compiled_ptr as *const CompiledWasmLoop).as_ref() else {
+            return;
+        };
+        let Some(new_loop) = (new_target.compiled_ptr as *const CompiledWasmLoop).as_ref() else {
+            return;
+        };
+
+        new_loop
+            .ca_active
+            .set(new_loop.ca_active.get() || old_loop.ca_active.get());
+        let old_callers = old_loop.ca_callers.borrow().clone();
+        let mut new_callers = new_loop.ca_callers.borrow_mut();
+        for caller in old_callers {
+            if !new_callers
+                .iter()
+                .any(|known| std::sync::Arc::ptr_eq(known, &caller))
+            {
+                new_callers.push(caller);
             }
         }
     }
@@ -1303,6 +1376,21 @@ impl majit_backend::Backend for WasmBackend {
         // codegen frame-slot / unhandled-opcode declines. So re-firing the guard
         // only rebuilds the same unsupported bridge; record it terminal.
         true
+    }
+
+    /// `compile_tmp_callback` parity: install a resolvable-but-not-enterable
+    /// placeholder before tracing.  Stage 1 still declines its zero geometry;
+    /// the stable dispatch slot is what lets the completed module later update
+    /// already-emitted callers without patching wasm bytes.
+    fn register_pending_target(
+        &mut self,
+        token_number: u64,
+        input_types: Vec<majit_ir::Type>,
+        _num_inputs: usize,
+        _num_scalar_inputargs: usize,
+        _index_of_virtualizable: i32,
+    ) {
+        register_pending_call_assembler_target(token_number, input_types);
     }
 
     // ── Blackhole allocation (llmodel.py:775-790) ──
@@ -1389,11 +1477,34 @@ impl majit_backend::Backend for WasmBackend {
         }
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let ops: &[Op] = &ops_owned;
-        // A general CALL_ASSEMBLER can enter an already-compiled loop through
-        // the shared table. Keep one frozen target per trace in Slice A.
-        let ca_target = general_int_call_assembler_target(ops);
-        let allow_ca =
-            ca_deopt_helper_slot() != 0 && ca_baseline_helper_slot() != 0 && ca_target.is_some();
+        // Freeze this token's generated frame layout before CA resolution.  A
+        // self-recursive CALL_ASSEMBLER reaches this point while its token is
+        // still a pending placeholder, so this is the one authoritative frame
+        // geometry for both the loop and each nursery-allocated self callee.
+        let raw_frame_value_slots = codegen::frame_value_slots(inputargs, ops);
+        let raw_num_ref_homes = codegen::count_ref_homes(inputargs, ops);
+        let frame = codegen::FrameGeometry::compact(
+            raw_frame_value_slots.max(FROZEN_CHAIN_VALUE_SLOTS),
+            raw_num_ref_homes.max(FROZEN_CHAIN_REF_HOMES),
+        );
+        let input_types: Vec<majit_ir::Type> = inputargs.iter().map(|ia| ia.tp).collect();
+        // Count with CA direct-lowering enabled.  This is the safety census
+        // for a pending self target: no CompiledWasmLoop exists yet to inspect.
+        let pending_self_has_trampoline_calls = codegen::has_trampoline_calls(inputargs, ops, true);
+        // A general CALL_ASSEMBLER can enter already-compiled loops through
+        // the shared table. Codegen keeps each callee's geometry keyed by its
+        // operation's target token.  The pending self token is admitted with
+        // the current frame; distinct sibling targets retain their live census.
+        let ca_targets = general_int_call_assembler_target(
+            ops,
+            Some(PendingSelfCa {
+                token_number: token.number,
+                input_types: &input_types,
+                frame,
+                has_trampoline_calls: pending_self_has_trampoline_calls,
+            }),
+        );
+        let allow_ca = ca_deopt_helper_slot() != 0 && ca_targets.is_some();
         // This must use the same direct-vs-trampoline predicates as codegen:
         // a CA callee runs this source-loop body on a movable nursery frame.
         let has_trampoline_calls = codegen::has_trampoline_calls(inputargs, ops, allow_ca);
@@ -1428,15 +1539,6 @@ impl majit_backend::Backend for WasmBackend {
         let alloc_fn_ptr = wasm_jit_alloc as *const () as usize as i64;
         let alloc_array_fn_ptr = wasm_jit_alloc_array as *const () as usize as i64;
         let wb_fn_ptr = wasm_jit_write_barrier as *const () as usize as i64;
-        // Freeze this token's generated frame layout at first compilation.
-        // Every geometry retains its tail call area for later bridges. CA
-        // callee frames use only the homes prefix (`ca_frame_bytes`) below.
-        let raw_frame_value_slots = codegen::frame_value_slots(inputargs, ops);
-        let raw_num_ref_homes = codegen::count_ref_homes(inputargs, ops);
-        let frame = codegen::FrameGeometry::compact(
-            raw_frame_value_slots.max(FROZEN_CHAIN_VALUE_SLOTS),
-            raw_num_ref_homes.max(FROZEN_CHAIN_REF_HOMES),
-        );
         // Exit indices come from the global fail-index space so a cross-trace
         // chain's `frame[0]` resolves regardless of which module wrote it
         // (`failguard::FAIL_DESCR_REGISTRY`).
@@ -1457,7 +1559,7 @@ impl majit_backend::Backend for WasmBackend {
                 0, // external_jump_slot: a loop's JUMP is a local back-edge `br`
                 0, // external_jump_key: unused without an external JUMP
                 frame,
-                ca_target.as_ref().map_or_else(
+                ca_targets.as_ref().map_or_else(
                     || codegen::CaParams {
                         // A loop can run on a nursery CA frame and must reload
                         // local 0 after a collection even when it emits no CA.
@@ -1465,22 +1567,18 @@ impl majit_backend::Backend for WasmBackend {
                         jf_top_addr: jf_top_addr(),
                         ..codegen::CaParams::default()
                     },
-                    |target| codegen::CaParams {
+                    |targets| codegen::CaParams {
                         emit_ca: true,
-                        callee_slot: target.func_handle,
-                        callee_frame_bytes: target.callee_frame_bytes,
-                        loop_finish_fi: target.loop_finish_fi,
+                        targets: ca_codegen_targets(targets),
                         deopt_helper_slot: ca_deopt_helper_slot(),
-                        baseline_helper_slot: ca_baseline_helper_slot(),
-                        terminal_declined_ptr: target.terminal_declined_ptr,
-                        callee_compiled_ptr: target.compiled_ptr,
                         ca_alloc_fn_ptr: wasm_jit_ca_alloc_frame as *const () as usize as i64,
                         ca_pop_fn_ptr: wasm_jit_ca_pop_frame as *const () as usize as i64,
                         ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
                         ca_reload_caller_fn_ptr: wasm_jit_ca_reload_caller_frame as *const ()
                             as usize as i64,
-                        callee_gcmap_ptr: target.callee_gcmap_ptr,
-                        inline: ca_inline_params(target.callee_frame_bytes),
+                        // Inline allocation is shared module state, so admit
+                        // it only if the largest target frame is eligible.
+                        inline: ca_inline_params(ca_max_frame_bytes(targets)),
                         jf_top_addr: jf_top_addr(),
                     },
                 ),
@@ -1669,25 +1767,48 @@ impl majit_backend::Backend for WasmBackend {
             .find(|descr| descr.is_finish)
             .map(|descr| descr.fail_index)
             .unwrap_or(0);
-        let callee_gcmap_ptr =
-            Box::leak(build_callee_gcmap(&compiled.input_types, compiled.frame)).as_ptr() as i64;
+        // For a pending self target this is the exact map already embedded in
+        // the module's CA arm. Reuse it for the published metadata so the
+        // loop and its self-callee have demonstrably identical geometry. A
+        // non-self loop still owns a freshly built map for future callers.
+        let callee_gcmap_ptr = ca_targets
+            .as_ref()
+            .and_then(|targets| {
+                targets
+                    .iter()
+                    .find(|(target_token, _)| *target_token == token.number)
+                    .map(|(_, target)| target.callee_gcmap_ptr)
+            })
+            .unwrap_or_else(|| {
+                Box::leak(build_callee_gcmap(&compiled.input_types, compiled.frame)).as_ptr() as i64
+            });
+        // The module has now acquired its host-appended shared-table slot and
+        // its finish index. Publish those mutable pieces before exposing the
+        // immutable geometry metadata: previously compiled CALL_ASSEMBLER
+        // modules load this stable entry at runtime.
+        ca_dispatch_publish(
+            token.number,
+            compiled.func_handle,
+            loop_finish_fi,
+            compiled as *const CompiledWasmLoop as usize as u32,
+        );
         publish_call_assembler_target(
             token.number,
             CallAssemblerTarget {
+                token_number: token.number,
                 func_handle: compiled.func_handle,
                 input_types: compiled.input_types.clone(),
                 callee_frame_bytes: compiled.frame.ca_frame_bytes,
                 callee_gcmap_ptr,
                 loop_finish_fi,
                 compiled_ptr: compiled as *const CompiledWasmLoop as usize as u64,
-                terminal_declined_ptr: (&compiled.ca_terminal_declined
-                    as *const std::cell::Cell<bool>) as usize
-                    as u32,
                 has_trampoline_calls: compiled.has_trampoline_calls.get(),
             },
         );
-        if let Some(target) = ca_target.as_ref() {
-            mark_call_assembler_target_active(target, token);
+        if let Some(targets) = ca_targets.as_ref() {
+            for (_, target) in targets {
+                mark_call_assembler_target_active(target, token);
+            }
         }
 
         Ok(AsmInfo {
@@ -1734,44 +1855,18 @@ impl majit_backend::Backend for WasmBackend {
 
         // is_loop=false: a bridge's terminal JUMP with no LABEL is a loop-closing
         // bridge whose re-entry target is plumbed via `external_jump_slot`.
-        // Lift the CALL_ASSEMBLER decline for a self-recursive single-int bridge
-        // (the fib shape) so the CA arm lowers it to an in-module `call_indirect`
-        // into the source loop instead.
+        // Lift the CALL_ASSEMBLER decline when every callee target has frozen,
+        // directly-enterable geometry; the CA arm lowers each operation to its
+        // own in-module `call_indirect` target.
         // The CA arm must be able to complete a callee deopt; without the
         // registered `wasm_ca_resume_deopt` slot it could not, so decline the
         // lift (the host round-trip path still handles the CALL_ASSEMBLER).
-        let ca_target = bridge_int_call_assembler_target(ops, original_token.number);
-        let ca_candidate =
-            ca_deopt_helper_slot() != 0 && ca_baseline_helper_slot() != 0 && ca_target.is_some();
+        let ca_targets = bridge_int_call_assembler_target(ops);
+        let ca_candidate = ca_deopt_helper_slot() != 0 && ca_targets.is_some();
         // The CA candidate is a dedicated direct arm; all other ops are
         // scanned against their normal emission paths.
         let bridge_has_trampoline_calls =
             codegen::has_trampoline_calls(inputargs, ops, ca_candidate);
-
-        // Decline exception-resume bridges (`GuardException`): the guarded call
-        // raised, so the bridge resumes into the exception handler by re-entering
-        // the interpreter at the raising bytecode. That re-entry reads the
-        // pre-call operand stack, whose constant entries (e.g. a float dividend)
-        // live only in the guard's `rd_consts` resume data, not in a spilled
-        // frame slot. The compiled bridge reconstructs its state from inputargs
-        // (spilled slots) alone and cannot see `rd_consts`, so such a constant
-        // materialises as NULL and the re-entered interpreter runs e.g.
-        // `truediv(NULL, int)`, raising a spurious `unsupported operand type(s)
-        // for /`. Declining routes the deopt through the blackhole interpreter,
-        // which rematerialises constants from `rd_consts` (the native path).
-        // Non-raising (`GuardNoException`) loop-closing bridges keep their
-        // compiled fast path — the CallMayForce bridges wasm relies on for speed
-        // are unaffected, so this does not regress them.
-        if ops
-            .iter()
-            .any(|op| op.opcode == majit_ir::OpCode::GuardException)
-        {
-            return Err(BackendError::Unsupported(
-                "wasm backend: exception-resume bridge (GuardException) re-enters \
-                 the interpreter with unreconstructable rd_consts stack entries"
-                    .into(),
-            ));
-        }
 
         // The source guard this bridge attaches to. `fail_index` is its index in
         // the source loop's `fail_descrs` / cell array; `trace_id` identifies the
@@ -2112,29 +2207,25 @@ impl majit_backend::Backend for WasmBackend {
         let alloc_array_fn_ptr = wasm_jit_alloc_array as *const () as usize as i64;
         let wb_fn_ptr = wasm_jit_write_barrier as *const () as usize as i64;
 
-        // Self-recursive CALL_ASSEMBLER (PYRE_WASM_CA): the CA arm allocates a
-        // fresh callee using the source token's frozen geometry. The earlier
-        // frame-fit decline guarantees this bridge uses those same offsets.
-        let ca_params = if let Some(target) = ca_target.as_ref().filter(|_| allow_ca) {
+        // CALL_ASSEMBLER: the CA arm allocates a fresh callee using the target
+        // token's frozen geometry. The earlier frame-fit decline guarantees a
+        // movable callee cannot execute a trampoline-lowered op.
+        let ca_params = if let Some(targets) = ca_targets.as_ref().filter(|_| allow_ca) {
             codegen::CaParams {
                 emit_ca: true,
                 // `compile_bridge`'s trampoline-decline floor above guarantees
                 // no trampoline-lowered op executes on this movable CA callee
                 // frame, so its tail call area is never touched.
-                callee_slot: target.func_handle,
-                callee_frame_bytes: target.callee_frame_bytes,
-                loop_finish_fi: target.loop_finish_fi,
+                targets: ca_codegen_targets(targets),
                 deopt_helper_slot: ca_deopt_helper_slot(),
-                baseline_helper_slot: ca_baseline_helper_slot(),
-                terminal_declined_ptr: target.terminal_declined_ptr,
-                callee_compiled_ptr: target.compiled_ptr,
                 ca_alloc_fn_ptr: wasm_jit_ca_alloc_frame as *const () as usize as i64,
                 ca_pop_fn_ptr: wasm_jit_ca_pop_frame as *const () as usize as i64,
                 ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
                 ca_reload_caller_fn_ptr: wasm_jit_ca_reload_caller_frame as *const () as usize
                     as i64,
-                callee_gcmap_ptr: target.callee_gcmap_ptr,
-                inline: ca_inline_params(target.callee_frame_bytes),
+                // See compile_loop: one shared inline path must fit every
+                // per-op callee frame in this trace.
+                inline: ca_inline_params(ca_max_frame_bytes(targets)),
                 jf_top_addr: jf_top_addr(),
             }
         } else {
@@ -2251,10 +2342,12 @@ impl majit_backend::Backend for WasmBackend {
             if let Some(owner) = bridge_cells_owner {
                 source_loop._bridge_owned_cells.borrow_mut().push(owner);
             }
-            if let Some(target) = ca_target.as_ref().filter(|_| allow_ca) {
+            if let Some(targets) = ca_targets.as_ref().filter(|_| allow_ca) {
                 // Freeze this recursion to the CA mechanism: no further bridge
                 // chains here (see the decline above the codegen call).
-                mark_call_assembler_target_active(target, original_token);
+                for (_, target) in targets {
+                    mark_call_assembler_target_active(target, original_token);
+                }
             }
         }
 
@@ -2686,6 +2779,69 @@ impl majit_backend::Backend for WasmBackend {
 
     fn invalidate_loop(&self, _token: &JitCellToken) {
         // No native code to invalidate — wasm modules are immutable.
+        // A CALL_ASSEMBLER module bakes the stable dispatch entry's address;
+        // its lifetime ends only when CompiledWasmLoop::drop retracts every
+        // alias for that compiled_ptr.
+    }
+
+    fn redirect_call_assembler(
+        &self,
+        old: &JitCellToken,
+        new: &JitCellToken,
+    ) -> Result<(), BackendError> {
+        let Some(old_target) = call_assembler_target(old.number) else {
+            // Without the old metadata, no baked frame geometry is available
+            // to prove an existing caller can enter the replacement safely.
+            return Err(BackendError::Unsupported(format!(
+                "call-assembler redirect from token {} has no preserved geometry",
+                old.number
+            )));
+        };
+        let Some(mut new_target) = call_assembler_target(new.number) else {
+            return Err(BackendError::Unsupported(format!(
+                "call-assembler redirect to token {} has no compiled target",
+                new.number
+            )));
+        };
+        if old_target.input_types != new_target.input_types
+            || old_target.callee_frame_bytes != new_target.callee_frame_bytes
+            || old_target.callee_gcmap_ptr != new_target.callee_gcmap_ptr
+        {
+            return Err(BackendError::Unsupported(format!(
+                "call-assembler redirect from token {} to {} changed baked geometry",
+                old.number, new.number
+            )));
+        }
+        let movable_callee = new_target.callee_frame_bytes != 0
+            && new_target.callee_gcmap_ptr != 0
+            && new_target.compiled_ptr != 0
+            && !new_target.has_trampoline_calls
+            && unsafe {
+                (new_target.compiled_ptr as *const CompiledWasmLoop)
+                    .as_ref()
+                    .is_some_and(|loop_| {
+                        !loop_.has_trampoline_calls.get() && !loop_.ca_terminal_declined.get()
+                    })
+            };
+        if !movable_callee {
+            return Err(BackendError::Unsupported(format!(
+                "call-assembler redirect to token {} is not a movable-CA callee",
+                new.number
+            )));
+        }
+
+        // Existing callers retain `old`'s stable entry.  Make both the
+        // runtime dispatch values and the metadata lookup resolve to `new`.
+        ca_dispatch_redirect(
+            old.number,
+            new_target.func_handle,
+            new_target.loop_finish_fi,
+            new_target.compiled_ptr as u32,
+        );
+        transfer_call_assembler_target_activity(&old_target, &new_target);
+        new_target.token_number = old.number;
+        publish_call_assembler_target(old.number, new_target);
+        Ok(())
     }
 
     /// llsupport/gc.py:563 GcLLDescr_framework
