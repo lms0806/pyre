@@ -91,15 +91,10 @@ fn finish_trace_namespace_dependency(meta: &mut MetaInterp<PyreMeta>) {
 }
 
 thread_local! {
-    /// Green keys whose full-body walk failed on a structural walker
-    /// limitation (the recurring `DispatchError` classes listed in
-    /// `full_body_walk_trace`).  A retrace of such a key skips the walk and
-    /// re-interprets without JIT instead of re-walking and re-failing every
-    /// hot encounter; the location stays trace-eligible (not
-    /// `DONT_TRACE_HERE`), so upstream's invariant that an abort never marks a
-    /// location untraceable (pyjitpl.py:2392 aborted_tracing) holds.  A walker
-    /// improvement that closes one of those `DispatchError` classes shrinks
-    /// this set.
+    /// Green keys whose full-body walk deterministically re-reaches a
+    /// structural walk decline that must skip future walks of the same entry.
+    /// This set is intentionally narrow: transient walker capability gaps
+    /// return a plain abort and rely on the normal hotness/abort machinery.
     static FBW_DECLINED_KEYS: std::cell::RefCell<std::collections::HashSet<u64>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
     /// FOR_ITER green keys whose range-only specialization observed a class
@@ -134,8 +129,7 @@ fn fbw_bridge_decline(ctx: &TraceCtx) {
     }
 }
 
-fn p2_drain_abort(ctx: &TraceCtx) -> TraceAction {
-    fbw_bridge_decline(ctx);
+fn p2_drain_abort() -> TraceAction {
     TraceAction::Abort
 }
 
@@ -918,15 +912,21 @@ fn residual_ref_call_dst_before(code: &[u8], entry: usize) -> Option<usize> {
 /// reconstructed-frame walk plumbing before result-threading + the root walk
 /// are wired. The compile leg is unconditional.
 /// Thread a reconstructed callee's `SubReturn` value into the root portal's
-/// operand-stack result register so the subsequent root walk
-/// (`run_perfn_walk`'s bridge seeding) reads it as the call result at `root_pc`.
+/// residual-call result register so the subsequent root walk reads it as the
+/// call result at `root_pc`.
 ///
 /// `make_result_of_lastop` writes the result to the residual-call body's
 /// trailing `>r` destination byte, so use that register when the call ending at
 /// `root_pc` can be decoded.  Fall back to the codewriter-baked result-color
 /// trivia twin keyed by the call's JitCode pc for older shapes that lack the
-/// canonical residual-call encoding.  Returns `false` (caller declines the
-/// compile) when the register is unresolved.
+/// canonical residual-call encoding.
+///
+/// The result is always mirrored into `bridge_registers_r` for interior-entry
+/// bridge walks, whose Ref-bank seed is color-indexed.  Opcode-entry bridge
+/// walks rebuild slot-indexed locals and operand-stack values from
+/// `bridge_local_oprefs` / `bridge_stack_oprefs`, so mirror the destination
+/// there too.  Returns `false` (caller declines the compile) when the register
+/// is unresolved.
 fn inject_root_call_result(sym: &mut PyreSym, root_pc: usize, result: majit_ir::OpRef) -> bool {
     if sym.jitcode.is_null() {
         return false;
@@ -949,7 +949,14 @@ fn inject_root_call_result(sym: &mut PyreSym, root_pc: usize, result: majit_ir::
         }
         bridge_regs[result_reg] = result;
     }
-    if result_reg >= nlocals {
+    if result_reg < nlocals {
+        if let Some(ref mut locals) = sym.bridge_local_oprefs {
+            if locals.len() <= result_reg {
+                locals.resize(result_reg + 1, majit_ir::OpRef::NONE);
+            }
+            locals[result_reg] = result;
+        }
+    } else {
         let slot = result_reg - nlocals;
         let bridge = sym.bridge_stack_oprefs.get_or_insert_with(Vec::new);
         if bridge.len() <= slot {
@@ -987,7 +994,12 @@ fn drive_bridge_carrier_walk(
     }
     let Some(recipe) = carrier.recipes.last() else {
         crate::jitcode_dispatch::census_record("P2Drain::NoRecipes");
-        return p2_drain_abort(ctx);
+        // Churn guard (Task 8): making this class transient retried the same
+        // guard 500 times in depth2_inline_chain_typeflip.py and
+        // p2_local_result_bridge.py (loops_aborted 6 -> 505), so keep only
+        // this measured P2 class permanently declined.
+        fbw_bridge_decline(ctx);
+        return p2_drain_abort();
     };
 
     let pre_pos = ctx.get_trace_position();
@@ -1001,12 +1013,12 @@ fn drive_bridge_carrier_walk(
     else {
         ctx.cut_trace(pre_pos);
         crate::jitcode_dispatch::census_record("P2Drain::SetupFailed");
-        return p2_drain_abort(ctx);
+        return p2_drain_abort();
     };
     let Some(callee_pjc) = crate::state::pyjitcode_for_code(recipe.code_ptr) else {
         ctx.cut_trace(pre_pos);
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleePjc");
-        return p2_drain_abort(ctx);
+        return p2_drain_abort();
     };
     let entry = select_recipe_entry(
         recipe.jitcode_index,
@@ -1016,7 +1028,7 @@ fn drive_bridge_carrier_walk(
     let Some(entry) = entry else {
         ctx.cut_trace(pre_pos);
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleeEntry");
-        return p2_drain_abort(ctx);
+        return p2_drain_abort();
     };
     let callee_w_globals = crate::state::recover_inline_callee_globals(recipe.code_ptr) as usize;
     // The reconstructed callee's local slot concretes (`recipe.concrete_r` is
@@ -1109,7 +1121,7 @@ fn drive_bridge_carrier_walk(
     // pre-walk heap rather than dropping the journals (which would leave every
     // eager store standing to be applied a second time).
     crate::jitcode_dispatch::fbw_store_journal_rollback();
-    p2_drain_abort(ctx)
+    p2_drain_abort()
 }
 
 /// Shape A orthodox multi-frame bridge resume: the escape-hatch driver for a
@@ -1544,7 +1556,7 @@ fn run_perfn_walk(
         sidecar_entry
     } else {
         // Every non-entry resume carries its own JitCode coordinate. Without
-        // one the existing `None` path below declines the walk.
+        // one the site-specific decline below rejects the walk.
         None
     };
     let Some(pc_map_entry) = pc_map_entry else {
@@ -3220,19 +3232,11 @@ fn full_body_walk_trace(
             }
         },
         Some((_entry, _code_len, Err(e))) => {
-            // Structural walker limitations recur identically on every
-            // retrace of this location (the same jitcode walked from the same
-            // entry produces the same error), so record the key in
-            // `FBW_DECLINED_KEYS` instead of thrashing futile deep re-walks —
-            // each of which executes the body's residual calls concretely
-            // before failing at the unsupported resume / exception / closure
-            // shape.  `FBW_DECLINED_KEYS` is a permanent per-process decline:
-            // the key re-interprets without tracing.  These are the
-            // multi-session-blocked shapes (resume snapshot #124,
-            // exception-handler resume #51c, closure NULL-self #60, unported
-            // raise marker, a residual arg register the walk never binds);
-            // other errors retain the plain `Abort` without declining so a
-            // capability that lands mid-run can still pick the location up.
+            // Record the key in `FBW_DECLINED_KEYS` only for errors that
+            // deterministically re-reach a structural decline of the same
+            // entry.  Transient walker capability gaps retain the plain
+            // `Abort` without declining so a capability that lands mid-run can
+            // still pick the location up.
             use crate::jitcode_dispatch::DispatchError as DE;
             crate::jitcode_dispatch::census_record(e.variant_name());
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
@@ -3250,17 +3254,14 @@ fn full_body_walk_trace(
                 // location can never trace soundly — interpret it permanently
                 // (the loop runs correctly under the interpreter).
                 DE::InplaceContainerMutationUnsupported { .. } => TraceAction::AbortPermanent,
-                DE::AbortPermanentMarkerReached { .. }
-                | DE::GuardSnapshotVableUntyped { .. }
+                DE::AbortPermanentMarkerReached { .. } => TraceAction::AbortPermanent,
+                DE::GuardSnapshotVableUntyped { .. }
                 | DE::MayForceNullRefArgUnsupported { .. }
                 | DE::BranchGuardKeptStackUnsupported { .. }
                 | DE::NonStandardVableFinishPortalUnsupported { .. }
                 | DE::LoopBearingCalleeInlineUnsupported { .. }
                 | DE::UnfoldableListAppendResidualUnsupported { .. }
-                | DE::ResidualCallArgUnbound { .. } => {
-                    fbw_decline(crate::driver::make_green_key(w_code, start_pc));
-                    TraceAction::Abort
-                }
+                | DE::ResidualCallArgUnbound { .. } => TraceAction::Abort,
                 // #68 multiframe (`PYRE_FBW_INLINE_MULTIFRAME`): a data-dependent
                 // `goto_if_not` whose branch input is not concrete at trace-time
                 // recurs identically on every retrace of this entry (the same
@@ -3288,7 +3289,6 @@ fn full_body_walk_trace(
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                 eprintln!("[fbw-abort] start_pc={start_pc} run_perfn_walk returned None");
             }
-            fbw_bridge_decline(ctx);
             TraceAction::Abort
         }
     }
