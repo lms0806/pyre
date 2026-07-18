@@ -858,6 +858,15 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// boundary; read by [`reconcile_vstack_at_boundary`] for the
     /// RESULT-TO-TOS class.
     pub vstack_last_ref: OpRef,
+    /// #389(b): the py_pc the walk backed off FROM when it entered the
+    /// codewriter's out-of-order FOR_ITER-entry permutation lowering
+    /// (`SWAP`/`BUILD_LIST`/`SWAP` before a `FOR_ITER`, lowered non-monotonically
+    /// in jitcode).  `u32::MAX` when not inside such a region.  While set, the
+    /// per-op reconcile is invalid (the walk re-visits already-passed py_pcs out
+    /// of order), so `reconcile_vstack_at_boundary` reseeds the whole mirror from
+    /// the virtualizable shadow instead of replaying stack effects.  Cleared once
+    /// the walk advances past this ceiling (py-pc order is monotonic again).
+    pub vstack_reorder_ceiling: u32,
     /// #73: the jitcode offset of the `-live-` byte that
     /// precedes the CURRENT opcode's guard resume point — the `-live-`
     /// BEFORE (`pyjitpl.py:198`, normal guard resume reads at
@@ -2952,6 +2961,7 @@ pub fn dispatch_via_miframe(
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -3441,6 +3451,7 @@ fn drive_bridge_frame_subwalk(
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
             trace_ctx: ctx,
@@ -3773,6 +3784,7 @@ pub(crate) fn drive_outer_frame_continuation(
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
             trace_ctx: ctx,
@@ -8867,6 +8879,17 @@ thread_local! {
     static FBW_APPEND_JOURNAL: std::cell::RefCell<Vec<(pyre_object::PyObjectRef, usize)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
+    /// Undo log for Empty-list first-append promotion during pyre's
+    /// speculative full-body walk.  Entries ride the same commit/rollback
+    /// lifecycle as [`FBW_APPEND_JOURNAL`]: a committed walk keeps the typed
+    /// strategy, while a replayed walk restores the list to Empty so replay
+    /// can execute the append from the original shape.  This exists only for
+    /// pyre's speculative-replay walk and can be removed when
+    /// single-executor tracing lands (gh#73/#34).  Entries are GC roots via
+    /// [`fbw_store_journal_root_walker`].
+    static FBW_APPEND_PROMOTE_JOURNAL: std::cell::RefCell<Vec<pyre_object::PyObjectRef>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+
     /// Undo log for the walked region's eagerly executed module-global
     /// `IntMutableCell` stores: `(cell, intvalue_before)` pairs pushed by the
     /// StoreName/StoreGlobal cell fold before it writes `cell.intvalue` in
@@ -9054,6 +9077,7 @@ pub(crate) struct MidBodyPayload {
 struct FbwStoreJournalRootArea {
     stores: *const std::cell::RefCell<Vec<[pyre_object::PyObjectRef; 3]>>,
     appends: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, usize)>>,
+    append_promote: *const std::cell::RefCell<Vec<pyre_object::PyObjectRef>>,
     abort_overrides: *const std::cell::RefCell<Vec<(usize, pyre_object::PyObjectRef)>>,
     cell_stores: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64)>>,
     sys_exc: *const std::cell::RefCell<Vec<pyre_object::PyObjectRef>>,
@@ -9066,6 +9090,7 @@ thread_local! {
     static FBW_STORE_JOURNAL_ROOT_AREA: FbwStoreJournalRootArea = FbwStoreJournalRootArea {
         stores: FBW_STORE_JOURNAL.with(|value| value as *const _),
         appends: FBW_APPEND_JOURNAL.with(|value| value as *const _),
+        append_promote: FBW_APPEND_PROMOTE_JOURNAL.with(|value| value as *const _),
         abort_overrides: FBW_ABORT_OUTER_STACK_OVERRIDES.with(|value| value as *const _),
         cell_stores: FBW_CELL_STORE_JOURNAL.with(|value| value as *const _),
         sys_exc: FBW_SYS_EXC_JOURNAL.with(|value| value as *const _),
@@ -9097,6 +9122,7 @@ fn fbw_built_exc_take(op: OpRef) -> bool {
 pub(crate) fn fbw_store_journal_reset() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
+    FBW_APPEND_PROMOTE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_CELL_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_SYS_EXC_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_UNJOURNALED_VALUE_UNAVAILABLE.with(|c| c.set(false));
@@ -9153,6 +9179,13 @@ pub(crate) fn fbw_append_journal_push(list: pyre_object::PyObjectRef, length_bef
     fbw_bump_executed_effect();
 }
 
+/// Record an Empty-list first append whose eager execution promoted the list
+/// to a typed strategy, for strategy restore when the walk does not commit.
+#[allow(dead_code)]
+pub(crate) fn fbw_append_promote_journal_push(list: pyre_object::PyObjectRef) {
+    FBW_APPEND_PROMOTE_JOURNAL.with(|j| j.borrow_mut().push(list));
+}
+
 /// Record the `intvalue` a walked eager `IntMutableCell` store displaces,
 /// for the in-place restore when the walk does not commit its end state.
 // Consumed by the StoreName/StoreGlobal cell fold
@@ -9182,6 +9215,7 @@ fn fbw_sys_exc_journal_push(displaced: pyre_object::PyObjectRef) {
 pub(crate) fn fbw_store_journal_commit() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
+    FBW_APPEND_PROMOTE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_CELL_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     // A committed walk keeps its eager `sys_exc_value` store (the compiled
     // trace or the adopted end state carries the same exception state), so
@@ -9548,6 +9582,18 @@ pub(crate) fn fbw_store_journal_rollback() {
                     // fold path records it); nothing to rewind.
                     pyre_object::listobject::ListStrategy::Empty => {}
                 }
+            }
+        }
+    });
+    // The length rewind above already shrank the list back to length 0.
+    // `w_list_clear` additionally restores the Empty strategy and drops the
+    // typed backing block, completing the undo of the Empty-to-typed switch
+    // that the length journal alone cannot undo.
+    FBW_APPEND_PROMOTE_JOURNAL.with(|j| {
+        let mut entries = j.borrow_mut();
+        while let Some(list) = entries.pop() {
+            unsafe {
+                pyre_object::listobject::w_list_clear(list);
             }
         }
     });
@@ -9952,6 +9998,13 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     }
     let appends = unsafe { &mut *(*area.appends).as_ptr() };
     for (list, _len) in appends.iter_mut() {
+        visitor(unsafe { &mut *(list as *mut pyre_object::PyObjectRef).cast() });
+    }
+    // SAFETY: promoted-list refs can be nursery-resident across the rest of
+    // the walk; a minor collection may move them before rollback restores
+    // Empty, so each journal slot is a root.
+    let append_promote = unsafe { &mut *(*area.append_promote).as_ptr() };
+    for list in append_promote.iter_mut() {
         visitor(unsafe { &mut *(list as *mut pyre_object::PyObjectRef).cast() });
     }
     // Nested-inline abort outer-frame stash: PyObjectRef slots kept across the
@@ -10475,10 +10528,33 @@ fn reconcile_vstack_at_boundary(
         return;
     };
     let class = classify_vstack_opcode(&instr, op_arg);
+    // #389(b): the py3.14 inlined comprehension emits a
+    // `SWAP`/`BUILD_LIST`/`SWAP` preamble before its `FOR_ITER`, which the
+    // codewriter lowers NON-MONOTONICALLY in jitcode — the JitCode-PC floor
+    // pivot maps a later jit_pc back to an EARLIER py_pc, so the walk re-visits
+    // those preamble py_pcs OUT OF ORDER (a backward py transition, then a
+    // forward re-walk of the just-visited py_pcs).  A `SWAP`/`COPY` never
+    // branches, so a backward py transition whose PREDECESSOR is a permutation
+    // op is unambiguously this lowering artifact, not real re-execution (a
+    // genuine loop back-edge leaves a `JUMP`/branch as the predecessor, class
+    // `PopOnlyOrSideStore`).  In the region the per-op replay is WRONG: it
+    // re-applies the `SWAP` effect and reuses a stale `vstack_last_ref`,
+    // dropping the just-built list from the mirror.  Reseed the whole mirror
+    // from the authoritative virtualizable shadow (kept current by the portal
+    // `setarrayitem_vable_r` pushes) instead, until the walk advances PAST the
+    // py_pc it backed off from (py order monotonic again).
+    if matches!(class, VstackOpClass::Swap(_) | VstackOpClass::Copy(_))
+        && (new_pypc as usize) < prev_pypc
+        && ctx.vstack_reorder_ceiling == u32::MAX
+    {
+        ctx.vstack_reorder_ceiling = prev_pypc as u32;
+    }
+    let in_reorder_region = ctx.vstack_reorder_ceiling != u32::MAX;
     if std::env::var_os("PYRE_VSTACK_DIAG").is_some() {
         eprintln!(
             "[vstack-reconcile] prev_pypc={prev_pypc} new_pypc={new_pypc} \
-             new_depth={new_depth} prev_depth={} class={class:?} last_ref={:?} instr={instr:?}",
+             new_depth={new_depth} prev_depth={} class={class:?} reorder={in_reorder_region} \
+             last_ref={:?} instr={instr:?}",
             ctx.vstack_depth, ctx.vstack_last_ref
         );
     }
@@ -10489,7 +10565,14 @@ fn reconcile_vstack_at_boundary(
     // (LOAD_FAST / LOAD_NAME / COPY results) — values that may NOT be present
     // in the virtualizable shadow (function-local LOAD_FAST temps live only
     // in the walk register bank, never written through to the portal array).
-    match class {
+    // Inside the out-of-order permutation region the per-op replay is invalid;
+    // reseed from the shadow (same shape as `ShadowReseed`).
+    let effective_class = if in_reorder_region {
+        VstackOpClass::ShadowReseed
+    } else {
+        class
+    };
+    match effective_class {
         VstackOpClass::ResultToTos => {
             ctx.vstack_boxes.truncate(new_depth);
             if ctx.vstack_boxes.len() < new_depth {
@@ -10606,6 +10689,12 @@ fn reconcile_vstack_at_boundary(
         ctx.vstack_cur_pypc = new_pypc;
         ctx.vstack_depth = new_depth;
         ctx.vstack_last_ref = OpRef::NONE;
+    }
+    // #389(b): leave the out-of-order permutation region once the walk has
+    // advanced PAST the py_pc it backed off from — py order is monotonic again
+    // and the per-op reconcile is valid from here.
+    if ctx.vstack_reorder_ceiling != u32::MAX && new_pypc > ctx.vstack_reorder_ceiling {
+        ctx.vstack_reorder_ceiling = u32::MAX;
     }
 }
 
@@ -16468,6 +16557,7 @@ fn try_walker_inline_resolved_user_call(
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
             trace_ctx: ctx.trace_ctx,
@@ -20064,6 +20154,20 @@ fn newlist_virt_enabled() -> bool {
     *ENABLED
 }
 
+/// `PYRE_EMPTY_APPEND_VIRT` gate (read once) — admits the empty-list first
+/// append into the orthodox `w_list_append` fold by promoting the receiver
+/// Empty→typed (recording the strategy switch as inline IR) before the
+/// spare-capacity fold runs, instead of aborting with
+/// `UnfoldableListAppendResidualUnsupported`.  Default-on (the orthodox
+/// `EmptyListStrategy.append` → `switch_to_correct_strategy` shape); set
+/// `PYRE_EMPTY_APPEND_VIRT=0` to fall back to the residual abort.
+fn empty_append_virt_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("PYRE_EMPTY_APPEND_VIRT").map_or(true, |v| v != "0")
+    });
+    *ENABLED
+}
+
 /// #171: FBW virtualization of a non-escaping BUILD_LIST.
 /// `lower_tuple_build_hlop_to_insn` lowers BUILD_LIST to `new_array_clear`
 /// + per-index `setarrayitem_gc` + a `newlist_from_array` residual
@@ -21765,9 +21869,38 @@ unsafe fn orthodox_list_append_recognize(
     // fits-int results to `W_IntObject` across arithmetic / `int(str)` /
     // literals, so the long arm is an unreachable optimization and the
     // decline is correctness-safe (the generic residual handles it).
-    if !pyre_object::pyobject::is_list(inner_self)
-        || !pyre_object::w_list_can_append_without_realloc(inner_self)
-    {
+    if !pyre_object::pyobject::is_list(inner_self) {
+        return None;
+    }
+    // Empty-strategy first-append promotion (gated). `w_list_can_append_without_realloc`
+    // is false for Empty (no backing block yet), so classify by the value's
+    // type using switch_to_correct_strategy's int -> float -> object order
+    // (listobject.py:1154) and let the commit path install the typed storage.
+    if pyre_object::w_list_uses_empty_storage(inner_self) {
+        if !empty_append_virt_enabled() {
+            // Gate off: preserve the prior behavior (Empty always declined).
+            return None;
+        }
+        let int_ok = pyre_object::is_plain_int1(value)
+            && !pyre_object::pyobject::is_long(value)
+            && !(pyre_object::tagged_int::CAN_BE_TAGGED
+                && pyre_object::tagged_int::is_tagged_int(value));
+        let float_ok = !value.is_null() && pyre_object::is_plain_float_strict(value);
+        // switch_to_correct_strategy routes `is_plain_int1` -> Integer with no
+        // tagged exclusion. Exclude any plain-int / float from the object
+        // fallback so a tagged-int / fits-int `W_LongObject` DECLINES (generic
+        // residual) instead of mis-routing to Object and diverging the traced
+        // strategy from the concrete one the commit installs.
+        let obj_ok = !value.is_null()
+            && !pyre_object::is_plain_int1(value)
+            && !pyre_object::is_plain_float_strict(value);
+        if !int_ok && !float_ok && !obj_ok {
+            return None;
+        }
+        // Empty length is 0 (the journal rewind point).
+        return Some(0);
+    }
+    if !pyre_object::w_list_can_append_without_realloc(inner_self) {
         return None;
     }
     // Int-storage specialization: plain-int value stored unboxed (a
@@ -21849,6 +21982,55 @@ fn orthodox_list_append_commit(
         self_ref,
         majit_ir::Value::Ref(majit_ir::GcRef(inner_self as usize)),
     );
+
+    // Empty-strategy first-append promotion (gated): install typed storage on
+    // the receiver BEFORE the value-class pin / storage read below, so those
+    // observe the post-promotion strategy. Classify the target strategy from
+    // the value with recognize's int -> float -> object guards
+    // (switch_to_correct_strategy, listobject.py:1154), then emit the
+    // transition IR mutating the existing wrapper, promote the concrete list,
+    // and journal the rewind to Empty.
+    use pyre_object::listobject::ListStrategy;
+    let promote_empty = empty_append_virt_enabled()
+        && unsafe { pyre_object::w_list_uses_empty_storage(inner_self) };
+    if promote_empty {
+        let target = unsafe {
+            let int_ok = pyre_object::is_plain_int1(value)
+                && !pyre_object::pyobject::is_long(value)
+                && !(pyre_object::tagged_int::CAN_BE_TAGGED
+                    && pyre_object::tagged_int::is_tagged_int(value));
+            if int_ok {
+                ListStrategy::Integer
+            } else if !value.is_null() && pyre_object::is_plain_float_strict(value) {
+                ListStrategy::Float
+            } else {
+                ListStrategy::Object
+            }
+        };
+        // Guard the current (Empty) strategy so a deopt re-enters the empty
+        // path (mirror of `MIFrame::guard_list_strategy`: getfield strategy +
+        // GuardValue + replace_box).
+        let strategy_ref = crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            self_ref,
+            crate::descr::list_strategy_descr(),
+        );
+        let expected = ctx.trace_ctx.const_int(ListStrategy::Empty as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[strategy_ref, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(strategy_ref, expected);
+        // Emit the transition IR mutating the existing wrapper (helpers.rs).
+        // The emitter seeds the new block's capacity getfield cache so the
+        // append body sub-walk's spare-capacity `0 < capacity` check folds.
+        crate::helpers::emit_promote_empty_list_inline(ctx.trace_ctx, self_ref, target);
+        // Concrete promotion of the real list, then journal so a non-commit
+        // walk rolls back to Empty.
+        unsafe { pyre_object::w_list_switch_to_strategy_for(inner_self, value) };
+        fbw_append_promote_journal_push(inner_self);
+    }
 
     // Pin the appended value's class so the inlined `is_plain_int1` type
     // predicate folds during the sub-walk: guard_class(value, INT_TYPE) +
@@ -25239,6 +25421,7 @@ fn run_sub_jitcode_walk(
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -28021,6 +28204,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -28092,6 +28276,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -28153,6 +28338,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -28232,6 +28418,7 @@ mod tests {
                 vstack_cur_pypc: 0,
                 vstack_valid: false,
                 vstack_last_ref: OpRef::NONE,
+                vstack_reorder_ceiling: u32::MAX,
                 live_before_jit_pc: usize::MAX,
                 live_after_jit_pc: usize::MAX,
             };
@@ -28422,6 +28609,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -28484,6 +28672,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -28545,6 +28734,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -28615,6 +28805,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -28677,6 +28868,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -28738,6 +28930,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -29008,6 +29201,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -29182,6 +29376,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -29304,6 +29499,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -29420,6 +29616,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -29525,6 +29722,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -29627,6 +29825,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -29710,6 +29909,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -29772,6 +29972,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -29830,6 +30031,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -29897,6 +30099,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -29962,6 +30165,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30030,6 +30234,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30114,6 +30319,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30186,6 +30392,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30259,6 +30466,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30320,6 +30528,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30384,6 +30593,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30448,6 +30658,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30560,6 +30771,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30620,6 +30832,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30693,6 +30906,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30797,6 +31011,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30902,6 +31117,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30984,6 +31200,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31043,6 +31260,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31166,6 +31384,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31293,6 +31512,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31367,6 +31587,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31438,6 +31659,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31500,6 +31722,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31561,6 +31784,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31642,6 +31866,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31711,6 +31936,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31771,6 +31997,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31830,6 +32057,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31900,6 +32128,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32096,6 +32325,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32238,6 +32468,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32332,6 +32563,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32404,6 +32636,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32501,6 +32734,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32578,6 +32812,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32638,6 +32873,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32700,6 +32936,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32770,6 +33007,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32832,6 +33070,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32921,6 +33160,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32992,6 +33232,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -33081,6 +33322,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -33181,6 +33423,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -33355,6 +33598,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -33446,6 +33690,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -33508,6 +33753,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -33585,6 +33831,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -33686,6 +33933,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -33791,6 +34039,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -33871,6 +34120,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -33939,6 +34189,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34002,6 +34253,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34076,6 +34328,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34152,6 +34405,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34248,6 +34502,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34333,6 +34588,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34417,6 +34673,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34481,6 +34738,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34583,6 +34841,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34684,6 +34943,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34793,6 +35053,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34934,6 +35195,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -35011,6 +35273,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -35074,6 +35337,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -35161,6 +35425,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -35293,6 +35558,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -35401,6 +35667,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -35508,6 +35775,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -35594,6 +35862,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -35683,6 +35952,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -35770,6 +36040,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -35862,6 +36133,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -35952,6 +36224,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36031,6 +36304,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36131,6 +36405,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36209,6 +36484,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36275,6 +36551,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36353,6 +36630,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36451,6 +36729,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36539,6 +36818,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36605,6 +36885,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36697,6 +36978,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36772,6 +37054,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36858,6 +37141,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36932,6 +37216,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -37257,6 +37542,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -37341,6 +37627,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -37436,6 +37723,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -37505,6 +37793,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };

@@ -1229,6 +1229,19 @@ pub unsafe fn w_list_clear(obj: PyObjectRef) {
     list.strategy = ListStrategy::Empty;
 }
 
+/// listobject.py:1154-1168 EmptyListStrategy.switch_to_correct_strategy —
+/// public entry for the JIT's empty-append promotion. Installs empty typed
+/// storage (capacity-1 block, length 0) matching `value`'s type, WITHOUT
+/// appending. The caller performs the append afterward (the typed spare-
+/// capacity leg). Only valid on an Empty-strategy list.
+/// # Safety
+/// `obj` must point to a valid Empty-strategy `W_ListObject`; `value` live.
+pub unsafe fn w_list_switch_to_strategy_for(obj: PyObjectRef, value: PyObjectRef) {
+    let list = &mut *(obj as *mut W_ListObject);
+    debug_assert_eq!(list.strategy, ListStrategy::Empty);
+    switch_to_correct_strategy(list, value);
+}
+
 /// listobject.py:1873-1874 IntegerListStrategy.reverse
 /// Strategy-preserving: reverses typed storage in place.
 pub unsafe fn w_list_reverse(obj: PyObjectRef) {

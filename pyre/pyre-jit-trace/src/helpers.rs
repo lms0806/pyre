@@ -1252,6 +1252,126 @@ pub fn emit_typed_list_inline(
     list
 }
 
+/// Empty->typed in-place promotion of an existing `W_ListObject` wrapper (the
+/// comprehension accumulator). Mirrors `switch_to_correct_strategy`'s concrete
+/// effect as field mutations on `list_op`: allocate the capacity-1 typed
+/// backing block, then set strategy and the matching empty storage fields.
+/// Length stays 0; the subsequent append body sub-walk fills slot 0 through
+/// the spare-capacity leg.
+pub fn emit_promote_empty_list_inline(
+    ctx: &mut TraceCtx,
+    list_op: OpRef,
+    strategy: pyre_object::listobject::ListStrategy,
+) {
+    use crate::descr::{
+        list_float_items_block_descr, list_float_items_len_descr, list_int_items_block_descr,
+        list_int_items_len_descr, list_items_descr, list_length_descr, list_strategy_descr,
+    };
+    use crate::state::{float_gcarray_descr, int_gcarray_descr, pyobject_gcarray_descr};
+
+    let cap_ref = ctx.const_int(1);
+    let zero_ref = ctx.const_int(0);
+
+    match strategy {
+        pyre_object::listobject::ListStrategy::Integer => {
+            let array_descr = int_gcarray_descr();
+            let block = ctx.record_op_with_descr(OpCode::NewArray, &[cap_ref], array_descr);
+            ctx.heap_cache_mut().new_array(block, cap_ref, true);
+
+            let strategy_const = ctx.const_int(strategy as i64);
+            let strategy_descr = list_strategy_descr();
+            let strategy_idx = strategy_descr.index();
+            ctx.record_op_with_descr(
+                OpCode::SetfieldGc,
+                &[list_op, strategy_const],
+                strategy_descr,
+            );
+            ctx.heapcache_setfield_cached(list_op, strategy_idx, strategy_const);
+
+            let items_len_descr = list_int_items_len_descr();
+            let items_len_idx = items_len_descr.index();
+            ctx.record_op_with_descr(OpCode::SetfieldGc, &[list_op, zero_ref], items_len_descr);
+            ctx.heapcache_setfield_cached(list_op, items_len_idx, zero_ref);
+
+            let items_block_descr = list_int_items_block_descr();
+            let items_block_idx = items_block_descr.index();
+            ctx.record_op_with_descr(OpCode::SetfieldGc, &[list_op, block], items_block_descr);
+            ctx.heapcache_setfield_cached(list_op, items_block_idx, block);
+            // Seed the block's capacity getfield cache with the const (1). The
+            // block is a fresh const-size allocation whose capacity is known,
+            // matching the heapcache length tracking a `new_array` gets for a
+            // const-length array (heapcache.py:508 `new_array` →
+            // `arraylen_now_known`). The append body sub-walk reads
+            // `ItemsBlock.capacity` via a getfield (not arraylen), so seed that
+            // field-index channel explicitly; otherwise the read stays symbolic
+            // and the spare-capacity `0 < capacity` branch cannot fold.
+            let cap_idx = crate::descr::items_block_capacity_descr().index();
+            ctx.heapcache_setfield_cached(block, cap_idx, cap_ref);
+        }
+        pyre_object::listobject::ListStrategy::Float => {
+            let array_descr = float_gcarray_descr();
+            let block = ctx.record_op_with_descr(OpCode::NewArray, &[cap_ref], array_descr);
+            ctx.heap_cache_mut().new_array(block, cap_ref, true);
+
+            let strategy_const = ctx.const_int(strategy as i64);
+            let strategy_descr = list_strategy_descr();
+            let strategy_idx = strategy_descr.index();
+            ctx.record_op_with_descr(
+                OpCode::SetfieldGc,
+                &[list_op, strategy_const],
+                strategy_descr,
+            );
+            ctx.heapcache_setfield_cached(list_op, strategy_idx, strategy_const);
+
+            let items_len_descr = list_float_items_len_descr();
+            let items_len_idx = items_len_descr.index();
+            ctx.record_op_with_descr(OpCode::SetfieldGc, &[list_op, zero_ref], items_len_descr);
+            ctx.heapcache_setfield_cached(list_op, items_len_idx, zero_ref);
+
+            let items_block_descr = list_float_items_block_descr();
+            let items_block_idx = items_block_descr.index();
+            ctx.record_op_with_descr(OpCode::SetfieldGc, &[list_op, block], items_block_descr);
+            ctx.heapcache_setfield_cached(list_op, items_block_idx, block);
+            // Seed the block's capacity getfield cache with the const (1); see
+            // the Integer arm above for the rationale (const-size block, getfield
+            // capacity channel distinct from the `new_array` arraylen seed).
+            let cap_idx = crate::descr::items_block_capacity_descr().index();
+            ctx.heapcache_setfield_cached(block, cap_idx, cap_ref);
+        }
+        pyre_object::listobject::ListStrategy::Object => {
+            let array_descr = pyobject_gcarray_descr();
+            let block = ctx.record_op_with_descr(OpCode::NewArrayClear, &[cap_ref], array_descr);
+            ctx.heap_cache_mut().new_array(block, cap_ref, true);
+
+            let strategy_const = ctx.const_int(strategy as i64);
+            let strategy_descr = list_strategy_descr();
+            let strategy_idx = strategy_descr.index();
+            ctx.record_op_with_descr(
+                OpCode::SetfieldGc,
+                &[list_op, strategy_const],
+                strategy_descr,
+            );
+            ctx.heapcache_setfield_cached(list_op, strategy_idx, strategy_const);
+
+            let length_descr = list_length_descr();
+            let length_idx = length_descr.index();
+            ctx.record_op_with_descr(OpCode::SetfieldGc, &[list_op, zero_ref], length_descr);
+            ctx.heapcache_setfield_cached(list_op, length_idx, zero_ref);
+
+            let items_descr = list_items_descr();
+            let items_idx = items_descr.index();
+            ctx.record_op_with_descr(OpCode::SetfieldGc, &[list_op, block], items_descr);
+            ctx.heapcache_setfield_cached(list_op, items_idx, block);
+            // Object storage needs no capacity seed: the append body reads
+            // capacity through `list.items` (list_items_descr), a path that
+            // already resolves to the concrete block.
+        }
+        pyre_object::listobject::ListStrategy::Empty => {
+            debug_assert_ne!(strategy, pyre_object::listobject::ListStrategy::Empty);
+        }
+    }
+}
+
 /// Emit inline `space.newslice(w_start, w_end, w_step)` creation
 /// (NewWithVtable + 3 SetfieldGc).
 ///
