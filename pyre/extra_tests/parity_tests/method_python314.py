@@ -117,4 +117,40 @@ assert reconstructor is getattr
 assert reduce_args == (c, "method")
 assert reconstructor(*reduce_args).__func__ is function
 
+try:
+    types.MethodType.__getattribute__(bound, 123)
+except TypeError:
+    pass
+else:
+    raise AssertionError("method.__getattribute__ accepted a non-string name")
+
+for name, args in (
+    ("__call__", ()),
+    ("__get__", (None, C)),
+    ("__getattribute__", ("__name__",)),
+    ("__eq__", (bound,)),
+    ("__ne__", (bound,)),
+    ("__lt__", (bound,)),
+    ("__le__", (bound,)),
+    ("__gt__", (bound,)),
+    ("__ge__", (bound,)),
+    ("__hash__", ()),
+    ("__repr__", ()),
+    ("__reduce__", ()),
+):
+    try:
+        types.MethodType.__dict__[name](object(), *args)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError(f"method {name} accepted a foreign receiver")
+
+for name in ("__doc__", "__func__", "__self__"):
+    try:
+        types.MethodType.__dict__[name].__get__(object())
+    except TypeError:
+        pass
+    else:
+        raise AssertionError(f"method {name} accepted a foreign receiver")
+
 print("OK")

@@ -193,6 +193,203 @@ pub(crate) fn require_receiver(args: &[PyObjectRef], name: &str) -> Result<(), c
     Ok(())
 }
 
+/// The receiver check normally supplied by PyPy's
+/// `interp2app(W_ListObject.descr_*)` gateway.  CPython 3.14 exposes list's
+/// slot wrappers and ordinary methods as two descriptor kinds with distinct
+/// public mismatch messages, so callers identify which surface they expose.
+pub(crate) fn require_list_receiver(
+    args: &[PyObjectRef],
+    name: &str,
+    method_descriptor: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let Some(&receiver) = args.first() else {
+        let message = if method_descriptor {
+            format!("unbound method list.{name}() needs an argument")
+        } else {
+            format!("descriptor '{name}' of 'list' object needs an argument")
+        };
+        return Err(crate::PyError::type_error(message));
+    };
+    if !unsafe { pyre_object::is_list(receiver) } {
+        let received = crate::baseobjspace::object_functionstr_type_name(receiver);
+        let message = if method_descriptor {
+            format!("descriptor '{name}' for 'list' objects doesn't apply to a '{received}' object")
+        } else {
+            format!("descriptor '{name}' requires a 'list' object but received a '{received}'")
+        };
+        return Err(crate::PyError::type_error(message));
+    }
+    Ok(receiver)
+}
+
+/// The receiver check supplied by PyPy's
+/// `interp2app(W_AbstractTupleObject.descr_*)` gateway.  As with list,
+/// CPython 3.14 distinguishes slot-wrapper and method-descriptor mismatch
+/// messages on the public surface.
+pub(crate) fn require_tuple_receiver(
+    args: &[PyObjectRef],
+    name: &str,
+    method_descriptor: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let Some(&receiver) = args.first() else {
+        let message = if method_descriptor {
+            format!("unbound method tuple.{name}() needs an argument")
+        } else {
+            format!("descriptor '{name}' of 'tuple' object needs an argument")
+        };
+        return Err(crate::PyError::type_error(message));
+    };
+    if !unsafe { pyre_object::is_tuple(receiver) } {
+        let received = crate::baseobjspace::object_functionstr_type_name(receiver);
+        let message = if method_descriptor {
+            format!(
+                "descriptor '{name}' for 'tuple' objects doesn't apply to a '{received}' object"
+            )
+        } else {
+            format!("descriptor '{name}' requires a 'tuple' object but received a '{received}'")
+        };
+        return Err(crate::PyError::type_error(message));
+    }
+    Ok(receiver)
+}
+
+/// The receiver check supplied by PyPy's
+/// `interp2app(W_SetObject.descr_*)` gateway.  CPython 3.14 exposes set's
+/// slot wrappers and ordinary methods as two descriptor kinds with distinct
+/// public mismatch messages.
+pub(crate) fn require_set_receiver(
+    args: &[PyObjectRef],
+    name: &str,
+    method_descriptor: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let Some(&receiver) = args.first() else {
+        let message = if method_descriptor {
+            format!("unbound method set.{name}() needs an argument")
+        } else {
+            format!("descriptor '{name}' of 'set' object needs an argument")
+        };
+        return Err(crate::PyError::type_error(message));
+    };
+    if !unsafe { pyre_object::is_set(receiver) } {
+        let received = crate::baseobjspace::object_functionstr_type_name(receiver);
+        let message = if method_descriptor {
+            format!("descriptor '{name}' for 'set' objects doesn't apply to a '{received}' object")
+        } else {
+            format!("descriptor '{name}' requires a 'set' object but received a '{received}'")
+        };
+        return Err(crate::PyError::type_error(message));
+    }
+    Ok(receiver)
+}
+
+/// The receiver check supplied by PyPy's
+/// `interp2app(W_FrozensetObject.descr_*)` gateway.  The inherited
+/// `W_BaseSetObject` implementation is shared with set, while the gateway
+/// still requires a frozenset receiver.
+pub(crate) fn require_frozenset_receiver(
+    args: &[PyObjectRef],
+    name: &str,
+    method_descriptor: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let Some(&receiver) = args.first() else {
+        let message = if method_descriptor {
+            format!("unbound method frozenset.{name}() needs an argument")
+        } else {
+            format!("descriptor '{name}' of 'frozenset' object needs an argument")
+        };
+        return Err(crate::PyError::type_error(message));
+    };
+    if !unsafe { pyre_object::is_frozenset(receiver) } {
+        let received = crate::baseobjspace::object_functionstr_type_name(receiver);
+        let message = if method_descriptor {
+            format!(
+                "descriptor '{name}' for 'frozenset' objects doesn't apply to a '{received}' object"
+            )
+        } else {
+            format!("descriptor '{name}' requires a 'frozenset' object but received a '{received}'")
+        };
+        return Err(crate::PyError::type_error(message));
+    }
+    Ok(receiver)
+}
+
+/// The receiver check supplied by PyPy's
+/// `interp2app(W_SetIterObject.descr_*)` gateway.  Python 3.14 exposes
+/// `__iter__`/`__next__` as slot wrappers and the remaining operations as
+/// method descriptors.
+pub(crate) fn require_set_iterator_receiver(
+    args: &[PyObjectRef],
+    name: &str,
+    method_descriptor: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let Some(&receiver) = args.first() else {
+        let message = if method_descriptor {
+            format!("unbound method set_iterator.{name}() needs an argument")
+        } else {
+            format!("descriptor '{name}' of 'set_iterator' object needs an argument")
+        };
+        return Err(crate::PyError::type_error(message));
+    };
+    if !unsafe { pyre_object::is_set_iterator(receiver) } {
+        let received = crate::baseobjspace::object_functionstr_type_name(receiver);
+        let message = if method_descriptor {
+            format!(
+                "descriptor '{name}' for 'set_iterator' objects doesn't apply to a '{received}' object"
+            )
+        } else {
+            format!(
+                "descriptor '{name}' requires a 'set_iterator' object but received a '{received}'"
+            )
+        };
+        return Err(crate::PyError::type_error(message));
+    }
+    Ok(receiver)
+}
+
+/// Receiver validation supplied by `W_AbstractRangeIterator.typedef`'s
+/// gateways. Python 3.14 gives the machine-word and arbitrary-precision
+/// implementations distinct public owner names even though PyPy shares the
+/// abstract typedef implementation.
+pub(crate) fn require_range_iterator_receiver(
+    args: &[PyObjectRef],
+    name: &str,
+    method_descriptor: bool,
+    long: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let owner = if long {
+        "longrange_iterator"
+    } else {
+        "range_iterator"
+    };
+    let Some(&receiver) = args.first() else {
+        let message = if method_descriptor {
+            format!("unbound method {owner}.{name}() needs an argument")
+        } else {
+            format!("descriptor '{name}' of '{owner}' object needs an argument")
+        };
+        return Err(crate::PyError::type_error(message));
+    };
+    let matches = unsafe {
+        if long {
+            pyre_object::is_long_range_iter(receiver)
+        } else {
+            pyre_object::is_range_iter(receiver)
+        }
+    };
+    if !matches {
+        let received = crate::baseobjspace::object_functionstr_type_name(receiver);
+        let message = if method_descriptor {
+            format!(
+                "descriptor '{name}' for '{owner}' objects doesn't apply to a '{received}' object"
+            )
+        } else {
+            format!("descriptor '{name}' requires a '{owner}' object but received a '{received}'")
+        };
+        return Err(crate::PyError::type_error(message));
+    }
+    Ok(receiver)
+}
+
 /// Receiver-only arity for `str` methods that take no arguments (`isspace`,
 /// `lower`, …).  Rejects a missing receiver and any extra positional argument,
 /// matching `str.{name}() takes no arguments (N given)`.
@@ -215,12 +412,14 @@ pub(crate) fn require_no_args(args: &[PyObjectRef], name: &str) -> Result<(), cr
 // All take self (list) as first arg.
 
 pub fn list_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    require_list_receiver(args, "append", true)?;
     arity_exact(args, "list.append", 1)?;
     unsafe { w_list_append(args[0], args[1]) };
     Ok(w_none())
 }
 
 pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    require_list_receiver(args, "extend", true)?;
     arity_exact(args, "list.extend", 1)?;
     let list = args[0];
     let other = args[1];
@@ -277,6 +476,7 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// PyPy: listobject.py descr_insert — list.insert(index, item)
 pub fn list_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    require_list_receiver(args, "insert", true)?;
     arity_exact_unpack(args, "insert", 2)?;
     // `@unwrap_spec(index='index')` → getindex_w(index, OverflowError): coerce
     // through `__index__`; `get_positive_index` then clamps to `[0, len]`
@@ -290,7 +490,7 @@ pub fn list_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// listobject.py:759-772 — empty list raises "pop from empty list",
 /// otherwise out-of-range raises "pop index out of range".
 pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "pop")?;
+    require_list_receiver(args, "pop", true)?;
     // `descr_pop` checks arity before touching the list, so `pop(1, 2)` on an
     // empty list reports the surplus argument rather than "pop from empty list".
     arity_at_most(args, "pop", 1)?;
@@ -319,14 +519,14 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 
 /// PyPy: listobject.py descr_clear — list.clear()
 pub fn list_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "clear")?;
+    require_list_receiver(args, "clear", true)?;
     unsafe { pyre_object::listobject::w_list_clear(args[0]) };
     Ok(w_none())
 }
 
 /// PyPy: listobject.py descr_copy — list.copy()
 pub fn list_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "copy")?;
+    require_list_receiver(args, "copy", true)?;
     let list = args[0];
     unsafe {
         let n = w_list_len(list);
@@ -342,14 +542,14 @@ pub fn list_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 
 /// PyPy: listobject.py descr_reverse — list.reverse()
 pub fn list_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "reverse")?;
+    require_list_receiver(args, "reverse", true)?;
     unsafe { pyre_object::listobject::w_list_reverse(args[0]) };
     Ok(w_none())
 }
 
 /// PyPy: listobject.py descr_sort — list.sort()
 pub fn list_method_sort(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "sort")?;
+    require_list_receiver(args, "sort", true)?;
     let list = args[0];
     // Keep the argument decoding shared with `sorted()` before changing the
     // receiver's visible storage.
@@ -420,6 +620,7 @@ pub fn list_method_sort(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 
 /// listobject.py:795 `descr_index` — list.index(value[, start[, stop]]).
 pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    require_list_receiver(args, "index", true)?;
     arity_at_least(args, "index", 1)?;
     arity_at_most(args, "index", 3)?;
     let list = args[0];
@@ -461,6 +662,7 @@ pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 /// listobject.py:744 `descr_count` — list.count(value)
 pub fn list_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    require_list_receiver(args, "count", true)?;
     arity_exact(args, "list.count", 1)?;
     let list = args[0];
     let value = args[1];
@@ -475,6 +677,7 @@ pub fn list_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 /// listobject.py:782 `descr_remove` — list.remove(value).
 pub fn list_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    require_list_receiver(args, "remove", true)?;
     arity_exact(args, "list.remove", 1)?;
     crate::listobject::w_list_remove(args[0], args[1])?;
     Ok(w_none())
@@ -5235,25 +5438,29 @@ mod dict_method_tests {
 
 /// PyPy: tupleobject.py descr_index — tuple.index(value)
 pub fn tuple_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    require_tuple_receiver(args, "index", true)?;
     if args.len() < 2 {
         return Err(crate::PyError::type_error(format!(
             "index expected at least 1 argument, got {}",
             args.len().saturating_sub(1)
         )));
     }
+    if args.len() > 4 {
+        return Err(crate::PyError::type_error(format!(
+            "index expected at most 3 arguments, got {}",
+            args.len() - 1
+        )));
+    }
     let tup = args[0];
     let value = args[1];
-    unsafe {
-        let n = w_tuple_len(tup);
-        for i in 0..n {
-            if let Some(item) = w_tuple_getitem(tup, i as i64) {
-                if std::ptr::eq(item, value) {
-                    return Ok(w_int_new(i as i64));
-                }
-                if is_int(item) && is_int(value) && w_int_get_value(item) == w_int_get_value(value)
-                {
-                    return Ok(w_int_new(i as i64));
-                }
+    let length = unsafe { w_tuple_len(tup) } as i64;
+    let w_start = args.get(2).copied().unwrap_or_else(|| w_int_new(0));
+    let w_stop = args.get(3).copied().unwrap_or_else(|| w_int_new(i64::MAX));
+    let (start, stop) = crate::sliceobject::unwrap_start_stop(length, w_start, w_stop)?;
+    for i in start..stop.min(length) {
+        if let Some(item) = unsafe { w_tuple_getitem(tup, i) } {
+            if crate::baseobjspace::eq_w(item, value)? {
+                return Ok(w_int_new(i));
             }
         }
     }
@@ -5264,6 +5471,7 @@ pub fn tuple_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// PyPy: tupleobject.py descr_count — tuple.count(value)
 pub fn tuple_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    require_tuple_receiver(args, "count", true)?;
     if args.len() != 2 {
         return Err(crate::PyError::type_error(format!(
             "tuple.count() takes exactly one argument ({} given)",
@@ -5277,11 +5485,7 @@ pub fn tuple_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         let n = w_tuple_len(tup);
         for i in 0..n {
             if let Some(item) = w_tuple_getitem(tup, i as i64) {
-                if std::ptr::eq(item, value)
-                    || (is_int(item)
-                        && is_int(value)
-                        && w_int_get_value(item) == w_int_get_value(value))
-                {
+                if crate::baseobjspace::eq_w(item, value)? {
                     count += 1;
                 }
             }

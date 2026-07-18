@@ -1339,30 +1339,25 @@ fn memoryview_exit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     memoryview_release(&args[..1])
 }
 
-/// The raw logical bytes (`view.as_str`) of an operand that exports a
-/// contiguous buffer, or `None` when it exports none (so `__eq__` returns
-/// NotImplemented).  `descr__cmp` compares the two `as_str` byte strings,
-/// mirroring `space.buffer_w(w_other, space.BUF_CONTIG_RO)`: a memoryview,
-/// a bytes-like object, or a non-bytes contiguous exporter (`array.array`)
-/// are all gathered to bytes and compared.
-unsafe fn memoryview_operand_bytes(obj: PyObjectRef) -> Option<Vec<u8>> {
-    unsafe {
-        if pyre_object::memoryview::is_w_memoryview(obj) {
-            // A released view has no buffer to gather (its box is dropped);
-            // `descr__cmp` falls through to identity, so report no bytes.
-            if pyre_object::memoryview::w_memoryview_released(obj) {
-                return None;
-            }
-            return Some(memoryview_gather_bytes(obj));
-        }
-        if pyre_object::bytesobject::is_bytes_like(obj) {
-            return Some(pyre_object::bytesobject::bytes_like_data(obj).to_vec());
-        }
-        if let Ok(Some(b)) = crate::typedef::buffer_as_bytes_like(obj) {
-            return Some(pyre_object::bytesobject::bytes_like_data(b).to_vec());
-        }
-        None
+/// Gateway receiver check shared by the rich-comparison descriptors.  The
+/// type slot normally guarantees this, but direct descriptor calls must raise
+/// instead of interpreting an arbitrary object as `W_MemoryView`.
+fn memoryview_receiver(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if mv.is_null() {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' of 'memoryview' object needs an argument"
+        )));
     }
+    if !unsafe { pyre_object::memoryview::is_w_memoryview(mv) } {
+        let received = crate::typedef::r#type(mv)
+            .map(|t| unsafe { pyre_object::w_type_get_name(t) })
+            .unwrap_or("object");
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' requires a 'memoryview' object but received a '{received}'"
+        )));
+    }
+    Ok(mv)
 }
 
 /// True when `mv` or a memoryview `other` operand is released — either side
@@ -1375,39 +1370,148 @@ unsafe fn memoryview_released_either(mv: PyObjectRef, other: PyObjectRef) -> boo
     }
 }
 
-/// `memoryview.__eq__` — `descr__cmp('eq')`: compares the two views'
-/// raw byte strings (`as_str`); NotImplemented for any other operand.
-fn memoryview_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
+/// Python 3.14 `memory_richcompare`: equality first requires equivalent
+/// shapes, then compares unpacked element values.  Raw bytes are deliberately
+/// insufficient (`int(1)` and `float(1.0)` compare equal despite different
+/// encodings, while identical bytes can decode to unequal values).
+fn memoryview_compare_eq(args: &[PyObjectRef], name: &str) -> Result<Option<bool>, crate::PyError> {
+    let mv = memoryview_receiver(args, name)?;
     let other = args.get(1).copied().unwrap_or(w_none());
     unsafe {
-        // A released view (on either side) compares by identity (`view is None`
-        // branch); its backing must not be read after release.
         if memoryview_released_either(mv, other) {
-            return Ok(w_bool_from(mv == other));
+            return Ok(Some(mv == other));
         }
-        let a = memoryview_gather_bytes(mv);
-        match memoryview_operand_bytes(other) {
-            Some(b) => Ok(w_bool_from(a == b)),
-            None => Ok(pyre_object::w_not_implemented()),
+
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(mv);
+        pyre_object::gc_roots::pin_root(other);
+        let other = pyre_object::gc_roots::shadow_stack_get(base + 1);
+        let (rhs, temporary) = if pyre_object::memoryview::is_w_memoryview(other) {
+            (other, false)
+        } else {
+            match w_memoryview_new(other) {
+                Ok(view) => {
+                    pyre_object::gc_roots::pin_root(view);
+                    (pyre_object::gc_roots::shadow_stack_get(base + 2), true)
+                }
+                // `PyObject_GetBuffer(..., PyBUF_FULL_RO)` failures are
+                // cleared by CPython's `memory_richcompare`.
+                Err(_) => return Ok(None),
+            }
+        };
+        let lhs = pyre_object::gc_roots::shadow_stack_get(base);
+        let comparison = (|| -> Result<bool, crate::PyError> {
+            if pyre_object::memoryview::w_memoryview_ndim(lhs)
+                != pyre_object::memoryview::w_memoryview_ndim(rhs)
+                || pyre_object::memoryview::w_memoryview_native_shape(lhs)
+                    != pyre_object::memoryview::w_memoryview_native_shape(rhs)
+            {
+                return Ok(false);
+            }
+            let lhs_data = memoryview_gather_bytes(lhs);
+            let rhs_data = memoryview_gather_bytes(rhs);
+            let lhs_size = pyre_object::memoryview::w_memoryview_itemsize(lhs) as usize;
+            let rhs_size = pyre_object::memoryview::w_memoryview_itemsize(rhs) as usize;
+            if lhs_size == 0 || rhs_size == 0 {
+                return Ok(lhs_data.is_empty() && rhs_data.is_empty());
+            }
+            let count = lhs_data.len() / lhs_size;
+            if count != rhs_data.len() / rhs_size {
+                return Ok(false);
+            }
+            let lhs_fmt = pyre_object::memoryview::w_memoryview_format_str(lhs);
+            let rhs_fmt = pyre_object::memoryview::w_memoryview_format_str(rhs);
+            for index in 0..count {
+                let _values = pyre_object::gc_roots::push_roots();
+                let values = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(memoryview_unpack_element(
+                    lhs_fmt,
+                    &lhs_data,
+                    index * lhs_size,
+                    lhs_size,
+                ));
+                pyre_object::gc_roots::pin_root(memoryview_unpack_element(
+                    rhs_fmt,
+                    &rhs_data,
+                    index * rhs_size,
+                    rhs_size,
+                ));
+                if !crate::baseobjspace::eq_w(
+                    pyre_object::gc_roots::shadow_stack_get(values),
+                    pyre_object::gc_roots::shadow_stack_get(values + 1),
+                )? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })();
+        if temporary {
+            let release = memoryview_release(&[rhs]);
+            if comparison.is_ok() {
+                release?;
+            }
         }
+        comparison.map(Some)
     }
 }
 
-/// `memoryview.__ne__` — `descr__cmp('ne')`, the negation of `__eq__`.
+fn memoryview_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(match memoryview_compare_eq(args, "__eq__")? {
+        Some(equal) => w_bool_from(equal),
+        None => pyre_object::w_not_implemented(),
+    })
+}
+
+/// `memoryview.__ne__` — the negation of the same element-wise comparison.
 fn memoryview_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
-    let other = args.get(1).copied().unwrap_or(w_none());
+    Ok(match memoryview_compare_eq(args, "__ne__")? {
+        Some(equal) => w_bool_from(!equal),
+        None => pyre_object::w_not_implemented(),
+    })
+}
+
+/// Python 3.14 exposes all ordering slots but `memory_richcompare` returns
+/// `NotImplemented` for them after validating the descriptor receiver.
+fn memoryview_order(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, crate::PyError> {
+    memoryview_receiver(args, name)?;
+    Ok(pyre_object::w_not_implemented())
+}
+
+fn memoryview_lt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    memoryview_order(args, "__lt__")
+}
+fn memoryview_le(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    memoryview_order(args, "__le__")
+}
+fn memoryview_gt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    memoryview_order(args, "__gt__")
+}
+fn memoryview_ge(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    memoryview_order(args, "__ge__")
+}
+
+/// Python 3.14 `memoryview._from_flags(object, flags)`.  A memoryview input
+/// is cloned with its managed buffer and ignores flags.  For other exporters,
+/// pyre currently provides the full read-only view; the observable writable
+/// request bit is enforced here exactly like `PyBUF_WRITABLE`.
+fn memoryview_from_flags(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let object = args.get(1).copied().unwrap_or(w_none());
+    let flags = crate::baseobjspace::c_int_w(args.get(2).copied().unwrap_or(w_none()))?;
+    let view = w_memoryview_new(object)?;
     unsafe {
-        if memoryview_released_either(mv, other) {
-            return Ok(w_bool_from(mv != other));
-        }
-        let a = memoryview_gather_bytes(mv);
-        match memoryview_operand_bytes(other) {
-            Some(b) => Ok(w_bool_from(a != b)),
-            None => Ok(pyre_object::w_not_implemented()),
+        if !pyre_object::memoryview::is_w_memoryview(object)
+            && flags & 0x0001 != 0
+            && pyre_object::memoryview::w_memoryview_readonly(view)
+        {
+            memoryview_release(&[view])?;
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::BufferError,
+                "Object is not writable.",
+            ));
         }
     }
+    Ok(view)
 }
 
 /// `memoryview.hex` — the view's bytes as a hex string, reusing the
@@ -1679,6 +1783,10 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
         ("__repr__", memoryview_repr, 1),
         ("__eq__", memoryview_eq, 2),
         ("__ne__", memoryview_ne, 2),
+        ("__lt__", memoryview_lt, 2),
+        ("__le__", memoryview_le, 2),
+        ("__gt__", memoryview_gt, 2),
+        ("__ge__", memoryview_ge, 2),
         ("count", memoryview_count, 2),
         ("tobytes", memoryview_tobytes, 1),
         ("tolist", memoryview_tolist, 1),
@@ -1708,6 +1816,15 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
             pyre_object::function::w_classmethod_new(make_builtin_function(
                 "__class_getitem__",
                 crate::_pypy_generic_alias::generic_alias_class_getitem,
+            )),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "_from_flags",
+            pyre_object::function::w_classmethod_new(make_builtin_function_with_arity(
+                "_from_flags",
+                memoryview_from_flags,
+                3,
             )),
         );
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -8355,13 +8472,24 @@ fn builtin_chr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// W_Filter___new__`.  A lazy iterator: `function == None` keeps truthy
 /// items, otherwise `function(item)` is the predicate.
 pub(crate) fn builtin_filter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (args, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "filter() takes no keyword arguments",
+        ));
+    }
     if args.len() != 2 {
         return Err(crate::PyError::type_error(format!(
             "filter expected 2 arguments, got {}",
             args.len()
         )));
     }
-    let func = args[0];
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(args[0]);
+    let predicate_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(args[1]);
+    let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let func = unsafe { pyre_object::gc_roots::shadow_stack_get(predicate_slot) };
     // `functional.py:921-924` — a None predicate is stored as PY_NULL.
     let w_predicate = if unsafe { pyre_object::is_none(func) } {
         pyre_object::PY_NULL
@@ -8369,10 +8497,18 @@ pub(crate) fn builtin_filter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         func
     };
     // `functional.py:925 self.w_iterable = space.iter(w_iterable)`.
-    let w_iterable = crate::baseobjspace::iter(args[1])?;
+    let w_iterable = crate::baseobjspace::iter(unsafe {
+        pyre_object::gc_roots::shadow_stack_get(iterable_slot)
+    })?;
+    pyre_object::gc_roots::pin_root(w_iterable);
+    let iterator_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     Ok(pyre_object::functional::w_filter_new(
-        w_predicate,
-        w_iterable,
+        if w_predicate.is_null() {
+            pyre_object::PY_NULL
+        } else {
+            unsafe { pyre_object::gc_roots::shadow_stack_get(predicate_slot) }
+        },
+        unsafe { pyre_object::gc_roots::shadow_stack_get(iterator_slot) },
     ))
 }
 
@@ -8382,25 +8518,51 @@ pub(crate) fn builtin_filter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 pub(crate) fn builtin_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (args, kwargs) = split_builtin_kwargs(args);
     kwarg_reject_unknown(kwargs, &["strict"], "map")?;
-    let strict = kwarg_get(kwargs, "strict")
-        .map(|v| crate::baseobjspace::is_true(v))
-        .transpose()?
-        .unwrap_or(false);
     if args.len() < 2 {
         return Err(crate::PyError::type_error(
             "map() must have at least two arguments.",
         ));
     }
-    let func = args[0];
-    // `functional.py:835-836 build_iterators_from_args` — `iter()` each input.
-    let mut iters = Vec::with_capacity(args.len() - 1);
-    for &arg in &args[1..] {
-        iters.push(crate::baseobjspace::iter(arg)?);
+
+    // PyPy's `args_w` and `build_iterators_from_args` keep every argument live
+    // while `space.iter` and the Python 3.14 `strict` truth conversion execute.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = pyre_object::gc_roots::shadow_stack_len();
+    for &arg in args {
+        pyre_object::gc_roots::pin_root(arg);
     }
-    let w_iterators = pyre_object::w_list_new(iters);
+    let w_strict = kwarg_get(kwargs, "strict");
+    let strict_slot = w_strict.map(|value| {
+        pyre_object::gc_roots::pin_root(value);
+        pyre_object::gc_roots::shadow_stack_len() - 1
+    });
+    let strict = strict_slot
+        .map(|slot| {
+            crate::baseobjspace::is_true(unsafe { pyre_object::gc_roots::shadow_stack_get(slot) })
+        })
+        .transpose()?
+        .unwrap_or(false);
+
+    // `functional.py:835-836 build_iterators_from_args` — `iter()` each input.
+    let mut iter_slots = Vec::with_capacity(args.len() - 1);
+    for index in 1..args.len() {
+        let w_iter = crate::baseobjspace::iter(unsafe {
+            pyre_object::gc_roots::shadow_stack_get(args_base + index)
+        })?;
+        pyre_object::gc_roots::pin_root(w_iter);
+        iter_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
+    }
+    let w_iterators = pyre_object::w_list_new(
+        iter_slots
+            .into_iter()
+            .map(|slot| unsafe { pyre_object::gc_roots::shadow_stack_get(slot) })
+            .collect(),
+    );
+    pyre_object::gc_roots::pin_root(w_iterators);
+    let iterators_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     Ok(pyre_object::functional::w_map_new(
-        func,
-        w_iterators,
+        unsafe { pyre_object::gc_roots::shadow_stack_get(args_base) },
+        unsafe { pyre_object::gc_roots::shadow_stack_get(iterators_slot) },
         strict,
     ))
 }
@@ -8414,17 +8576,42 @@ pub(crate) fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // before the positional walk and look up `strict` from it.
     let (args, kwargs) = split_builtin_kwargs(args);
     kwarg_reject_unknown(kwargs, &["strict"], "zip")?;
-    let strict = kwarg_get(kwargs, "strict")
-        .map(|v| crate::baseobjspace::is_true(v))
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = pyre_object::gc_roots::shadow_stack_len();
+    for &arg in args {
+        pyre_object::gc_roots::pin_root(arg);
+    }
+    let strict_slot = kwarg_get(kwargs, "strict").map(|value| {
+        pyre_object::gc_roots::pin_root(value);
+        pyre_object::gc_roots::shadow_stack_len() - 1
+    });
+    let strict = strict_slot
+        .map(|slot| {
+            crate::baseobjspace::is_true(unsafe { pyre_object::gc_roots::shadow_stack_get(slot) })
+        })
         .transpose()?
         .unwrap_or(false);
     // `functional.py:835-836 build_iterators_from_args` — `iter()` each input.
-    let mut iters = Vec::with_capacity(args.len());
-    for &arg in args {
-        iters.push(crate::baseobjspace::iter(arg)?);
+    let mut iter_slots = Vec::with_capacity(args.len());
+    for index in 0..args.len() {
+        let w_iter = crate::baseobjspace::iter(unsafe {
+            pyre_object::gc_roots::shadow_stack_get(args_base + index)
+        })?;
+        pyre_object::gc_roots::pin_root(w_iter);
+        iter_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
     }
-    let w_iterators = pyre_object::w_list_new(iters);
-    Ok(pyre_object::functional::w_zip_new(w_iterators, strict))
+    let w_iterators = pyre_object::w_list_new(
+        iter_slots
+            .into_iter()
+            .map(|slot| unsafe { pyre_object::gc_roots::shadow_stack_get(slot) })
+            .collect(),
+    );
+    pyre_object::gc_roots::pin_root(w_iterators);
+    let iterators_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    Ok(pyre_object::functional::w_zip_new(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(iterators_slot) },
+        strict,
+    ))
 }
 
 /// `pypy/module/__builtin__/functional.py:253-272 W_Enumerate.descr_new`
@@ -8491,28 +8678,53 @@ pub(crate) fn builtin_enumerate(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
     } else {
         kwarg_get(kwargs, "start")
     };
-    // `functional.py:255-264 descr___new__` — `space.index(w_start)`
-    // then `space.int_w(w_start)`; on OverflowError, drop into bigint
-    // slot.  Pyre uses i64 directly and would overflow on bigint
-    // start; TODO: W_Enumerate
-    // can still promote during iteration once start fits in i64).
-    let start = match start_obj {
-        Some(o) if !unsafe { pyre_object::is_none(o) } => space_index_w(o)?,
-        _ => 0,
+    // The constructor can execute user `__index__` and allocate. Keep both
+    // arguments in the shadow stack exactly as the translated RPython locals
+    // remain GC-visible across `space.index` / `space.iter`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(source);
+    let source_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let raw_start = start_obj.unwrap_or(pyre_object::PY_NULL);
+    pyre_object::gc_roots::pin_root(raw_start);
+    let raw_start_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+    // `functional.py:255-264 descr___new__` — `space.index(w_start)` then
+    // `space.int_w(w_start)`; ONLY OverflowError activates the bigint slot.
+    // This preserves an arbitrary-precision start object verbatim, while a
+    // machine-sized int/long/bool stays in the unboxed `index` fast path.
+    let (start, w_start) = if raw_start.is_null() {
+        (0, pyre_object::PY_NULL)
+    } else {
+        let indexed = crate::baseobjspace::space_index(unsafe {
+            pyre_object::gc_roots::shadow_stack_get(raw_start_slot)
+        })?;
+        pyre_object::gc_roots::pin_root(indexed);
+        let indexed_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        match crate::baseobjspace::int_w(indexed) {
+            Ok(value) => (value, pyre_object::PY_NULL),
+            Err(e) if e.kind == crate::PyErrorKind::OverflowError => (-1, unsafe {
+                pyre_object::gc_roots::shadow_stack_get(indexed_slot)
+            }),
+            Err(e) => return Err(e),
+        }
     };
+    pyre_object::gc_roots::pin_root(w_start);
+    let w_start_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     // `functional.py:268-271` — `if start == 0 and type(w_iterable) is
     // W_ListObject: w_iter = w_iterable` (skip space.iter for the
     // common list-source case so __next__ can `getitem(index)`
     // directly).  Otherwise call `space.iter(w_iterable)`.
-    let w_iter_or_list = if start == 0 && unsafe { pyre_object::is_list(source) } {
-        source
-    } else {
-        crate::baseobjspace::iter(source)?
-    };
+    let source = unsafe { pyre_object::gc_roots::shadow_stack_get(source_slot) };
+    let w_iter_or_list =
+        if start == 0 && w_start.is_null() && unsafe { pyre_object::is_list(source) } {
+            source
+        } else {
+            crate::baseobjspace::iter(source)?
+        };
     Ok(pyre_object::functional::w_enumerate_new(
         w_iter_or_list,
         start,
-        pyre_object::PY_NULL, // i64 fast-path active per :225-227
+        unsafe { pyre_object::gc_roots::shadow_stack_get(w_start_slot) },
     ))
 }
 
@@ -8530,7 +8742,13 @@ pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             args.len()
         )));
     }
-    let obj = args[0];
+    // `descr___new__2` can execute `__reversed__`, `__len__`, or allocate an
+    // iterator. The translated RPython argument remains a GC root throughout;
+    // keep the Rust carrier in the shadow stack and reload at each call site.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(args[0]);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let obj = unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) };
     unsafe {
         // EXACT builtin list → `iterobject.py W_ReverseSeqIterObject` (the
         // Python 3.14-visible `list_reverseiterator`); tuple and the other
@@ -8543,11 +8761,17 @@ pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         if pyre_object::is_exact_builtin_instance(obj) {
             if pyre_object::is_list(obj) {
                 let n = pyre_object::w_list_len(obj) as i64;
-                return Ok(pyre_object::w_list_reverse_iter_new(obj, n - 1));
+                return Ok(pyre_object::w_list_reverse_iter_new(
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    n - 1,
+                ));
             }
             if pyre_object::is_tuple(obj) {
                 let n = pyre_object::w_tuple_len(obj) as i64;
-                return Ok(pyre_object::functional::w_reversed_new(obj, n - 1));
+                return Ok(pyre_object::functional::w_reversed_new(
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    n - 1,
+                ));
             }
             // bytes / bytearray expose the sequence protocol at the C level but
             // not as `__getitem__` / `__len__` type slots, so they would miss
@@ -8557,48 +8781,41 @@ pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
                 || pyre_object::bytearrayobject::is_bytearray(obj)
             {
                 let n = crate::baseobjspace::len_w(obj)?;
-                return Ok(pyre_object::functional::w_reversed_new(obj, n - 1));
+                return Ok(pyre_object::functional::w_reversed_new(
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    n - 1,
+                ));
             }
         }
         // range: functional.py W_Range.descr_reversed — reflect
         // the span and hand back a fresh reverse-walking iterator. (range is
         // not subclassable, so no override can apply.)
         if pyre_object::is_w_range(obj) {
-            return Ok(pyre_object::w_range_reversed(obj));
-        }
-        // range_iterator: a bare iterator (e.g. from `iter(range(n))`)
-        // can also be reversed. Mirror `W_IntRangeIterator`'s live
-        // `(current, remaining, step)` cursor by starting at the last
-        // remaining item, keeping the same count, and negating the step.
-        if pyre_object::is_range_iter(obj) {
-            let (current, remaining, step) = pyre_object::w_range_iter_fields(obj);
-            if remaining <= 0 {
-                return Ok(pyre_object::w_range_iter_new(0, 0, 1));
-            }
-            let last = current + (remaining - 1) * step;
-            return Ok(pyre_object::w_range_iter_new(last, remaining, -step));
-        }
-        // bytes / bytearray: yield the byte values in reverse.
-        if pyre_object::bytesobject::is_bytes_like(obj) {
-            let n = pyre_object::bytesobject::bytes_like_len(obj);
-            let mut items = Vec::with_capacity(n);
-            for i in (0..n).rev() {
-                items.push(w_int_new(
-                    pyre_object::bytesobject::bytes_like_getitem(obj, i) as i64,
-                ));
-            }
-            return Ok(pyre_object::w_seq_iter_new(
-                pyre_object::w_list_new(items),
-                n,
+            return Ok(pyre_object::w_range_reversed(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
             ));
         }
     }
     // `__reversed__` resolved through the type MRO (`functional.py:362-366`) —
     // honors a subclass override and the inherited builtin `list.__reversed__`,
     // and any user object defining `__reversed__`.
+    let obj = unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) };
     if let Some(tp) = crate::typedef::r#type(obj) {
         if let Some(method) = unsafe { crate::baseobjspace::lookup_in_type(tp, "__reversed__") } {
-            return Ok(crate::call_function(method, &[obj]));
+            // Python 3.14 `slot1` semantics: explicitly assigning None disables
+            // the protocol and does not fall back to `__len__`/`__getitem__`.
+            if unsafe { pyre_object::is_none(method) } {
+                return Err(crate::PyError::type_error(format!(
+                    "'{}' object is not reversible",
+                    crate::baseobjspace::object_functionstr_type_name(obj)
+                )));
+            }
+            pyre_object::gc_roots::pin_root(method);
+            let method_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            return Ok(crate::call_function(
+                unsafe { pyre_object::gc_roots::shadow_stack_get(method_slot) },
+                &[unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) }],
+            ));
         }
     }
     // functional.py:351 — without `__reversed__`, require the sequence
@@ -8611,7 +8828,10 @@ pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         if has_getitem {
             // `functional.py:354-359` — reverse lazily through `W_ReversedIterator`.
             let n = crate::baseobjspace::len_w(obj)?;
-            return Ok(pyre_object::functional::w_reversed_new(obj, n - 1));
+            return Ok(pyre_object::functional::w_reversed_new(
+                unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) },
+                n - 1,
+            ));
         }
     }
     Err(crate::PyError::type_error(format!(

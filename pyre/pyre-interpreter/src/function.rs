@@ -382,10 +382,13 @@ pub(crate) fn function_new_impl(
     // part of the same `malloc_typed` call, so it never spans a
     // collection point.
     let _roots = pyre_object::gc_roots::push_roots();
+    let closure_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(closure);
+    let code_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(code as PyObjectRef);
     // `function.py:57 self.w_func_globals = w_globals` stores the dict
     // object directly as the function's sole globals carrier.
+    let globals_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_func_globals_obj);
 
     // CPython 3.14 `_PyEval_BuiltinsFromGlobals` at function construction:
@@ -404,7 +407,16 @@ pub(crate) fn function_new_impl(
             selected
         }
     };
+    let builtins_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_builtins);
+
+    // `pick_builtin_obj` and later allocations may collect.  Reload every
+    // pinned input before embedding it in the new Function; the original raw
+    // locals are not rewritten when the shadow-stack slots are forwarded.
+    let closure = pyre_object::gc_roots::shadow_stack_get(closure_slot);
+    let code = pyre_object::gc_roots::shadow_stack_get(code_slot) as *const ();
+    let w_func_globals_obj = pyre_object::gc_roots::shadow_stack_get(globals_slot);
+    let w_builtins = pyre_object::gc_roots::shadow_stack_get(builtins_slot);
 
     let name_ptr = pyre_object::lltype::malloc_raw(name) as *const String;
     let function = Function {
@@ -611,6 +623,25 @@ pub unsafe fn function_get_self_or_none(obj: PyObjectRef) -> PyObjectRef {
     } else {
         w_self
     }
+}
+
+/// CPython 3.14 `meth_reduce`: type-bound builtins reconstruct through
+/// `getattr(__self__, __name__)`; module-level builtins reduce by qualname.
+pub unsafe fn descr_builtin_function_reduce(obj: PyObjectRef) -> crate::PyResult {
+    let w_self = unsafe { function_get_self_or_none(obj) };
+    if !w_self.is_null()
+        && !unsafe { pyre_object::is_none(w_self) }
+        && !unsafe { pyre_object::is_module(w_self) }
+    {
+        let name = pyre_object::w_str_new(unsafe { crate::function_get_name(obj) });
+        return Ok(pyre_object::w_tuple_new(vec![
+            crate::baseobjspace::builtin_callable("getattr"),
+            pyre_object::w_tuple_new(vec![w_self, name]),
+        ]));
+    }
+    Ok(pyre_object::w_str_new(&unsafe {
+        function_get_qualname(obj)
+    }))
 }
 
 /// Stamp PyPy `BuiltinFunction.w_moduleobj` after the defining module object
@@ -2094,12 +2125,29 @@ pub unsafe fn descr_method__new__(
     Ok(pyre_object::w_method_new(w_function, w_instance, w_class))
 }
 
+/// `interp2app` unwraps the receiver as `Method` before entering PyPy's
+/// method bodies.  Reproduce that gateway contract before reading the Rust
+/// payload, including for direct descriptor calls with a foreign receiver.
+#[inline]
+pub fn require_method(method: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+    if method.is_null() || !unsafe { pyre_object::function::is_method(method) } {
+        let received = crate::typedef::r#type(method)
+            .map(|tp| unsafe { pyre_object::w_type_get_name(tp) })
+            .unwrap_or("object");
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' requires a 'method' object but received a '{received}'"
+        )));
+    }
+    Ok(method)
+}
+
 #[inline]
 pub unsafe fn descr_method_get(
     method: PyObjectRef,
     obj: PyObjectRef,
     cls: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
+    let method = require_method(method, "__get__")?;
     let obj_is_none = obj.is_null() || unsafe { pyre_object::is_none(obj) };
     let cls_is_none = cls.is_null() || unsafe { pyre_object::is_none(cls) };
     if obj_is_none && cls_is_none {
@@ -2111,7 +2159,10 @@ pub unsafe fn descr_method_get(
 #[inline]
 pub fn descr_method_call(args: &[PyObjectRef]) -> crate::PyResult {
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let method = positional.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let method = require_method(
+        positional.first().copied().unwrap_or(pyre_object::PY_NULL),
+        "__call__",
+    )?;
     let call_args = positional.get(1..).unwrap_or(&[]);
     if !crate::builtins::has_real_kwargs(kwargs) {
         return crate::call::call_function_impl_result(method, call_args);
@@ -2139,6 +2190,7 @@ pub unsafe fn descr_method_eq(
     this: PyObjectRef,
     other: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
+    let this = require_method(this, "__eq__")?;
     if !unsafe { pyre_object::is_method(other) } {
         return Ok(pyre_object::special::w_not_implemented());
     }
@@ -2156,6 +2208,7 @@ pub unsafe fn descr_method_ne(
     this: PyObjectRef,
     other: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
+    require_method(this, "__ne__")?;
     let equal = unsafe { descr_method_eq(this, other)? };
     if unsafe { pyre_object::is_not_implemented(equal) } {
         Ok(equal)
@@ -2168,6 +2221,7 @@ pub unsafe fn descr_method_ne(
 
 #[inline]
 pub unsafe fn descr_method_repr(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let obj = require_method(obj, "__repr__")?;
     let function = unsafe { pyre_object::w_method_get_func(obj) };
     let instance = unsafe { pyre_object::w_method_get_self(obj) };
     let w_name = match crate::baseobjspace::getattr_str(function, "__qualname__") {
@@ -2196,6 +2250,10 @@ pub unsafe fn descr_method_getattribute(
     obj: PyObjectRef,
     name: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
+    let obj = require_method(obj, "__getattribute__")?;
+    if !unsafe { pyre_object::is_str(name) } {
+        return Err(crate::PyError::type_error("attribute name must be string"));
+    }
     let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(name) }) else {
         return Err(crate::PyError::type_error("attribute name must be string"));
     };
@@ -2214,6 +2272,7 @@ pub unsafe fn descr_method_getattribute(
 
 #[inline]
 pub unsafe fn descr_method_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
+    let obj = require_method(obj, "__hash__")?;
     let function = unsafe { pyre_object::w_method_get_func(obj) };
     let instance = unsafe { pyre_object::w_method_get_self(obj) };
     let x = pyre_object::gc_hook::gc_identity_hash(instance as usize) as i64;
@@ -2224,6 +2283,7 @@ pub unsafe fn descr_method_hash(obj: PyObjectRef) -> Result<i64, crate::PyError>
 
 #[inline]
 pub unsafe fn descr_method__reduce__(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let obj = require_method(obj, "__reduce__")?;
     let function = unsafe { pyre_object::w_method_get_func(obj) };
     let instance = unsafe { pyre_object::w_method_get_self(obj) };
     let name = crate::baseobjspace::getattr_str(function, "__name__")?;

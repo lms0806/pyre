@@ -85,6 +85,7 @@ pub unsafe fn w_enumerate_get_iter_or_list(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_enumerate_set_iter_or_list(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_Enumerate)).w_iter_or_list = value;
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
     }
 }
 
@@ -117,6 +118,7 @@ pub unsafe fn w_enumerate_get_w_index(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_enumerate_set_w_index(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_Enumerate)).w_index = value;
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
     }
 }
 
@@ -206,6 +208,7 @@ pub unsafe fn w_reversed_get_sequence(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_reversed_set_sequence(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_ReversedIterator)).w_sequence = value;
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
     }
 }
 
@@ -400,6 +403,10 @@ pub struct W_Zip {
     pub w_iterators: PyObjectRef,
     /// `functional.py:1014 self.strict`; `descr_setstate` toggles it.
     pub strict: bool,
+    /// `functional.py:1017 self._iteration_progress` — number of iterators
+    /// already consumed in the current tuple, used by strict mismatch
+    /// reporting when a later iterator stops.
+    pub iteration_progress: usize,
 }
 
 /// Allocate a `W_Zip`.  `w_iterators` is a `list` of already-built
@@ -414,6 +421,7 @@ pub fn w_zip_new(w_iterators: PyObjectRef, strict: bool) -> PyObjectRef {
         },
         w_iterators,
         strict,
+        iteration_progress: 0,
     })
 }
 
@@ -445,6 +453,22 @@ pub unsafe fn w_zip_set_strict(obj: PyObjectRef, value: bool) {
     unsafe {
         (*(obj as *mut W_Zip)).strict = value;
     }
+}
+
+/// # Safety
+/// `obj` must point to a valid `W_Zip`.
+#[inline]
+pub unsafe fn w_zip_set_iteration_progress(obj: PyObjectRef, value: usize) {
+    unsafe {
+        (*(obj as *mut W_Zip)).iteration_progress = value;
+    }
+}
+
+/// # Safety
+/// `obj` must point to a valid `W_Zip`.
+#[inline]
+pub unsafe fn w_zip_get_iteration_progress(obj: PyObjectRef) -> usize {
+    unsafe { (*(obj as *const W_Zip)).iteration_progress }
 }
 /// Machine-int range iterator object.
 ///
@@ -1016,7 +1040,7 @@ pub fn range_length_big(start: &BigInt, stop: &BigInt, step: &BigInt) -> BigInt 
 // advances by one each step (`self.w_index`), so the cursor keeps arbitrary
 // precision and never overflows for a range longer than a machine word.
 
-#[pyre_class("range_iterator", type_id = 8, static_name = "LONG_RANGE_ITER")]
+#[pyre_class("longrange_iterator", type_id = 8, static_name = "LONG_RANGE_ITER")]
 pub struct W_LongRangeIterator {
     pub start: PyObjectRef,
     pub step: PyObjectRef,

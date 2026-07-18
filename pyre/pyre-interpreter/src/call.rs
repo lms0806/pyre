@@ -690,7 +690,7 @@ pub fn call_function_ex(
             unpacked
         }
     };
-    if !self_or_null.is_null() && !unsafe { pyre_object::is_none(self_or_null) } {
+    if !self_or_null.is_null() {
         args.insert(0, self_or_null);
     }
 
@@ -737,7 +737,7 @@ pub fn call_kw(
 ) -> PyResult {
     let mut args: Vec<PyObjectRef> = positional.to_vec();
 
-    if self_or_null != pyre_object::PY_NULL && !unsafe { pyre_object::is_none(self_or_null) } {
+    if self_or_null != pyre_object::PY_NULL {
         args.insert(0, self_or_null);
     }
 
@@ -748,7 +748,7 @@ pub fn call_kw(
     let callable_unwrapped = if unsafe { pyre_object::is_method(callable_unwrapped) } {
         let func = unsafe { pyre_object::w_method_get_func(callable_unwrapped) };
         let receiver = unsafe { pyre_object::w_method_get_self(callable_unwrapped) };
-        if !receiver.is_null() && !unsafe { pyre_object::is_none(receiver) } {
+        if !receiver.is_null() {
             args.insert(0, receiver);
         }
         func
@@ -896,13 +896,13 @@ pub fn call_kw(
         let func = unsafe { pyre_object::w_method_get_func(callable_unwrapped) };
         let receiver = unsafe {
             let w_self = pyre_object::w_method_get_self(callable_unwrapped);
-            if !w_self.is_null() && !pyre_object::is_none(w_self) {
+            if !w_self.is_null() {
                 w_self
             } else {
                 pyre_object::w_method_get_class(callable_unwrapped)
             }
         };
-        if !receiver.is_null() && unsafe { !pyre_object::is_none(receiver) } {
+        if !receiver.is_null() {
             let mut prepended = Vec::with_capacity(1 + args.len());
             prepended.push(receiver);
             prepended.extend_from_slice(&args);
@@ -977,6 +977,28 @@ fn classmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRef
     Ok(Some(bound))
 }
 
+/// Resolve a `__call__` introduced by a staticmethod subtype. Exact builtin
+/// wrappers use the direct unwrap fast path; subtypes honor their override.
+fn staticmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+    if !unsafe { pyre_object::is_staticmethod(callable) }
+        || unsafe {
+            pyre_object::is_exact_type(callable, &pyre_object::function::STATICMETHOD_TYPE)
+        }
+    {
+        return Ok(None);
+    }
+    let Some(w_type) = crate::typedef::r#type(callable) else {
+        return Ok(None);
+    };
+    let Some(call_descr) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__call__") })
+    else {
+        return Ok(None);
+    };
+    let bound =
+        unsafe { crate::baseobjspace::get(call_descr, callable, w_type) }?.unwrap_or(call_descr);
+    Ok(Some(bound))
+}
+
 fn call_callable_with_mode(
     frame: &mut PyFrame,
     callable: PyObjectRef,
@@ -987,14 +1009,14 @@ fn call_callable_with_mode(
         let func = unsafe { pyre_object::w_method_get_func(callable) };
         let receiver = unsafe {
             let w_self = pyre_object::w_method_get_self(callable);
-            if !w_self.is_null() && !pyre_object::is_none(w_self) {
+            if !w_self.is_null() {
                 w_self
             } else {
                 pyre_object::w_method_get_class(callable)
             }
         };
         let mut call_args = Vec::with_capacity(1 + args.len());
-        if !receiver.is_null() && unsafe { !pyre_object::is_none(receiver) } {
+        if !receiver.is_null() {
             call_args.push(receiver);
         }
         call_args.extend_from_slice(args);
@@ -1009,7 +1031,7 @@ fn call_callable_with_mode(
 
     // staticmethod → unwrap
     // PyPy: function.py StaticMethod.descr_call
-    if unsafe { pyre_object::is_staticmethod(callable) } {
+    if unsafe { pyre_object::is_exact_type(callable, &pyre_object::function::STATICMETHOD_TYPE) } {
         let func = unsafe { pyre_object::w_staticmethod_get_func(callable) };
         return call_callable_with_mode(frame, func, args, mode);
     }
@@ -1669,16 +1691,24 @@ pub fn call_with_kwargs(
     // function.py:712-713 StaticMethod.descr_call — the wrapper contributes
     // no implicit argument; forward the original positional and keyword
     // collections unchanged to its w_function.
-    if unsafe { pyre_object::is_staticmethod(callable) } {
+    if unsafe { pyre_object::is_exact_type(callable, &pyre_object::function::STATICMETHOD_TYPE) } {
         let func = unsafe { pyre_object::w_staticmethod_get_func(callable) };
         return call_with_kwargs(frame, func, pos_args, kwargs);
+    }
+    if let Some(bound) = staticmethod_call_override(callable)? {
+        return call_with_kwargs(frame, bound, pos_args, kwargs);
     }
 
     if unsafe { pyre_object::is_classmethod(callable) } {
         if let Some(bound) = classmethod_call_override(callable)? {
             return call_with_kwargs(frame, bound, pos_args, kwargs);
         }
-        return Err(PyError::type_error("'classmethod' object is not callable"));
+        let type_name = crate::typedef::r#type(callable)
+            .map(|tp| unsafe { pyre_object::w_type_get_name(tp) })
+            .unwrap_or("classmethod");
+        return Err(PyError::type_error(format!(
+            "'{type_name}' object is not callable"
+        )));
     }
 
     // Unwrap bound methods: prepend receiver to pos_args.
@@ -1686,7 +1716,7 @@ pub fn call_with_kwargs(
         let func = unsafe { pyre_object::w_method_get_func(callable) };
         let receiver = unsafe { pyre_object::w_method_get_self(callable) };
         let mut full_args = Vec::with_capacity(1 + pos_args.len());
-        if !receiver.is_null() && !unsafe { pyre_object::is_none(receiver) } {
+        if !receiver.is_null() {
             full_args.push(receiver);
         }
         full_args.extend_from_slice(pos_args);
@@ -2157,7 +2187,7 @@ pub fn call_with_kwargs(
         let func = unsafe { pyre_object::w_method_get_func(callable) };
         let w_self = unsafe { pyre_object::w_method_get_self(callable) };
         let mut full_args = Vec::with_capacity(1 + pos_args.len());
-        if !w_self.is_null() && unsafe { !pyre_object::is_none(w_self) } {
+        if !w_self.is_null() {
             full_args.push(w_self);
         }
         full_args.extend_from_slice(pos_args);
@@ -2257,13 +2287,13 @@ pub fn call_function_impl_result(
         if pyre_object::is_method(callable) {
             let func = pyre_object::w_method_get_func(callable);
             let w_self = pyre_object::w_method_get_self(callable);
-            let receiver = if !w_self.is_null() && !pyre_object::is_none(w_self) {
+            let receiver = if !w_self.is_null() {
                 w_self
             } else {
                 pyre_object::w_method_get_class(callable)
             };
             let mut call_args = Vec::with_capacity(1 + args.len());
-            if !receiver.is_null() && !pyre_object::is_none(receiver) {
+            if !receiver.is_null() {
                 call_args.push(receiver);
             }
             call_args.extend_from_slice(args);
@@ -2310,9 +2340,12 @@ pub fn call_function_impl_result(
         }
         // staticmethod → unwrap and call the wrapped function
         // PyPy: function.py StaticMethod.descr_staticmethod__call__
-        if pyre_object::is_staticmethod(callable) {
+        if pyre_object::is_exact_type(callable, &pyre_object::function::STATICMETHOD_TYPE) {
             let func = pyre_object::w_staticmethod_get_func(callable);
             return call_function_impl_result(func, args);
+        }
+        if let Some(bound) = staticmethod_call_override(callable)? {
+            return call_function_impl_result(bound, args);
         }
         if let Some(bound) = classmethod_call_override(callable)? {
             return call_function_impl_result(bound, args);
@@ -2341,9 +2374,11 @@ pub fn call_function_impl_result(
             }
         }
     }
+    let type_name = crate::typedef::r#type(callable)
+        .map(|tp| unsafe { pyre_object::w_type_get_name(tp) })
+        .unwrap_or_else(|| unsafe { (*(*callable).ob_type).name });
     Err(PyError::type_error(format!(
-        "'{}' object is not callable",
-        unsafe { (*(*callable).ob_type).name }
+        "'{type_name}' object is not callable"
     )))
 }
 
@@ -3846,7 +3881,7 @@ fn type_descr_call_with_mode(
     // typeobject.py:726 — `w_newfunc = space.get(w_newdescr, space.w_None,
     // w_type=self)`.  A descriptor with no __get__ (`get` → None) is its own
     // bound value, matching `space.get`'s `if w_get is None: return w_descr`.
-    let new_fn = unsafe { crate::baseobjspace::get(new_descr, pyre_object::w_none(), w_type)? }
+    let new_fn = unsafe { crate::baseobjspace::get(new_descr, pyre_object::PY_NULL, w_type)? }
         .unwrap_or(new_descr);
     // typeobject.py:731 — `space.call_obj_args(w_newfunc, self, __args__)`.
     let mut new_args = Vec::with_capacity(1 + args.len());

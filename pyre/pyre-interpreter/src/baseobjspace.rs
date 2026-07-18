@@ -2063,21 +2063,17 @@ pub(crate) fn range_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         if pyre_object::is_range_iter(args[0]) {
             // CPython 3.14 `rangeiter_setstate`: `PyLong_AsLong`, so an
-            // overflowing Python int raises instead of being clipped.
-            if !(is_int(args[1]) || is_long(args[1]) || is_bool(args[1])) {
-                return Err(PyError::type_error("state must be an int"));
-            }
-            let mut state = BigInt::from(int_w(args[1])?);
-            if state < BigInt::zero() {
-                state = BigInt::zero();
-            }
+            // overflowing Python int raises instead of being clipped. Unlike
+            // the long variant, PyLong_AsLong also accepts `__index__`.
+            let state = int_w(space_index(args[1])?).map_err(|err| {
+                if err.kind == PyErrorKind::OverflowError {
+                    PyError::overflow_error("Python int too large to convert to C long")
+                } else {
+                    err
+                }
+            })?;
             let (current, remaining, step) = pyre_object::w_range_iter_fields(args[0]);
-            let remaining_b = BigInt::from(remaining);
-            if state > remaining_b {
-                state = remaining_b;
-            }
-            let state_obj = pyre_object::range_bigint_to_obj(state);
-            let skipped = pyre_object::range_obj_as_i64(state_obj).unwrap_or(remaining);
+            let skipped = state.clamp(0, remaining);
             let next = (current as i128 + skipped as i128 * step as i128) as i64;
             pyre_object::w_range_iter_set_cursor(args[0], next, remaining - skipped);
         } else {
@@ -2117,7 +2113,11 @@ pub(crate) fn dict_view_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
         let w_dict = pyre_object::dictmultiobject::w_dict_view_iterator_get_dict(args[0]);
         let kind = pyre_object::dictmultiobject::w_dict_view_iterator_get_kind(args[0]);
         let index = pyre_object::dictmultiobject::w_dict_view_iterator_get_index(args[0]);
-        let entries = pyre_object::w_dict_items(w_dict);
+        let reverse = pyre_object::dictmultiobject::w_dict_view_iterator_get_reverse(args[0]);
+        let mut entries = pyre_object::w_dict_items(w_dict);
+        if reverse {
+            entries.reverse();
+        }
         let mut items = Vec::new();
         for (k, v) in entries.into_iter().skip(index) {
             let item = match kind {
@@ -2136,8 +2136,12 @@ pub(crate) fn dict_view_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
 pub(crate) fn dict_view_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let w_dict = pyre_object::dictmultiobject::w_dict_view_iterator_get_dict(args[0]);
+        let startlen = pyre_object::dictmultiobject::w_dict_view_iterator_get_startlen(args[0]);
+        if pyre_object::w_dict_len(w_dict) != startlen {
+            return Ok(w_int_new(0));
+        }
         let index = pyre_object::dictmultiobject::w_dict_view_iterator_get_index(args[0]);
-        let remaining = (pyre_object::w_dict_len(w_dict) as i64) - (index as i64);
+        let remaining = (startlen as i64) - (index as i64);
         Ok(w_int_new(remaining.max(0)))
     }
 }
@@ -2145,9 +2149,26 @@ pub(crate) fn dict_view_iter_length_hint_method(args: &[PyObjectRef]) -> PyResul
 /// `enumerate.__reduce__()` — `functional.py W_Enumerate.descr_reduce`:
 /// `(enumerate, (source_iter, index))`.
 pub(crate) fn enumerate_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if self_.is_null() || !unsafe { pyre_object::functional::is_enumerate(self_) } {
+        return Err(PyError::type_error(format!(
+            "descriptor '__reduce__' for 'enumerate' objects doesn't apply to a '{}' object",
+            object_functionstr_type_name(self_),
+        )));
+    }
     unsafe {
-        let i64_index = pyre_object::functional::w_enumerate_get_index(args[0]);
-        let raw = pyre_object::functional::w_enumerate_get_iter_or_list(args[0]);
+        // `descr___reduce__` may allocate while normalising the list fast path.
+        // Keep `self` live and reload it before every later field read, matching
+        // the GC-transformed RPython object's rooted `self` local.
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(args[0]);
+        let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let self_type = crate::typedef::r#type(self_).unwrap_or(pyre_object::PY_NULL);
+        pyre_object::gc_roots::pin_root(self_type);
+        let self_type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let i64_index = pyre_object::functional::w_enumerate_get_index(self_);
+        let raw = pyre_object::functional::w_enumerate_get_iter_or_list(self_);
         let w_iter = if raw.is_null() {
             // Exhausted enumerate (`:294-295` set `w_iter_or_list` to
             // null); substitute an empty seq-iter so the reduce stays
@@ -2167,36 +2188,100 @@ pub(crate) fn enumerate_reduce_method(args: &[PyObjectRef]) -> PyResult {
         } else {
             raw
         };
-        let w_index_slot = pyre_object::functional::w_enumerate_get_w_index(args[0]);
+        pyre_object::gc_roots::pin_root(w_iter);
+        let iter_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let w_index_slot = pyre_object::functional::w_enumerate_get_w_index(self_);
         let index = if w_index_slot.is_null() {
             w_int_new(i64_index)
         } else {
             w_index_slot
         };
-        let state = w_tuple_new(vec![w_iter, index]);
-        Ok(w_tuple_new(vec![builtin_callable("enumerate"), state]))
+        pyre_object::gc_roots::pin_root(index);
+        let index_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let state = w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(iter_slot),
+            pyre_object::gc_roots::shadow_stack_get(index_slot),
+        ]);
+        pyre_object::gc_roots::pin_root(state);
+        let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        Ok(w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(self_type_slot),
+            pyre_object::gc_roots::shadow_stack_get(state_slot),
+        ]))
     }
+}
+
+/// `W_Enumerate.descr___iter__` receiver-unwrapping parity. PyPy's
+/// `interp2app` binds `self: W_Enumerate`, so a direct descriptor call with a
+/// foreign object raises before the body returns `self`.
+pub(crate) fn enumerate_iter_method(args: &[PyObjectRef]) -> PyResult {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if self_.is_null() || !unsafe { pyre_object::functional::is_enumerate(self_) } {
+        return Err(PyError::type_error(format!(
+            "descriptor '__iter__' requires a 'enumerate' object but received a '{}'",
+            object_functionstr_type_name(self_),
+        )));
+    }
+    Ok(self_)
+}
+
+/// `W_Enumerate.descr_next` receiver-unwrapping parity; the actual line-by-line
+/// iteration state machine remains in [`next`].
+pub(crate) fn enumerate_next_method(args: &[PyObjectRef]) -> PyResult {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if self_.is_null() || !unsafe { pyre_object::functional::is_enumerate(self_) } {
+        return Err(PyError::type_error(format!(
+            "descriptor '__next__' requires a 'enumerate' object but received a '{}'",
+            object_functionstr_type_name(self_),
+        )));
+    }
+    next(self_)
 }
 
 /// `reversed.__reduce__()` — `functional.py:407-417
 /// W_ReversedIterator.descr___reduce__`: `(reversed, (sequence,),
 /// remaining)` while live; `(reversed, ((),))` once exhausted (the slot
-/// is cleared to `PY_NULL`).  The reconstructor is the `reversed`
-/// builtin so `pickle` recreates the iterator via `reversed(sequence)`.
+/// is cleared to `PY_NULL`).  As in PyPy, the reconstructor is
+/// `space.type(self)`, preserving subclasses while recreating the iterator
+/// through the same reversed-sequence constructor protocol.
 pub(crate) fn reversed_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    let self_ = reversed_receiver(args, "__reduce__")?;
     unsafe {
-        let seq = pyre_object::functional::w_reversed_get_sequence(args[0]);
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(self_);
+        let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let self_type = crate::typedef::r#type(self_).unwrap_or(pyre_object::PY_NULL);
+        pyre_object::gc_roots::pin_root(self_type);
+        let self_type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let seq = pyre_object::functional::w_reversed_get_sequence(self_);
         if !seq.is_null() {
-            let remaining = pyre_object::functional::w_reversed_get_remaining(args[0]);
-            let state = w_tuple_new(vec![seq]);
+            pyre_object::gc_roots::pin_root(seq);
+            let seq_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let remaining = pyre_object::functional::w_reversed_get_remaining(self_);
+            let state = w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(seq_slot)]);
+            pyre_object::gc_roots::pin_root(state);
+            let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_remaining = w_int_new(remaining);
+            pyre_object::gc_roots::pin_root(w_remaining);
+            let remaining_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             Ok(w_tuple_new(vec![
-                builtin_callable("reversed"),
-                state,
-                w_int_new(remaining),
+                pyre_object::gc_roots::shadow_stack_get(self_type_slot),
+                pyre_object::gc_roots::shadow_stack_get(state_slot),
+                pyre_object::gc_roots::shadow_stack_get(remaining_slot),
             ]))
         } else {
-            let state = w_tuple_new(vec![w_tuple_new(vec![])]);
-            Ok(w_tuple_new(vec![builtin_callable("reversed"), state]))
+            let empty = w_tuple_new(vec![]);
+            pyre_object::gc_roots::pin_root(empty);
+            let empty_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let state = w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(empty_slot)]);
+            pyre_object::gc_roots::pin_root(state);
+            let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            Ok(w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(self_type_slot),
+                pyre_object::gc_roots::shadow_stack_get(state_slot),
+            ]))
         }
     }
 }
@@ -2205,16 +2290,40 @@ pub(crate) fn reversed_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// descr___setstate__`: set `remaining` then clamp into `[-1, n-1]`
 /// (`n == len(sequence)`, or 0 once exhausted).
 pub(crate) fn reversed_setstate_method(args: &[PyObjectRef]) -> PyResult {
-    let mut remaining = int_w(args[1])?;
+    let self_ = reversed_receiver(args, "__setstate__")?;
+    let state = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    if state.is_null()
+        || !unsafe {
+            pyre_object::is_int(state) || pyre_object::is_long(state) || pyre_object::is_bool(state)
+        }
+    {
+        return Err(PyError::type_error("an integer is required"));
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(self_);
+    let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(state);
+    let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let mut remaining = int_w(unsafe { pyre_object::gc_roots::shadow_stack_get(state_slot) })?;
     unsafe {
-        let seq = pyre_object::functional::w_reversed_get_sequence(args[0]);
-        let n = if !seq.is_null() { len_w(seq)? } else { 0 };
+        let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let seq = pyre_object::functional::w_reversed_get_sequence(self_);
+        pyre_object::gc_roots::pin_root(seq);
+        let seq_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let n = if !seq.is_null() {
+            len_w(pyre_object::gc_roots::shadow_stack_get(seq_slot))?
+        } else {
+            0
+        };
         if remaining < -1 {
             remaining = -1;
         } else if remaining > n - 1 {
             remaining = n - 1;
         }
-        pyre_object::functional::w_reversed_set_remaining(args[0], remaining);
+        pyre_object::functional::w_reversed_set_remaining(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            remaining,
+        );
     }
     Ok(w_none())
 }
@@ -2222,12 +2331,23 @@ pub(crate) fn reversed_setstate_method(args: &[PyObjectRef]) -> PyResult {
 /// `reversed.__length_hint__()` — `functional.py:374-383
 /// descr_length_hint`: elements not yet produced, `0` once exhausted.
 pub(crate) fn reversed_length_hint_method(args: &[PyObjectRef]) -> PyResult {
+    let self_ = reversed_receiver(args, "__length_hint__")?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(self_);
+    let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     unsafe {
-        let remaining = pyre_object::functional::w_reversed_get_remaining(args[0]);
+        let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let remaining = pyre_object::functional::w_reversed_get_remaining(self_);
         let mut res = 0i64;
         if remaining >= 0 {
-            let seq = pyre_object::functional::w_reversed_get_sequence(args[0]);
-            let total = if !seq.is_null() { len_w(seq)? } else { 0 };
+            let seq = pyre_object::functional::w_reversed_get_sequence(self_);
+            pyre_object::gc_roots::pin_root(seq);
+            let seq_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let total = if !seq.is_null() {
+                len_w(pyre_object::gc_roots::shadow_stack_get(seq_slot))?
+            } else {
+                0
+            };
             let rem_length = remaining + 1;
             if rem_length <= total {
                 res = rem_length;
@@ -2237,23 +2357,85 @@ pub(crate) fn reversed_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     }
 }
 
+fn reversed_receiver(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, PyError> {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if self_.is_null() || !unsafe { pyre_object::functional::is_reversed(self_) } {
+        return Err(PyError::type_error(format!(
+            "descriptor '{name}' for 'reversed' objects doesn't apply to a '{}' object",
+            object_functionstr_type_name(self_),
+        )));
+    }
+    Ok(self_)
+}
+
+/// `W_ReversedIterator.descr___iter__` with the receiver check supplied by
+/// PyPy's `interp2app` gateway before its one-line `return self` body.
+pub(crate) fn reversed_iter_method(args: &[PyObjectRef]) -> PyResult {
+    reversed_receiver(args, "__iter__")
+}
+
+/// `W_ReversedIterator.descr_next` gateway wrapper. The state-machine body is
+/// shared with the interpreter's [`next`] dispatcher below.
+pub(crate) fn reversed_next_method(args: &[PyObjectRef]) -> PyResult {
+    next(reversed_receiver(args, "__next__")?)
+}
+
 /// `filter.__reduce__()` — `functional.py:944-949 W_Filter.descr_reduce`:
 /// `(filter, (predicate, iterable))`, where `predicate` is `None` when the
 /// stored predicate is `PY_NULL`.  Pickle recreates the iterator via
 /// `filter(predicate, iterable)`; the captured iterator carries its
 /// position.
 pub(crate) fn filter_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    let self_ = filter_receiver(args, "__reduce__")?;
     unsafe {
-        let w_predicate = pyre_object::functional::w_filter_get_predicate(args[0]);
-        let w_predicate = if w_predicate.is_null() {
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(self_);
+        let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let self_type = crate::typedef::r#type(self_).unwrap_or(pyre_object::PY_NULL);
+        pyre_object::gc_roots::pin_root(self_type);
+        let self_type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let raw_predicate = pyre_object::functional::w_filter_get_predicate(self_);
+        let w_predicate = if raw_predicate.is_null() {
             w_none()
         } else {
-            w_predicate
+            raw_predicate
         };
-        let w_iterable = pyre_object::functional::w_filter_get_iterable(args[0]);
-        let state = w_tuple_new(vec![w_predicate, w_iterable]);
-        Ok(w_tuple_new(vec![builtin_callable("filter"), state]))
+        pyre_object::gc_roots::pin_root(w_predicate);
+        let predicate_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let w_iterable = pyre_object::functional::w_filter_get_iterable(self_);
+        pyre_object::gc_roots::pin_root(w_iterable);
+        let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let state = w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(predicate_slot),
+            pyre_object::gc_roots::shadow_stack_get(iterable_slot),
+        ]);
+        pyre_object::gc_roots::pin_root(state);
+        let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        Ok(w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(self_type_slot),
+            pyre_object::gc_roots::shadow_stack_get(state_slot),
+        ]))
     }
+}
+
+fn filter_receiver(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, PyError> {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if self_.is_null() || !unsafe { pyre_object::functional::is_filter(self_) } {
+        return Err(PyError::type_error(format!(
+            "descriptor '{name}' for 'filter' objects doesn't apply to a '{}' object",
+            object_functionstr_type_name(self_),
+        )));
+    }
+    Ok(self_)
+}
+
+pub(crate) fn filter_iter_method(args: &[PyObjectRef]) -> PyResult {
+    filter_receiver(args, "__iter__")
+}
+
+pub(crate) fn filter_next_method(args: &[PyObjectRef]) -> PyResult {
+    next(filter_receiver(args, "__next__")?)
 }
 
 /// `functional.py:1065-1067 _raise_strict_error` — the strict zip/map
@@ -2286,6 +2468,7 @@ unsafe fn pull_iterator_tuple(
     w_iterators: PyObjectRef,
     strict: bool,
     func_name: &str,
+    w_zip: Option<PyObjectRef>,
 ) -> Result<Option<Vec<PyObjectRef>>, PyError> {
     let n = pyre_object::w_list_len(w_iterators) as usize;
     if n == 0 {
@@ -2301,6 +2484,16 @@ unsafe fn pull_iterator_tuple(
     // later iterations dereference it again — a raw local would go stale.
     pyre_object::gc_roots::pin_root(w_iterators);
     let iters_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let zip_slot = w_zip.map(|zip| {
+        pyre_object::gc_roots::pin_root(zip);
+        pyre_object::gc_roots::shadow_stack_len() - 1
+    });
+    if let Some(slot) = zip_slot {
+        pyre_object::functional::w_zip_set_iteration_progress(
+            pyre_object::gc_roots::shadow_stack_get(slot),
+            0,
+        );
+    }
     let base = pyre_object::gc_roots::shadow_stack_len();
     for i in 0..n {
         let it = pyre_object::w_list_getitem(
@@ -2309,15 +2502,30 @@ unsafe fn pull_iterator_tuple(
         )
         .unwrap();
         match next(it) {
-            Ok(v) => pyre_object::gc_roots::pin_root(v),
+            Ok(v) => {
+                pyre_object::gc_roots::pin_root(v);
+                if let Some(slot) = zip_slot {
+                    pyre_object::functional::w_zip_set_iteration_progress(
+                        pyre_object::gc_roots::shadow_stack_get(slot),
+                        i + 1,
+                    );
+                }
+            }
             Err(e) if e.kind == PyErrorKind::StopIteration => {
                 if !strict {
                     return Ok(None);
                 }
                 // A StopIteration in strict mode is a length mismatch.
                 // `i` iterators yielded before this one ran dry.
-                if i > 0 {
-                    return Err(strict_zip_error(func_name, i, "shorter"));
+                let iteration_progress = if let Some(slot) = zip_slot {
+                    pyre_object::functional::w_zip_get_iteration_progress(
+                        pyre_object::gc_roots::shadow_stack_get(slot),
+                    )
+                } else {
+                    i
+                };
+                if iteration_progress > 0 {
+                    return Err(strict_zip_error(func_name, iteration_progress, "shorter"));
                 }
                 if n == 1 {
                     // A single iterable can never mismatch.
@@ -2369,21 +2577,49 @@ unsafe fn pull_iterator_tuple(
 /// `(map, (func, *iterators))`, with a trailing `True` when `strict`
 /// (CPython 3.14).  The captured iterators carry their positions.
 pub(crate) fn map_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    let self_ = map_receiver(args, "__reduce__")?;
     unsafe {
-        let w_fun = pyre_object::functional::w_map_get_fun(args[0]);
-        let w_iterators = pyre_object::functional::w_map_get_iterators(args[0]);
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(self_);
+        let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let self_type = crate::typedef::r#type(self_).unwrap_or(pyre_object::PY_NULL);
+        pyre_object::gc_roots::pin_root(self_type);
+        let self_type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let w_fun = pyre_object::functional::w_map_get_fun(self_);
+        pyre_object::gc_roots::pin_root(w_fun);
+        let fun_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let w_iterators = pyre_object::functional::w_map_get_iterators(self_);
+        pyre_object::gc_roots::pin_root(w_iterators);
+        let iterators_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let n = pyre_object::w_list_len(w_iterators);
         let mut state_items = Vec::with_capacity(n as usize + 1);
-        state_items.push(w_fun);
+        state_items.push(pyre_object::gc_roots::shadow_stack_get(fun_slot));
         for i in 0..n {
-            state_items.push(pyre_object::w_list_getitem(w_iterators, i as i64).unwrap());
+            let w_iter = pyre_object::w_list_getitem(
+                pyre_object::gc_roots::shadow_stack_get(iterators_slot),
+                i as i64,
+            )
+            .unwrap();
+            pyre_object::gc_roots::pin_root(w_iter);
+            state_items.push(w_iter);
         }
         let state = w_tuple_new(state_items);
-        let map_fn = builtin_callable("map");
-        if pyre_object::functional::w_map_get_strict(args[0]) {
-            Ok(w_tuple_new(vec![map_fn, state, w_bool_from(true)]))
+        pyre_object::gc_roots::pin_root(state);
+        let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        if pyre_object::functional::w_map_get_strict(pyre_object::gc_roots::shadow_stack_get(
+            self_slot,
+        )) {
+            Ok(w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(self_type_slot),
+                pyre_object::gc_roots::shadow_stack_get(state_slot),
+                w_bool_from(true),
+            ]))
         } else {
-            Ok(w_tuple_new(vec![map_fn, state]))
+            Ok(w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(self_type_slot),
+                pyre_object::gc_roots::shadow_stack_get(state_slot),
+            ]))
         }
     }
 }
@@ -2391,29 +2627,84 @@ pub(crate) fn map_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// `map.__setstate__(strict)` — CPython 3.14: set the `strict` flag from the
 /// unpickled state.
 pub(crate) fn map_setstate_method(args: &[PyObjectRef]) -> PyResult {
-    let strict = is_true(args[1])?;
+    let self_ = map_receiver(args, "__setstate__")?;
+    let state = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(self_);
+    let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(state);
+    let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let strict = is_true(unsafe { pyre_object::gc_roots::shadow_stack_get(state_slot) })?;
     unsafe {
-        pyre_object::functional::w_map_set_strict(args[0], strict);
+        pyre_object::functional::w_map_set_strict(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            strict,
+        );
     }
     Ok(w_none())
+}
+
+fn map_receiver(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, PyError> {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if self_.is_null() || !unsafe { pyre_object::functional::is_map(self_) } {
+        return Err(PyError::type_error(format!(
+            "descriptor '{name}' for 'map' objects doesn't apply to a '{}' object",
+            object_functionstr_type_name(self_),
+        )));
+    }
+    Ok(self_)
+}
+
+pub(crate) fn map_iter_method(args: &[PyObjectRef]) -> PyResult {
+    map_receiver(args, "__iter__")
+}
+
+pub(crate) fn map_next_method(args: &[PyObjectRef]) -> PyResult {
+    next(map_receiver(args, "__next__")?)
 }
 
 /// `zip.__reduce__()` — `functional.py:1081-1087 W_Zip.descr_reduce`:
 /// `(zip, (*iterators))`, with a trailing `True` when `strict`.
 pub(crate) fn zip_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    let self_ = zip_receiver(args, "__reduce__")?;
     unsafe {
-        let w_iterators = pyre_object::functional::w_zip_get_iterators(args[0]);
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(self_);
+        let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let self_type = crate::typedef::r#type(self_).unwrap_or(pyre_object::PY_NULL);
+        pyre_object::gc_roots::pin_root(self_type);
+        let self_type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let w_iterators = pyre_object::functional::w_zip_get_iterators(self_);
+        pyre_object::gc_roots::pin_root(w_iterators);
+        let iterators_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let n = pyre_object::w_list_len(w_iterators);
         let mut state_items = Vec::with_capacity(n as usize);
         for i in 0..n {
-            state_items.push(pyre_object::w_list_getitem(w_iterators, i as i64).unwrap());
+            let w_iter = pyre_object::w_list_getitem(
+                pyre_object::gc_roots::shadow_stack_get(iterators_slot),
+                i as i64,
+            )
+            .unwrap();
+            pyre_object::gc_roots::pin_root(w_iter);
+            state_items.push(w_iter);
         }
         let state = w_tuple_new(state_items);
-        let zip_fn = builtin_callable("zip");
-        if pyre_object::functional::w_zip_get_strict(args[0]) {
-            Ok(w_tuple_new(vec![zip_fn, state, w_bool_from(true)]))
+        pyre_object::gc_roots::pin_root(state);
+        let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        if pyre_object::functional::w_zip_get_strict(pyre_object::gc_roots::shadow_stack_get(
+            self_slot,
+        )) {
+            Ok(w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(self_type_slot),
+                pyre_object::gc_roots::shadow_stack_get(state_slot),
+                w_bool_from(true),
+            ]))
         } else {
-            Ok(w_tuple_new(vec![zip_fn, state]))
+            Ok(w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(self_type_slot),
+                pyre_object::gc_roots::shadow_stack_get(state_slot),
+            ]))
         }
     }
 }
@@ -2421,11 +2712,40 @@ pub(crate) fn zip_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// `zip.__setstate__(strict)` — `functional.py:1089-1091
 /// W_Zip.descr_setstate`: `self.strict = bool(state)`.
 pub(crate) fn zip_setstate_method(args: &[PyObjectRef]) -> PyResult {
-    let strict = is_true(args[1])?;
+    let self_ = zip_receiver(args, "__setstate__")?;
+    let state = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(self_);
+    let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(state);
+    let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let strict = is_true(unsafe { pyre_object::gc_roots::shadow_stack_get(state_slot) })?;
     unsafe {
-        pyre_object::functional::w_zip_set_strict(args[0], strict);
+        pyre_object::functional::w_zip_set_strict(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            strict,
+        );
     }
     Ok(w_none())
+}
+
+fn zip_receiver(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, PyError> {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if self_.is_null() || !unsafe { pyre_object::functional::is_zip(self_) } {
+        return Err(PyError::type_error(format!(
+            "descriptor '{name}' for 'zip' objects doesn't apply to a '{}' object",
+            object_functionstr_type_name(self_),
+        )));
+    }
+    Ok(self_)
+}
+
+pub(crate) fn zip_iter_method(args: &[PyObjectRef]) -> PyResult {
+    zip_receiver(args, "__iter__")
+}
+
+pub(crate) fn zip_next_method(args: &[PyObjectRef]) -> PyResult {
+    next(zip_receiver(args, "__next__")?)
 }
 
 /// `pypy/interpreter/baseobjspace.py:870 finditem` — return the value
@@ -2578,7 +2898,12 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
     };
     if step == 1 {
         let s_lo = start.max(0) as usize;
-        let s_hi = stop.max(0) as usize;
+        // listobject.py passes `(start, step, slicelength)` to `setslice`;
+        // its contiguous replacement range is therefore
+        // `start..start+slicelength`.  A normalized slice such as `5:2`
+        // has zero length and inserts/deletes at 5, rather than forming the
+        // invalid Rust range `5..2`.
+        let s_hi = stop.max(start).max(0) as usize;
         pyre_object::listobject::w_list_setslice(obj, s_lo, s_hi, w_other)
             .expect("w_other is always a valid list");
         return Ok(w_none());
@@ -3643,6 +3968,8 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             || pyre_object::interp_itertools::is_takewhile(obj)
             || pyre_object::interp_itertools::is_dropwhile(obj)
             || pyre_object::interp_itertools::is_filterfalse(obj)
+            || pyre_object::interp_itertools::is_compress(obj)
+            || pyre_object::interp_itertools::is_starmap(obj)
             || pyre_object::interp_itertools::is_pairwise(obj)
             || pyre_object::interp_itertools::is_cycle(obj)
             || pyre_object::interp_itertools::is_chain(obj)
@@ -4250,8 +4577,11 @@ pub(crate) unsafe fn object_getattribute_surrogate(
             }
             // typeobject.py:820-823: the type's own MRO value, bound through
             // `space.get(w_value, space.w_None, self)` = `__get__(None, type)`.
+            // Internally a null receiver distinguishes this class access from
+            // attribute access on the actual `None` singleton; `get` converts
+            // it back to `w_None` only for a Python-visible `__get__` call.
             if let Some(w_value) = lookup_in_type_wtf8(obj, name) {
-                if let Some(result) = get(w_value, w_none(), obj)? {
+                if let Some(result) = get(w_value, PY_NULL, obj)? {
                     return Ok(result);
                 }
                 return Ok(w_value);
@@ -4876,11 +5206,11 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             // typeobject.py:820-823 — the type's own MRO value, bound via
             // `space.get(w_value, space.w_None, self)` = `__get__(None, type)`
             // (functions stay unbound, classmethod binds the class, a custom
-            // descriptor sees `obj is None`).  The receiver must be the `None`
-            // singleton, not a null pointer, or a Python
-            // `__get__(self, obj, objtype=None)` loses its `obj` argument.
+            // descriptor sees `obj is None`).  A null internal receiver keeps
+            // this distinct from looking up a descriptor on the actual None
+            // singleton; `get` materialises `w_None` for custom `__get__`.
             if let Some(value) = lookup_in_type_where(obj, name) {
-                match get(value, w_none(), obj) {
+                match get(value, PY_NULL, obj) {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => return Ok(value),
                     Err(e) => {
@@ -4946,11 +5276,8 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     if (name == "__reduce__" || name == "__reduce_ex__")
         && unsafe { pyre_object::py_type_check(obj, &crate::function::BUILTIN_FUNCTION_TYPE) }
     {
-        let reduce_fn: fn(&[PyObjectRef]) -> PyResult = |args| {
-            Ok(w_str_new(&unsafe {
-                crate::function::function_get_qualname(args[0])
-            }))
-        };
+        let reduce_fn: fn(&[PyObjectRef]) -> PyResult =
+            |args| unsafe { crate::function::descr_builtin_function_reduce(args[0]) };
         let (sname, arity): (&'static str, u16) = if name == "__reduce_ex__" {
             ("__reduce_ex__", 2)
         } else {
@@ -4978,8 +5305,13 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 let w_descr = lookup_in_type_where(w_type, name);
                 if let Some(descr) = w_descr {
                     if is_data_descr(descr) {
-                        if let Some(result) = get(descr, obj, w_type)? {
-                            return Ok(result);
+                        match get(descr, obj, w_type) {
+                            Ok(Some(result)) => return Ok(result),
+                            Ok(None) => {}
+                            Err(e) if e.kind == PyErrorKind::AttributeError => {
+                                return instance_getattr_hook_or_err(w_type, obj, name, e);
+                            }
+                            Err(e) => return Err(e),
                         }
                     }
                 }
@@ -4993,8 +5325,13 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                     if crate::is_function(descr) {
                         return Ok(pyre_object::w_method_new(descr, obj, w_type));
                     }
-                    if let Some(result) = get(descr, obj, w_type)? {
-                        return Ok(result);
+                    match get(descr, obj, w_type) {
+                        Ok(Some(result)) => return Ok(result),
+                        Ok(None) => {}
+                        Err(e) if e.kind == PyErrorKind::AttributeError => {
+                            return instance_getattr_hook_or_err(w_type, obj, name, e);
+                        }
+                        Err(e) => return Err(e),
                     }
                     return Ok(descr);
                 }
@@ -7219,7 +7556,7 @@ pub(crate) unsafe fn get(
         if std::ptr::eq(ob_type, &crate::FUNCTION_TYPE as *const _)
             && crate::is_builtin_code(crate::function_get_code(descr) as pyre_object::PyObjectRef)
         {
-            if obj.is_null() || is_none(obj) {
+            if obj.is_null() {
                 return Ok(Some(descr));
             }
             return Ok(Some(pyre_object::w_method_new(descr, obj, w_type)));
@@ -7228,10 +7565,10 @@ pub(crate) unsafe fn get(
 
     // property: PyPy W_Property.get → call fget(obj)
     if is_property(descr) {
-        // W_Property.get: `if space.is_w(w_obj, space.w_None): return self`
-        // — a `None` receiver (class-level access via `__get__(None, type)`)
-        // returns the property itself, the same as a null receiver.
-        if obj.is_null() || is_none(obj) {
+        // W_Property.get receives `space.w_None` for class access.  Internally
+        // that state is a null pointer so the actual None singleton can still
+        // be a property-bearing instance.
+        if obj.is_null() {
             return Ok(Some(descr));
         }
         let fget = w_property_get_fget(descr);
@@ -7251,7 +7588,7 @@ pub(crate) unsafe fn get(
     //   return w_result
     if pyre_object::is_member(descr) {
         // typedef.py:507-508
-        if obj.is_null() || is_none(obj) {
+        if obj.is_null() {
             return Ok(Some(descr));
         }
         // typedef.py:510: self.typecheck(space, w_obj) → TypeError
@@ -7302,7 +7639,9 @@ pub(crate) unsafe fn get(
     if let Some(descr_type) = crate::typedef::r#type(descr) {
         if let Some(get_fn) = lookup_in_type_where(descr_type, "__get__") {
             if !get_fn.is_null() {
-                let result = crate::call::call_function_impl_result(get_fn, &[descr, obj, w_type])?;
+                let visible_obj = if obj.is_null() { w_none() } else { obj };
+                let result =
+                    crate::call::call_function_impl_result(get_fn, &[descr, visible_obj, w_type])?;
                 return Ok(Some(result));
             }
         }
@@ -9727,6 +10066,8 @@ pub fn is_iterable(obj: PyObjectRef) -> bool {
             || pyre_object::interp_itertools::is_takewhile(obj)
             || pyre_object::interp_itertools::is_dropwhile(obj)
             || pyre_object::interp_itertools::is_filterfalse(obj)
+            || pyre_object::interp_itertools::is_compress(obj)
+            || pyre_object::interp_itertools::is_starmap(obj)
             || pyre_object::interp_itertools::is_pairwise(obj)
             || pyre_object::interp_itertools::is_cycle(obj)
             || pyre_object::interp_itertools::is_chain(obj)
@@ -9972,6 +10313,8 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             || pyre_object::interp_itertools::is_takewhile(obj)
             || pyre_object::interp_itertools::is_dropwhile(obj)
             || pyre_object::interp_itertools::is_filterfalse(obj)
+            || pyre_object::interp_itertools::is_compress(obj)
+            || pyre_object::interp_itertools::is_starmap(obj)
             || pyre_object::interp_itertools::is_pairwise(obj)
             || pyre_object::interp_itertools::is_cycle(obj)
             || pyre_object::interp_itertools::is_chain(obj)
@@ -10437,6 +10780,73 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 }
             }
         }
+        // itertools.compress — interp_itertools.py W_Compress.next_w.
+        // Pull data first, then its matching selector; exhaustion of either
+        // input stops the iterator.  Keep the owner and yielded data item
+        // rooted across both arbitrary Python iterator/truth calls.
+        if pyre_object::interp_itertools::is_compress(obj) {
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            loop {
+                let _iteration_roots = pyre_object::gc_roots::push_roots();
+                let w_data = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                    as *const pyre_object::interp_itertools::W_Compress))
+                    .w_data;
+                pyre_object::gc_roots::pin_root(w_data);
+                let data_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let w_item = next(pyre_object::gc_roots::shadow_stack_get(data_slot))?;
+                pyre_object::gc_roots::pin_root(w_item);
+                let item_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+                let w_selectors = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                    as *const pyre_object::interp_itertools::W_Compress))
+                    .w_selectors;
+                pyre_object::gc_roots::pin_root(w_selectors);
+                let selectors_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let w_selector = next(pyre_object::gc_roots::shadow_stack_get(selectors_slot))?;
+                pyre_object::gc_roots::pin_root(w_selector);
+                let selector_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                if is_true(pyre_object::gc_roots::shadow_stack_get(selector_slot))? {
+                    return Ok(pyre_object::gc_roots::shadow_stack_get(item_slot));
+                }
+            }
+        }
+        // itertools.starmap — interp_itertools.py W_StarMap.next_w:
+        // fetch one argument bundle and call `w_fun(*bundle)`.  Every edge is
+        // re-read from the rooted owner across calls that may move the heap.
+        if pyre_object::interp_itertools::is_starmap(obj) {
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_iterable = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                as *const pyre_object::interp_itertools::W_StarMap))
+                .w_iterable;
+            pyre_object::gc_roots::pin_root(w_iterable);
+            let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_obj = next(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?;
+            pyre_object::gc_roots::pin_root(w_obj);
+            let obj_args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let call_args = crate::builtins::collect_iterable(
+                pyre_object::gc_roots::shadow_stack_get(obj_args_slot),
+            )?;
+            let first_arg_slot = pyre_object::gc_roots::shadow_stack_len();
+            for &arg in &call_args {
+                pyre_object::gc_roots::pin_root(arg);
+            }
+            let rooted_args: Vec<_> = (0..call_args.len())
+                .map(|index| pyre_object::gc_roots::shadow_stack_get(first_arg_slot + index))
+                .collect();
+            let w_fun = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                as *const pyre_object::interp_itertools::W_StarMap))
+                .w_fun;
+            pyre_object::gc_roots::pin_root(w_fun);
+            let fun_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            return crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(fun_slot),
+                &rooted_args,
+            );
+        }
         // `pypy/module/__builtin__/functional.py:930-942 W_Filter.next_w`
         // (reverse=False): pull from the iterator until the predicate (or
         // truthiness, when None) passes.
@@ -10461,7 +10871,12 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let w_iterable = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
                     as *const pyre_object::functional::W_Filter))
                     .w_iterable;
-                let w_obj = next(w_iterable)?;
+                let w_obj = {
+                    let _iter_roots = pyre_object::gc_roots::push_roots();
+                    pyre_object::gc_roots::pin_root(w_iterable);
+                    let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                    next(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?
+                };
                 let _r = pyre_object::gc_roots::push_roots();
                 pyre_object::gc_roots::pin_root(w_obj);
                 let w_obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -10471,11 +10886,15 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let pred = if w_predicate.is_null() {
                     is_true(pyre_object::gc_roots::shadow_stack_get(w_obj_slot))?
                 } else {
+                    pyre_object::gc_roots::pin_root(w_predicate);
+                    let predicate_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                     let w_pred = crate::call::call_function_impl_result(
-                        w_predicate,
+                        pyre_object::gc_roots::shadow_stack_get(predicate_slot),
                         &[pyre_object::gc_roots::shadow_stack_get(w_obj_slot)],
                     )?;
-                    is_true(w_pred)?
+                    pyre_object::gc_roots::pin_root(w_pred);
+                    let pred_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                    is_true(pyre_object::gc_roots::shadow_stack_get(pred_slot))?
                 };
                 if pred {
                     return Ok(pyre_object::gc_roots::shadow_stack_get(w_obj_slot));
@@ -10487,12 +10906,36 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         // (strict raises on mismatch).
         if pyre_object::functional::is_map(obj) {
             use pyre_object::functional as mo;
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let w_iterators = mo::w_map_get_iterators(obj);
+            pyre_object::gc_roots::pin_root(w_iterators);
+            let iterators_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let strict = mo::w_map_get_strict(obj);
-            return match pull_iterator_tuple(w_iterators, strict, "map")? {
+            return match pull_iterator_tuple(
+                pyre_object::gc_roots::shadow_stack_get(iterators_slot),
+                strict,
+                "map",
+                None,
+            )? {
                 Some(items) => {
-                    let w_fun = mo::w_map_get_fun(obj);
-                    crate::call::call_function_impl_result(w_fun, &items)
+                    let items_base = pyre_object::gc_roots::shadow_stack_len();
+                    for &item in &items {
+                        pyre_object::gc_roots::pin_root(item);
+                    }
+                    let w_fun =
+                        mo::w_map_get_fun(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+                    pyre_object::gc_roots::pin_root(w_fun);
+                    let fun_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                    let rooted_items: Vec<_> = (0..items.len())
+                        .map(|index| pyre_object::gc_roots::shadow_stack_get(items_base + index))
+                        .collect();
+                    crate::call::call_function_impl_result(
+                        pyre_object::gc_roots::shadow_stack_get(fun_slot),
+                        &rooted_items,
+                    )
                 }
                 None => Err(PyError::stop_iteration()),
             };
@@ -10502,10 +10945,26 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         // mismatch).
         if pyre_object::functional::is_zip(obj) {
             use pyre_object::functional as zo;
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let w_iterators = zo::w_zip_get_iterators(obj);
+            pyre_object::gc_roots::pin_root(w_iterators);
+            let iterators_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let strict = zo::w_zip_get_strict(obj);
-            return match pull_iterator_tuple(w_iterators, strict, "zip")? {
-                Some(items) => Ok(pyre_object::w_tuple_new(items)),
+            return match pull_iterator_tuple(
+                pyre_object::gc_roots::shadow_stack_get(iterators_slot),
+                strict,
+                "zip",
+                Some(pyre_object::gc_roots::shadow_stack_get(obj_slot)),
+            )? {
+                Some(items) => {
+                    for &item in &items {
+                        pyre_object::gc_roots::pin_root(item);
+                    }
+                    Ok(pyre_object::w_tuple_new(items))
+                }
                 None => Err(PyError::stop_iteration()),
             };
         }
@@ -10675,7 +11134,17 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 ));
             }
             let index = dv::w_dict_view_iterator_get_index(obj);
-            let Some((k, mut v)) = pyre_object::dictmultiobject::w_dict_nth_item(dict, index)
+            if index >= startlen {
+                return Err(PyError::stop_iteration());
+            }
+            let reverse = dv::w_dict_view_iterator_get_reverse(obj);
+            let storage_index = if reverse {
+                startlen.saturating_sub(index + 1)
+            } else {
+                index
+            };
+            let Some((k, mut v)) =
+                pyre_object::dictmultiobject::w_dict_nth_item(dict, storage_index)
             else {
                 return Err(PyError::stop_iteration());
             };
@@ -10783,6 +11252,13 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         }
         if pyre_object::functional::is_enumerate(obj) {
             use pyre_object::functional as eo;
+            // `space.add` and `space.next` below can allocate or invoke Python.
+            // RPython's GC transform keeps `self` and the active bigint Box
+            // rooted; mirror that explicitly and reload fields after calls.
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let w_index_slot = eo::w_enumerate_get_w_index(obj);
             let mut w_iter_or_list = eo::w_enumerate_get_iter_or_list(obj);
             let mut w_item: PyObjectRef = pyre_object::PY_NULL;
@@ -10813,10 +11289,23 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                             // Promote to bigint slot per `:299-302`.
                             let w_idx =
                                 pyre_object::w_long_new(::malachite_bigint::BigInt::from(index));
+                            pyre_object::gc_roots::pin_root(w_idx);
+                            let w_idx_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                             let one =
                                 pyre_object::w_long_new(::malachite_bigint::BigInt::from(1i64));
-                            let bumped = add(w_idx, one)?;
-                            eo::w_enumerate_set_w_index(obj, bumped);
+                            pyre_object::gc_roots::pin_root(one);
+                            let one_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                            let bumped = add(
+                                pyre_object::gc_roots::shadow_stack_get(w_idx_slot),
+                                pyre_object::gc_roots::shadow_stack_get(one_slot),
+                            )?;
+                            pyre_object::gc_roots::pin_root(bumped);
+                            let bumped_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                            eo::w_enumerate_set_w_index(
+                                obj,
+                                pyre_object::gc_roots::shadow_stack_get(bumped_slot),
+                            );
                             eo::w_enumerate_set_index(obj, -1);
                         }
                     }
@@ -10824,21 +11313,42 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 w_index = pyre_object::w_int_new(index);
             } else {
                 // Bigint slot active — bump via `space.add`.
+                pyre_object::gc_roots::pin_root(w_index_slot);
+                let w_index_slot_root = pyre_object::gc_roots::shadow_stack_len() - 1;
                 let one = pyre_object::w_int_new(1);
-                let bumped = add(w_index_slot, one)?;
-                eo::w_enumerate_set_w_index(obj, bumped);
-                w_index = w_index_slot;
+                pyre_object::gc_roots::pin_root(one);
+                let one_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let bumped = add(
+                    pyre_object::gc_roots::shadow_stack_get(w_index_slot_root),
+                    pyre_object::gc_roots::shadow_stack_get(one_slot),
+                )?;
+                pyre_object::gc_roots::pin_root(bumped);
+                let bumped_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                eo::w_enumerate_set_w_index(
+                    obj,
+                    pyre_object::gc_roots::shadow_stack_get(bumped_slot),
+                );
+                w_index = pyre_object::gc_roots::shadow_stack_get(w_index_slot_root);
             }
+            pyre_object::gc_roots::pin_root(w_index);
+            let result_index_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             if w_item.is_null() {
                 // Re-read slot — list fast-path already set w_item;
                 // otherwise we need to pull from the iterator.
+                let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 w_iter_or_list = eo::w_enumerate_get_iter_or_list(obj);
                 if w_iter_or_list.is_null() {
                     return Err(PyError::stop_iteration());
                 }
-                w_item = next(w_iter_or_list)?;
+                pyre_object::gc_roots::pin_root(w_iter_or_list);
+                let iter_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                w_item = next(pyre_object::gc_roots::shadow_stack_get(iter_slot))?;
             }
-            return Ok(pyre_object::w_tuple_new(vec![w_index, w_item]));
+            return Ok(pyre_object::w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(result_index_slot),
+                w_item,
+            ]));
         }
         // `pypy/module/__builtin__/functional.py:385-405
         // W_ReversedIterator.descr_next` — `getitem(sequence, remaining)`
@@ -10853,8 +11363,17 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let _roots = pyre_object::gc_roots::push_roots();
                 pyre_object::gc_roots::pin_root(obj);
                 let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                let seq = ro::w_reversed_get_sequence(obj);
-                match getitem(seq, w_int_new(remaining)) {
+                let seq =
+                    ro::w_reversed_get_sequence(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+                pyre_object::gc_roots::pin_root(seq);
+                let seq_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let index = w_int_new(remaining);
+                pyre_object::gc_roots::pin_root(index);
+                let index_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                match getitem(
+                    pyre_object::gc_roots::shadow_stack_get(seq_slot),
+                    pyre_object::gc_roots::shadow_stack_get(index_slot),
+                ) {
                     Ok(w_item) => {
                         ro::w_reversed_set_remaining(
                             pyre_object::gc_roots::shadow_stack_get(obj_slot),
@@ -11081,7 +11600,9 @@ pub(crate) fn property_descr_set_impl(args: &[PyObjectRef]) -> PyResult {
 pub(crate) fn property_descr_delete_impl(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let prop = property_require_obj(args.first().copied().unwrap_or(PY_NULL), "__delete__")?;
-        let obj = args[1];
+        let obj = args.get(1).copied().ok_or_else(|| {
+            crate::PyError::type_error("property.__delete__() takes exactly one argument (0 given)")
+        })?;
         let fdel = w_property_get_fdel(prop);
         if fdel.is_null() || is_none(fdel) {
             return Err(property_no_accessor(prop, obj, "deleter")?);

@@ -86,6 +86,27 @@ assert len(positions) == len(code.co_code) // 2
 assert lines and all(len(row) == 3 for row in lines)
 assert branches == [(12, 18, 48)]
 
+
+def loop(values):
+    for value in values:
+        pass
+
+
+assert list(loop.__code__.co_branches()) == [(6, 10, 20)]
+
+large_namespace = {}
+large_body = "\n".join(f"        value = {number}" for number in range(300))
+exec(
+    "def large_branch(flag):\n"
+    "    if flag:\n"
+    f"{large_body}\n"
+    "    return value\n",
+    large_namespace,
+)
+large_branches = list(large_namespace["large_branch"].__code__.co_branches())
+assert large_branches
+assert max(max(row) for row in large_branches) > 512
+
 same = code.replace()
 same_dunder = code.__replace__()
 assert same is not code
@@ -94,6 +115,60 @@ assert same_dunder == code
 assert hash(same) == hash(code)
 assert code.replace(co_name="renamed").co_name == "renamed"
 assert code.replace(co_qualname="outer.renamed").co_qualname == "outer.renamed"
+different_lines = code.replace(co_linetable=b"")
+different_exceptions = code.replace(co_exceptiontable=b"x")
+assert different_lines != code
+assert different_exceptions != code
+assert hash(different_lines) != hash(code)
+assert hash(different_exceptions) != hash(code)
+assert list(different_lines.co_positions()) != positions
+
+for changes in (
+    {"co_argcount": len(code.co_varnames) + 1},
+    {"co_posonlyargcount": code.co_argcount + 1},
+    {"co_kwonlyargcount": len(code.co_varnames) + 1},
+    {"co_nlocals": code.co_nlocals + 1},
+):
+    try:
+        code.replace(**changes)
+    except (ValueError, SystemError):
+        pass
+    else:
+        raise AssertionError(f"code.replace accepted inconsistent counts: {changes}")
+
+for field in ("co_argcount", "co_stacksize", "co_flags", "co_firstlineno"):
+    try:
+        code.replace(**{field: 1 << 40})
+    except OverflowError:
+        pass
+    else:
+        raise AssertionError(f"code.replace accepted an oversized {field}")
+
+
+def constants_sample():
+    return 1j, frozenset({1, 2})
+
+
+constants_code = constants_sample.__code__
+assert constants_code.replace(co_consts=constants_code.co_consts) == constants_code
+
+
+def outer(captured):
+    def inner():
+        return captured
+
+    return inner
+
+
+outer_code = outer.__code__
+assert outer_code._varname_from_oparg(0) == "captured"
+try:
+    outer_code._varname_from_oparg(len(outer_code.co_varnames))
+except IndexError:
+    pass
+else:
+    raise AssertionError("cellvar/local alias was exposed as a second locals-plus slot")
+
 assert types.CodeType.__eq__(code, object()) is NotImplemented
 assert types.CodeType.__ne__(code, object()) is NotImplemented
 for name in ("__lt__", "__le__", "__gt__", "__ge__"):
