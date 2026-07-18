@@ -5083,16 +5083,21 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 enum ExceptionGroupCondition {
     Class(PyObjectRef),
     Callable(PyObjectRef),
+    Identity(Vec<usize>),
 }
 
 impl ExceptionGroupCondition {
     fn matches(&self, exc: PyObjectRef) -> Result<bool, crate::PyError> {
         match *self {
-            Self::Class(classinfo) => crate::baseobjspace::isinstance(exc, classinfo),
+            // Match on the exception's type (`exception_match`), not
+            // `isinstance`, so a matcher class with a custom metaclass
+            // `__instancecheck__` cannot pull unrelated leaves into a subgroup.
+            Self::Class(classinfo) => Ok(crate::eval::check_exc_match_against(exc, classinfo)),
             Self::Callable(callable) => {
                 let result = crate::call::call_function_impl_result(callable, &[exc])?;
                 crate::baseobjspace::is_true(result)
             }
+            Self::Identity(ref addresses) => Ok(addresses.contains(&(exc as usize))),
         }
     }
 }
@@ -5136,21 +5141,22 @@ fn exception_group_copy_attrs(
     Ok(())
 }
 
-fn exception_group_derive_from(
-    w_self: PyObjectRef,
-    exceptions: Vec<PyObjectRef>,
-) -> Result<PyObjectRef, crate::PyError> {
-    let (message, _) = exception_group_fields(w_self)?;
-    let cls = crate::typedef::r#type(w_self).unwrap();
-    let list = pyre_object::w_list_new(exceptions);
-    crate::call::call_function_impl_result(cls, &[message, list])
-}
-
 fn exception_group_derive_and_copy(
     w_self: PyObjectRef,
     exceptions: Vec<PyObjectRef>,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let group = exception_group_derive_from(w_self, exceptions)?;
+    // _derive_and_copy_attrs: construct the sub-result through the overridable
+    // `derive` method so a subclass can control reconstruction (e.g. thread
+    // extra constructor args), then copy the metadata attrs onto it.
+    let derive = crate::baseobjspace::getattr_str(w_self, "derive")?;
+    let list = pyre_object::w_list_new(exceptions);
+    let group = crate::call::call_function_impl_result(derive, &[list])?;
+    let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
+    if !crate::baseobjspace::isinstance(group, base_group)? {
+        return Err(crate::PyError::type_error(
+            "derive must return an instance of BaseExceptionGroup",
+        ));
+    }
     exception_group_copy_attrs(w_self, group)?;
     Ok(group)
 }
@@ -5229,6 +5235,181 @@ fn exception_group_split_inner(
     Ok((yes, no))
 }
 
+pub(crate) fn exception_group_match(
+    w_exc: PyObjectRef,
+    w_type: PyObjectRef,
+) -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
+    let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
+    if crate::eval::check_exc_match_against(w_exc, w_type) {
+        if crate::baseobjspace::isinstance(w_exc, base_group)? {
+            return Ok((w_exc, pyre_object::w_none()));
+        }
+        let message = unsafe { pyre_object::w_str_new("") };
+        let exceptions = pyre_object::w_tuple_new(vec![w_exc]);
+        let group = exception_group_new(&[base_group, message, exceptions])?;
+        return Ok((group, pyre_object::w_none()));
+    }
+    if crate::baseobjspace::isinstance(w_exc, base_group)? {
+        // Partial match: call the (overridable) `split` method and validate it
+        // returns a 2-tuple of (match, rest).
+        let split = crate::baseobjspace::getattr_str(w_exc, "split")?;
+        let pair = crate::call::call_function_impl_result(split, &[w_type])?;
+        if !unsafe { pyre_object::is_tuple(pair) } {
+            let name = crate::baseobjspace::object_functionstr_type_name(pair);
+            return Err(crate::PyError::type_error(format!(
+                "split must return a tuple, not {name}"
+            )));
+        }
+        let n = unsafe { pyre_object::w_tuple_len(pair) };
+        if n < 2 {
+            return Err(crate::PyError::type_error(format!(
+                "split must return a 2-tuple, got tuple of size {n}"
+            )));
+        }
+        // Tuples longer than 2 are accepted for backwards compatibility; only
+        // the first two elements (match, rest) are used.
+        let matching = unsafe { pyre_object::w_tuple_getitem(pair, 0) }.unwrap();
+        let rest = unsafe { pyre_object::w_tuple_getitem(pair, 1) }.unwrap();
+        return Ok((matching, rest));
+    }
+    Ok((pyre_object::w_none(), w_exc))
+}
+
+fn exception_group_notes(w_exc: PyObjectRef) -> Result<Option<PyObjectRef>, crate::PyError> {
+    match crate::baseobjspace::getattr_str(w_exc, "__notes__") {
+        Ok(notes) => Ok(Some(notes)),
+        Err(err) if err.kind == crate::PyErrorKind::AttributeError => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Identity comparison of a `__traceback__`/`__cause__`/`__context__` slot,
+/// treating an unset (raw NULL) slot and the `None` singleton as the same
+/// Python-level value.  `_is_same_exception_metadata` reads these through the
+/// attribute layer, which normalizes an unset slot to `None`; the raw slot
+/// accessors do not, so a copy made via getattr/setattr (holding `None`) would
+/// otherwise not compare equal to a source whose slot was never materialized.
+fn exception_group_meta_ref_eq(w_left: PyObjectRef, w_right: PyObjectRef) -> bool {
+    let left_none = w_left.is_null() || unsafe { pyre_object::is_none(w_left) };
+    let right_none = w_right.is_null() || unsafe { pyre_object::is_none(w_right) };
+    if left_none || right_none {
+        left_none && right_none
+    } else {
+        std::ptr::eq(w_left, w_right)
+    }
+}
+
+fn exception_group_same_metadata(
+    w_left: PyObjectRef,
+    w_right: PyObjectRef,
+) -> Result<bool, crate::PyError> {
+    let left_notes = exception_group_notes(w_left)?;
+    let right_notes = exception_group_notes(w_right)?;
+    if !match (left_notes, right_notes) {
+        (Some(left), Some(right)) => std::ptr::eq(left, right),
+        (None, None) => true,
+        _ => false,
+    } {
+        return Ok(false);
+    }
+    Ok(unsafe {
+        exception_group_meta_ref_eq(
+            pyre_object::interp_exceptions::w_exception_get_traceback(w_left),
+            pyre_object::interp_exceptions::w_exception_get_traceback(w_right),
+        ) && exception_group_meta_ref_eq(
+            pyre_object::interp_exceptions::w_exception_get_cause(w_left),
+            pyre_object::interp_exceptions::w_exception_get_cause(w_right),
+        ) && exception_group_meta_ref_eq(
+            pyre_object::interp_exceptions::w_exception_get_context(w_left),
+            pyre_object::interp_exceptions::w_exception_get_context(w_right),
+        )
+    })
+}
+
+fn exception_group_collect_leaf_addresses(
+    w_exc: PyObjectRef,
+    addresses: &mut Vec<usize>,
+) -> Result<(), crate::PyError> {
+    if unsafe { pyre_object::is_none(w_exc) } {
+        return Ok(());
+    }
+    let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
+    if crate::baseobjspace::isinstance(w_exc, base_group)? {
+        let (_, exceptions) = exception_group_fields(w_exc)?;
+        for child in unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) } {
+            exception_group_collect_leaf_addresses(child, addresses)?;
+        }
+    } else if unsafe { pyre_object::is_exception(w_exc) } {
+        let address = w_exc as usize;
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    } else {
+        let name = crate::baseobjspace::object_functionstr_type_name(w_exc);
+        return Err(crate::PyError::type_error(format!(
+            "expected BaseException, got {name}"
+        )));
+    }
+    Ok(())
+}
+
+fn exception_group_projection(
+    w_group: PyObjectRef,
+    keep: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let mut addresses = Vec::new();
+    for w_exc in keep.iter().copied() {
+        exception_group_collect_leaf_addresses(w_exc, &mut addresses)?;
+    }
+    let (matching, _) =
+        exception_group_split_inner(w_group, &ExceptionGroupCondition::Identity(addresses))?;
+    Ok(matching)
+}
+
+pub(crate) fn exception_group_prep_reraise_star(
+    w_orig: PyObjectRef,
+    w_exc_list: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let exceptions = crate::baseobjspace::fixedview(w_exc_list, -1)?;
+    if exceptions.is_empty() {
+        return Ok(pyre_object::w_none());
+    }
+    let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
+    if !crate::baseobjspace::isinstance(w_orig, base_group)? {
+        return Ok(exceptions[0]);
+    }
+
+    let mut raised = Vec::new();
+    let mut reraised = Vec::new();
+    for w_exc in exceptions {
+        if !unsafe { pyre_object::is_none(w_exc) } {
+            if exception_group_same_metadata(w_exc, w_orig)? {
+                reraised.push(w_exc);
+            } else {
+                raised.push(w_exc);
+            }
+        }
+    }
+    let reraised_group = exception_group_projection(w_orig, &reraised)?;
+    if raised.is_empty() {
+        return Ok(reraised_group);
+    }
+    if !unsafe { pyre_object::is_none(reraised_group) } {
+        raised.push(reraised_group);
+    }
+    if raised.len() == 1 {
+        return Ok(raised[0]);
+    }
+    // Construct through BaseExceptionGroup so a merged result that carries a
+    // bare BaseException (e.g. a reraised KeyboardInterrupt alongside a freshly
+    // raised Exception) stays a BaseExceptionGroup; the constructor promotes to
+    // ExceptionGroup only when every leaf is an Exception.
+    let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
+    let message = unsafe { pyre_object::w_str_new("") };
+    let list = pyre_object::w_list_new(raised);
+    exception_group_new(&[base_group, message, list])
+}
+
 fn exception_group_subgroup(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 2 {
         return Err(crate::PyError::type_error(
@@ -5256,9 +5437,13 @@ fn exception_group_derive(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             "derive() takes exactly one argument",
         ));
     }
+    // The default derive constructs a BaseExceptionGroup (promoted to
+    // ExceptionGroup when every leaf is an Exception), NOT `type(self)`: a
+    // subclass that adds constructor args must override `derive` to preserve
+    // its type, otherwise split/subgroup fall back to the base class.
     let (message, _) = exception_group_fields(args[0])?;
-    let cls = crate::typedef::r#type(args[0]).unwrap();
-    crate::call::call_function_impl_result(cls, &[message, args[1]])
+    let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
+    crate::call::call_function_impl_result(base_group, &[message, args[1]])
 }
 
 fn exception_group_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -5332,7 +5517,15 @@ fn make_exception_group_type(name: &'static str, bases: &[PyObjectRef]) -> PyObj
                     ns,
                     "__new__",
                     make_builtin_function("__new__", exception_group_new),
-                )
+                );
+                pyre_object::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__class_getitem__",
+                    pyre_object::function::w_classmethod_new(make_builtin_function(
+                        "__class_getitem__",
+                        crate::_pypy_generic_alias::generic_alias_class_getitem,
+                    )),
+                );
             };
         },
         bases,

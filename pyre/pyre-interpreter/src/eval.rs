@@ -1055,20 +1055,7 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Resul
     // `__context__` and `__cause__`/`__suppress_context__` writes land
     // in the typed slots on `W_BaseException` per
     // `interp_exceptions.py:113-117`.
-    let active = get_current_exception();
-    if !active.is_null()
-        && active != exc
-        && unsafe { !pyre_object::is_none(active) }
-        && unsafe { pyre_object::is_exception(exc) }
-    {
-        // `interp_exceptions.py:115 W_BaseException.w_context = None`
-        // class default — only write if no `__context__` is already
-        // stamped on the exception (mirrors `or_insert` semantics).
-        let existing = unsafe { pyre_object::interp_exceptions::w_exception_get_context(exc) };
-        if existing.is_null() {
-            unsafe { pyre_object::interp_exceptions::w_exception_set_context(exc, active) };
-        }
-    }
+    crate::error::chain_context(exc, get_current_exception());
     if let Some(cause_obj) = cause {
         if !cause_obj.is_null() && unsafe { pyre_object::is_exception(exc) } {
             // `interp_exceptions.py:166-174 descr_setcause` — writes
@@ -1124,6 +1111,30 @@ pub fn validate_check_exc_match_class(exc_type: PyObjectRef) -> Result<(), PyErr
             }
         } else if !crate::baseobjspace::exception_is_valid_class_w(exc_type) {
             return Err(PyError::type_error(CANNOT_CATCH_MSG));
+        }
+    }
+    Ok(())
+}
+
+fn validate_check_eg_match_class(exc_type: PyObjectRef) -> Result<(), PyError> {
+    validate_check_exc_match_class(exc_type)?;
+    let base_group = crate::builtins::lookup_exc_class("BaseExceptionGroup").unwrap();
+    unsafe {
+        if pyre_object::is_tuple(exc_type) {
+            let n = pyre_object::w_tuple_len(exc_type) as i64;
+            for i in 0..n {
+                if let Some(w_type) = pyre_object::w_tuple_getitem(exc_type, i) {
+                    if crate::baseobjspace::issubclass(w_type, base_group)? {
+                        return Err(PyError::type_error(
+                            "catching ExceptionGroup with except* is not allowed. Use except instead.",
+                        ));
+                    }
+                }
+            }
+        } else if crate::baseobjspace::issubclass(exc_type, base_group)? {
+            return Err(PyError::type_error(
+                "catching ExceptionGroup with except* is not allowed. Use except instead.",
+            ));
         }
     }
     Ok(())
@@ -1206,6 +1217,11 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
     if err.exc_object.is_null() {
         err.exc_object = exc_obj;
     }
+    // Implicit __context__ chaining: any exception raised while another is being
+    // handled records that active exception as its __context__, not only an
+    // explicit `raise`.  Recorded once (skipped when a __context__ is already
+    // stamped), so it lands at the frame where the exception first surfaces.
+    crate::error::chain_context(err.exc_object, get_current_exception());
     if err.attach_tb {
         if !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
             // The materialized exception is old-gen managed but lives only in the
@@ -1271,6 +1287,13 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
             return false;
         }
     }
+    // `attach_tb=False` (RaiseWithExplicitTraceback) suppresses the traceback
+    // record for the frame that performed the re-raise only.  Once that frame's
+    // record/trace decision is made, the flag is cleared so that if no handler
+    // is found here and the exception propagates to the caller, that outer frame
+    // records its own traceback entry — mirroring the special-exception being
+    // unwrapped to a plain OperationError after one frame.
+    err.attach_tb = true;
     let code = unsafe { &*crate::pyframe_get_pycode(frame) };
     // pyre's `last_instr` is a rustpython code-unit index; the PyPy-shaped
     // `lookup_exceptiontable` lookup takes byte offsets, so multiply by 2.
@@ -2815,7 +2838,15 @@ impl OpcodeStepExecutor for PyFrame {
                 if exc.is_null() || unsafe { pyre_object::is_none(exc) } {
                     Err(PyError::runtime_error("No active exception to reraise"))
                 } else if unsafe { pyre_object::is_exception(exc) } {
-                    Err(unsafe { PyError::from_exc_object(exc) })
+                    // RAISE_VARARGS(nbargs=0) re-raises the active exception via
+                    // RaiseWithExplicitTraceback, i.e. without recording a fresh
+                    // traceback for this frame.  Preserving the exception's existing
+                    // w_traceback keeps its identity stable (mirroring the RERAISE
+                    // opcode below), which the except* metadata check
+                    // (_is_same_exception_metadata) relies on.
+                    let mut err = unsafe { PyError::from_exc_object(exc) };
+                    err.attach_tb = false;
+                    Err(err)
                 } else {
                     Err(PyError::runtime_error("No active exception to reraise"))
                 }
@@ -3167,6 +3198,31 @@ impl OpcodeStepExecutor for PyFrame {
         let matched = check_exc_match_against(exc_value, exc_type);
         self.push(pyre_object::w_bool_from(matched));
         Ok(())
+    }
+
+    fn check_eg_match(&mut self) -> Result<(), PyError> {
+        let exc_type = self.pop();
+        validate_check_eg_match_class(exc_type)?;
+        let exc_value = self.pop();
+        let (matching, rest) = if unsafe { pyre_object::is_none(exc_value) } {
+            (pyre_object::w_none(), pyre_object::w_none())
+        } else {
+            crate::builtins::exception_group_match(exc_value, exc_type)?
+        };
+        self.push(rest);
+        self.push(matching);
+        if !unsafe { pyre_object::is_none(matching) } {
+            set_current_exception(matching);
+        }
+        Ok(())
+    }
+
+    fn prep_reraise_star(
+        &mut self,
+        orig: Self::Value,
+        exceptions: Self::Value,
+    ) -> Result<Self::Value, PyError> {
+        crate::builtins::exception_group_prep_reraise_star(orig, exceptions)
     }
 
     // ── PopExcept ──
