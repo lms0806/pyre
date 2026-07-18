@@ -488,6 +488,11 @@ pub struct FbwWalkMode {
     pub current_exception_seed: Option<OpRef>,
     /// Concrete shadow paired with [`FbwWalkMode::current_exception_seed`].
     pub current_exception_seed_concrete: pyre_object::PyObjectRef,
+    /// Walker-carried mirror of
+    /// `MetaInterp.class_of_last_exc_is_const` (`pyjitpl.py:3382-3393`).
+    /// This is shared logically across recursive MIFrame walks; catch routing
+    /// writes the proven-class state back into the caller's copy.
+    pub class_of_last_exc_is_const: bool,
 }
 
 /// The outer snapshot's Python-PC coordinate. Non-root producers preserve the
@@ -517,6 +522,7 @@ impl Default for FbwWalkMode {
             carrier_resume: false,
             current_exception_seed: None,
             current_exception_seed_concrete: pyre_object::PY_NULL,
+            class_of_last_exc_is_const: false,
         }
     }
 }
@@ -1745,6 +1751,7 @@ pub fn walk(
                 if let Some(target) = try_catch_exception_at(code, pc) {
                     ctx.last_exc_value = Some(exc);
                     ctx.last_exc_value_concrete = exc_concrete;
+                    ctx.fbw_mode.class_of_last_exc_is_const = true;
                     // The exception is now caught by this frame's handler, so
                     // drain the standing residual-call exception flag the
                     // raising helper published (`try_execute_residual_call_via_
@@ -2914,6 +2921,7 @@ pub fn dispatch_via_miframe(
                 } else {
                     pyre_object::PY_NULL
                 },
+                class_of_last_exc_is_const: sym.class_of_last_exc_is_const,
                 ..Default::default()
             },
             session,
@@ -2978,6 +2986,7 @@ pub fn dispatch_via_miframe(
         // Read final last_exc_value before wc drops so the borrow
         // checker can release sym for the writeback below.
         let final_last_exc = wc.last_exc_value;
+        let final_class_of_last_exc_is_const = wc.fbw_mode.class_of_last_exc_is_const;
         drop(wc);
         // Full `sym.last_exc_*` state writeback parity.
         //
@@ -3012,7 +3021,7 @@ pub fn dispatch_via_miframe(
         //     concrete state is fed by another path).
         if let Some(exc) = final_last_exc {
             sym.last_exc_box = exc;
-            sym.class_of_last_exc_is_const = true;
+            sym.class_of_last_exc_is_const = final_class_of_last_exc_is_const;
         }
         outcome
     };
@@ -3419,6 +3428,7 @@ fn drive_bridge_frame_subwalk(
                 current_exception_seed: (!root_sym.last_exc_box.is_none())
                     .then_some(root_sym.last_exc_box),
                 current_exception_seed_concrete: root_sym.last_exc_value,
+                class_of_last_exc_is_const: root_sym.class_of_last_exc_is_const,
             },
             session,
             registers_r: &mut regs_r,
@@ -3764,6 +3774,7 @@ pub(crate) fn drive_outer_frame_continuation(
                 current_exception_seed: (!root_sym.last_exc_box.is_none())
                     .then_some(root_sym.last_exc_box),
                 current_exception_seed_concrete: root_sym.last_exc_value,
+                class_of_last_exc_is_const: root_sym.class_of_last_exc_is_const,
             },
             session,
             registers_r: &mut regs_r,
@@ -7083,6 +7094,9 @@ fn try_execute_residual_call_via_executor(
             ctx.last_exc_value = Some(ctx.trace_ctx.const_ref(bh_exc));
             ctx.last_exc_value_concrete =
                 ConcreteValue::Ref(bh_exc as usize as pyre_object::PyObjectRef);
+            // `pyjitpl.py:2768-2777 execute_raised(..., constant=False)`:
+            // a residual exception has not had its class proven by a guard yet.
+            ctx.fbw_mode.class_of_last_exc_is_const = false;
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(bh_exc));
             // `execute_raised` records the raise into `last_exc_value`
             // (above) only.  The shared `bh_*` residual helper also
@@ -13510,8 +13524,10 @@ fn walker_record_guard_exception(ctx: &mut WalkContext<'_, '_>, pc: usize) {
             return;
         }
     };
-    // `pyjitpl.py:3382-3384`: ALWAYS emit `GuardException` with a const
-    // class pin (`class_of_last_exc_is_const = True` after the emit).
+    let class_of_last_exc_is_const = ctx.fbw_mode.class_of_last_exc_is_const;
+    // `pyjitpl.py:3382-3393` / `pyjitpl.rs:12221-12258`: always emit
+    // `GuardException` with a const class pin, but keep its live result box
+    // unless the exception class was already proven constant.
     // Pyre's `W_BaseException.ob_header.ob_type` is the per-`ExcKind`
     // `PyType` static (`interp_exceptions.rs::exc_kind_to_pytype`), matching
     // upstream `OBJECT.typeptr = specific class` (`rclass.py:167-174`).
@@ -13521,9 +13537,22 @@ fn walker_record_guard_exception(ctx: &mut WalkContext<'_, '_>, pc: usize) {
             .ob_type as i64
     };
     let exc_type_const = ctx.trace_ctx.const_int(exc_type_ptr);
-    ctx.trace_ctx
+    let guard_op = ctx
+        .trace_ctx
         .record_guard(OpCode::GuardException, &[exc_type_const], 0);
     let _ = walker_capture_snapshot_for_last_guard(ctx, pc);
+    // `op.setref_base(val)` supplies the recording-time shadow without
+    // changing the guard result's live replay identity.
+    ctx.trace_ctx.set_opref_concrete(
+        guard_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(exc_obj as usize)),
+    );
+    ctx.last_exc_value = Some(if class_of_last_exc_is_const {
+        ctx.trace_ctx.const_ref(exc_obj as usize as i64)
+    } else {
+        guard_op
+    });
+    ctx.fbw_mode.class_of_last_exc_is_const = true;
 }
 
 fn clear_walk_exception(ctx: &mut WalkContext<'_, '_>) {
@@ -13956,7 +13985,11 @@ fn try_walker_store_subscr_specialization(
             let exc_concrete = ConcreteValue::Ref(bh_exc as usize as pyre_object::PyObjectRef);
             ctx.last_exc_value = Some(exc);
             ctx.last_exc_value_concrete = exc_concrete;
+            ctx.fbw_mode.class_of_last_exc_is_const = false;
             walker_record_guard_exception(ctx, op.pc);
+            let exc = ctx
+                .last_exc_value
+                .expect("GuardException must bind the raised exception box");
             return Some(DispatchOutcome::SubRaise { exc, exc_concrete });
         }
         // Defensive: helper returned 0 but did not stash an exception.
@@ -16388,6 +16421,7 @@ fn try_walker_inline_resolved_user_call(
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 ctx.last_exc_value = Some(exc);
                 ctx.last_exc_value_concrete = exc_concrete;
+                ctx.fbw_mode.class_of_last_exc_is_const = true;
                 Ok(Some((DispatchOutcome::Continue, target)))
             } else {
                 Ok(Some((
@@ -16571,6 +16605,249 @@ fn try_walker_inline_exception_string_override(
         ctx.trace_ctx
             .heap_cache_mut()
             .class_now_known(result, str_type);
+    }
+    Ok(Some(inlined))
+}
+
+/// Inline a plain Python `__add__` after the numeric BINARY_OP
+/// specializations decline. The receiver class and its version tag pin the
+/// descriptor lookup, matching `try_dispatch_binary_special`'s forward arm.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_inline_user_binop(
+    ctx: &mut WalkContext<'_, '_>,
+    op: &DecodedOp,
+    code: &[u8],
+    op_tag: i64,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor
+        || !ctx.is_full_body_walk
+        || dst_bank != 'r'
+        || r_args.len() != 2
+    {
+        return Ok(None);
+    }
+
+    let Some(pyre_interpreter::bytecode::BinaryOperator::Add) =
+        pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag)
+    else {
+        return Ok(None);
+    };
+    let dunder = "__add__";
+
+    let lhs = r_args[0];
+    let rhs = r_args[1];
+    let Some(concrete_lhs) = walker_concrete_ref_object(ctx, lhs) else {
+        return Ok(None);
+    };
+    let Some(concrete_rhs) = walker_concrete_ref_object(ctx, rhs) else {
+        return Ok(None);
+    };
+
+    let w_class = unsafe { (*concrete_lhs).w_class };
+    if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
+        return Ok(None);
+    }
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_class) };
+    if version_tag == 0 {
+        return Ok(None);
+    }
+
+    let Some(w_typ_r) = pyre_interpreter::typedef::r#type(concrete_rhs) else {
+        return Ok(None);
+    };
+    if !std::ptr::eq(w_class, w_typ_r)
+        && unsafe { pyre_object::typeobject::w_type_issubtype(w_typ_r, w_class) }
+    {
+        return Ok(None);
+    }
+
+    let Some(method) = (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, dunder) })
+    else {
+        return Ok(None);
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
+        return Ok(None);
+    };
+    if nparams != 2 {
+        return Ok(None);
+    }
+
+    let arg_concretes = vec![
+        ConcreteValue::Ref(method),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(concrete_lhs),
+        ConcreteValue::Ref(concrete_rhs),
+    ];
+    let method_const = ctx.trace_ctx.const_ref(method as i64);
+    let Some(inlined) = try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        method_const,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        method,
+        method_const,
+        method,
+        arg_concretes,
+        vec![lhs, rhs],
+        vec![
+            ConcreteValue::Ref(concrete_lhs),
+            ConcreteValue::Ref(concrete_rhs),
+        ],
+        true,
+        w_code,
+        nparams,
+        has_closure,
+        Some((lhs, concrete_lhs, w_class, version_tag)),
+        false,
+        false,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    if matches!(inlined.0, DispatchOutcome::Continue) {
+        let result = ctx.registers_r[dst];
+        if matches!(
+            concrete_from_recorded_opref(ctx, result),
+            ConcreteValue::Ref(obj)
+                if std::ptr::eq(obj, pyre_object::special::w_not_implemented())
+        ) {
+            return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+        }
+    }
+    Ok(Some(inlined))
+}
+
+/// Inline a plain Python rich-compare dunder after the numeric COMPARE_OP
+/// specializations decline. The receiver class and its version tag pin the
+/// descriptor lookup; a proper-subclass rhs declines so its reflected dunder
+/// retains priority.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_inline_user_compareop(
+    ctx: &mut WalkContext<'_, '_>,
+    op: &DecodedOp,
+    code: &[u8],
+    op_tag: i64,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor
+        || !ctx.is_full_body_walk
+        || dst_bank != 'r'
+        || r_args.len() != 2
+    {
+        return Ok(None);
+    }
+
+    let Some(cmp_op) = pyre_interpreter::runtime_ops::compare_op_from_tag(op_tag) else {
+        return Ok(None);
+    };
+    // Forward rich-compare dunder only; a proper-subclass rhs declines below so
+    // its reflected dunder (__lt__/__gt__, __le__/__ge__, __eq__/__ne__ self)
+    // keeps priority, matching try_compare_override's forward-first dispatch.
+    let dunder = match cmp_op {
+        pyre_interpreter::bytecode::ComparisonOperator::Less => "__lt__",
+        pyre_interpreter::bytecode::ComparisonOperator::LessOrEqual => "__le__",
+        pyre_interpreter::bytecode::ComparisonOperator::Greater => "__gt__",
+        pyre_interpreter::bytecode::ComparisonOperator::GreaterOrEqual => "__ge__",
+        pyre_interpreter::bytecode::ComparisonOperator::Equal => "__eq__",
+        pyre_interpreter::bytecode::ComparisonOperator::NotEqual => "__ne__",
+    };
+
+    let lhs = r_args[0];
+    let rhs = r_args[1];
+    let Some(concrete_lhs) = walker_concrete_ref_object(ctx, lhs) else {
+        return Ok(None);
+    };
+    let Some(concrete_rhs) = walker_concrete_ref_object(ctx, rhs) else {
+        return Ok(None);
+    };
+
+    let w_class = unsafe { (*concrete_lhs).w_class };
+    if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
+        return Ok(None);
+    }
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_class) };
+    if version_tag == 0 {
+        return Ok(None);
+    }
+
+    let Some(w_typ_r) = pyre_interpreter::typedef::r#type(concrete_rhs) else {
+        return Ok(None);
+    };
+    if !std::ptr::eq(w_class, w_typ_r)
+        && unsafe { pyre_object::typeobject::w_type_issubtype(w_typ_r, w_class) }
+    {
+        return Ok(None);
+    }
+
+    let Some(method) = (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, dunder) })
+    else {
+        return Ok(None);
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
+        return Ok(None);
+    };
+    if nparams != 2 {
+        return Ok(None);
+    }
+
+    let arg_concretes = vec![
+        ConcreteValue::Ref(method),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(concrete_lhs),
+        ConcreteValue::Ref(concrete_rhs),
+    ];
+    let method_const = ctx.trace_ctx.const_ref(method as i64);
+    let Some(inlined) = try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        method_const,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        method,
+        method_const,
+        method,
+        arg_concretes,
+        vec![lhs, rhs],
+        vec![
+            ConcreteValue::Ref(concrete_lhs),
+            ConcreteValue::Ref(concrete_rhs),
+        ],
+        true,
+        w_code,
+        nparams,
+        has_closure,
+        Some((lhs, concrete_lhs, w_class, version_tag)),
+        false,
+        false,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    if matches!(inlined.0, DispatchOutcome::Continue) {
+        let result = ctx.registers_r[dst];
+        if matches!(
+            concrete_from_recorded_opref(ctx, result),
+            ConcreteValue::Ref(obj)
+                if std::ptr::eq(obj, pyre_object::special::w_not_implemented())
+        ) {
+            return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+        }
     }
     Ok(Some(inlined))
 }
@@ -24433,6 +24710,20 @@ fn dispatch_residual_call_iIRd_kind(
                 if specialized.is_some() {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
+                if ei.pyre_helper == majit_ir::PyreHelperKind::BinaryOp {
+                    if let Some(inlined) = try_walker_inline_user_binop(
+                        ctx, op, code, op_tag, &r_args, call_descr, dst, dst_bank,
+                    )? {
+                        return Ok(inlined);
+                    }
+                }
+                if ei.pyre_helper == majit_ir::PyreHelperKind::CompareOp {
+                    if let Some(inlined) = try_walker_inline_user_compareop(
+                        ctx, op, code, op_tag, &r_args, call_descr, dst, dst_bank,
+                    )? {
+                        return Ok(inlined);
+                    }
+                }
             }
         }
     }
@@ -25058,6 +25349,7 @@ fn dispatch_inline_call_dr_kind(
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 ctx.last_exc_value = Some(exc);
+                ctx.fbw_mode.class_of_last_exc_is_const = true;
                 // Thread the callee's concrete
                 // exception across the frame boundary.  Without this a
                 // downstream `raise/r` / `reraise/` in the caller's
@@ -25200,6 +25492,7 @@ fn dispatch_inline_call_dir_kind(
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 ctx.last_exc_value = Some(exc);
+                ctx.fbw_mode.class_of_last_exc_is_const = true;
                 // Thread the callee's concrete
                 // exception across the frame boundary.  Without this a
                 // downstream `raise/r` / `reraise/` in the caller's
@@ -25354,6 +25647,7 @@ fn dispatch_inline_call_dirf_kind(
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 ctx.last_exc_value = Some(exc);
+                ctx.fbw_mode.class_of_last_exc_is_const = true;
                 // Thread the callee's concrete
                 // exception across the frame boundary.  Without this a
                 // downstream `raise/r` / `reraise/` in the caller's
@@ -26871,6 +27165,7 @@ fn handle(
             }
             ctx.last_exc_value = Some(exc);
             ctx.last_exc_value_concrete = concrete_exc;
+            ctx.fbw_mode.class_of_last_exc_is_const = true;
             // Gated `PYRE_FBW_RAISE`: route the top-level raise through
             // `SubRaise` so walk()'s SubRaise arm runs the in-frame
             // `catch_exception/L` lookahead (`finishframe_lookahead_at`) and
