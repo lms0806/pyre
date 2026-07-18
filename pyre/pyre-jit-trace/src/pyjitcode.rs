@@ -91,8 +91,6 @@ pub struct PyJitCodeMetadata {
     /// per materialized trace-entry green. Sorted ascending by green py_pc for
     /// binary search; empty for skeleton / fixture metadata.
     pub merge_entry_by_green: Vec<(u32, u32)>,
-    /// Value-stack depth at each Python PC, in slots above stack_base.
-    pub depth_at_py_pc: Vec<u16>,
     /// task#50 phase-1: predecessor-keyed jitcode-pc twin of `pcdep_color_slots`.
     /// Each entry `(off, colors)` maps a JitCode byte offset to the pcdep
     /// color→slot list of the py_pc that `python_pc_for_jitcode_pc(off)` returns
@@ -160,35 +158,18 @@ pub struct PyJitCodeMetadata {
     /// fixture.
     pub after_residual_marker_marker_by_jit_pc: Vec<(usize, Option<usize>)>,
     pub after_residual_marker_pred_by_jit_pc: Vec<(usize, Option<usize>)>,
-    /// Result color (`result_color_at_pc`) of the call-result operand slot at
-    /// the after-residual fallthrough PC, keyed by JitCode byte offset with the
-    /// same exact-marker / predecessor-op-start split as
-    /// `after_residual_marker_*`. Value =
+    /// Result color of the call-result operand slot at the after-residual
+    /// fallthrough PC, keyed by JitCode byte offset with the same exact-marker
+    /// / predecessor-op-start split as `after_residual_marker_*`. Value =
     /// `result_color_at_pc[semantic_fallthrough_pc(skip_python_trivia_forward(py))]`
-    /// (`None` past the table end). Retires the runtime py-keyed result-color
-    /// read in the inline-caller marker-miss fallback. Empty for skeleton /
-    /// fixture.
+    /// computed at codewrite time (`None` past the table end). Retires the
+    /// runtime py-keyed result-color read in the inline-caller marker-miss
+    /// fallback. Empty for skeleton / fixture.
     pub result_color_after_residual_marker_by_jit_pc: Vec<(usize, Option<u16>)>,
     pub result_color_after_residual_pred_by_jit_pc: Vec<(usize, Option<u16>)>,
-    /// Post-regalloc Ref-bank color of the call-result operand-stack slot
-    /// (top of stack = `depth_at_py_pc[pc] - 1`) at each Python PC, or
-    /// `u16::MAX` where the stack is empty. The inline multiframe capture
-    /// (`jitcode_dispatch::compute_inline_caller_frame` /
-    /// `compute_nested_inline_caller_frame`) nulls the not-yet-produced result
-    /// register before serializing the paused caller frame; that slot is not a
-    /// live Variable at the return PC, so it carries no `pcdep_color_slots`
-    /// entry — the same not-yet-defined call-result box that `_result_argcode`
-    /// (pyjitpl.py) clears in a non-topmost resumed frame (`registers_r[index]
-    /// = CONST_NULL` for the `'r'` argcode). This precomputed table (built in
-    /// `finalize_jitcode` from the compile-time stack coloring) supplies its
-    /// color. Same length as `depth_at_py_pc`; empty for non-compiled skeleton
-    /// metadata.
-    pub result_color_at_pc: Vec<u16>,
-    /// #73 metadata-inventory twin of `result_color_at_pc`, keyed by JitCode
-    /// byte offset. Entries retain the first Python PC for each shared resume
-    /// marker and are sorted for predecessor lookup. Audit-only for now; the
-    /// py_pc-keyed table remains the runtime source of truth.
-    pub result_color_by_jit_pc: Vec<(usize, u16)>,
+    /// Whether codewriter register allocation assigned non-identity frame
+    /// colors. Skeleton and portal metadata leave this false.
+    pub has_color_map: bool,
     /// Post-regalloc Ref-bank color of the portal jitdriver's first red
     /// argument (`frame`).  RPython parity: `pypy/module/pypyjit/
     /// interp_jit.py:67 reds = ['frame', 'ec']` declares the portal
@@ -224,30 +205,6 @@ pub struct PyJitCodeMetadata {
     /// `nlocals + ncells + max_stackdepth`). Sized to the static peak, not
     /// `max(depth_at_pc)` — JIT-traced PCs may not reach `co_stacksize`.
     pub max_stackdepth: usize,
-    /// Per-Python-PC bank-tagged color↔slot map for the live restorable
-    /// frame slots. Indexed by `py_pc`; each entry is `(bank, color, slot)`
-    /// where bank = `Kind::index()` (0=Int, 1=Ref, 2=Float), color is the
-    /// post-regalloc register within that bank, and slot is the unified
-    /// `locals_cells_stack_w` semantic index (local `i` for `i < nlocals`,
-    /// `nlocals + d` for operand-stack depth `d`). Sorted by
-    /// `(bank, color, slot)`.
-    ///
-    /// Records each slot's TRUE per-program-point SSA color — the runtime
-    /// analog of RPython's compile-time baked register operands, precomputed
-    /// per Python PC so a guard resume can invert color→slot without walking
-    /// the jitcode. It is the static form of the per-bank register enumeration
-    /// that `resume.py`'s `_prepare_next_section` → `enumerate_vars` dispatches
-    /// at resume time to seed `registers_i` / `registers_r` / `registers_f`
-    /// from the encoded section. Stack
-    /// slots and body locals are freely chordal-colored (only the
-    /// startblock inputargs are pinned by `enforce_input_args`,
-    /// `flatten.py:88-100` parity), so there is no `color == slot`
-    /// identity and no flat whole-jitcode slot → color map. Empty when the
-    /// producer did not populate it (skeletons / fixtures); readers branch to the slot-identity reconstruction
-    /// then. When populated, the `-live-` markers carry the SAME per-PC
-    /// colors (built by `filter_liveness_in_place` off this map), so
-    /// encode/decode/`-live-` stay in one consistent color space.
-    pub pcdep_color_slots: Vec<Vec<(u8, u16, u16)>>,
     /// Per-Python-PC operand-stack Ref CONSTANTS (`(semantic_slot, raw_ref)`).
     /// `pcdep_color_slots` records live restorable Variables only; for the
     /// virtualizable ROOT frame the operand-stack constants are rematerialized
@@ -604,18 +561,6 @@ impl PyJitCode {
         Self::predecessor_index(search).map(|i| table[i].1)
     }
 
-    /// #73 metadata-inventory predecessor twin of `result_color_at_pc`.
-    /// Returns the value for the largest JitCode byte offset at or before
-    /// `jit_pc`, or `None` when the audit-only twin is empty.
-    pub fn result_color_for_jitcode_pc_pred(&self, jit_pc: usize) -> Option<u16> {
-        let table = &self.metadata.result_color_by_jit_pc;
-        if table.is_empty() {
-            return None;
-        }
-        let search = table.binary_search_by_key(&jit_pc, |&(off, _)| off);
-        Self::predecessor_index(search).map(|i| table[i].1)
-    }
-
     /// gh#73 S3.2: const operand-stack slots keyed by a JitCode byte offset via
     /// the `const_ref_slots_by_jit_pc` predecessor twin. Equals
     /// `const_ref_slots_at_pc[python_pc_for_jitcode_pc(jit_pc)]` by construction
@@ -929,9 +874,6 @@ impl PyJitCode {
                 after_residual_marker_pred_by_jit_pc: Vec::new(),
                 result_color_after_residual_marker_by_jit_pc: Vec::new(),
                 result_color_after_residual_pred_by_jit_pc: Vec::new(),
-                depth_at_py_pc: Vec::new(),
-                result_color_at_pc: Vec::new(),
-                result_color_by_jit_pc: Vec::new(),
                 // Encoder/decoder readers in
                 // `get_list_of_active_boxes`, `regalloc::external/input_indices`,
                 // and `setup_bridge_sym::portal_red_regs_at` sentinel-skip both
@@ -943,7 +885,7 @@ impl PyJitCode {
                 built_as_portal: false,
                 stack_base: 0,
                 max_stackdepth: 0,
-                pcdep_color_slots: Vec::new(),
+                has_color_map: false,
                 const_ref_slots_at_pc: Vec::new(),
                 const_ref_slots_by_jit_pc: Vec::new(),
                 is_drained: false,

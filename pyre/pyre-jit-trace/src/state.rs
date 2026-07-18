@@ -929,7 +929,21 @@ pub(crate) fn sub_jitcode_entry_param_colors(code: *const ()) -> Option<Vec<(u8,
         return None;
     }
     let pjc = pyjitcode_for_code(code)?;
-    pjc.metadata.pcdep_color_slots.first().cloned()
+    let legacy = pjc.pcdep_for_jitcode_pc(0);
+    if crate::jitcode_dispatch::pcmap_pivot_audit_enabled() {
+        crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("entry_param_colors", "fire");
+        let twin = pjc.pcdep_for_jitcode_pc(0);
+        if legacy == twin {
+            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("entry_param_colors", "eq");
+        } else {
+            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("entry_param_colors", "di");
+            crate::jitcode_dispatch::pcmap_pivot_audit_record_data(
+                "entry_param_colors",
+                &format!("legacy={legacy:?} twin={twin:?}"),
+            );
+        }
+    }
+    legacy
 }
 
 pub(crate) type SubDescrPool = (
@@ -1377,46 +1391,19 @@ pub fn seed_compiled_trace_jitcode_test_state(
     }
 }
 
-/// Per-PC `(color, semantic_slot)` resume entries for the registered
-/// jitcode at `jitcode_index` (`metadata.pcdep_color_slots[py_pc]`).
-/// Empty when the index or PC is out of range, or the jitcode was never
-/// colored (portal/skeleton installs).
-///
-/// Used by tests + tooling that need to translate a physical frame slot
-/// (local `i` for `i < code.varnames.len()`, `metadata.stack_base + d` for
-/// operand-stack depth `d`) into the post-rename register color the dispatcher would touch
-/// at a given PC — colors are per-program-point, so a flat
-/// slot-arithmetic lookup does not exist.
-pub fn pcdep_color_slots_at(jitcode_index: i32, py_pc: i32) -> Vec<(u8, u16, u16)> {
+/// Trivia-aware per-PC `(color, semantic_slot)` resume entries keyed directly
+/// by a JitCode byte offset. `None` when the index, offset, or trivia twin is
+/// unavailable; callers that preserve the legacy empty-result behavior may use
+/// `unwrap_or_default()`.
+pub fn pcdep_trivia_at(jitcode_index: i32, jit_pc: i32) -> Option<Vec<(u8, u16, u16)>> {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
         sd.jitcodes
-            .get(jitcode_index as usize)
-            .and_then(|jc| {
-                jc.payload
-                    .metadata
-                    .pcdep_color_slots
-                    .get(usize::try_from(py_pc).ok()?)
-                    .cloned()
-            })
-            .unwrap_or_default()
-    })
-}
-
-/// Whether `pcdep_color_slots[pc]` maps register color `color` to a semantic
-/// frame slot — i.e. the register allocator assigned this color to a real
-/// local/stack value at `pc`, so the color does NOT carry its force-alived
-/// portal-red meaning there (`collect_outer_active_boxes` scratch gate /
-/// `setup_bridge_sym` ec-seed gate).
-pub fn pcdep_color_names_frame_slot_at(jitcode_index: i32, pc: usize, color: u16) -> bool {
-    ensure_finish_setup();
-    METAINTERP_SD.with(|r| {
-        let sd = r.borrow();
-        sd.jitcodes
-            .get(jitcode_index as usize)
-            .and_then(|jc| jc.payload.metadata.pcdep_color_slots.get(pc))
-            .is_some_and(|entries| entries.iter().any(|&(b, c, _)| b == 1 && c == color))
+            .get(jitcode_index as usize)?
+            .payload
+            .pcdep_trivia_for_jitcode_pc(usize::try_from(jit_pc).ok()?)
+            .map(ToOwned::to_owned)
     })
 }
 
@@ -1486,10 +1473,6 @@ pub(crate) struct BridgeSemanticMaps {
     pub pcdep_entries: Vec<(u8, u16, u16)>,
 }
 
-pub(crate) fn bridge_semantic_maps_at(jitcode_index: i32, pc: i32) -> BridgeSemanticMaps {
-    bridge_semantic_maps_at_with_jitcode_pc(jitcode_index, pc, majit_ir::resumedata::NO_JITCODE_PC)
-}
-
 /// When a kept-stack branch guard carries the guard's own jitcode
 /// coordinate (`jitcode_pc != NO_JITCODE_PC`), the pcdep/depth tables
 /// must be keyed at the GUARD's Python PC — the encode side
@@ -1549,58 +1532,54 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
         // `liveness_py_pc = guard_py_pc` keying. The guard PC is where the
         // computed kept operand-stack temps are live; at the merge-target PC
         // they've been consumed and carry no pcdep entry.
-        // Index the py_pc-keyed depth/pcdep tables at a resolved Python PC.
-        let via_py_pc = |rp: usize| {
-            let depth = payload
-                .metadata
-                .depth_at_py_pc
+        let via_py_pc = |rp: usize| -> usize {
+            if payload.code_ptr.is_null() {
+                return 0;
+            }
+            crate::liveness::liveness_for(payload.code_ptr)
+                .depth_at_py_pc()
                 .get(rp)
                 .copied()
-                .unwrap_or(0) as usize;
-            let pcdep = payload
-                .metadata
-                .pcdep_color_slots
-                .get(rp)
-                .cloned()
-                .unwrap_or_default();
-            (depth, pcdep)
+                .unwrap_or(0) as usize
         };
-        let (stack_depth_at_pc, pcdep_entries) =
-            if jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_pc >= 0 {
-                let jp = jitcode_pc as usize;
-                // Validate with `can_decode_live_vars` — symmetric with the
-                // liveness decode in `resolve_resume_pc_with_jitcode_pc`.
-                // A non-decodable carried coordinate falls back to the
-                // merge-target PC so liveness and pcdep key the same point.
-                if payload.jitcode.can_decode_live_vars(jp, sd.op_live) {
-                    // Decode-identity: source depth/pcdep from the carried genuine
-                    // `jitcode_pc` via the predecessor-keyed twins. Every real carried
-                    // coordinate is an op-start or block-head offset of a colored
-                    // jitcode, for which the codewriter seeds these twins; a twin miss
-                    // degrades to the merge-target PC (the same fallback the
-                    // non-decodable path uses below), keeping liveness and pcdep on one
-                    // coordinate. A portal bridge is uncolored — `pcdep_color_slots` /
-                    // `depth_at_py_pc` are empty, so `via_py_pc` returns `(0, empty)`
-                    // for any resolved py — so the merge-target fallback is identical
-                    // to the retired `python_pc_for_jitcode_pc` re-inversion there.
-                    match (
-                        payload.depth_for_jitcode_pc_pred(jp),
-                        payload.pcdep_for_jitcode_pc(jp),
-                    ) {
-                        (Some(depth), Some(pcdep)) => (depth as usize, pcdep),
-                        _ => via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize),
-                    }
-                } else {
-                    via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize)
-                }
-            } else {
-                via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize)
-            };
+        let (stack_depth_at_pc, pcdep_entries) = if jitcode_pc >= 0
+            && payload
+                .jitcode
+                .can_decode_live_vars(jitcode_pc as usize, sd.op_live)
+        {
+            let jp = jitcode_pc as usize;
+            // Decode-identity: source depth/pcdep from the carried genuine
+            // `jitcode_pc` via the predecessor-keyed twins. Every real carried
+            // coordinate is an op-start or block-head offset of a colored
+            // jitcode, for which the codewriter seeds these twins; a twin miss
+            // degrades to the merge-target PC (the same fallback the
+            // non-decodable path uses below), keeping liveness and pcdep on one
+            // coordinate. A portal bridge is uncolored, so `via_py_pc` returns
+            // `(0, empty)` for any resolved py; the merge-target fallback is
+            // identical to the retired `python_pc_for_jitcode_pc` re-inversion.
+            match (
+                payload.depth_for_jitcode_pc_pred(jp),
+                payload.pcdep_for_jitcode_pc(jp),
+            ) {
+                (Some(depth), Some(pcdep)) => (depth as usize, pcdep),
+                _ => (
+                    via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize),
+                    Vec::new(),
+                ),
+            }
+        } else {
+            // A non-decodable carried coordinate falls back to the merge-target
+            // PC so liveness and pcdep key the same point.
+            (
+                via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize),
+                Vec::new(),
+            )
+        };
         BridgeSemanticMaps {
             // #73: the codewriter colored this jitcode iff `pcdep_color_slots`
             // is non-empty — the field-free replacement for the retired flat
             // `local_color_map.is_empty() && stack_color_map.is_empty()` test.
-            has_color_map: !payload.metadata.pcdep_color_slots.is_empty(),
+            has_color_map: payload.metadata.has_color_map,
             stack_depth_at_pc,
             pcdep_entries,
         }
@@ -6011,7 +5990,7 @@ fn reconstruct_inline_recipe(
     // resume pc there is no per-pc map to faithfully rebuild the frame, so
     // decline to the single-frame bridge (whose vable payload IS semantic-
     // ordered) rather than rebuild the frame with mis-slotted boxes.
-    let maps = bridge_semantic_maps_at(frame.jitcode_index, frame.pc);
+    let maps = bridge_semantic_maps_from_pc(frame.jitcode_index, frame.pc);
     if maps.pcdep_entries.is_empty() {
         return None;
     }
@@ -8901,11 +8880,16 @@ impl JitState for PyreJitState {
         // `ensure_execution_context` frame-field recovery instead.
         let (_pfr, portal_ec_reg) = crate::state::portal_red_regs_at(frame0.jitcode_index);
         if portal_ec_reg != u16::MAX {
-            let ec_color_names_frame_slot = crate::state::pcdep_color_names_frame_slot_at(
-                frame0.jitcode_index,
-                frame0.pc as usize,
-                portal_ec_reg,
-            );
+            let ec_color_names_frame_slot = pyjitcode_for_jitcode_index(frame0.jitcode_index)
+                .is_some_and(|payload| {
+                    payload
+                        .pcdep_trivia_for_jitcode_pc(frame0.pc as usize)
+                        .is_some_and(|entries| {
+                            entries
+                                .iter()
+                                .any(|&(bank, color, _)| bank == 1 && color == portal_ec_reg)
+                        })
+                });
             if !ec_color_names_frame_slot {
                 let slot = portal_ec_reg as usize;
                 assert!(
@@ -12525,15 +12509,12 @@ mod tests {
                 after_residual_marker_pred_by_jit_pc: Vec::new(),
                 result_color_after_residual_marker_by_jit_pc: Vec::new(),
                 result_color_after_residual_pred_by_jit_pc: Vec::new(),
-                depth_at_py_pc: vec![2],
-                result_color_at_pc: Vec::new(),
-                result_color_by_jit_pc: Vec::new(),
+                has_color_map: false,
                 portal_frame_reg: 0,
                 portal_ec_reg: 0,
                 built_as_portal: true,
                 stack_base: 1,
                 max_stackdepth: 0,
-                pcdep_color_slots: Vec::new(),
                 const_ref_slots_at_pc: Vec::new(),
                 const_ref_slots_by_jit_pc: Vec::new(),
                 is_drained: true,
@@ -13211,8 +13192,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
     // frame/ec seeding so a reused color resolves to the live stack value.
     // Falls back to identity when no live color owns the slot (empty map /
     // non-diverging coloring).
-    let py_pc = backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc);
-    let pcdep = pcdep_color_slots_at(recipe.jitcode_index, py_pc);
+    let pcdep = pcdep_trivia_at(recipe.jitcode_index, recipe.jitcode_pc).unwrap_or_default();
     for k in nlocals..valuestackdepth {
         let opref = recipe.registers_r[k];
         if opref.is_none() {
