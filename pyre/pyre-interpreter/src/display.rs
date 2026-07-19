@@ -460,6 +460,12 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
         return Ok(format!("{}", pyre_object::tagged_int::untag_int(obj)));
     }
+    // The recursive container branches below (dict/list/tuple/set/deque/
+    // slice/range) re-enter `py_repr` on each element in native Rust with
+    // no Python frame push, so a deeply nested structure blows the C stack
+    // before any frame-level check fires. Guard the stack here so
+    // `repr(deeply_nested)` raises RecursionError instead of overflowing.
+    crate::stack_check::stack_check()?;
     if obj.is_null() {
         return Ok("NULL".to_string());
     }
@@ -1120,6 +1126,12 @@ unsafe fn exception_descr_str_wtf8(obj: PyObjectRef) -> Result<Option<Wtf8Buf>, 
             return Ok(None);
         }
         let first = pyre_object::w_tuple_getitem(args, 0).unwrap_or(args);
+        // A tagged `int` immediate is never a `str`; skip the `ob_type` deref
+        // (which would read the immediate as a pointer) and fall back to
+        // `py_str`, which formats the tagged value directly.
+        if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(first) {
+            return Ok(None);
+        }
         if first.is_null() || !std::ptr::eq((*first).ob_type, &STR_TYPE as *const PyType) {
             return Ok(None);
         }

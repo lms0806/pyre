@@ -2448,7 +2448,17 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 let result = crate::call_function(method, &[w_obj]);
                 if !result.is_null() {
                     if !pyre_object::is_bool(result) {
-                        let tp_name = (*(*result).ob_type).name;
+                        // A tagged immediate is always an exact `int`; name it
+                        // without derefing its (non-pointer) tagged bits as
+                        // `ob_type`. Mirrors the tag short-circuit in
+                        // `builtin_str`. Gated on `CAN_BE_TAGGED`.
+                        let tp_name: &str = if pyre_object::tagged_int::CAN_BE_TAGGED
+                            && pyre_object::tagged_int::is_tagged_int(result)
+                        {
+                            "int"
+                        } else {
+                            (*(*result).ob_type).name
+                        };
                         return Err(crate::PyError::type_error(format!(
                             "__bool__ should return bool, returned {}",
                             tp_name,
@@ -5076,7 +5086,7 @@ fn init_dict_type(ns: PyObjectRef) {
                         // Unbound `dict.__repr__(x)` on a non-dict receiver —
                         // reject it like a builtin descriptor rather than
                         // formatting an empty `{}`.
-                        let tp_name = unsafe { (*(*recv).ob_type).name };
+                        let tp_name = unsafe { pyre_object::type_name_of(recv) };
                         return Err(crate::PyError::type_error(format!(
                             "descriptor '__repr__' for 'dict' objects \
                          doesn't apply to a '{tp_name}' object"
@@ -6802,7 +6812,7 @@ fn mappingproxy_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         .unwrap_or(false);
     let is_seq = unsafe { pyre_object::is_list(w_mapping) || pyre_object::is_tuple(w_mapping) };
     if !has_getitem || is_seq {
-        let tp = unsafe { (*(*w_mapping).ob_type).name };
+        let tp = unsafe { pyre_object::type_name_of(w_mapping) };
         return Err(crate::PyError::type_error(format!(
             "mappingproxy() argument must be a mapping, not {tp}"
         )));
@@ -9089,7 +9099,7 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             if !pyre_object::is_type(w_base) {
                 return Err(crate::PyError::type_error(format!(
                     "{type_name}.__bases__ must be tuple of classes, not '{}'",
-                    (*(*w_base).ob_type).name
+                    pyre_object::type_name_of(w_base)
                 )));
             }
             let cand_layout = pyre_object::w_type_get_layout_ptr(w_base);
@@ -10844,7 +10854,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                             "descriptor '{}' for '{}' objects doesn't apply to '{}' object",
                             slot_name,
                             pyre_object::w_type_get_name(w_cls),
-                            (*(*obj).ob_type).name,
+                            pyre_object::type_name_of(obj),
                         )));
                     }
                 }
@@ -10898,7 +10908,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                             "descriptor '{}' for '{}' objects doesn't apply to '{}' object",
                             slot_name,
                             pyre_object::w_type_get_name(w_cls),
-                            (*(*obj).ob_type).name,
+                            pyre_object::type_name_of(obj),
                         )));
                     }
                 }
@@ -10949,7 +10959,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                             "descriptor '{}' for '{}' objects doesn't apply to '{}' object",
                             slot_name,
                             pyre_object::w_type_get_name(w_cls),
-                            (*(*obj).ob_type).name,
+                            pyre_object::type_name_of(obj),
                         )));
                     }
                 }
@@ -13092,7 +13102,7 @@ fn init_int_type(ns: PyObjectRef) {
                     Some(o) => {
                         return Err(crate::PyError::type_error(format!(
                             "expected str, got {} object",
-                            unsafe { (*(*o).ob_type).name }
+                            unsafe { pyre_object::type_name_of(o) }
                         )));
                     }
                 };
@@ -14406,6 +14416,29 @@ fn init_bool_type(ns: PyObjectRef) {
 // ── Object TypeDef ───────────────────────────────────────────────────
 // PyPy: pypy/objspace/std/objectobject.py TypeDef("object", ...)
 
+/// True when a class's `__new__` / `__init__` slot still resolves to the
+/// one `object` owns — i.e. the class does not override it.  A
+/// `staticmethod`-wrapped `__new__` is unwrapped to its function first
+/// (`_same_static_method`, objectobject.py:113-116) before the identity
+/// compare, so a slot carrying `object`'s own `__new__` staticmethod
+/// matches.
+fn object_slot_inherited(
+    class_slot: Option<PyObjectRef>,
+    object_slot: Option<PyObjectRef>,
+) -> bool {
+    let unwrap = |s: Option<PyObjectRef>| -> PyObjectRef {
+        match s {
+            Some(f) if unsafe { pyre_object::function::is_staticmethod(f) } => unsafe {
+                pyre_object::function::w_staticmethod_get_func(f)
+            },
+            Some(f) => f,
+            None => PY_NULL,
+        }
+    };
+    let a = unwrap(class_slot);
+    !a.is_null() && crate::baseobjspace::is_w(a, unwrap(object_slot))
+}
+
 /// `object.__new__(cls)` — allocate a bare instance of cls.
 ///
 /// PyPy: objectobject.py descr__new__
@@ -14452,70 +14485,93 @@ fn same_inherited_slot(a: Option<PyObjectRef>, b: Option<PyObjectRef>) -> bool {
 }
 
 fn object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // objectobject.py:118 descr__new__ — `w_type` is a mandatory argument.
-    if args.is_empty() {
+    let w_object = w_object();
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let Some(&w_type_arg) = positional.first() else {
         return Err(crate::PyError::type_error(
-            "object.__new__(): not enough arguments",
+            "object.__new__(): not enough arguments".to_string(),
         ));
+    };
+    let cls = w_type_arg;
+    // Bootstrap: before `object` is installed the slot lookups below cannot
+    // run, and no excess-args call reaches here that early.
+    if w_object.is_null() {
+        return Ok(if unsafe { is_type(cls) } {
+            w_instance_new(cls)
+        } else {
+            w_instance_new(PY_NULL)
+        });
     }
-    let cls = args[0];
-    // cls should be a W_TypeObject — create instance of it
-    if unsafe { is_type(cls) } {
-        // objectobject.py descr__new__ — surplus arguments are accepted only
-        // when __new__ or __init__ is overridden; the bare object() takes
-        // none.  A type that overrides __new__ but forwards excess args to
-        // object.__new__ hits the first error.
-        if args.len() > 1 {
-            let obj = w_object();
-            let tp_new = unsafe { crate::baseobjspace::lookup_in_type(cls, "__new__") };
-            let obj_new = unsafe { crate::baseobjspace::lookup_in_type(obj, "__new__") };
-            if !same_inherited_slot(tp_new, obj_new) {
-                return Err(crate::PyError::type_error(
-                    "object.__new__() takes exactly one argument (the type to instantiate)",
-                ));
-            }
-            let tp_init = unsafe { crate::baseobjspace::lookup_in_type(cls, "__init__") };
-            let obj_init = unsafe { crate::baseobjspace::lookup_in_type(obj, "__init__") };
-            if same_inherited_slot(tp_init, obj_init) {
-                let name = unsafe { pyre_object::w_type_get_name(cls) };
-                return Err(crate::PyError::type_error(format!(
-                    "{name}() takes no arguments"
-                )));
-            }
-        }
-        // objectobject.py:131 descr__new__ — abstract classes refuse instantiation.
-        if unsafe { pyre_object::w_type_is_abstract(cls) } {
-            return Err(abstract_instantiation_error(cls));
-        }
-        return Ok(w_instance_new(cls));
+    // `_precheck_for_new` (typeobject.py:1001-1004): a non-type first
+    // argument is a `TypeError`, not a silent bare instance.  `%T` names the
+    // Python type of `cls` (tag-safe via `r#type`), not its raw C layout.
+    if !unsafe { is_type(cls) } {
+        let name = crate::typedef::r#type(cls)
+            .map(|t| unsafe { pyre_object::w_type_get_name(t) })
+            .unwrap_or("object");
+        return Err(crate::PyError::type_error(format!(
+            "object.__new__(X): X is not a type object ({name})"
+        )));
     }
-    // Fallback: create bare instance with no type
-    Ok(w_instance_new(PY_NULL))
+    // objectobject.py descr__new__ — surplus arguments are accepted only
+    // when __new__ or __init__ is overridden; the bare object() takes
+    // none.  A type that overrides __new__ but forwards excess args to
+    // object.__new__ hits the first error.
+    if positional.len() > 1 || crate::builtins::has_real_kwargs(kwargs) {
+        let tp_new = unsafe { crate::baseobjspace::lookup_in_type(cls, "__new__") };
+        let obj_new = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__new__") };
+        if !same_inherited_slot(tp_new, obj_new) {
+            return Err(crate::PyError::type_error(
+                "object.__new__() takes exactly one argument (the type to instantiate)",
+            ));
+        }
+        let tp_init = unsafe { crate::baseobjspace::lookup_in_type(cls, "__init__") };
+        let obj_init = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__init__") };
+        if same_inherited_slot(tp_init, obj_init) {
+            let name = unsafe { pyre_object::w_type_get_name(cls) };
+            return Err(crate::PyError::type_error(format!(
+                "{name}() takes no arguments"
+            )));
+        }
+    }
+    // objectobject.py:131 descr__new__ — abstract classes refuse instantiation,
+    // checked after the excess-args gate and before allocating.
+    if unsafe { pyre_object::w_type_is_abstract(cls) } {
+        return Err(abstract_instantiation_error(cls));
+    }
+    Ok(w_instance_new(cls))
 }
 
 /// `object.__init__(self)` — no-op base __init__.  Surplus arguments are
 /// accepted only when __init__ or __new__ is overridden (objectobject.py
 /// descr__init__); otherwise the bare object initializer takes none.
 fn object_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() > 1 {
-        let w_obj = args[0];
-        if let Some(w_type) = crate::typedef::r#type(w_obj) {
-            let obj = w_object();
-            let tp_init = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__init__") };
-            let obj_init = unsafe { crate::baseobjspace::lookup_in_type(obj, "__init__") };
-            if !same_inherited_slot(tp_init, obj_init) {
-                return Err(crate::PyError::type_error(
-                    "object.__init__() takes exactly one argument (the instance to initialize)",
-                ));
-            }
-            let tp_new = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") };
-            let obj_new = unsafe { crate::baseobjspace::lookup_in_type(obj, "__new__") };
-            if same_inherited_slot(tp_new, obj_new) {
-                let name = unsafe { pyre_object::w_type_get_name(w_type) };
-                return Err(crate::PyError::type_error(format!(
-                    "{name}.__init__() takes exactly one argument (the instance to initialize)"
-                )));
-            }
+    let w_object = w_object();
+    if w_object.is_null() {
+        return Ok(w_none());
+    }
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if !(positional.len() > 1 || crate::builtins::has_real_kwargs(kwargs)) {
+        return Ok(w_none());
+    }
+    let Some(&w_obj) = positional.first() else {
+        return Ok(w_none());
+    };
+    if let Some(w_type) = crate::typedef::r#type(w_obj) {
+        let tp_init = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__init__") };
+        let obj_init = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__init__") };
+        if !same_inherited_slot(tp_init, obj_init) {
+            return Err(crate::PyError::type_error(
+                "object.__init__() takes exactly one argument (the instance to initialize)",
+            ));
+        }
+        let tp_new = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") };
+        let obj_new = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__new__") };
+        if same_inherited_slot(tp_new, obj_new) {
+            let name = unsafe { pyre_object::w_type_get_name(w_type) };
+            return Err(crate::PyError::type_error(format!(
+                "{name}.__init__() takes exactly one argument (the instance to initialize)"
+            )));
         }
     }
     Ok(w_none())
@@ -15957,6 +16013,10 @@ fn require_bytes_like(obj: PyObjectRef) -> Result<&'static [u8], crate::PyError>
 /// bytes-method TypeErrors.  More accurate than the raw `ob_type` name for
 /// instance-layout objects (e.g. a memoryview reports `memoryview`).
 fn type_name_of(obj: PyObjectRef) -> String {
+    // A tagged int immediate is an exact builtin int; skip the ob_type deref.
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        return "int".to_string();
+    }
     match r#type(obj) {
         Some(tp) => unsafe { pyre_object::w_type_get_name(tp) }.to_string(),
         None => unsafe { (*(*obj).ob_type).name.to_string() },
@@ -16179,7 +16239,7 @@ fn bytes_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     if kwargs.is_some() {
         return Err(crate::PyError::type_error(format!(
             "{}.replace() takes no keyword arguments",
-            unsafe { (*(*pos[0]).ob_type).name }
+            unsafe { pyre_object::type_name_of(pos[0]) }
         )));
     }
     assert!(pos.len() >= 3, "replace() takes at least 2 arguments");
@@ -16567,7 +16627,7 @@ fn bytes_method_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     if pos.len() != 2 {
         return Err(crate::PyError::type_error(format!(
             "{}.removeprefix() takes exactly one argument ({} given)",
-            unsafe { (*(*pos[0]).ob_type).name },
+            unsafe { pyre_object::type_name_of(pos[0]) },
             pos.len().saturating_sub(1)
         )));
     }
@@ -16588,7 +16648,7 @@ fn bytes_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     if pos.len() != 2 {
         return Err(crate::PyError::type_error(format!(
             "{}.removesuffix() takes exactly one argument ({} given)",
-            unsafe { (*(*pos[0]).ob_type).name },
+            unsafe { pyre_object::type_name_of(pos[0]) },
             pos.len().saturating_sub(1)
         )));
     }
@@ -16796,7 +16856,7 @@ fn parse_hex_string(args: &[PyObjectRef]) -> Result<Vec<u8>, crate::PyError> {
         Some(&a) => {
             return Err(crate::PyError::type_error(format!(
                 "fromhex() argument must be str or bytes-like, not {}",
-                unsafe { (*(*a).ob_type).name }
+                unsafe { pyre_object::type_name_of(a) }
             )));
         }
         None => {
@@ -16909,7 +16969,7 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             }
         }
         Some(b) => {
-            let tname = unsafe { (*(*b).ob_type).name };
+            let tname = unsafe { pyre_object::type_name_of(b) };
             return Err(crate::PyError::type_error(format!(
                 "expected str, got {tname} object"
             )));
@@ -17538,7 +17598,7 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
     // unicodeobject.py:1669 — encoding/errors must be str (space.text_w)
     if let Some(enc) = w_encoding {
         if !unsafe { pyre_object::is_str(enc) } && !unsafe { pyre_object::is_none(enc) } {
-            let tn = unsafe { (*(*enc).ob_type).name };
+            let tn = unsafe { pyre_object::type_name_of(enc) };
             return Err(crate::PyError::type_error(format!(
                 "decode() argument 'encoding' must be str, not {tn}",
             )));
@@ -17546,7 +17606,7 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
     }
     if let Some(err) = w_errors {
         if !unsafe { pyre_object::is_str(err) } && !unsafe { pyre_object::is_none(err) } {
-            let tn = unsafe { (*(*err).ob_type).name };
+            let tn = unsafe { pyre_object::type_name_of(err) };
             return Err(crate::PyError::type_error(format!(
                 "decode() argument 'errors' must be str, not {tn}",
             )));
@@ -21876,7 +21936,7 @@ fn descr_get_dict(
     let w_obj = args[1];
     let w_dict = crate::baseobjspace::getdict(w_obj);
     if w_dict.is_null() {
-        let tp_name = unsafe { (*(*w_obj).ob_type).name };
+        let tp_name = unsafe { pyre_object::type_name_of(w_obj) };
         return Err(crate::PyError::type_error(format!(
             "descriptor '__dict__' doesn't apply to '{}' objects",
             tp_name,

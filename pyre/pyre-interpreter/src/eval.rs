@@ -10,9 +10,8 @@ use crate::{
     ArithmeticOpcodeHandler, BranchOpcodeHandler, ConstantOpcodeHandler, ControlFlowOpcodeHandler,
     IterOpcodeHandler, LocalOpcodeHandler, NamespaceOpcodeHandler, OpcodeStepExecutor, PyError,
     PyErrorKind, PyResult, SharedOpcodeHandler, StackOpcodeHandler, StepResult, TruthOpcodeHandler,
-    build_list_from_refs, build_map_from_refs, build_tuple_from_refs,
-    decode_instruction_for_dispatch, ensure_range_iter, execute_opcode_step, stack_underflow_error,
-    unpack_sequence_exact,
+    build_list_from_refs, build_map_from_refs, build_tuple_from_refs, decode_instruction_forward,
+    ensure_range_iter, execute_opcode_step, stack_underflow_error, unpack_sequence_exact,
 };
 use pyre_object::*;
 
@@ -1542,9 +1541,9 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
                 continue;
             }
         }
-        let (opcode_pc, instruction, op_arg) = decode_instruction_for_dispatch(code, pc)?;
+        let (opcode_pc, instruction, op_arg) = decode_instruction_forward(code, pc)?;
         let fallthrough = opcode_pc + 1;
-        // `decode_instruction_for_dispatch` absorbs any EXTENDED_ARG prefix
+        // `decode_instruction_forward` absorbs any EXTENDED_ARG prefix
         // units, so the real opcode may sit past `pc`.  Re-point `last_instr`
         // at the opcode unit (`opcode_pc`) so a falling-through handler's
         // `next_instr()` (= last_instr + 1) lands at `fallthrough` rather than

@@ -548,6 +548,10 @@ unsafe fn p_recursive_issubclass_w(
 /// looked up via `space.lookup(w_klass_or_tuple, "__instancecheck__")`,
 /// then the abstract `__class__`/`__bases__` walk.
 pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyError> {
+    // Nested tuple / union classinfo recurses in native Rust with no
+    // Python frame push, so guard the C stack here or a deep classinfo
+    // blows it before any frame-level check fires.
+    crate::stack_check::stack_check()?;
     unsafe {
         // abstractinst.py:104-106 — quick exact-type test.
         if let Some(t) = crate::typedef::r#type(obj) {
@@ -613,6 +617,10 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
 /// Tuple/union recursion, `__subclasscheck__` override looked up on
 /// `type(classinfo)`, then the abstract `__bases__` walk.
 pub fn issubclass(derived: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyError> {
+    // Nested tuple / union classinfo recurses in native Rust with no
+    // Python frame push, so guard the C stack here or a deep classinfo
+    // blows it before any frame-level check fires.
+    crate::stack_check::stack_check()?;
     unsafe {
         // abstractinst.py:181-187 — tuple recursion.
         if is_tuple(classinfo) {
@@ -1209,7 +1217,7 @@ pub(crate) fn getitem_slot(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "'{}' object is not subscriptable",
-            (*(*obj).ob_type).name,
+            pyre_object::type_name_of(obj),
         )))
     }
 }
@@ -2833,7 +2841,7 @@ pub(crate) fn setitem_slot(obj: PyObjectRef, index: PyObjectRef, value: PyObject
         }
         Err(PyError::type_error(format!(
             "'{}' object does not support item assignment",
-            (*(*obj).ob_type).name,
+            pyre_object::type_name_of(obj),
         )))
     }
 }
@@ -7826,7 +7834,7 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         if !is_type(w_newcls) {
             return Err(crate::PyError::type_error(format!(
                 "__class__ must be set to new-style class, not '{}' object",
-                (*(*w_newcls).ob_type).name,
+                pyre_object::type_name_of(w_newcls),
             )));
         }
         // objectobject.py:143-145 — w_newcls must be a heap type.
@@ -8689,6 +8697,8 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     // module/type misses above — so the receiver's own type is named and the
     // obj/name context is attached, rather than the bare `object` base.
     // `w_descr` carries a found-but-non-data descriptor so the miss is read-only.
+    // `raiseattrerror` resolves the type name via the tag-safe `typedef::type`,
+    // so a tagged immediate never reaches a raw `ob_type` deref here.
     Err(raiseattrerror(obj, name, w_descr))
 }
 
@@ -10139,6 +10149,17 @@ unsafe fn obj_type_name(obj: PyObjectRef) -> &'static str {
     }
 }
 
+/// Type name for the "not iterable" TypeError. A tagged immediate is an
+/// exact `int`; name it without derefing its (non-pointer) tagged bits as
+/// `ob_type`. Gated on `CAN_BE_TAGGED`; folds to the raw deref at flag-false.
+unsafe fn not_iterable_type_name(obj: PyObjectRef) -> &'static str {
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        "int"
+    } else {
+        (*(*obj).ob_type).name
+    }
+}
+
 unsafe fn iter_check_is_iterator(w_iterator: PyObjectRef) -> PyResult {
     let w_type = crate::typedef::r#type(w_iterator).unwrap_or(std::ptr::null_mut());
     let has_next = if !w_type.is_null() && lookup_in_type_where(w_type, "__next__").is_some() {
@@ -10467,7 +10488,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                     if is_none(method) {
                         return Err(PyError::type_error(format!(
                             "'{}' object is not iterable",
-                            (*(*obj).ob_type).name
+                            not_iterable_type_name(obj)
                         )));
                     }
                     let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
@@ -10483,7 +10504,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
     }
     Err(PyError::type_error(format!(
         "'{}' object is not iterable",
-        unsafe { (*(*obj).ob_type).name }
+        unsafe { not_iterable_type_name(obj) }
     )))
 }
 

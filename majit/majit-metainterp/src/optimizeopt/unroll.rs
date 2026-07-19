@@ -3811,6 +3811,23 @@ impl OptUnroll {
             }
         }
 
+        // RPython keys `mapping` by Box identity: the seeding loops above bind
+        // each short-preamble INPUT box to its jump arg, and the replay loop
+        // below binds each short-op RESULT box (`mapping[sop] = op`). Those two
+        // key spaces never intersect — a Box is either an input or a produced
+        // result, never both. pyre's flat-OpRef namespace has no such guarantee:
+        // a re-virtualizing ALLOCATION short op (e.g. `NewWithVtable`) can be
+        // assigned a result position that equals a loop-input OpRef (the export
+        // aliases the virtual's materialization onto the label slot that carries
+        // it). If the replay's `mapping.insert(sp_op.pos, ...)` overwrote that
+        // seeded entry, every later short op that reads the input would resolve to
+        // the fresh, field-less allocation instead of the loop-carried box.
+        // Snapshot the seeded input keys so the replay can preserve them for
+        // allocation ops only (see the insert site below), restoring the RPython
+        // input-vs-result key disjointness. (A colliding non-allocation op is a
+        // real recomputation and must NOT be preserved — see the insert site.)
+        let seeded_input_keys: indexmap::IndexSet<OpRef> = mapping.keys().copied().collect();
+
         let mut replay_index = 0;
 
         fn current_short_len(
@@ -3960,7 +3977,32 @@ impl OptUnroll {
                 new_op.pos.set(new_ref);
                 // unroll.py:412-414: mapping[sop] = op; i += 1; send_extra_operation(op)
                 // RPython sets mapping BEFORE send_extra_operation.
-                mapping.insert(sp_op.pos.get(), new_ref);
+                //
+                // RPython keys `mapping` by Box identity, and a short-op RESULT
+                // Box is never also a short-preamble INPUT Box, so `mapping[sop]
+                // = op` can never overwrite a seeded input → jump_arg entry. In
+                // pyre's flat-OpRef namespace a re-virtualizing ALLOCATION short op
+                // can be exported with a result position that equals a loop-input
+                // OpRef (the virtual's materialization aliases the label slot that
+                // already carries it). Overwriting the seed for such an op would
+                // make every later short op that reads the input resolve to this
+                // fresh, field-less allocation instead of the loop-carried box, so
+                // a `GetfieldGcPureI` over the aliased input reads an uninitialized
+                // field. Skip the insert ONLY for those allocation ops
+                // (`is_malloc`: New..Newunicode) to preserve the seed. A colliding
+                // NON-allocation op (a pure read/compute whose result pos happens
+                // to alias a seed, e.g. `GetfieldGcPureI` producing an Int loop
+                // slot) is a genuine recomputation whose fresh result IS the
+                // correct binding — skipping it would strand the slot on the seed's
+                // Ref box and feed a Ref into an Int consumer (getintbound_handle
+                // 'i'-typed assert). Keep the RPython input-vs-result key
+                // disjointness for the allocation case only; the redundant
+                // reconstruction op is left unmapped (dead) and elided by DCE.
+                let skip_insert =
+                    sp_op.opcode.is_malloc() && seeded_input_keys.contains(&sp_op.pos.get());
+                if !skip_insert {
+                    mapping.insert(sp_op.pos.get(), new_ref);
+                }
                 replay_index += 1;
                 // unroll.py:414 lets send_extra_operation raise InvalidLoop.
                 // This function returns Vec (flag convention, as the arity /
